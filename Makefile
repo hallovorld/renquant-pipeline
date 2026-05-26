@@ -1,4 +1,8 @@
+ifneq ("$(wildcard ../RenQuant/.venv/bin/python)","")
+PYTHON ?= ../RenQuant/.venv/bin/python
+else
 PYTHON ?= python3
+endif
 COMMON_SRC ?= ../renquant-common/src
 BASE_DATA_SRC ?= ../renquant-base-data/src
 ARTIFACTS_SRC ?= ../renquant-artifacts/src

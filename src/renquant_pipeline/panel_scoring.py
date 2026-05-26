@@ -13,6 +13,7 @@ from renquant_common import Job, Task
 
 from .decision_trace import append_ticker_daily_state_rows
 from .order_attribution import stamp_order_attribution
+from .xgboost_scorer import load_xgboost_panel_scorer
 
 
 class LoadScorerTask(Task):
@@ -73,16 +74,35 @@ class ApplyScoresTask(Task):
         intercept = _linear_intercept(ctx)
         scores: dict[str, float] = {}
         matrix = getattr(ctx, "panel_feature_matrix", {}) or {}
+        artifact_scorer = None
+        scorer_load_error = None
+        if not explicit_scores and not linear_weights:
+            try:
+                artifact_scorer = load_xgboost_panel_scorer(getattr(ctx, "artifact_manifest", {}) or {})
+            except Exception as exc:  # noqa: BLE001
+                scorer_load_error = str(exc)
+
+        artifact_scores: dict[str, float] = {}
+        if artifact_scorer is not None:
+            try:
+                artifact_scores = artifact_scorer.predict_rows(matrix)
+            except Exception as exc:  # noqa: BLE001
+                scorer_load_error = str(exc)
 
         for ticker, row in matrix.items():
             if ticker in explicit_scores:
                 score = _finite_float(explicit_scores[ticker])
             elif linear_weights:
                 score = _linear_score(row, linear_weights, intercept)
+            elif ticker in artifact_scores:
+                score = _finite_float(artifact_scores[ticker])
             else:
                 score = None
             if score is None:
-                _block(ctx, ticker, "missing_panel_score")
+                reason = "missing_panel_score"
+                if scorer_load_error:
+                    reason = f"panel_scorer_load_failed:{scorer_load_error[:120]}"
+                _block(ctx, ticker, reason)
                 continue
             scores[ticker] = score
 
