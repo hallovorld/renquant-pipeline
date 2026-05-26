@@ -2,6 +2,17 @@
 
 Runtime decision-pipeline repository for RenQuant.
 
+Operating model: https://github.com/hallovorld/RenQuant/blob/main/doc/arch/subrepo-operating-model.md
+
+Repository map: [RENQUANT_REPOS.md](RENQUANT_REPOS.md)
+
+Local automation:
+
+```bash
+make test
+make doctor
+```
+
 This repo owns inference/runtime composition: preflight, regime gates,
 candidate scoring, ranking, selection, rotation, QP, order-intent generation,
 and decision-trace persistence. It consumes model artifacts through contracts;

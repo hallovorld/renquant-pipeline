@@ -10,11 +10,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from renquant_common import Job, Pipeline, Task
+from renquant_artifacts import validate_artifact_manifest
+from renquant_base_data import validate_data_manifest
 
 
 @dataclass
 class InferenceContext:
     strategy_config: dict[str, Any]
+    data_manifest: dict[str, Any]
     artifact_manifest: dict[str, Any]
     market_snapshot: dict[str, Any]
     account_snapshot: dict[str, Any] = field(default_factory=dict)
@@ -30,8 +33,8 @@ class ValidateRuntimeInputsTask(Task):
     def run(self, ctx: InferenceContext) -> bool | None:
         if not ctx.strategy_config.get("watchlist"):
             raise ValueError("strategy_config missing watchlist")
-        if not ctx.artifact_manifest.get("artifact_id"):
-            raise ValueError("artifact_manifest missing artifact_id")
+        validate_data_manifest(ctx.data_manifest)
+        validate_artifact_manifest(ctx.artifact_manifest)
         if not ctx.market_snapshot.get("as_of"):
             raise ValueError("market_snapshot missing as_of")
         return True

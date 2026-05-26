@@ -9,7 +9,22 @@ from renquant_pipeline import InferenceContext, RuntimeInferencePipeline
 def _ctx() -> InferenceContext:
     return InferenceContext(
         strategy_config={"watchlist": ["AAPL", "MSFT"]},
-        artifact_manifest={"artifact_id": "panel-ltr-prod"},
+        data_manifest={
+            "dataset_id": "daily-fixture",
+            "schema_version": "fixture-v1",
+            "fingerprint": "sha256:data",
+            "uri": "object://renquant-data/daily-fixture.parquet",
+            "asset_class": "equity",
+        },
+        artifact_manifest={
+            "artifact_id": "panel-ltr-prod",
+            "model_family": "gbdt-panel-ltr",
+            "strategy": "renquant_104",
+            "fingerprint": "sha256:model",
+            "uri": "object://renquant-artifacts/panel-ltr-prod.json",
+            "promotion_status": "prod",
+            "metrics": {"accepted": True},
+        },
         market_snapshot={"as_of": "2026-05-25"},
     )
 
@@ -43,5 +58,13 @@ def test_runtime_pipeline_requires_artifact_manifest() -> None:
     ctx = _ctx()
     ctx.artifact_manifest = {}
 
-    with pytest.raises(ValueError, match="artifact_manifest missing"):
+    with pytest.raises(ValueError, match="artifact manifest missing"):
+        RuntimeInferencePipeline([ScoreTask()]).run(ctx)
+
+
+def test_runtime_pipeline_requires_data_manifest() -> None:
+    ctx = _ctx()
+    ctx.data_manifest = {}
+
+    with pytest.raises(ValueError, match="data manifest missing"):
         RuntimeInferencePipeline([ScoreTask()]).run(ctx)

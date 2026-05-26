@@ -1,0 +1,39 @@
+schema_version: 1
+name: renquant-pipeline
+role: runtime inference and decision pipeline
+operating_model: https://github.com/hallovorld/RenQuant/blob/main/doc/arch/subrepo-operating-model.md
+repo_map: RENQUANT_REPOS.md
+pipeline_required: true
+branch_policy:
+  main: stable interface for downstream repos and automation
+  feature_branches: experiments, optimizations, and large upgrades
+source_repo:
+  name: RenQuant
+  never_delete: true
+dependencies:
+  - renquant-common
+  - renquant-strategy-104
+  - renquant-base-data
+  - renquant-artifacts
+inputs:
+  - strategy config bundle
+  - model artifact manifest
+  - data manifest
+  - account and holding snapshot
+outputs:
+  - decision trace
+  - order intents
+  - runtime gate report
+owns:
+  - preflight contract checks
+  - candidate scoring and gating
+  - ranking, selection, rotation, QP sizing
+  - order-intent generation
+forbidden:
+  - model training
+  - broker order submission
+  - raw data storage
+  - silent fallback on missing metadata
+automation:
+  test: make test
+  doctor: make doctor

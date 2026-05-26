@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: renquant-pipeline
+      - uses: actions/checkout@v4
+        with:
+          repository: hallovorld/renquant-common
+          path: renquant-common
+      - uses: actions/checkout@v4
+        with:
+          repository: hallovorld/renquant-base-data
+          path: renquant-base-data
+      - uses: actions/checkout@v4
+        with:
+          repository: hallovorld/renquant-artifacts
+          path: renquant-artifacts
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install test tools
+        run: python -m pip install pytest
+      - name: Test
+        working-directory: renquant-pipeline
+        run: make test
