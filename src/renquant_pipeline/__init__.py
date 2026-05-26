@@ -24,6 +24,11 @@ from .panel_scoring import (
     VetoWeakBuysTask,
 )
 from .runtime_features import build_runtime_feature_frame, transform_feature_rows
+from .selection import (
+    SelectAcceptedCandidatesTask,
+    SelectionJob,
+    ValidateSelectionDoesNotPromoteTask,
+)
 from .xgboost_scorer import XGBoostPanelScorer, load_xgboost_panel_scorer
 from .artifact_contract import (
     ContractResult,
@@ -54,6 +59,9 @@ __all__ = [
     "PanelScoringJob",
     "RegimeModelAdmissionTask",
     "RuntimeInferencePipeline",
+    "SelectAcceptedCandidatesTask",
+    "SelectionJob",
+    "ValidateSelectionDoesNotPromoteTask",
     "VetoWeakBuysTask",
     "XGBoostPanelScorer",
     "append_ticker_daily_state_rows",

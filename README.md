@@ -34,6 +34,10 @@ require OOS IC, WF Sharpe, SPY-relative Sharpe/APY, current-regime evidence,
 calibration health, config fingerprint, and sector-map fingerprint before any
 candidate reaches sizing/QP.
 
+Selection is a separate job after alpha admission. `SelectionJob` can rank and
+limit already accepted candidates, but it raises if anything tries to promote a
+blocked or non-accepted ticker into the selected set.
+
 Order intents are not allowed to leave this repo unexplained. Use
 `stamp_order_attribution()` or `EmitAttributedOrderIntentsTask`; every intent
 must include ticker, action, quantity, source job/task, acceptance reason,
