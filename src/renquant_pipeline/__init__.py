@@ -22,6 +22,7 @@ from .panel_scoring import (
     RegimeModelAdmissionTask,
     VetoWeakBuysTask,
 )
+from .runtime_features import build_runtime_feature_frame, transform_feature_rows
 from .xgboost_scorer import XGBoostPanelScorer, load_xgboost_panel_scorer
 from .artifact_contract import (
     ContractResult,
@@ -55,6 +56,7 @@ __all__ = [
     "XGBoostPanelScorer",
     "append_ticker_daily_state_rows",
     "build_run_bundle",
+    "build_runtime_feature_frame",
     "build_ticker_daily_state_rows",
     "hash_jsonable",
     "live_state_legacy_path",
@@ -66,6 +68,7 @@ __all__ = [
     "runs_db_path",
     "score_snapshot",
     "stamp_order_attribution",
+    "transform_feature_rows",
     "validate_feature_contract",
     "validate_model_evidence_contract",
     "validate_order_attribution",

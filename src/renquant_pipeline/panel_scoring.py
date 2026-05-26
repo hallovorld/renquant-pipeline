@@ -13,6 +13,7 @@ from renquant_common import Job, Task
 
 from .decision_trace import append_ticker_daily_state_rows
 from .order_attribution import stamp_order_attribution
+from .runtime_features import build_runtime_feature_frame
 from .xgboost_scorer import load_xgboost_panel_scorer
 
 
@@ -40,7 +41,12 @@ class BuildFeatureMatrixTask(Task):
 
     def run(self, ctx: Any) -> bool | None:
         feature_cols = list(getattr(ctx, "panel_feature_cols", []) or [])
-        frame = _feature_frame(ctx)
+        try:
+            frame = _feature_frame(ctx, feature_cols)
+        except Exception as exc:  # noqa: BLE001
+            _block_all(ctx, f"feature_transform_failed:{str(exc)[:120]}")
+            _trace(ctx)
+            return False
         matrix: dict[str, dict[str, Any]] = {}
         for ticker in _watchlist(ctx):
             row = frame.get(ticker)
@@ -315,21 +321,13 @@ def _feature_cols(artifact: dict[str, Any]) -> list[str]:
     return []
 
 
-def _feature_frame(ctx: Any) -> dict[str, dict[str, Any]]:
-    market = getattr(ctx, "market_snapshot", {}) or {}
-    raw = market.get("feature_frame") or market.get("features") or {}
-    if isinstance(raw, dict):
-        return {str(ticker): dict(row) for ticker, row in raw.items() if isinstance(row, dict)}
-    if isinstance(raw, list):
-        frame: dict[str, dict[str, Any]] = {}
-        for row in raw:
-            if not isinstance(row, dict):
-                continue
-            ticker = row.get("ticker") or row.get("symbol")
-            if ticker:
-                frame[str(ticker)] = dict(row)
-        return frame
-    return {}
+def _feature_frame(ctx: Any, feature_cols: list[str]) -> dict[str, dict[str, Any]]:
+    return build_runtime_feature_frame(
+        getattr(ctx, "market_snapshot", {}) or {},
+        getattr(ctx, "artifact_manifest", {}) or {},
+        feature_cols,
+        panel_config=_panel_cfg(ctx),
+    )
 
 
 def _panel_scores_from_snapshot(ctx: Any) -> dict[str, Any]:

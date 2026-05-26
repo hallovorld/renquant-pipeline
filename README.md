@@ -21,9 +21,13 @@ it does not train models and does not submit broker orders.
 ## Runtime Decision Contract
 
 Panel scoring is fail-closed. Runtime must provide an artifact feature contract,
-per-ticker feature rows, and either explicit panel scores or a declared linear
-scorer. Missing metadata, missing features, missing scores, failed model
-admission, or missing order quantities block buys and record `blocked_by`.
+per-ticker feature rows, and either explicit panel scores, a declared linear
+scorer, or a local XGBoost artifact payload. `feature_frame` is treated as
+already in scorer space. `raw_feature_frame` and source-space overrides must
+carry artifact normalization metadata (`feature_means`, `feature_stds`,
+`feature_norm_kind`) so live/sim/backtest use the same feature-space transform.
+Missing metadata, missing features, missing scores, failed model admission, or
+missing order quantities block buys and record `blocked_by`.
 
 Order intents are not allowed to leave this repo unexplained. Use
 `stamp_order_attribution()` or `EmitAttributedOrderIntentsTask`; every intent
