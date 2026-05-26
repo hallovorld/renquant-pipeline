@@ -1,6 +1,7 @@
 """RenQuant runtime decision pipeline package."""
 
 from .inference import InferenceContext, RuntimeInferencePipeline
+from .model_admission import ModelAdmissionResult, evaluate_model_admission
 from .decision_trace import (
     append_ticker_daily_state_rows,
     build_ticker_daily_state_rows,
@@ -43,6 +44,7 @@ from .state_paths import (
 __all__ = [
     "ContractResult",
     "InferenceContext",
+    "ModelAdmissionResult",
     "ATTRIBUTION_VERSION",
     "ApplyGlobalCalibrationTask",
     "ApplyScoresTask",
@@ -58,6 +60,7 @@ __all__ = [
     "build_run_bundle",
     "build_runtime_feature_frame",
     "build_ticker_daily_state_rows",
+    "evaluate_model_admission",
     "hash_jsonable",
     "live_state_legacy_path",
     "live_state_path",

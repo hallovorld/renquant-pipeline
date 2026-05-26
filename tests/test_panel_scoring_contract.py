@@ -27,6 +27,7 @@ def _ctx(*, feature_frame=None, panel_scores=None, artifact_extra=None) -> Infer
             "oos_mean_ic": 0.04,
             "wf_sharpe": 1.5,
             "spy_relative_sharpe": 0.3,
+            "spy_relative_apy": 0.02,
             "config_fingerprint": "sha256:cfg",
         },
     }
@@ -34,6 +35,7 @@ def _ctx(*, feature_frame=None, panel_scores=None, artifact_extra=None) -> Infer
     return InferenceContext(
         strategy_config={
             "watchlist": ["AAPL", "MSFT"],
+            "config_fingerprint": "sha256:cfg",
             "sector_map": {"AAPL": "TECH", "MSFT": "TECH"},
             "ranking": {
                 "panel_scoring": {

@@ -12,6 +12,7 @@ from renquant_artifacts import validate_feature_contract
 from renquant_common import Job, Task
 
 from .decision_trace import append_ticker_daily_state_rows
+from .model_admission import evaluate_model_admission
 from .order_attribution import stamp_order_attribution
 from .runtime_features import build_runtime_feature_frame
 from .xgboost_scorer import load_xgboost_panel_scorer
@@ -158,36 +159,21 @@ class RegimeModelAdmissionTask(Task):
 
     def run(self, ctx: Any) -> bool | None:
         cfg = _panel_cfg(ctx).get("model_admission") or {}
-        artifact = getattr(ctx, "artifact_manifest", {}) or {}
-        metrics = artifact.get("metrics") or {}
-        if metrics.get("accepted") is False:
-            _block_all(ctx, "model_not_accepted")
+        result = evaluate_model_admission(
+            strategy_config=getattr(ctx, "strategy_config", {}) or {},
+            artifact_manifest=getattr(ctx, "artifact_manifest", {}) or {},
+            market_snapshot=getattr(ctx, "market_snapshot", {}) or {},
+            admission_config=cfg,
+        )
+        setattr(ctx, "model_admission", {
+            "ok": result.ok,
+            "reason": result.reason,
+            "details": result.details,
+        })
+        if not result.ok:
+            _block_all(ctx, result.reason or "model_admission_failed")
             _trace(ctx)
             return False
-        if not cfg.get("enabled", False):
-            return True
-
-        for field, reason in (
-            ("min_oos_mean_ic", "model_oos_ic_below_floor"),
-            ("min_wf_sharpe", "model_wf_sharpe_below_floor"),
-            ("min_spy_relative_sharpe", "model_spy_relative_sharpe_below_floor"),
-        ):
-            floor = cfg.get(field)
-            if floor is None:
-                continue
-            metric_name = field.removeprefix("min_")
-            value = metrics.get(metric_name) or artifact.get(metric_name)
-            numeric = _finite_float(value)
-            if numeric is None or numeric < float(floor):
-                _block_all(ctx, reason)
-                _trace(ctx)
-                return False
-
-        if cfg.get("require_config_fingerprint", False):
-            if not (artifact.get("config_fingerprint") or metrics.get("config_fingerprint")):
-                _block_all(ctx, "missing_config_fingerprint")
-                _trace(ctx)
-                return False
         return True
 
 

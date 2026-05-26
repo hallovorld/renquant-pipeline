@@ -29,6 +29,11 @@ carry artifact normalization metadata (`feature_means`, `feature_stds`,
 Missing metadata, missing features, missing scores, failed model admission, or
 missing order quantities block buys and record `blocked_by`.
 
+Model admission is explicit and fail-closed when enabled. The runtime can
+require OOS IC, WF Sharpe, SPY-relative Sharpe/APY, current-regime evidence,
+calibration health, config fingerprint, and sector-map fingerprint before any
+candidate reaches sizing/QP.
+
 Order intents are not allowed to leave this repo unexplained. Use
 `stamp_order_attribution()` or `EmitAttributedOrderIntentsTask`; every intent
 must include ticker, action, quantity, source job/task, acceptance reason,
