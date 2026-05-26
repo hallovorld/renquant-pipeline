@@ -6,6 +6,7 @@ from .artifact_contract import (
     build_run_bundle,
     hash_jsonable,
     validate_feature_contract,
+    validate_model_evidence_contract,
     validate_panel_artifact_contract,
 )
 from .state_paths import (
@@ -28,5 +29,6 @@ __all__ = [
     "runs_db_legacy_path",
     "runs_db_path",
     "validate_feature_contract",
+    "validate_model_evidence_contract",
     "validate_panel_artifact_contract",
 ]

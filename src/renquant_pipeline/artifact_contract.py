@@ -21,6 +21,7 @@ from renquant_artifacts.contracts import (
     sentiment_runtime_gate_requirement,
     sha256_file,
     validate_feature_contract,
+    validate_model_evidence_contract,
     validate_panel_artifact_contract,
 )
 
@@ -39,5 +40,6 @@ __all__ = [
     "sentiment_runtime_gate_requirement",
     "sha256_file",
     "validate_feature_contract",
+    "validate_model_evidence_contract",
     "validate_panel_artifact_contract",
 ]
