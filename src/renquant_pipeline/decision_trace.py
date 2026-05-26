@@ -1,0 +1,151 @@
+"""Decision-trace rows shared by runtime and backtesting.
+
+The trace contract is intentionally plain dictionaries. Storage layers can
+persist them to SQLite, JSONL, or LEAN logs without importing broker or model
+code.
+"""
+from __future__ import annotations
+
+from typing import Any, Iterable
+
+
+def model_type_from_artifact(artifact: dict[str, Any] | None) -> str | None:
+    """Infer a stable model-type label from an artifact manifest."""
+    if not isinstance(artifact, dict):
+        return None
+    for key in ("model_type", "model_family", "kind", "backend"):
+        value = artifact.get(key)
+        if value:
+            return str(value)
+    metadata = artifact.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("model_type", "model_family", "kind", "backend"):
+            value = metadata.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+def build_ticker_daily_state_rows(
+    config: dict[str, Any],
+    ctx: Any,
+    *,
+    selected_tickers: Iterable[str] | None = None,
+    blocked_map: dict[str, str] | None = None,
+    model_types: dict[str, str] | None = None,
+    pending_broker_tickers: Iterable[str] | None = None,
+    sector_map: dict[str, str] | None = None,
+    qp_delta_by_ticker: dict[str, float] | None = None,
+    qp_target_by_ticker: dict[str, float] | None = None,
+    qp_status: str | None = None,
+    extra_tickers: Iterable[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Build complete per-ticker decision rows for the current runtime state."""
+    selected = set(selected_tickers or [])
+    pending = set(pending_broker_tickers or [])
+    blocked = blocked_map or getattr(ctx, "blocked_by", {}) or {}
+    sectors = sector_map or config.get("sector_map") or {}
+    scores = getattr(ctx, "scores", {}) or {}
+    panel_scores = getattr(ctx, "panel_scores", None) or scores
+    rank_scores = getattr(ctx, "rank_scores", None) or scores
+    watchlist = list(config.get("watchlist") or [])
+    held = _position_tickers(getattr(ctx, "account_snapshot", {}) or {})
+    ticker_order = _stable_ticker_order(watchlist, held, selected, blocked, pending, extra_tickers)
+    artifact_model_type = model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+
+    rows: list[dict[str, Any]] = []
+    for ticker in ticker_order:
+        model_type = (model_types or {}).get(ticker) or artifact_model_type
+        rows.append(
+            {
+                "ticker": ticker,
+                "as_of": _get_market_value(ctx, "as_of"),
+                "regime": _get_value(ctx, "regime"),
+                "confidence": _finite_or_none(_get_value(ctx, "confidence")),
+                "sector": sectors.get(ticker, "UNKNOWN"),
+                "model_type": model_type,
+                "score": _finite_or_none(scores.get(ticker)),
+                "panel_score": _finite_or_none(panel_scores.get(ticker)),
+                "rank_score": _finite_or_none(rank_scores.get(ticker)),
+                "blocked_by": blocked.get(ticker),
+                "selected": ticker in selected,
+                "in_watchlist": ticker in watchlist,
+                "has_position": ticker in held,
+                "pending_at_broker": ticker in pending,
+                "qp_delta": _finite_or_none((qp_delta_by_ticker or {}).get(ticker)),
+                "qp_target": _finite_or_none((qp_target_by_ticker or {}).get(ticker)),
+                "qp_status": qp_status,
+            }
+        )
+    return rows
+
+
+def append_ticker_daily_state_rows(
+    config: dict[str, Any],
+    ctx: Any,
+    **kwargs: Any,
+) -> list[dict[str, Any]]:
+    """Append per-ticker state rows to ``ctx.decision_trace`` and return them."""
+    rows = build_ticker_daily_state_rows(config, ctx, **kwargs)
+    if not hasattr(ctx, "decision_trace") or getattr(ctx, "decision_trace") is None:
+        setattr(ctx, "decision_trace", [])
+    ctx.decision_trace.extend(rows)
+    return rows
+
+
+def _stable_ticker_order(
+    watchlist: Iterable[str],
+    held: Iterable[str],
+    selected: Iterable[str],
+    blocked: dict[str, str],
+    pending: Iterable[str],
+    extra_tickers: Iterable[str] | None,
+) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for source in (watchlist, held, selected, blocked.keys(), pending, extra_tickers or []):
+        for ticker in source:
+            symbol = str(ticker)
+            if symbol not in seen:
+                ordered.append(symbol)
+                seen.add(symbol)
+    return ordered
+
+
+def _position_tickers(account_snapshot: dict[str, Any]) -> set[str]:
+    positions = account_snapshot.get("positions") or {}
+    if isinstance(positions, dict):
+        return {str(ticker) for ticker, position in positions.items() if position}
+    if isinstance(positions, list):
+        tickers: set[str] = set()
+        for position in positions:
+            if isinstance(position, dict):
+                ticker = position.get("ticker") or position.get("symbol")
+                if ticker:
+                    tickers.add(str(ticker))
+        return tickers
+    return set()
+
+
+def _get_market_value(ctx: Any, key: str) -> Any:
+    market = getattr(ctx, "market_snapshot", {}) or {}
+    return market.get(key)
+
+
+def _get_value(ctx: Any, key: str) -> Any:
+    if hasattr(ctx, key):
+        return getattr(ctx, key)
+    market = getattr(ctx, "market_snapshot", {}) or {}
+    return market.get(key)
+
+
+def _finite_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number

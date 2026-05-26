@@ -18,6 +18,18 @@ candidate scoring, ranking, selection, rotation, QP, order-intent generation,
 and decision-trace persistence. It consumes model artifacts through contracts;
 it does not train models and does not submit broker orders.
 
+## Runtime Decision Contract
+
+Panel scoring is fail-closed. Runtime must provide an artifact feature contract,
+per-ticker feature rows, and either explicit panel scores or a declared linear
+scorer. Missing metadata, missing features, missing scores, failed model
+admission, or missing order quantities block buys and record `blocked_by`.
+
+Order intents are not allowed to leave this repo unexplained. Use
+`stamp_order_attribution()` or `EmitAttributedOrderIntentsTask`; every intent
+must include ticker, action, quantity, source job/task, acceptance reason,
+model type, sector, score snapshot, artifact fingerprint, and decision inputs.
+
 ## Pipeline Rule
 
 All runtime flows are built from `renquant-common` Task/Job/Pipeline

@@ -24,6 +24,7 @@ class InferenceContext:
     decision_trace: list[dict[str, Any]] = field(default_factory=list)
     scores: dict[str, float] = field(default_factory=dict)
     order_intents: list[dict[str, Any]] = field(default_factory=list)
+    blocked_by: dict[str, str] = field(default_factory=dict)
     buy_blocked: bool = False
 
 

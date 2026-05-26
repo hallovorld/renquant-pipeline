@@ -38,7 +38,7 @@ class ScoreTask(Task):
 
 class SelectTask(Task):
     def run(self, ctx: InferenceContext) -> bool | None:
-        ctx.order_intents.append({"ticker": "AAPL", "action": "buy"})
+        ctx.order_intents.append({"ticker": "AAPL", "action": "buy", "quantity": 1})
         ctx.decision_trace.append({"stage": "select", "selected": "AAPL"})
         return True
 
@@ -50,7 +50,7 @@ def test_runtime_pipeline_emits_order_intents_and_trace() -> None:
     assert result.ok is True
     assert result.name == "runtime-inference"
     assert ctx.scores["AAPL"] == pytest.approx(0.7)
-    assert ctx.order_intents == [{"ticker": "AAPL", "action": "buy"}]
+    assert ctx.order_intents == [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
     assert [row["stage"] for row in ctx.decision_trace] == ["score", "select"]
 
 
