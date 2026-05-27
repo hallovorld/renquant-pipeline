@@ -28,6 +28,14 @@ LIFTED_MODULES = [
     "renquant_pipeline.kernel.realized_pnl",
     "renquant_pipeline.kernel.portfolio",
     "renquant_pipeline.kernel.scoring",
+    # slice 3
+    "renquant_pipeline.kernel.portfolio_qp.qp_solver",
+    "renquant_pipeline.kernel.portfolio_qp.signal_combiner",
+    "renquant_pipeline.kernel.portfolio_qp.cvxportfolio_backend",
+    "renquant_pipeline.kernel.selection",
+    "renquant_pipeline.kernel.rotation",
+    "renquant_pipeline.kernel.rotation_convex",
+    "renquant_pipeline.kernel.exits",
 ]
 
 
@@ -43,3 +51,23 @@ def test_kelly_fraction_is_bounded() -> None:
     # The module exposes kelly-fraction helpers; just assert callables exist.
     public = [n for n in dir(kelly) if not n.startswith("_")]
     assert public, "kelly module exposes no public symbols"
+
+
+def test_qp_solver_prefers_higher_mu_asset() -> None:
+    """Behavioral sanity on the lifted QP solver (slice 3).
+
+    From cash, with asset 0 carrying positive expected return and asset 1
+    flat, the convex Markowitz solve must allocate at least as much weight
+    to the higher-μ asset and stay inside the unit budget.
+    """
+    qp = importlib.import_module("renquant_pipeline.kernel.portfolio_qp.qp_solver")
+    sol = qp.solve_portfolio_qp(
+        w_current=[0.0, 0.0],
+        mu=[0.05, 0.0],
+        sigma=[0.20, 0.20],
+        risk_aversion=3.0,
+        w_upper=0.50,
+    )
+    assert sol.status.startswith("optimal")
+    assert sol.target_w[0] >= sol.target_w[1] - 1e-9
+    assert sum(sol.target_w) <= 1.0 + 1e-6
