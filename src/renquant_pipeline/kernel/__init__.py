@@ -5,8 +5,8 @@ copied verbatim from `backtesting/renquant_104/kernel/` into the pipeline
 package and verified import-clean here. The umbrella keeps its working copy
 until cutover.
 
-Lifted slices (pure leaves — stdlib + numpy/pandas only, no internal
-kernel imports):
+Lifted slices (pure leaves — stdlib + numpy/pandas, optionally cvxpy/scipy/
+pandas_market_calendars, no internal kernel imports):
 
 Slice 1 — sizing / exits:
 * ``kelly``        — fractional-Kelly position sizing
@@ -26,6 +26,19 @@ Slice 2 — regime / intraday / config / safety / portfolio:
 * ``realized_pnl``       — realized P&L (FIFO/HIFO) computation
 * ``portfolio``          — portfolio state helpers
 * ``scoring``            — score value types / helpers
+
+Slice 3 — QP engine math + selection / rotation / exits:
+* ``portfolio_qp.qp_solver``            — cvxpy/CLARABEL Markowitz QP solver
+* ``portfolio_qp.signal_combiner``      — multi-signal μ combination
+* ``portfolio_qp.cvxportfolio_backend`` — cvxportfolio backend (uses qp_solver)
+* ``selection``        — candidate scoring, guards, tiered selection loop
+* ``rotation``         — thesis-rotation pair finding
+* ``rotation_convex``  — convex rotation optimization
+* ``exits``            — tax-lot accounting + exit-signal evaluation
+
+The QP *Tasks/Jobs* (``job_qp``, ``task_joint_qp``, ``tasks``) are NOT in
+this slice — they depend on the pipeline orchestration core
+(``kernel.pipeline.{context,pipeline,atoms}``), which lifts in a later slice.
 """
 from __future__ import annotations
 
