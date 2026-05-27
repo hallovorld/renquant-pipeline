@@ -38,7 +38,15 @@ Slice 3 — QP engine math + selection / rotation / exits:
 
 The QP *Tasks/Jobs* (``job_qp``, ``task_joint_qp``, ``tasks``) are NOT in
 this slice — they depend on the pipeline orchestration core
-(``kernel.pipeline.{context,pipeline,atoms}``), which lifts in a later slice.
+(``kernel.pipeline.{pipeline,atoms}``), lifted in slice 4.
+
+Slice 4 — orchestration core (``kernel.pipeline`` subpackage; see its own
+``__init__`` docstring). Unlike the leaf slices this one *reconciles* onto
+``renquant_common`` instead of copying verbatim: ``pipeline`` re-exports the
+canonical ``Task``/``Job``/``run_parallel``/``ParallelTimeoutError``/
+``resolve_workers`` and adds only a thin ``TickerJob`` + config-deriving
+``run_parallel`` wrapper; ``atoms`` are verbatim reusable Task atoms.
+``InferenceContext`` already lives in ``renquant_pipeline.context`` (P1).
 """
 from __future__ import annotations
 
