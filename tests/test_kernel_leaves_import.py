@@ -11,11 +11,23 @@ import importlib
 import pytest
 
 LIFTED_MODULES = [
+    # slice 1
     "renquant_pipeline.kernel.kelly",
     "renquant_pipeline.kernel.exit_types",
     "renquant_pipeline.kernel.market_gates",
     "renquant_pipeline.kernel.vol_target",
     "renquant_pipeline.kernel.sizing",
+    # slice 2
+    "renquant_pipeline.kernel.regime_resolver",
+    "renquant_pipeline.kernel.regime_hmm",
+    "renquant_pipeline.kernel.intraday",
+    "renquant_pipeline.kernel.intraday_wash",
+    "renquant_pipeline.kernel.config",
+    "renquant_pipeline.kernel.config_consistency",
+    "renquant_pipeline.kernel.net_safety",
+    "renquant_pipeline.kernel.realized_pnl",
+    "renquant_pipeline.kernel.portfolio",
+    "renquant_pipeline.kernel.scoring",
 ]
 
 
