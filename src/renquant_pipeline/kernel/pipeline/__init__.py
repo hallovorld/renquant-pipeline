@@ -15,6 +15,17 @@ the umbrella's duplicate orchestration primitives onto :mod:`renquant_common`:
 ``InferenceContext`` / ``TickerInferenceContext`` already live in
 :mod:`renquant_pipeline.context` (lifted in P1 with ``RegimeLabel`` adopted);
 this package imports them from there rather than defining a second copy.
+
+Slice 7 — first decision-tree Job + context shim:
+* ``context`` — a re-export shim (`from renquant_pipeline.context import ...`)
+  so the umbrella Tasks' ``from .context import`` relative import resolves
+  verbatim inside this package. Single source of truth, not a duplicate.
+* ``job_regime`` / ``task_regime`` / ``task_spy_regime`` /
+  ``task_trend_overlay`` — the 3-layer regime detection Job (Hurst → CUSUM →
+  GMM → BEAROverride → TrendOverlay → Finalize, + SPY-label). ``job_regime``
+  and ``task_trend_overlay`` are verbatim; ``task_regime`` / ``task_spy_regime``
+  have only absolute ``kernel.X`` lazy imports rewritten to
+  ``renquant_pipeline.kernel.X``. Parity test runs the full Job end-to-end.
 """
 from __future__ import annotations
 
