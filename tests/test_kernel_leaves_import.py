@@ -36,6 +36,16 @@ LIFTED_MODULES = [
     "renquant_pipeline.kernel.rotation",
     "renquant_pipeline.kernel.rotation_convex",
     "renquant_pipeline.kernel.exits",
+    # slice 5
+    "renquant_pipeline.kernel.models",
+    "renquant_pipeline.kernel.execution",
+    "renquant_pipeline.kernel.execution.types",
+    "renquant_pipeline.kernel.execution.fees",
+    "renquant_pipeline.kernel.execution.slippage",
+    "renquant_pipeline.kernel.execution.t2_settlement",
+    "renquant_pipeline.kernel.execution.backend",
+    "renquant_pipeline.kernel.execution.backend_sim",
+    "renquant_pipeline.kernel.execution.backend_lean",
 ]
 
 
@@ -71,3 +81,23 @@ def test_qp_solver_prefers_higher_mu_asset() -> None:
     assert sol.status.startswith("optimal")
     assert sol.target_w[0] >= sol.target_w[1] - 1e-9
     assert sum(sol.target_w) <= 1.0 + 1e-6
+
+
+def test_calibrate_score_is_nan_guarded_and_bounded() -> None:
+    """models.calibrate_score (slice 5): finite [0,1], NaN-guarded (§5.13.11)."""
+    models = importlib.import_module("renquant_pipeline.kernel.models")
+    import math
+
+    finite = models.calibrate_score(0.5, None)
+    assert math.isfinite(finite) and 0.0 <= finite <= 1.0
+    # Non-finite input must not leak through the calibrator.
+    nan_out = models.calibrate_score(float("nan"), None)
+    assert math.isfinite(nan_out) and 0.0 <= nan_out <= 1.0
+
+
+def test_execution_sell_fees_are_nonnegative() -> None:
+    """execution.fees (slice 5): computed sell fees are finite and >= 0."""
+    fees = importlib.import_module("renquant_pipeline.kernel.execution.fees")
+    out = fees.compute_sell_fees(100.0, 50.0, fees.FeeConfig())
+    total = sum(v for v in out.values() if isinstance(v, (int, float)))
+    assert total >= 0.0
