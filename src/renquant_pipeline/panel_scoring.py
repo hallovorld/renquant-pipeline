@@ -2,20 +2,85 @@
 
 This module owns the strict runtime contract around panel scores. It does not
 train models and it does not import model libraries at module import time.
+Scorers are resolved through ``renquant_common.load_scorer`` against entry
+points registered by ``renquant-model`` (per RFC §"Cross-Repo Contracts →
+Scorer Protocol").
 """
 from __future__ import annotations
 
 import math
+from datetime import datetime, timezone
 from typing import Any
 
 from renquant_artifacts import validate_feature_contract
-from renquant_common import Job, Task
+from renquant_common import (
+    ArtifactManifest,
+    Job,
+    OOSEvidence,
+    ScorerKindNotRegistered,
+    Task,
+    load_scorer,
+)
 
 from .decision_trace import append_ticker_daily_state_rows
 from .model_admission import evaluate_model_admission
 from .order_attribution import stamp_order_attribution
 from .runtime_features import build_runtime_feature_frame
-from .xgboost_scorer import load_xgboost_panel_scorer
+
+
+def _legacy_dict_to_manifest(legacy: dict[str, Any]) -> ArtifactManifest | None:
+    """Bridge legacy artifact dicts → ArtifactManifest for load_scorer.
+
+    Producers in the umbrella still emit loose dicts (``uri`` /
+    ``model_family`` / ``local_artifact_path`` / no ``oos_evidence``).
+    Until those producers migrate to writing real :class:`ArtifactManifest`
+    instances (during the umbrella code lift), this shim translates and
+    fills missing fields with sentinel defaults. The strict contract is
+    preserved on the producer side; only consumers wear the synthesis cost.
+    """
+    if not legacy:
+        return None
+    kind = legacy.get("kind")
+    if not kind:
+        return None
+    artifact_uri = legacy.get("artifact_uri") or legacy.get("uri") or ""
+    local = legacy.get("local_artifact_path")
+    if local:
+        artifact_uri = f"file://{local}"
+    if not artifact_uri:
+        return None
+    return ArtifactManifest(
+        kind=str(kind),
+        family=str(
+            legacy.get("family")
+            or legacy.get("model_family")
+            or "unknown"
+        ),
+        artifact_uri=str(artifact_uri),
+        feature_fingerprint=str(
+            legacy.get("feature_fingerprint")
+            or legacy.get("fingerprint")
+            or "legacy:unknown"
+        ),
+        config_fingerprint=str(
+            legacy.get("config_fingerprint") or "legacy:unknown"
+        ),
+        training_data_fingerprint=str(
+            legacy.get("training_data_fingerprint") or "legacy:unknown"
+        ),
+        trained_at=legacy.get("trained_at")
+        or datetime(1970, 1, 1, tzinfo=timezone.utc),
+        lookahead_days=int(legacy.get("lookahead_days") or 1),
+        oos_evidence=OOSEvidence(
+            mean_ic=float(legacy.get("oos_mean_ic") or 0.0),
+            std_ic=float(legacy.get("oos_std_ic") or 0.0),
+            per_fold_ic=tuple(legacy.get("oos_per_fold_ic") or ()),
+            cv_method=str(legacy.get("cv_method") or "unknown"),
+            embargo_days=int(legacy.get("cv_embargo_days") or 0),
+        ),
+        calibrator_uri=legacy.get("calibrator_uri"),
+        owner_repo=str(legacy.get("owner_repo") or "umbrella-legacy"),
+    )
 
 
 class LoadScorerTask(Task):
@@ -85,7 +150,13 @@ class ApplyScoresTask(Task):
         scorer_load_error = None
         if not explicit_scores and not linear_weights:
             try:
-                artifact_scorer = load_xgboost_panel_scorer(getattr(ctx, "artifact_manifest", {}) or {})
+                manifest = _legacy_dict_to_manifest(
+                    getattr(ctx, "artifact_manifest", {}) or {}
+                )
+                if manifest is not None:
+                    artifact_scorer = load_scorer(manifest)
+            except ScorerKindNotRegistered as exc:
+                scorer_load_error = f"scorer_not_registered:{exc}"
             except Exception as exc:  # noqa: BLE001
                 scorer_load_error = str(exc)
 
