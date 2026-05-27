@@ -4,22 +4,25 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "renquant-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 description = "Runtime decision-pipeline composition for RenQuant."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "renquant-common>=0.1.0",
+  "renquant-common>=0.2,<0.3",
   "renquant-base-data>=0.1.0",
   "renquant-artifacts>=0.1.0",
 ]
 
+# Optional extras let downstream installs pull in a specific scorer family.
+# Pipeline itself does NOT import these libraries; it goes through
+# renquant_common.load_scorer + entry points per RFC §"Cross-Repo Contracts".
 [project.optional-dependencies]
-gbdt = ["xgboost>=2.0"]
+gbdt = ["renquant-model-gbdt>=0.2,<0.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../renquant-common/src", "../renquant-base-data/src", "../renquant-artifacts/src"]
+pythonpath = ["src", "../renquant-common/src", "../renquant-base-data/src", "../renquant-artifacts/src", "../renquant-model-gbdt/src"]
 testpaths = ["tests"]

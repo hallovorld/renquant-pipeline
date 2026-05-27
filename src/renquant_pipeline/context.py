@@ -1,12 +1,15 @@
 """InferenceContext — shared state passed through the 7-job InferencePipeline.
 
-Self-contained: only stdlib + dataclasses.  No common/ imports.
+Imports renquant_common for the RegimeLabel enum (single source of truth for
+the regime taxonomy per RFC §"Cross-Repo Contracts → RegimeLabel").
 """
 from __future__ import annotations
 
 import datetime
 from dataclasses import dataclass, field
 from typing import Any
+
+from renquant_common import RegimeLabel
 
 
 @dataclass
@@ -67,8 +70,11 @@ class InferenceContext:
     regime_counts: dict = field(default_factory=dict)  # regime → int
 
     # ── Pipeline outputs (written by jobs) ───────────────────────────────────
-    # RegimeJob
-    regime: str = "BULL_CALM"
+    # RegimeJob — see renquant_common.RegimeLabel for the closed set.
+    # Stored as the enum's `.value` (a str) so dataclass equality + JSON
+    # serialization remain string-typed; callers may pass either the
+    # RegimeLabel member or its .value when updating.
+    regime: str = RegimeLabel.BULL_CALM.value
     confidence: float = 0.5
 
     # DrawdownJob — updates hwm and skip_buys in place (no separate fields)

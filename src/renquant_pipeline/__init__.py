@@ -29,7 +29,6 @@ from .selection import (
     SelectionJob,
     ValidateSelectionDoesNotPromoteTask,
 )
-from .xgboost_scorer import XGBoostPanelScorer, load_xgboost_panel_scorer
 from .artifact_contract import (
     ContractResult,
     build_run_bundle,
@@ -63,7 +62,6 @@ __all__ = [
     "SelectionJob",
     "ValidateSelectionDoesNotPromoteTask",
     "VetoWeakBuysTask",
-    "XGBoostPanelScorer",
     "append_ticker_daily_state_rows",
     "build_run_bundle",
     "build_runtime_feature_frame",
@@ -72,7 +70,6 @@ __all__ = [
     "hash_jsonable",
     "live_state_legacy_path",
     "live_state_path",
-    "load_xgboost_panel_scorer",
     "model_type_from_artifact",
     "resolve_live_state_read",
     "runs_db_legacy_path",
