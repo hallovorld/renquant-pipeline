@@ -56,6 +56,19 @@ Slice 5 — model scoring + execution backend support (verbatim):
   ``backend_lean``. Self-contained (relative imports), no LEAN runtime import
   at module load. ``models`` traverses JSON xgboost trees — it does NOT import
   the xgboost library, so the import boundary holds.
+
+Slice 6 — regime / indicators tier (copy-AND-rewrite, NOT verbatim):
+* ``regime``      — regime detector (Hurst / CUSUM / GMM / ADX layers)
+* ``indicators``  — technical indicators + SPY context builders
+
+These use absolute ``kernel.X`` imports in the umbrella, rewritten here to
+``renquant_pipeline.kernel.X``. ``regime`` ↔ ``indicators`` form a *lazy*
+(function-level) mutual-import cycle, so module load is clean; the rewritten
+cross-imports are exercised by ``tests/test_lift_rewrite_parity.py``.
+
+(The data-access layer ``data`` / ``data_cache`` is NOT lifted here — it
+imports the alpaca SDK for ingestion and belongs in ``renquant-base-data``
+per the migration manifest, not the decision pipeline.)
 """
 from __future__ import annotations
 
