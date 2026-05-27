@@ -47,6 +47,15 @@ canonical ``Task``/``Job``/``run_parallel``/``ParallelTimeoutError``/
 ``resolve_workers`` and adds only a thin ``TickerJob`` + config-deriving
 ``run_parallel`` wrapper; ``atoms`` are verbatim reusable Task atoms.
 ``InferenceContext`` already lives in ``renquant_pipeline.context`` (P1).
+
+Slice 5 — model scoring + execution backend support (verbatim):
+* ``models``           — artifact scoring (manual / classification / qlearning
+  / json-tree xgboost), calibration, expected-return helpers
+* ``execution`` (subpackage) — sim/LEAN execution backends: ``types``,
+  ``fees``, ``slippage``, ``t2_settlement``, ``backend``, ``backend_sim``,
+  ``backend_lean``. Self-contained (relative imports), no LEAN runtime import
+  at module load. ``models`` traverses JSON xgboost trees — it does NOT import
+  the xgboost library, so the import boundary holds.
 """
 from __future__ import annotations
 
