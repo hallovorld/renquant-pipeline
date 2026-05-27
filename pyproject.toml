@@ -17,12 +17,14 @@ dependencies = [
 # Optional extras let downstream installs pull in a specific scorer family.
 # Pipeline itself does NOT import these libraries; it goes through
 # renquant_common.load_scorer + entry points per RFC §"Cross-Repo Contracts".
+# renquant-model is the merged GBDT + PatchTST family repo (RFC P3); the
+# [gbdt] extra selects its xgboost backend.
 [project.optional-dependencies]
-gbdt = ["renquant-model-gbdt>=0.2,<0.3"]
+gbdt = ["renquant-model[gbdt]>=0.1,<0.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src", "../renquant-common/src", "../renquant-base-data/src", "../renquant-artifacts/src", "../renquant-model-gbdt/src"]
+pythonpath = ["src", "../renquant-common/src", "../renquant-base-data/src", "../renquant-artifacts/src", "../renquant-model/src"]
 testpaths = ["tests"]
