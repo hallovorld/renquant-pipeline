@@ -29,4 +29,16 @@ Slice 7 — first decision-tree Job + context shim:
 """
 from __future__ import annotations
 
-__all__: list[str] = []
+# Public API parity with the umbrella's kernel.pipeline package (QA-while-moving,
+# 2026-05-27): consumers (live runner, LEAN/sim adapters) do
+# `from kernel.pipeline import InferencePipeline, SellOnlyPipeline, ...`.
+from .context import InferenceContext, TickerInferenceContext
+from .pipeline import Job, TickerJob, run_parallel
+from .pp_inference import InferencePipeline, SellOnlyPipeline
+
+__all__ = [
+    "InferenceContext", "TickerInferenceContext",
+    "Job", "TickerJob",
+    "InferencePipeline", "SellOnlyPipeline",
+    "run_parallel",
+]
