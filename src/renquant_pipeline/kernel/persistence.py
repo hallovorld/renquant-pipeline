@@ -30,6 +30,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
+from renquant_common import record_training_run as _record_training_run
+
 log = logging.getLogger("kernel.persistence")
 _ECON_ABS_TOL = 1e-6
 _ECON_REL_TOL = 1e-6
@@ -1405,69 +1407,30 @@ def record_training_run(
     also_log_jsonl: bool = True,
     jsonl_dir: Path | None = None,
 ) -> str | None:
-    """Record a training run to SQLite and (by default) append a line to
-    `logs/training/{YYYY-MM-DD}.jsonl` mirroring the same fields.
-
-    The JSONL log exists for operators who want to grep training history
-    without opening the SQLite DB — a symmetric plain-text audit trail.
-    """
-    rd = run_date or datetime.datetime.utcnow()
-    run_id = f"{rd.strftime('%Y%m%d%H%M%S')}-{artifact_type}-{uuid.uuid4().hex[:6]}"
-
-    # Audit #71: subprocess to git was being invoked twice (row dict + SQL
-    # VALUES). Resolve once and reuse.
-    sha = _commit_sha()
-
-    row = {
-        "run_id":                run_id,
-        "run_date":              rd.isoformat(),
-        "strategy":              strategy,
-        "artifact_type":         artifact_type,
-        "oos_mean_ic":           oos_mean_ic,
-        "train_ic":              train_ic,
-        "n_rows":                n_rows,
-        "n_tickers":             n_tickers,
-        "n_dates":               n_dates,
-        "n_features":            n_features,
-        "elapsed_sec":           elapsed_sec,
-        "trigger":               trigger,
-        "device":                device,
-        "deterministic":         deterministic,
-        "training_window_years": training_window_years,
-        "artifact_path":         artifact_path,
-        "commit_sha":            sha,
-        "notes":                 notes,
-    }
-
-    if conn is not None:
-        conn.execute(
-            """INSERT INTO training_runs
-                  (run_id, run_date, strategy, artifact_type, config_json,
-                   oos_mean_ic, train_ic, n_rows, feature_cols, artifact_path,
-                   commit_sha, elapsed_sec, trigger, n_tickers, n_dates,
-                   n_features, device, deterministic, training_window_years,
-                   notes)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (run_id, rd.isoformat(), strategy, artifact_type,
-             json.dumps(config_snapshot, default=str) if config_snapshot else None,
-             oos_mean_ic, train_ic, n_rows,
-             json.dumps(feature_cols) if feature_cols is not None else None,
-             artifact_path, sha,
-             elapsed_sec, trigger, n_tickers, n_dates, n_features, device,
-             int(deterministic) if deterministic is not None else None,
-             training_window_years, notes),
-        )
-        conn.commit()
-
-    # JSONL log (operator-friendly audit trail)
-    if also_log_jsonl:
-        log_dir = jsonl_dir or _default_training_jsonl_dir(conn)
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{rd.strftime('%Y-%m-%d')}.jsonl"
-        with log_path.open("a") as f:
-            f.write(json.dumps(row, default=str) + "\n")
-
-    return run_id
+    """Compatibility wrapper around ``renquant_common.record_training_run``."""
+    return _record_training_run(
+        conn,
+        run_date=run_date,
+        strategy=strategy,
+        artifact_type=artifact_type,
+        config_snapshot=config_snapshot,
+        oos_mean_ic=oos_mean_ic,
+        train_ic=train_ic,
+        n_rows=n_rows,
+        feature_cols=feature_cols,
+        artifact_path=artifact_path,
+        elapsed_sec=elapsed_sec,
+        trigger=trigger,
+        n_tickers=n_tickers,
+        n_dates=n_dates,
+        n_features=n_features,
+        device=device,
+        deterministic=deterministic,
+        training_window_years=training_window_years,
+        notes=notes,
+        also_log_jsonl=also_log_jsonl,
+        jsonl_dir=jsonl_dir,
+    )
 
 
 def record_live_state_snapshot(
