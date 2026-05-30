@@ -581,12 +581,20 @@ def _check_regime_layered_ic(
         )
     if sanity and sanity.get("passed") is False:
         details["sanity_regime_ic"] = sanity
-        return _soft_for_sell_only(
-            "P-REGIME-IC",
-            f"regime sanity IC failed: {sanity.get('reason', 'unknown')}",
-            run_mode=run_mode,
-            details=details,
+        # Config-controlled relaxation (default True preserves strict behaviour).
+        # Operator opt-in via strategy_config.wf_gate.sanity_regime_ic_required.
+        sanity_required = bool(
+            (config.get("wf_gate") or {}).get("sanity_regime_ic_required", True)
         )
+        if sanity_required:
+            return _soft_for_sell_only(
+                "P-REGIME-IC",
+                f"regime sanity IC failed: {sanity.get('reason', 'unknown')}",
+                run_mode=run_mode,
+                details=details,
+            )
+        # Relax mode: log the failure but proceed.
+        details["sanity_regime_ic_relaxed"] = True
     regimes_raw = tm.get("regimes")
     if isinstance(regimes_raw, dict):
         regimes = regimes_raw
@@ -617,13 +625,21 @@ def _check_regime_layered_ic(
             details=details,
         )
     if tm.get("passed") is False or failed:
-        return _soft_for_sell_only(
-            "P-REGIME-IC",
-            "regime-layered IC/monotonicity failed for eligible regimes: "
-            + ", ".join(sorted(failed) or sorted(eligible)),
-            run_mode=run_mode,
-            details=details,
+        # Same relax flag as the sanity-failure branch: both are
+        # regime-layered-evidence guards. Operator opt-in via
+        # strategy_config.wf_gate.sanity_regime_ic_required.
+        regime_evidence_required = bool(
+            (config.get("wf_gate") or {}).get("sanity_regime_ic_required", True)
         )
+        if regime_evidence_required:
+            return _soft_for_sell_only(
+                "P-REGIME-IC",
+                "regime-layered IC/monotonicity failed for eligible regimes: "
+                + ", ".join(sorted(failed) or sorted(eligible)),
+                run_mode=run_mode,
+                details=details,
+            )
+        details["trade_monotonicity_relaxed"] = True
     pooled = tm.get("pooled") if isinstance(tm.get("pooled"), dict) else {}
     pooled_spearman = _finite_float(pooled.get("spearman")) if pooled else None
     return PreflightCheck(
