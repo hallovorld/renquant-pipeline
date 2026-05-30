@@ -12,6 +12,7 @@ dependencies = [
   "renquant-common>=0.3,<0.4",
   "renquant-base-data>=0.1.0",
   "renquant-artifacts>=0.1.0",
+  "cvxpy>=1.4",
 ]
 
 # Optional extras let downstream installs pull in a specific scorer family.
