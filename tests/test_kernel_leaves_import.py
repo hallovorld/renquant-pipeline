@@ -23,7 +23,8 @@ LIFTED_MODULES = [
     "renquant_pipeline.kernel.intraday",
     "renquant_pipeline.kernel.intraday_wash",
     "renquant_pipeline.kernel.config",
-    "renquant_pipeline.kernel.config_consistency",
+    # config_consistency lifted to renquant_common (canonical) on 2026-05-30;
+    # the pipeline-side duplicate was removed in D8.
     "renquant_pipeline.kernel.net_safety",
     "renquant_pipeline.kernel.realized_pnl",
     "renquant_pipeline.kernel.portfolio",
