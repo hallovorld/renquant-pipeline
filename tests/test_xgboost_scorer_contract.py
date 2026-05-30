@@ -8,6 +8,7 @@ from renquant_pipeline import InferenceContext, PanelScoringJob, RuntimeInferenc
 
 
 pytest.importorskip("xgboost")
+pytest.importorskip("renquant_model_gbdt")
 
 
 def _xgb_artifact(tmp_path) -> dict:
