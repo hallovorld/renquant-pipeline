@@ -2,9 +2,9 @@
 
 ## Project Structure & Module Organization
 
-This is a Python `src/` layout. Runtime code lives in
-`src/renquant_pipeline/`; tests live in `tests/`; repo context lives in
-`README.md`, `RENQUANT_REPOS.md`, `renquant_repo.yml`, and `docs/`.
+Runtime code lives in `src/renquant_pipeline/`; tests live in `tests/`; repo
+context lives in `README.md`, `RENQUANT_REPOS.md`, `renquant_repo.yml`, and
+`docs/`.
 
 Important areas:
 
@@ -24,9 +24,10 @@ Important areas:
 - `python -m pytest -q tests/test_selection_contract.py`: runs one focused test
   file during iteration.
 
-The Makefile prefers `.venv/bin/python`, then `python3`. Local imports expect
-sibling repos such as `../renquant-common`, `../renquant-base-data`, and
-`../renquant-artifacts`.
+The Makefile prefers `.venv/bin/python`, then `python3`; override defaults
+with `PYTHON=python3.10 make test`. Local imports expect sibling repos such as
+`../renquant-common`, `../renquant-base-data`, and `../renquant-artifacts`;
+optional scorer tests may use `../renquant-model`.
 
 ## Coding Style & Naming Conventions
 
@@ -60,10 +61,11 @@ After merge, the umbrella repo must advance its pin before production use.
 
 This repo consumes strategy config, data manifests, and artifact manifests. It
 exports decision traces, gate reports, and order intents. Upstream changes in
-`renquant-common`, `renquant-base-data`, `renquant-artifacts`, or
-`renquant-model` can break admission. Downstream `renquant-execution`,
-`renquant-backtesting`, and `renquant-orchestrator` rely on stable exports from
-`renquant_pipeline.__init__`, order-attribution fields, and trace schemas.
+`renquant-common`, `renquant-strategy-104`, `renquant-base-data`,
+`renquant-artifacts`, or `renquant-model` can break admission. Downstream
+`renquant-execution`, `renquant-backtesting`, and `renquant-orchestrator` rely
+on stable exports from `renquant_pipeline.__init__`, order-attribution fields,
+and trace schemas.
 
 Do not add model training, broker order submission, raw data storage, secrets,
 large artifacts, generated caches, or environment-specific paths.
