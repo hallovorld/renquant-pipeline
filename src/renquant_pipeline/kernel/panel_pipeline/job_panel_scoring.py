@@ -2205,7 +2205,7 @@ def _ngb_cfg(ctx) -> dict:
 # net signal; disable where ts-30-placebo-adjusted net IC was negative.
 # Operator can override via regime_params.<R>.sentiment.enabled.
 
-from renquant_pipeline.artifact_contract import (  # noqa: E402
+from renquant_artifacts.contracts import (  # noqa: E402
     SENTIMENT_DEFAULT_REGIME_POLICY as _SENTIMENT_DEFAULT_REGIME_POLICY,
     SENTIMENT_FEATURE_COLS,
 )

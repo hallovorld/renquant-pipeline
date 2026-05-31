@@ -397,7 +397,7 @@ def _check_panel_artifact_contract(
         payload = json.loads(p.read_text())
     except Exception as exc:
         return PreflightCheck("P-PANEL-CONTRACT", "hard", False, f"unreadable: {exc}")
-    from renquant_pipeline.artifact_contract import validate_panel_artifact_contract  # noqa: PLC0415
+    from renquant_artifacts.contracts import validate_panel_artifact_contract  # noqa: PLC0415
     result = validate_panel_artifact_contract(
         payload,
         strict=strict_contract,

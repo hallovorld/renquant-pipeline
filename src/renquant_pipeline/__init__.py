@@ -29,7 +29,10 @@ from .selection import (
     SelectionJob,
     ValidateSelectionDoesNotPromoteTask,
 )
-from .artifact_contract import (
+# §3.5 canonical-path policy: artifact contracts live in renquant-artifacts.
+# Subrepo re-exports for the public ``renquant_pipeline.*`` API, but the
+# import resolves straight to the canonical source — no internal shim.
+from renquant_artifacts.contracts import (
     ContractResult,
     build_run_bundle,
     hash_jsonable,

@@ -110,7 +110,7 @@ class PanelContractTask(PreflightTask):
             return PreflightCheck(
                 self.check_name, "hard", False, f"unreadable: {exc}",
             )
-        from renquant_pipeline.artifact_contract import validate_panel_artifact_contract  # noqa: PLC0415
+        from renquant_artifacts.contracts import validate_panel_artifact_contract  # noqa: PLC0415
         result = validate_panel_artifact_contract(
             payload,
             strict=strict_contract,
