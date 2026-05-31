@@ -1,6 +1,6 @@
 """P-RUN-ID — panel-ltr and ngboost-head share the same train_run_id.
 
-Migrated from kernel.preflight._check_artifact_run_id_alignment.
+Migrated from renquant_pipeline.kernel.preflight._check_artifact_run_id_alignment.
 External audit fix #2 (2026-04-29): without run_id, one artifact can
 silently come from a different training run.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _ngboost_activation,
     _resolve_artifact_path,

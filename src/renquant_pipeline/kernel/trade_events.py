@@ -4,7 +4,7 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
-from kernel.pipeline.exit_params import apply_stop_loss_anchor_policy
+from renquant_pipeline.kernel.pipeline.exit_params import apply_stop_loss_anchor_policy
 
 
 def _none_or_float(value: Any) -> float | None:

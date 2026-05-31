@@ -1,12 +1,12 @@
 """P-WATCHLIST — config watchlist length consistent with training.
 
-Migrated from kernel.preflight._check_watchlist_size.
+Migrated from renquant_pipeline.kernel.preflight._check_watchlist_size.
 """
 from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
     _active_panel_kind,

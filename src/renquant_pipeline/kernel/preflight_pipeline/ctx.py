@@ -13,7 +13,7 @@ from typing import Any
 # Re-export legacy PreflightCheck (the result record) so consumers don't need
 # two imports. Migration target: lift PreflightCheck into this module once
 # the legacy preflight.py retires.
-from kernel.preflight import PreflightCheck  # noqa: PLC0415  (legacy bridge)
+from renquant_pipeline.kernel.preflight import PreflightCheck  # noqa: PLC0415  (legacy bridge)
 
 
 @dataclass

@@ -25,7 +25,7 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 import numpy as np
 import pandas as pd
 
-from kernel.panel_pipeline.panel_scorer import stamp_artifact_metadata
+from renquant_pipeline.kernel.panel_pipeline.panel_scorer import stamp_artifact_metadata
 
 log = logging.getLogger("kernel.panel_pipeline.hf_patchtst_scorer")
 

@@ -102,7 +102,7 @@ class RegimeRouter:
         """Load and return the PanelScorer for `regime`."""
         path = self.pick_artifact(regime)
         # Lazy import to avoid pulling panel_pipeline at module-import time
-        from kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
         return PanelScorer.load(path)
 
     # ── Helpers ──────────────────────────────────────────────────────────

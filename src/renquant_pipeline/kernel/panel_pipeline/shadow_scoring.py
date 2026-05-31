@@ -46,8 +46,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.pipeline import Job, Task
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 log = logging.getLogger("kernel.panel_pipeline.shadow_scoring")
 
@@ -191,7 +191,7 @@ class ApplyShadowScoringTask(Task):
                              exc)
                 return None
 
-        from kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
         repo = Path(__file__).resolve().parents[4]
 
         for sm in shadow_models:

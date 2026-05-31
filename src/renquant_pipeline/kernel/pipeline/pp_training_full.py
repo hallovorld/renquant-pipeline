@@ -107,7 +107,7 @@ class RunBaselineTask(FullTrainingTask):
     """Run the per-ticker TrainingPipeline (tournament + export + correlation)."""
 
     def run(self, ctx: FullTrainingContext) -> "bool | None":
-        from kernel.pipeline.pp_training import TrainingPipeline, TrainingContext  # noqa: PLC0415
+        from renquant_pipeline.kernel.pipeline.pp_training import TrainingPipeline, TrainingContext  # noqa: PLC0415
 
         cfg = dict(ctx.config)
         cfg["_strategy_dir"]   = str(ctx.strategy_dir)
@@ -140,7 +140,7 @@ class FetchPanelDataTask(FullTrainingTask):
     """Fetch OHLCV for watchlist ∪ benchmark ∪ sector ETFs into ctx.ohlcv_all."""
 
     def run(self, ctx: FullTrainingContext) -> "bool | None":
-        from kernel.data import fetch_ohlcv  # noqa: PLC0415
+        from renquant_pipeline.kernel.data import fetch_ohlcv  # noqa: PLC0415
 
         config     = ctx.config
         watchlist  = config["watchlist"]

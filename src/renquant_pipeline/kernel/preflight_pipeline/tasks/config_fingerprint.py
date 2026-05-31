@@ -1,6 +1,6 @@
 """P-CONFIG-FP — live config's fingerprint matches artifact's stored fp.
 
-Migrated from kernel.preflight._check_config_fingerprint. Catches:
+Migrated from renquant_pipeline.kernel.preflight._check_config_fingerprint. Catches:
 watchlist drift, lookahead change, objective change, asset_embeddings flip
 — the four-incidents class from 2026-04-27/28.
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
     _active_panel_kind,
@@ -73,7 +73,7 @@ class ConfigFingerprintTask(PreflightTask):
     def _evaluate(self, meta: dict, kind: str, p,
                   ctx: PreflightContext) -> PreflightCheck:
         try:
-            from kernel.config_consistency import (  # noqa: PLC0415
+            from renquant_common.config_consistency import (  # noqa: PLC0415
                 _model_relevant_fields,
                 fingerprint_config,
             )

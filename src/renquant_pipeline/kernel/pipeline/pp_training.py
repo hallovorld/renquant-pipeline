@@ -373,7 +373,7 @@ class DataFetchJob(TrainingJob):
         return False
 
     def run(self, ctx: TrainingContext) -> None:
-        from kernel.data import fetch_ohlcv
+        from renquant_pipeline.kernel.data import fetch_ohlcv
 
         cfg = ctx.config
         start = cfg["sample_start"]

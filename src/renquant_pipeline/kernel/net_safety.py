@@ -21,7 +21,7 @@ This module wraps any network-touching callable with:
 
 Usage:
 
-    from kernel.net_safety import call_with_timeout, FetchBudget
+    from renquant_pipeline.kernel.net_safety import call_with_timeout, FetchBudget
 
     # Per-call timeout
     info = call_with_timeout(

@@ -20,6 +20,7 @@ _UMBRELLA = Path(__file__).resolve().parents[2] / "RenQuant" / "backtesting" / \
 
 
 def test_byte_equivalent_to_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     if not _UMBRELLA.exists():
         pytest.skip(f"umbrella not at {_UMBRELLA}")
     seen = 0

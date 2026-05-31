@@ -32,7 +32,7 @@ Checks (each returns ok / soft-warn / hard-fail):
 	                          (only if broker is provided; skipped in dry-run)
 
 Usage in live/runner.py:
-    from kernel.preflight import run_preflight, PreflightFailed
+    from renquant_pipeline.kernel.preflight import run_preflight, PreflightFailed
     try:
         run_preflight(config, broker, strategy_dir)
     except PreflightFailed as e:
@@ -397,7 +397,7 @@ def _check_panel_artifact_contract(
         payload = json.loads(p.read_text())
     except Exception as exc:
         return PreflightCheck("P-PANEL-CONTRACT", "hard", False, f"unreadable: {exc}")
-    from kernel.artifact_contract import validate_panel_artifact_contract  # noqa: PLC0415
+    from renquant_pipeline.artifact_contract import validate_panel_artifact_contract  # noqa: PLC0415
     result = validate_panel_artifact_contract(
         payload,
         strict=strict_contract,
@@ -801,7 +801,7 @@ def _check_config_fingerprint(
                 "P-CONFIG-FP", "hard", False, f"unreadable: {exc}",
             )
     try:
-        from kernel.config_consistency import (  # noqa: PLC0415
+        from renquant_common.config_consistency import (  # noqa: PLC0415
             fingerprint_config, _model_relevant_fields,
         )
     except Exception as exc:
@@ -1074,7 +1074,7 @@ def _check_correlation_artifact_metadata(
         )
     try:
         raw = json.loads(p.read_text())
-        from kernel.walk_forward import parse_correlation_artifact  # noqa: PLC0415
+        from renquant_pipeline.kernel.walk_forward import parse_correlation_artifact  # noqa: PLC0415
         matrix, as_of = parse_correlation_artifact(raw)
     except Exception as exc:
         return _soft_for_sell_only(
@@ -1105,7 +1105,7 @@ def _check_correlation_artifact_metadata(
         )
 
     try:
-        from kernel.walk_forward.leakage_guard import _to_timestamp  # noqa: PLC0415
+        from renquant_pipeline.kernel.walk_forward.leakage_guard import _to_timestamp  # noqa: PLC0415
         _to_timestamp(as_of, label="correlation as_of_date")
     except Exception as exc:
         return _soft_for_sell_only(
@@ -1225,7 +1225,7 @@ def _check_state_file(
             "P-STATE-FILE", "soft", True, "no broker_name (dry-run); skip",
         )
     try:
-        from kernel.state_paths import resolve_live_state_read  # noqa: PLC0415
+        from renquant_pipeline.kernel.state_paths import resolve_live_state_read  # noqa: PLC0415
     except Exception as exc:
         return PreflightCheck(
             "P-STATE-FILE", "soft", True,
@@ -1572,7 +1572,7 @@ def _check_calibrator_health(
                     details={"max_abs_er_y": er_max_abs,
                              "bound": ER_BOUND, "n_knots": len(er_y)},
                 )
-            from kernel.calibrator_quality import flat_region_stats  # noqa: PLC0415
+            from renquant_common.calibrator_quality import flat_region_stats  # noqa: PLC0415
             er_flat = flat_region_stats(er_x, er_y)
             max_er_flat = float(
                 config.get("panel_ltr", {})
@@ -1693,7 +1693,7 @@ def _check_calibrator_flat_region(
 
     # 2026-05-18 user audit: DRY — extracted to kernel/calibrator_quality.py
     # to prevent silent drift between preflight + fit_script + test impls.
-    from kernel.calibrator_quality import flat_region_stats  # noqa: PLC0415
+    from renquant_common.calibrator_quality import flat_region_stats  # noqa: PLC0415
     stats = flat_region_stats(x, y)
     flat_frac = stats["fraction"]
     if flat_frac > max_flat_fraction:
@@ -1784,7 +1784,7 @@ def run_preflight(
 
     # Deferred import — avoids circular import (preflight_pipeline imports
     # from this module via bridge).
-    from kernel.preflight_pipeline import (  # noqa: PLC0415
+    from renquant_pipeline.kernel.preflight_pipeline import (  # noqa: PLC0415
         PreflightContext,
         build_preflight_pipeline,
     )

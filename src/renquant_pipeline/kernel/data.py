@@ -261,7 +261,7 @@ def fetch_ohlcv(
                 kwargs["end_date"] = end
             return obb.equity.price.historical(**kwargs).to_df()
 
-        from kernel.net_safety import call_with_timeout  # noqa: PLC0415
+        from renquant_pipeline.kernel.net_safety import call_with_timeout  # noqa: PLC0415
         df = call_with_timeout(
             _fetch_yf,
             timeout_sec=timeout_sec,
@@ -394,7 +394,7 @@ def _do_incremental_fetch(
         log.info("Cold fetch for %s: [%s .. %s] (10yr history)", symbol, fetch_start, end_ts.date())
 
     # Network-protected fetch
-    from kernel.net_safety import call_with_timeout  # noqa: PLC0415
+    from renquant_pipeline.kernel.net_safety import call_with_timeout  # noqa: PLC0415
 
     yf_symbol = _yf_translate(symbol)
 
@@ -541,7 +541,7 @@ def fetch_intraday_bars(
 
     # Hard timeout: Alpaca can hang under intermittent network; don't let
     # it block the caller (intraday_sell script, live runner, etc).
-    from kernel.net_safety import call_with_timeout  # noqa: PLC0415
+    from renquant_pipeline.kernel.net_safety import call_with_timeout  # noqa: PLC0415
     bars = call_with_timeout(
         lambda: client.get_stock_bars(req),
         timeout_sec=timeout_sec,

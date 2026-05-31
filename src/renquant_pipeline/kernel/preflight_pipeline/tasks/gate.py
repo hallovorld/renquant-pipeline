@@ -1,6 +1,6 @@
 """Gate-group Tasks — WF gate metadata + regime-layered IC.
 
-Migrated from kernel.preflight._check_wf_gate_metadata + _check_regime_layered_ic.
+Migrated from renquant_pipeline.kernel.preflight._check_wf_gate_metadata + _check_regime_layered_ic.
 Behavior parity asserted by tests/test_preflight_pipeline_gate.py.
 
 These are the LARGEST checks in the suite (131 + 131 lines each). They share
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
     _active_panel_kind,

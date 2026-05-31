@@ -25,6 +25,7 @@ _LIFTED = ("pp_execution.py", "pp_research_acceptance.py", "pp_training.py", "pp
 
 
 def test_byte_equivalent_to_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     if not _UMBRELLA.exists():
         pytest.skip(f"umbrella not at {_UMBRELLA}")
     for name in _LIFTED:

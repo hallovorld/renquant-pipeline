@@ -31,7 +31,7 @@ Concrete stores (inherit / compose with this):
 
 Public API::
 
-    from kernel.data_cache import CachedStore
+    from renquant_pipeline.kernel.data_cache import CachedStore
 
     store = CachedStore(
         cache_dir="data/intraday",
@@ -188,7 +188,7 @@ class CachedStore:
             fetch_start = None
 
         # Timeout-protected fetch
-        from kernel.net_safety import call_with_timeout  # noqa: PLC0415
+        from renquant_pipeline.kernel.net_safety import call_with_timeout  # noqa: PLC0415
         label = f"CachedStore[{self.file_pattern}]({symbol})"
         # Round-2 audit (#R2-16): the previous `try/except TypeError` was
         # dead code — call_with_timeout swallows ALL exceptions and

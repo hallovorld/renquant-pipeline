@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 from abc import abstractmethod
 
-from kernel.pipeline.pipeline import Task
+from renquant_pipeline.kernel.pipeline.pipeline import Task
 
 from .ctx import PreflightContext
 
@@ -45,7 +45,7 @@ class PreflightTask(Task):
         # Legacy parity: append the result and log a marker line, regardless of
         # outcome. Strict-mode hard-fail enforcement is done by PreflightPipeline
         # AFTER all checks have run (matches run_preflight semantics).
-        from kernel.preflight import (  # noqa: PLC0415  (legacy bridge)
+        from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415  (legacy bridge)
             PreflightCheck,
             _is_sell_only_run,
         )
@@ -101,7 +101,7 @@ class PreflightPipeline:
         self.jobs = jobs
 
     def run(self, ctx: PreflightContext, *, strict: bool = True) -> list:
-        from kernel.preflight import PreflightFailed  # noqa: PLC0415
+        from renquant_pipeline.kernel.preflight import PreflightFailed  # noqa: PLC0415
 
         ctx.results = []
         for job in self.jobs:

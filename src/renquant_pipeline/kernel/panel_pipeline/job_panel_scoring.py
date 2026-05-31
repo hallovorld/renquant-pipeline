@@ -37,8 +37,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.pipeline import Job, Task
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
@@ -559,7 +559,7 @@ class LoadScorerTask(Task):
     ) -> bool:
         strict = bool(panel_cfg.get("strict_config_consistency", True))
         try:
-            from kernel.config_consistency import (  # noqa: PLC0415
+            from renquant_common.config_consistency import (  # noqa: PLC0415
                 assert_consistent, ConfigModelMismatch,
             )
             import json as _j  # noqa: PLC0415
@@ -610,7 +610,7 @@ class LoadScorerTask(Task):
         # via single config knob `ranking.panel_scoring.kind`. Default xgb
         # for back-compat. Each kind's handler in kernel/panel_pipeline/
         # model_registry.py decides how to load its scorer.
-        from kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
         kind = panel_cfg.get("kind", "xgb")
         try:
             handler = registry.get(kind)
@@ -787,7 +787,7 @@ class ApplyScoresTask(Task):
         # panel_ltr_xgboost alpha158 artifacts.
         scorer_kind = scorer.metadata.get("kind") if hasattr(scorer, "metadata") else None
         if scorer_kind in ("panel_linear", "panel_ltr_xgboost"):
-            from kernel.panel_pipeline.alpha158_features import compute_alpha158_at  # noqa: PLC0415
+            from renquant_pipeline.kernel.panel_pipeline.alpha158_features import compute_alpha158_at  # noqa: PLC0415
             today = getattr(ctx, "today", None)
             ohlcv_dict = getattr(ctx, "ohlcv", None) or getattr(ctx, "ohlcv_all", None)
             if ohlcv_dict is None:
@@ -1018,7 +1018,7 @@ class ApplyScoresTask(Task):
 
                 # Raw inference rows must be transformed through the artifact
                 # feature contract before XGB scoring.
-                from kernel.panel_pipeline.feature_transform import (  # noqa: PLC0415
+                from renquant_pipeline.kernel.panel_pipeline.feature_transform import (  # noqa: PLC0415
                     transform_feature_frame,
                 )
                 # Apply artifact-stored normalization. transform_feature_frame
@@ -2205,7 +2205,7 @@ def _ngb_cfg(ctx) -> dict:
 # net signal; disable where ts-30-placebo-adjusted net IC was negative.
 # Operator can override via regime_params.<R>.sentiment.enabled.
 
-from kernel.artifact_contract import (  # noqa: E402
+from renquant_pipeline.artifact_contract import (  # noqa: E402
     SENTIMENT_DEFAULT_REGIME_POLICY as _SENTIMENT_DEFAULT_REGIME_POLICY,
     SENTIMENT_FEATURE_COLS,
 )
@@ -2688,14 +2688,14 @@ class ApplyKellySizingTask(Task):
         if not kelly_cfg.get("enabled", False):
             return   # no-op — golden behaviour preserved
 
-        from kernel.kelly import kelly_target_pct      # noqa: PLC0415
+        from renquant_pipeline.kernel.kelly import kelly_target_pct      # noqa: PLC0415
 
         fractional        = float(kelly_cfg.get("fractional",        0.25))
         min_edge          = float(kelly_cfg.get("min_edge",          0.0))
         max_concentration = float(kelly_cfg.get("max_concentration", 0.35))
 
         # Audit fix CONF-MULT (2026-04-25): floored confidence multiplier.
-        from kernel.regime import confidence_to_size_multiplier  # noqa: PLC0415
+        from renquant_pipeline.kernel.regime import confidence_to_size_multiplier  # noqa: PLC0415
         _conf_mult = confidence_to_size_multiplier(ctx.confidence)
         regime_p = ctx.config.get("regime_params", {}).get(ctx.regime, {})
         max_pct  = float(regime_p.get("max_position_pct", 0.15)) * _conf_mult
@@ -2821,13 +2821,13 @@ class PanelScoringJob(Job):
     def tasks(self) -> list[Task]:
         # Lazy import — avoids a circular import that fires when
         # job_panel_scoring is imported by InferencePipeline init.
-        from kernel.panel_pipeline.task_quality_floor import (  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.task_quality_floor import (  # noqa: PLC0415
             QualityFloorTask,
         )
         # 2026-05-18 SHADOW SCORING — register here so it runs AFTER
         # ApplyScoresTask (which writes primary scores). Lazy-imported to
         # avoid forcing import cost on configs that don't use shadow.
-        from kernel.panel_pipeline.shadow_scoring import ApplyShadowScoringTask  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.shadow_scoring import ApplyShadowScoringTask  # noqa: PLC0415
         return [
             LoadScorerTask(),
             BuildFeatureMatrixTask(),
