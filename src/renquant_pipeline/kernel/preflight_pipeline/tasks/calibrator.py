@@ -1,6 +1,6 @@
 """Calibrator-group Tasks — health + flat-region.
 
-Migrated from kernel.preflight._check_calibrator_health +
+Migrated from renquant_pipeline.kernel.preflight._check_calibrator_health +
 _check_calibrator_flat_region. Both checks gate the global-calibration
 artifact against the bug classes that produced incidents in 2026-05:
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import logging
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _is_global_calibration_enabled,
     _resolve_artifact_path,
@@ -140,7 +140,7 @@ class CalibratorHealthTask(PreflightTask):
                     details={"max_abs_er_y": er_max_abs,
                              "bound": ER_BOUND, "n_knots": len(er_y)},
                 )
-            from kernel.calibrator_quality import flat_region_stats  # noqa: PLC0415
+            from renquant_common.calibrator_quality import flat_region_stats  # noqa: PLC0415
             er_flat = flat_region_stats(er_x, er_y)
             max_er_flat = float(
                 ctx.config.get("panel_ltr", {})
@@ -255,7 +255,7 @@ class CalibratorFlatRegionTask(PreflightTask):
         health_cfg = panel_cfg.get("calibrator_health", {}) or {}
         max_flat_fraction = float(health_cfg.get("max_flat_fraction", 0.30))
         # DRY: shared with the training fit script + test impls
-        from kernel.calibrator_quality import flat_region_stats  # noqa: PLC0415
+        from renquant_common.calibrator_quality import flat_region_stats  # noqa: PLC0415
         stats = flat_region_stats(x, y)
         flat_frac = stats["fraction"]
         if flat_frac > max_flat_fraction:

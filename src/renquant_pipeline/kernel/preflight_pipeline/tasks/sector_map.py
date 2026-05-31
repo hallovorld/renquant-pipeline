@@ -1,10 +1,10 @@
 """P-SECTOR-MAP — every buyable ticker must have sector metadata.
 
-Migrated from kernel.preflight._check_sector_map_coverage.
+Migrated from renquant_pipeline.kernel.preflight._check_sector_map_coverage.
 """
 from __future__ import annotations
 
-from kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
 
 from ..base import PreflightTask
 from ..ctx import PreflightContext

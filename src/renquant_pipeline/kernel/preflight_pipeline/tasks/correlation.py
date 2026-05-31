@@ -1,12 +1,12 @@
 """P-CORR-METADATA — buy/full runs require stamped correlation metadata.
 
-Migrated from kernel.preflight._check_correlation_artifact_metadata.
+Migrated from renquant_pipeline.kernel.preflight._check_correlation_artifact_metadata.
 """
 from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _correlation_artifact_path,
     _soft_for_sell_only,
@@ -39,7 +39,7 @@ class CorrelationMetadataTask(PreflightTask):
             )
         try:
             raw = json.loads(p.read_text())
-            from kernel.walk_forward import parse_correlation_artifact  # noqa: PLC0415
+            from renquant_pipeline.kernel.walk_forward import parse_correlation_artifact  # noqa: PLC0415
             matrix, as_of = parse_correlation_artifact(raw)
         except Exception as exc:  # noqa: BLE001
             return _soft_for_sell_only(
@@ -74,7 +74,7 @@ class CorrelationMetadataTask(PreflightTask):
                 details=details,
             )
         try:
-            from kernel.walk_forward.leakage_guard import _to_timestamp  # noqa: PLC0415
+            from renquant_pipeline.kernel.walk_forward.leakage_guard import _to_timestamp  # noqa: PLC0415
             _to_timestamp(as_of, label="correlation as_of_date")
         except Exception as exc:  # noqa: BLE001
             return _soft_for_sell_only(

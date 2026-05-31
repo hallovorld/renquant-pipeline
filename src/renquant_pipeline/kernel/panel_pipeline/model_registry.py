@@ -10,7 +10,7 @@ handler is a function that takes config + does its own work.
 Example use:
 
     # Inference (LoadScorerTask):
-    from kernel.panel_pipeline.model_registry import registry
+    from renquant_pipeline.kernel.panel_pipeline.model_registry import registry
     kind = config.get("ranking", {}).get("panel_scoring", {}).get("kind", "xgb")
     handler = registry.get(kind)
     scorer = handler.scorer_loader(artifact_path, config)
@@ -28,7 +28,7 @@ Adding a new model:
         requires_history = False
         @classmethod
         def scorer_loader(cls, artifact_path, config):
-            from kernel.panel_pipeline.lgbm_scorer import LGBMScorer
+            from renquant_pipeline.kernel.panel_pipeline.lgbm_scorer import LGBMScorer
             return LGBMScorer.load(artifact_path)
         @classmethod
         def train_cmd(cls, args) -> list[str]:
@@ -95,7 +95,7 @@ class XGBHandler(_ModelHandler):
 
     @classmethod
     def scorer_loader(cls, artifact_path, config):
-        from kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
         return PanelScorer.load(artifact_path)
 
     @classmethod
@@ -116,7 +116,7 @@ class PatchTSTHandler(_ModelHandler):
 
     @classmethod
     def scorer_loader(cls, artifact_path, config):
-        from kernel.panel_pipeline.patchtst_scorer import PatchTSTPanelScorer  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.patchtst_scorer import PatchTSTPanelScorer  # noqa: PLC0415
         panel_cfg = config.get("ranking", {}).get("panel_scoring", {})
         seq_len = int(panel_cfg.get("seq_len", 32))
         feature_cols = panel_cfg.get("feature_cols")
@@ -154,7 +154,7 @@ class HFPatchTSTHandler(_ModelHandler):
 
     @classmethod
     def scorer_loader(cls, artifact_path, config):
-        from kernel.panel_pipeline.hf_patchtst_scorer import HFPatchTSTPanelScorer  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.hf_patchtst_scorer import HFPatchTSTPanelScorer  # noqa: PLC0415
         return HFPatchTSTPanelScorer.load(artifact_path)
 
     @classmethod
@@ -196,7 +196,7 @@ class RegimeRouterHandler(_ModelHandler):
 
     @classmethod
     def scorer_loader(cls, artifact_path, config):
-        from kernel.panel_pipeline.regime_router_scorer import (  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.regime_router_scorer import (  # noqa: PLC0415
             RegimeRouterScorer, DEFAULT_ROUTING)
         from pathlib import Path as _P  # noqa: PLC0415
         rr_cfg = (config.get("ranking", {}).get("panel_scoring", {})

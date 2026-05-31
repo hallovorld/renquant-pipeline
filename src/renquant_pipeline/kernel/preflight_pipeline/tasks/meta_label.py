@@ -1,13 +1,13 @@
 """P-META-LABEL — meta-label artifact contract for the path-rule exit veto.
 
-Migrated from kernel.preflight._check_meta_label_artifact_contract. Decomposed
+Migrated from renquant_pipeline.kernel.preflight._check_meta_label_artifact_contract. Decomposed
 per §1c into validation helpers.
 """
 from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _finite_float,
     _resolve_artifact_path,

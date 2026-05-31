@@ -2,7 +2,7 @@
 
 Import from this top-level module so call sites stay clean:
 
-    from kernel.pipeline.atoms import (
+    from renquant_pipeline.kernel.pipeline.atoms import (
         IsFiniteGuardTask, BuildVectorFromMappingTask,
         WriteJSONArtifactTask, LogSummaryTask, ...
     )

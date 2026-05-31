@@ -111,7 +111,7 @@ def build_ensemble_scorer(
     Each path is dispatched through :meth:`PanelScorer.load` so any
     supported backend (xgboost / lightgbm / transformer) can be combined.
     """
-    from kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
+    from renquant_pipeline.kernel.panel_pipeline.panel_scorer import PanelScorer  # noqa: PLC0415
     scorers = [PanelScorer.load(Path(p)) for p in artifact_paths]
     return EnsemblePanelScorer(scorers=scorers, weights=weights, metadata=metadata)
 

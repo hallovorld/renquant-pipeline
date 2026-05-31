@@ -1,5 +1,9 @@
-ifneq ("$(wildcard ../RenQuant/.venv/bin/python)","")
-PYTHON ?= ../RenQuant/.venv/bin/python
+# Standalone interpreter resolution.  Borrowing the umbrella's
+# ../RenQuant/.venv hides undeclared dependencies + environment drift, which
+# defeats the "subrepo executes standalone" invariant.  Local .venv wins, then
+# python3 on PATH; PYTHON=... still overrides explicitly for CI / dev convenience.
+ifneq ("$(wildcard .venv/bin/python)","")
+PYTHON ?= .venv/bin/python
 else
 PYTHON ?= python3
 endif

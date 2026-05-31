@@ -25,6 +25,7 @@ _UMBRELLA = (Path(__file__).resolve().parents[2] / "RenQuant" / "backtesting"
 
 
 def test_byte_equivalent_to_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     """Every .py file in the lift package must MD5-match its umbrella twin."""
     if not _UMBRELLA.exists():
         pytest.skip(f"umbrella not at {_UMBRELLA}")
@@ -71,6 +72,7 @@ def test_expected_files_present() -> None:
 
 
 def test_preflight_py_matches_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     """``kernel/preflight.py`` is also part of this lift (PR #8 wrapper change).
 
     The wrapper change replaces ``run_preflight``'s body with a thin call to
@@ -87,6 +89,7 @@ def test_preflight_py_matches_umbrella() -> None:
 
 
 def test_job_panel_scoring_matches_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     """``panel_pipeline/job_panel_scoring.py`` carries the (d) bypass change.
 
     Subrepo must match umbrella so both repos honor the same

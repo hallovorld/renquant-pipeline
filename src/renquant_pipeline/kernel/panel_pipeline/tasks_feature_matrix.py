@@ -16,8 +16,8 @@ import logging
 
 import pandas as pd
 
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.pipeline import Job, Task
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .feature_matrix import build_inference_matrix
 from .panel_scorer import PanelScorer
@@ -165,7 +165,7 @@ class RowCoverageGateTask(Task):
         X = getattr(ctx, "_panel_matrix", None)
         if X is None:
             return None
-        from kernel.row_coverage import coverage_from_config, filter_by_coverage
+        from renquant_common.row_coverage import coverage_from_config, filter_by_coverage
         enabled, min_pct = coverage_from_config(ctx.config)
         if not enabled:
             return

@@ -31,7 +31,7 @@ from __future__ import annotations
 
 # Public API parity with the umbrella's kernel.pipeline package (QA-while-moving,
 # 2026-05-27): consumers (live runner, LEAN/sim adapters) do
-# `from kernel.pipeline import InferencePipeline, SellOnlyPipeline, ...`.
+# `from renquant_pipeline.kernel.pipeline import InferencePipeline, SellOnlyPipeline, ...`.
 from .context import InferenceContext, TickerInferenceContext
 from .pipeline import Job, TickerJob, run_parallel
 from .pp_inference import InferencePipeline, SellOnlyPipeline

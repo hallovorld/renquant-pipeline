@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
 
 from ..base import PreflightTask
 from ..ctx import PreflightContext
@@ -28,7 +28,7 @@ class StateFileTask(PreflightTask):
                 self.check_name, "soft", True, "no broker_name (dry-run); skip",
             )
         try:
-            from kernel.state_paths import resolve_live_state_read  # noqa: PLC0415
+            from renquant_pipeline.kernel.state_paths import resolve_live_state_read  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             return PreflightCheck(
                 self.check_name, "soft", True,

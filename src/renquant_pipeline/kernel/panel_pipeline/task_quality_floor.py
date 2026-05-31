@@ -22,8 +22,8 @@ import math
 from pathlib import Path
 from typing import Any
 
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.pipeline import Task
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.pipeline import Task
 
 log = logging.getLogger("kernel.panel_pipeline.quality_floor")
 
@@ -445,7 +445,7 @@ class QualityFloorTask(Task):
         if db is None:
             return None
         try:
-            from kernel.pipeline.task_score_distribution import (  # noqa: PLC0415
+            from renquant_pipeline.kernel.pipeline.task_score_distribution import (  # noqa: PLC0415
                 get_score_percentile_threshold,
             )
         except Exception:

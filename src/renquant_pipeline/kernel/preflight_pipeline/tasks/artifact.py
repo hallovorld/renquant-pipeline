@@ -1,6 +1,6 @@
 """Artifact-group Tasks — model_artifact + panel_contract + best_iter.
 
-Migrated from kernel.preflight._check_model_artifact,
+Migrated from renquant_pipeline.kernel.preflight._check_model_artifact,
 _check_panel_artifact_contract, _check_best_iter. Behavior parity asserted by
 tests/test_preflight_pipeline.py.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge — helpers stay
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge — helpers stay
                                 # in preflight.py until later PR retires them)
     PreflightCheck,
     _active_panel_config,
@@ -110,7 +110,7 @@ class PanelContractTask(PreflightTask):
             return PreflightCheck(
                 self.check_name, "hard", False, f"unreadable: {exc}",
             )
-        from kernel.artifact_contract import validate_panel_artifact_contract  # noqa: PLC0415
+        from renquant_artifacts.contracts import validate_panel_artifact_contract  # noqa: PLC0415
         result = validate_panel_artifact_contract(
             payload,
             strict=strict_contract,

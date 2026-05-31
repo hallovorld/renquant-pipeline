@@ -1,7 +1,7 @@
 """P-BROKER-CONNECT — connect + get_account_value works."""
 from __future__ import annotations
 
-from kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import PreflightCheck  # noqa: PLC0415 (legacy bridge)
 
 from ..base import PreflightTask
 from ..ctx import PreflightContext

@@ -222,9 +222,9 @@ class PanelScorer:
             except Exception:
                 pass  # fall through to legacy if checkpoint peek failed
             if isinstance(ckpt, dict) and "config_dict" in ckpt and "feature_cols" in ckpt:
-                from kernel.panel_pipeline.hf_patchtst_scorer import HFPatchTSTPanelScorer  # noqa: PLC0415
+                from renquant_pipeline.kernel.panel_pipeline.hf_patchtst_scorer import HFPatchTSTPanelScorer  # noqa: PLC0415
                 return HFPatchTSTPanelScorer.load(path)
-            from kernel.panel_pipeline.transformer_scorer import TransformerPanelScorer  # noqa: PLC0415
+            from renquant_pipeline.kernel.panel_pipeline.transformer_scorer import TransformerPanelScorer  # noqa: PLC0415
             return TransformerPanelScorer.load(path)
         try:
             payload = json.loads(path.read_text())
@@ -235,7 +235,7 @@ class PanelScorer:
         kind = payload.get("kind")
         if kind == "panel_transformer":
             # JSON sidecar was passed; transformer loader will find the .pt.
-            from kernel.panel_pipeline.transformer_scorer import TransformerPanelScorer  # noqa: PLC0415
+            from renquant_pipeline.kernel.panel_pipeline.transformer_scorer import TransformerPanelScorer  # noqa: PLC0415
             return TransformerPanelScorer.load(path)
         if kind == "panel_lgbm":
             # Delay import to keep lightgbm optional.

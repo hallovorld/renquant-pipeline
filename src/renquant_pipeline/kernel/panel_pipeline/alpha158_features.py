@@ -16,7 +16,7 @@ import the same low-level functions).
 
 Usage::
 
-    from kernel.panel_pipeline.alpha158_features import compute_alpha158_at
+    from renquant_pipeline.kernel.panel_pipeline.alpha158_features import compute_alpha158_at
 
     # Given an OHLCV DataFrame indexed by date for one ticker:
     feats: dict[str, float] = compute_alpha158_at(ohlcv_df, today)

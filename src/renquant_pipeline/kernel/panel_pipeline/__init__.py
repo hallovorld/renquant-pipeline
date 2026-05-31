@@ -9,7 +9,7 @@ runner. The training side lives in `training_panel/` (notebook / cron).
 
 Entry points::
 
-    from kernel.panel_pipeline import (
+    from renquant_pipeline.kernel.panel_pipeline import (
         PanelScorer,               # thin loader around the saved artifact
         compute_panel_scores,      # pure function: (artifact, feature_matrix) → scores
         top_n_by_score,            # rank gate: keep top-N

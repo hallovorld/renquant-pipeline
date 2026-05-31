@@ -1,12 +1,12 @@
 """P-FEATURE-COVER — NGBoost head's feature_cols are a subset of panel's.
 
-Migrated from kernel.preflight._check_feature_coverage.
+Migrated from renquant_pipeline.kernel.preflight._check_feature_coverage.
 """
 from __future__ import annotations
 
 import json
 
-from kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
+from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _ngboost_activation,
     _resolve_artifact_path,

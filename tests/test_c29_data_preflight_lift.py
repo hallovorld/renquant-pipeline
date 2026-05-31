@@ -27,6 +27,7 @@ _LIFTED = ("data.py", "data_cache.py", "data_coverage.py", "preflight.py", "trad
 
 
 def test_byte_equivalent_to_umbrella() -> None:
+    pytest.skip("retired in Phase 5: subrepo imports rewritten to renquant_pipeline.* and renquant_common.*, byte-mirror invariant intentionally broken")
     if not _UMBRELLA.exists():
         pytest.skip(f"umbrella not at {_UMBRELLA}")
     for name in _LIFTED:
