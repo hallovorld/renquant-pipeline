@@ -45,47 +45,7 @@ from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
 
 
-def _resolve_umbrella_data_root() -> Path:
-    """Resolve the directory that contains `data/` (and `backtesting/`, etc.).
-
-    Production daily/live calls this module through the multirepo bridge
-    (scripts/daily_multirepo.py), where this file lives at
-    `<github>/renquant-pipeline/src/renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py`.
-    Hardcoding `parents[4]` resolves to the renquant-pipeline checkout,
-    which has no `data/` directory — fail-closed (`panel_fundamentals_missing`).
-
-    Resolution order:
-      1. ``RENQUANT_DATA_ROOT`` env var (the canonical override). Same
-         contract as codex PR renquant-model#22.
-      2. The renquant-pipeline checkout's sibling ``RenQuant`` directory
-         (``<github>/RenQuant``), if it has ``data/sec_fundamentals_daily.parquet``.
-      3. The umbrella convention ``~/git/github/RenQuant``.
-      4. Legacy ``parents[4]`` (works only when this file is loaded from
-         within the umbrella checkout — preserves rollback semantics).
-
-    The function caches the resolved root via lru_cache below.
-    """
-    raw = os.environ.get("RENQUANT_DATA_ROOT")
-    if raw:
-        cand = Path(raw).expanduser().resolve()
-        if cand.exists():
-            return cand
-    pkg_root = Path(__file__).resolve().parents[4]   # renquant-pipeline checkout
-    sibling = pkg_root.parent / "RenQuant"
-    if (sibling / "data" / "sec_fundamentals_daily.parquet").exists():
-        return sibling.resolve()
-    home_default = Path.home() / "git" / "github" / "RenQuant"
-    if (home_default / "data" / "sec_fundamentals_daily.parquet").exists():
-        return home_default.resolve()
-    # Last-resort legacy behavior (umbrella checkout):
-    return pkg_root
-
-
-from functools import lru_cache
-
-@lru_cache(maxsize=1)
-def _data_root_cached() -> Path:
-    return _resolve_umbrella_data_root()
+from renquant_pipeline.kernel.panel_pipeline._data_root import data_root as _data_root_cached
 
 log = logging.getLogger("kernel.panel_pipeline.scoring")
 

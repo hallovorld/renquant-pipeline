@@ -40,7 +40,13 @@ import sys
 from pathlib import Path
 from typing import Callable, Optional
 
-_REPO = Path(__file__).resolve().parents[4]
+# §7.5 single source: route umbrella root through _data_root.data_root().
+# Used by train_cmd to build legacy umbrella `scripts/patchtst_hf.py`
+# subprocess args. Lazy so module import doesn't trigger root resolution
+# when `train_cmd` isn't actually called (daily/live inference path).
+def _umbrella_repo() -> Path:
+    from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+    return data_root()
 
 
 class _ModelHandler:
@@ -101,9 +107,9 @@ class XGBHandler(_ModelHandler):
     @classmethod
     def train_cmd(cls, args) -> list[str]:
         return [
-            sys.executable, str(_REPO / "scripts/train_panel_alpha158_xgb.py"),
+            sys.executable, str(_umbrella_repo() / "scripts/train_panel_alpha158_xgb.py"),
             "--dataset", args.dataset,
-            "--output", args.output or str(_REPO / "artifacts/panel-ltr.alpha158_fund.json"),
+            "--output", args.output or str(_umbrella_repo() / "artifacts/panel-ltr.alpha158_fund.json"),
             "--label", args.label,
             "--seed", str(args.seed),
         ]
@@ -129,14 +135,14 @@ class PatchTSTHandler(_ModelHandler):
     @classmethod
     def train_cmd(cls, args) -> list[str]:
         return [
-            sys.executable, str(_REPO / "scripts/transformer_v4.py"),
+            sys.executable, str(_umbrella_repo() / "scripts/transformer_v4.py"),
             "--dataset", args.dataset,
             "--arch", "patchtst",
             "--label", args.label,
             "--seq-len", str(getattr(args, "seq_len", 32)),
             "--epochs", str(getattr(args, "epochs", 10)),
             "--num-seeds", str(getattr(args, "num_seeds", 5)),
-            "--output-dir", args.output_dir or str(_REPO / "artifacts/patchtst_unified"),
+            "--output-dir", args.output_dir or str(_umbrella_repo() / "artifacts/patchtst_unified"),
             "--device", getattr(args, "device", "mps"),
         ]
 
@@ -162,7 +168,7 @@ class HFPatchTSTHandler(_ModelHandler):
         # NOTE: --warmup-epochs not yet wired in scripts/patchtst_hf.py
         # (DOE warmup_epochs knob is decorative until LR scheduler added).
         return [
-            sys.executable, str(_REPO / "scripts/patchtst_hf.py"),
+            sys.executable, str(_umbrella_repo() / "scripts/patchtst_hf.py"),
             "--dataset", args.dataset,
             "--label", args.label,
             "--cut", getattr(args, "cut", "cut1_covid"),
@@ -170,7 +176,7 @@ class HFPatchTSTHandler(_ModelHandler):
             "--epochs", str(getattr(args, "epochs", 15)),
             "--lr", str(getattr(args, "lr", 1e-4)),
             "--weight-decay", str(getattr(args, "weight_decay", 1e-2)),
-            "--output-dir", args.output_dir or str(_REPO / "artifacts/hf_patchtst_prod"),
+            "--output-dir", args.output_dir or str(_umbrella_repo() / "artifacts/hf_patchtst_prod"),
             "--device", getattr(args, "device", "mps"),
             "--save-model",
         ]
@@ -205,7 +211,7 @@ class RegimeRouterHandler(_ModelHandler):
         if not sub_scorers_cfg:
             raise ValueError("regime_router config missing 'scorers' dict "
                               "(at ranking.panel_scoring.regime_router.scorers)")
-        strategy_dir = config.get("_strategy_dir") or _REPO / "backtesting/renquant_104"
+        strategy_dir = config.get("_strategy_dir") or _umbrella_repo() / "backtesting/renquant_104"
         loaded = {}
         for key, sub in sub_scorers_cfg.items():
             sub_kind = sub["kind"]

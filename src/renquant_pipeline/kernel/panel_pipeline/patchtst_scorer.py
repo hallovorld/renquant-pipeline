@@ -27,10 +27,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-_REPO_ROOT = Path(__file__).resolve().parents[4]
-_SCRIPTS = _REPO_ROOT / "scripts"
-if str(_SCRIPTS) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS))
+# §7.5 single source for umbrella root. Resolved lazily — first time the
+# legacy `scripts/transformer_v4.py` importer below is reached. Module
+# import is no longer disk-layout-dependent so pipeline package import
+# succeeds in any multirepo configuration.
+def _add_umbrella_scripts_to_path() -> None:
+    from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+    scripts = data_root() / "scripts"
+    if str(scripts) not in sys.path:
+        sys.path.insert(0, str(scripts))
 
 # 2026-05-18 OpenMP fix: xgboost (imported via panel_pipeline.__init__)
 # sets OMP threads at import time. PyTorch TransformerEncoder construction
@@ -73,6 +78,7 @@ class PatchTSTPanelScorer:
         """Load PatchTST checkpoint. Needs feature_cols passed in since
         transformer_v4.py doesn't save them in the .pt."""
         import torch  # noqa: PLC0415
+        _add_umbrella_scripts_to_path()
         from transformer_v4 import PatchTSTRanker  # noqa: PLC0415
         ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
         # Determine n_channels from first layer shape

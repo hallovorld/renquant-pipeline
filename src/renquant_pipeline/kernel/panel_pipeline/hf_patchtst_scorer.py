@@ -103,6 +103,10 @@ class HFPatchTSTPanelScorer:
         import torch  # noqa: PLC0415
         from transformers import PatchTSTConfig  # noqa: PLC0415
         # Preferred path: import HFPatchTSTRanker from the model subrepo (post PR #22).
+        # Catch ONLY ModuleNotFoundError for the missing-package case. Any other
+        # ImportError (broken submodule, syntax error inside renquant_model_patchtst,
+        # missing transformers, etc.) must propagate — silently falling back to
+        # the legacy file-import would mask real packaging defects.
         try:
             from renquant_model_patchtst.hf_trainer import HFPatchTSTRanker  # noqa: PLC0415
 
@@ -111,9 +115,15 @@ class HFPatchTSTPanelScorer:
 
             _RankerProxy.HFPatchTSTRanker = HFPatchTSTRanker
             hf_mod = _RankerProxy
-        except ImportError:
-            # Fallback: file-import for environments without renquant-model installed
-            # (umbrella rollback / dev). Resolve umbrella root via env or sibling.
+        except ModuleNotFoundError as exc:
+            # ONLY fall back if `renquant_model_patchtst` itself is missing.
+            # Internal import failures (e.g. `from renquant_model_patchtst.foo import bar`
+            # where bar is broken) raise ModuleNotFoundError too — distinguish via
+            # exc.name: only fall back when the missing module IS the top-level
+            # package, not a submodule.
+            if exc.name not in ("renquant_model_patchtst",):
+                raise
+            # Fallback: file-import for umbrella rollback / dev environments.
             import importlib.util  # noqa: PLC0415
             from pathlib import Path as _P  # noqa: PLC0415
 
