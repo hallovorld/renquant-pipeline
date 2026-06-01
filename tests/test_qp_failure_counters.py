@@ -78,12 +78,16 @@ def test_missing_counters_dict_is_noop():
     _stamp_qp_failure_counter(ctx, "infeasible")          # must not raise
 
 
-def test_repeated_calls_accumulate():
+def test_repeated_calls_are_idempotent_within_ctx():
+    """Codex PR #9 v2: subsequent calls within the same ctx are no-ops.
+    SolveMarkowitzQPTask stamps on non-optimal, then EmitOrdersFromQPSolutionTask
+    runs and would stamp the same status again — must not double-count."""
     ctx = _ctx_with_counters()
     _stamp_qp_failure_counter(ctx, "infeasible")
     _stamp_qp_failure_counter(ctx, "infeasible:cov")
     _stamp_qp_failure_counter(ctx, "missing_solution")
-    assert ctx.counters == {"qp_infeasible": 2, "qp_missing_solution": 1}
+    # Only the first stamp wins — bar-level idempotency.
+    assert ctx.counters == {"qp_infeasible": 1}
 
 
 # ── Integration: ComputeFullSigma fail path stamps counters too ──────────────
@@ -115,3 +119,43 @@ def test_solve_markowitz_nonoptimal_stamps_counter():
     _stamp_all_qp_blocks(ctx, ctx._qp_failure_reason)
     _stamp_qp_failure_counter(ctx, ctx._qp_status)
     assert ctx.counters.get("qp_infeasible") == 1
+
+
+# ── Codex PR #9 v2 review: Solve → Emit must not double-count ────────────────
+
+def test_solve_then_emit_does_not_double_stamp():
+    """When SolveMarkowitzQPTask stamps then continues (no return False) and
+    EmitOrdersFromQPSolutionTask also stamps the same status, the counter
+    must remain exactly 1 — not 2."""
+    ctx = _ctx_with_counters()
+    # 1) SolveMarkowitzQPTask sees non-optimal sol.status, stamps:
+    _stamp_qp_failure_counter(ctx, "infeasible")
+    assert ctx.counters["qp_infeasible"] == 1
+    assert getattr(ctx, "_qp_failure_counter_stamped", False) is True
+    # 2) EmitOrdersFromQPSolutionTask receives the same status, calls helper:
+    _stamp_qp_failure_counter(ctx, "infeasible")
+    # Idempotent — counter unchanged:
+    assert ctx.counters["qp_infeasible"] == 1
+
+
+def test_idempotent_across_status_variants_within_one_ctx():
+    """Even if a later caller passes a DIFFERENT status, idempotency holds
+    for the lifetime of the ctx (one bar = one stamp event)."""
+    ctx = _ctx_with_counters()
+    _stamp_qp_failure_counter(ctx, "infeasible")
+    _stamp_qp_failure_counter(ctx, "optimal_no_signal")
+    _stamp_qp_failure_counter(ctx, "missing_solution")
+    # Only the first stamp wins:
+    assert ctx.counters == {"qp_infeasible": 1}
+
+
+def test_fresh_ctx_stamps_again():
+    """A new ctx (next bar) gets its own stamp — not blocked by a previous
+    ctx's flag."""
+    ctx1 = _ctx_with_counters()
+    _stamp_qp_failure_counter(ctx1, "infeasible")
+    assert ctx1.counters == {"qp_infeasible": 1}
+
+    ctx2 = _ctx_with_counters()
+    _stamp_qp_failure_counter(ctx2, "infeasible")
+    assert ctx2.counters == {"qp_infeasible": 1}
