@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,9 @@ from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
+
+
+from renquant_pipeline.kernel.panel_pipeline._data_root import data_root as _data_root_cached
 
 log = logging.getLogger("kernel.panel_pipeline.scoring")
 
@@ -719,7 +723,7 @@ class ApplyScoresTask(Task):
             panel_history = getattr(ctx, "_panel_history", None)
             if panel_history is None:
                 from pathlib import Path as _P  # noqa: PLC0415
-                repo = _P(__file__).resolve().parents[4]
+                repo = _data_root_cached()
                 panel_path = repo / "data" / "alpha158_291_fundamental_dataset.parquet"
                 try:
                     full_panel = pd.read_parquet(panel_path)
@@ -838,7 +842,7 @@ class ApplyScoresTask(Task):
                 needs_fund = any(fc in scorer.feature_cols for fc in fund_cols)
                 if needs_fund:
                     from pathlib import Path                                         # noqa: PLC0415
-                    repo = Path(__file__).resolve().parents[4]
+                    repo = _data_root_cached()
                     fp = repo / "data" / "sec_fundamentals_daily.parquet"
                     if not fp.exists():
                         _fail_closed_panel_scoring(ctx, "panel_fundamentals_missing")
@@ -873,7 +877,7 @@ class ApplyScoresTask(Task):
                 needs_sue  = any(sc in scorer.feature_cols for sc in sue_cols)
                 if needs_pead or needs_sue:
                     from pathlib import Path  # noqa: PLC0415
-                    repo = Path(__file__).resolve().parents[4]
+                    repo = _data_root_cached()
                     earn_dir = repo / "data" / "earnings_surprise"
                     today_ts = pd.Timestamp(today)
                     context_tickers = _stable_feature_context_tickers(
@@ -918,7 +922,7 @@ class ApplyScoresTask(Task):
                 needs_sent = any(sc in scorer.feature_cols for sc in sent_cols)
                 if needs_sent:
                     from pathlib import Path as _P  # noqa: PLC0415
-                    repo_root = _P(__file__).resolve().parents[4]
+                    repo_root = _data_root_cached()
                     sent_dir = repo_root / "data" / "news_sentiment_alpaca"
                     today_ts_sent = pd.Timestamp(today)
                     context_tickers = _stable_feature_context_tickers(
@@ -1047,7 +1051,7 @@ class ApplyScoresTask(Task):
                         # past panel-max-date. For SIM tests on dates ≤
                         # 2026-02-10 this is correct.
                         from pathlib import Path as _P  # noqa: PLC0415
-                        repo = _P(__file__).resolve().parents[4]
+                        repo = _data_root_cached()
                         panel_path = repo / "data" / "alpha158_291_fundamental_dataset.parquet"
                         try:
                             full_panel = pd.read_parquet(panel_path)

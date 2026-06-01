@@ -56,8 +56,12 @@ log = logging.getLogger("kernel.panel_pipeline.shadow_scoring")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-# Default MLflow tracking URI: file-based local store at repo/mlruns
-_DEFAULT_TRACKING_URI = "file:" + str(Path(__file__).resolve().parents[4] / "mlruns")
+# Default MLflow tracking URI: file-based local store at <umbrella>/mlruns.
+# Lazy resolution — module import does not require the umbrella to be
+# locatable; only callers of _ensure_mlflow_setup() with no tracking_uri arg.
+def _default_tracking_uri() -> str:
+    from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+    return "file:" + str(data_root() / "mlruns")
 _DEFAULT_EXPERIMENT = "renquant_104_shadow"
 _SCORER_CACHE: dict[tuple[str, str], object] = {}
 
@@ -66,7 +70,7 @@ def _ensure_mlflow_setup(tracking_uri: Optional[str] = None,
                          experiment_name: Optional[str] = None) -> str:
     """Set MLflow tracking URI + experiment. Returns experiment_id."""
     import mlflow  # noqa: PLC0415
-    mlflow.set_tracking_uri(tracking_uri or _DEFAULT_TRACKING_URI)
+    mlflow.set_tracking_uri(tracking_uri or _default_tracking_uri())
     name = experiment_name or _DEFAULT_EXPERIMENT
     exp = mlflow.get_experiment_by_name(name)
     if exp is None:
@@ -192,7 +196,8 @@ class ApplyShadowScoringTask(Task):
                 return None
 
         from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
-        repo = Path(__file__).resolve().parents[4]
+        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+        repo = data_root()
 
         for sm in shadow_models:
             name = sm.get("name", "unnamed_shadow")

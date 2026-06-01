@@ -95,18 +95,87 @@ class HFPatchTSTPanelScorer:
 
     @classmethod
     def load(cls, path: str | Path) -> "HFPatchTSTPanelScorer":
-        """Load HF PatchTST checkpoint produced by scripts/patchtst_hf.py
-        --save-model."""
+        """Load HF PatchTST checkpoint produced by renquant_model_patchtst.hf_trainer
+        (formerly scripts/patchtst_hf.py — script was moved into the subrepo by
+        renquant-model PR #22; the file-import path was broken in multirepo runs
+        where ``parents[4]`` resolves to ``renquant-pipeline``, not the umbrella).
+
+        Import ordering (v3-PR #7 codex review): the import-source decision
+        (canonical vs file-import fallback) runs FIRST, before importing
+        torch + transformers. This way:
+          - a clean install without [patchtst] extras AND without an umbrella
+            checkout fails with a clear ImportError from the fallback branch,
+            not with a confusing torch ModuleNotFoundError further up;
+          - tests that only exercise the import-source decision can stub
+            sys.modules['torch']/['transformers'] without bypassing the
+            production code path.
+        """
+        import os  # noqa: PLC0415
+        # Preferred path: import HFPatchTSTRanker from the model subrepo (post PR #22).
+        # Catch ONLY ModuleNotFoundError for the missing-package case. Other
+        # ImportError variants (broken submodule, missing transformers, syntax
+        # errors inside the package) must propagate — silently falling back
+        # would mask real packaging defects.
+        #
+        # Two scenarios trigger fallback:
+        #   exc.name == "renquant_model_patchtst"             — package not installed at all
+        #   exc.name == "renquant_model_patchtst.hf_trainer"  — stub installed (the deprecated
+        #                                                       standalone renquant-model-patchtst
+        #                                                       PyPI package has only __init__.py
+        #                                                       and lacks hf_trainer)
+        # Any deeper submodule miss (e.g. "transformers" missing while hf_trainer ITSELF
+        # is importable) is a real packaging defect and MUST raise.
+        _FALLBACK_TRIGGERS = (
+            "renquant_model_patchtst",
+            "renquant_model_patchtst.hf_trainer",
+        )
+        try:
+            from renquant_model_patchtst.hf_trainer import HFPatchTSTRanker  # noqa: PLC0415
+
+            class _RankerProxy:
+                pass
+
+            _RankerProxy.HFPatchTSTRanker = HFPatchTSTRanker
+            hf_mod = _RankerProxy
+        except ModuleNotFoundError as exc:
+            if exc.name not in _FALLBACK_TRIGGERS:
+                raise
+            # Fallback: file-import for umbrella rollback / dev environments.
+            import importlib.util  # noqa: PLC0415
+            from pathlib import Path as _P  # noqa: PLC0415
+
+            env_root = os.environ.get("RENQUANT_DATA_ROOT")
+            if env_root:
+                repo = _P(env_root).expanduser().resolve()
+            else:
+                pipeline_root = _P(__file__).resolve().parents[4]
+                sibling = pipeline_root.parent / "RenQuant"
+                home_default = _P.home() / "git" / "github" / "RenQuant"
+                if (sibling / "scripts" / "patchtst_hf.py").exists():
+                    repo = sibling.resolve()
+                elif (home_default / "scripts" / "patchtst_hf.py").exists():
+                    repo = home_default.resolve()
+                else:
+                    repo = pipeline_root  # last resort (will raise below if missing)
+
+            legacy = repo / "scripts" / "patchtst_hf.py"
+            if not legacy.exists():
+                raise ImportError(
+                    f"renquant_model_patchtst.hf_trainer.HFPatchTSTRanker unavailable AND "
+                    f"legacy {legacy} missing. Install renquant-model OR set "
+                    f"RENQUANT_DATA_ROOT to an umbrella checkout with scripts/patchtst_hf.py."
+                )
+            spec = importlib.util.spec_from_file_location("patchtst_hf_mod", legacy)
+            hf_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hf_mod)
+
+        # Heavy runtime deps imported HERE — only after the import-source
+        # decision succeeded. Base installs without [patchtst] AND without
+        # an umbrella checkout already raised the ImportError above; reaching
+        # this line implies HFPatchTSTRanker is in scope and the artifact
+        # will actually be loaded.
         import torch  # noqa: PLC0415
         from transformers import PatchTSTConfig  # noqa: PLC0415
-        # Import HFPatchTSTRanker from the training script
-        import importlib.util  # noqa: PLC0415
-        from pathlib import Path as _P  # noqa: PLC0415
-        repo = _P(__file__).resolve().parents[4]
-        spec = importlib.util.spec_from_file_location(
-            "patchtst_hf_mod", repo / "scripts/patchtst_hf.py")
-        hf_mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(hf_mod)
 
         path = Path(path)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)

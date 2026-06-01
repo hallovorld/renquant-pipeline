@@ -22,6 +22,15 @@ dependencies = [
 # [gbdt] extra selects its xgboost backend.
 [project.optional-dependencies]
 gbdt = ["renquant-model[gbdt]>=0.1,<0.2"]
+# PatchTST family inference (kernel/panel_pipeline/hf_patchtst_scorer.py
+# imports HFPatchTSTRanker). The PatchTST namespace (renquant_model_patchtst)
+# is shipped by the merged renquant-model distribution; the standalone
+# `renquant-model-patchtst` PyPI package is a deprecated stub
+# (MIGRATED_TO_renquant-model.md). The [patchtst] extra of renquant-model
+# pulls in torch + transformers. Without this extra, hf_patchtst_scorer
+# falls back to file-importing scripts/patchtst_hf.py from an umbrella
+# checkout (rollback only).
+patchtst = ["renquant-model[patchtst]>=0.1,<0.2"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
