@@ -103,10 +103,23 @@ class HFPatchTSTPanelScorer:
         import torch  # noqa: PLC0415
         from transformers import PatchTSTConfig  # noqa: PLC0415
         # Preferred path: import HFPatchTSTRanker from the model subrepo (post PR #22).
-        # Catch ONLY ModuleNotFoundError for the missing-package case. Any other
-        # ImportError (broken submodule, syntax error inside renquant_model_patchtst,
-        # missing transformers, etc.) must propagate — silently falling back to
-        # the legacy file-import would mask real packaging defects.
+        # Catch ONLY ModuleNotFoundError for the missing-package case. Other
+        # ImportError variants (broken submodule, missing transformers, syntax
+        # errors inside the package) must propagate — silently falling back
+        # would mask real packaging defects.
+        #
+        # Two scenarios trigger fallback:
+        #   exc.name == "renquant_model_patchtst"             — package not installed at all
+        #   exc.name == "renquant_model_patchtst.hf_trainer"  — stub installed (the deprecated
+        #                                                       standalone renquant-model-patchtst
+        #                                                       PyPI package has only __init__.py
+        #                                                       and lacks hf_trainer)
+        # Any deeper submodule miss (e.g. "transformers" missing while hf_trainer ITSELF
+        # is importable) is a real packaging defect and MUST raise.
+        _FALLBACK_TRIGGERS = (
+            "renquant_model_patchtst",
+            "renquant_model_patchtst.hf_trainer",
+        )
         try:
             from renquant_model_patchtst.hf_trainer import HFPatchTSTRanker  # noqa: PLC0415
 
@@ -116,12 +129,7 @@ class HFPatchTSTPanelScorer:
             _RankerProxy.HFPatchTSTRanker = HFPatchTSTRanker
             hf_mod = _RankerProxy
         except ModuleNotFoundError as exc:
-            # ONLY fall back if `renquant_model_patchtst` itself is missing.
-            # Internal import failures (e.g. `from renquant_model_patchtst.foo import bar`
-            # where bar is broken) raise ModuleNotFoundError too — distinguish via
-            # exc.name: only fall back when the missing module IS the top-level
-            # package, not a submodule.
-            if exc.name not in ("renquant_model_patchtst",):
+            if exc.name not in _FALLBACK_TRIGGERS:
                 raise
             # Fallback: file-import for umbrella rollback / dev environments.
             import importlib.util  # noqa: PLC0415

@@ -1,75 +1,163 @@
-"""Regression test for hf_patchtst_scorer's narrowed ImportError catch.
+"""Behavioral regression tests for HFPatchTSTPanelScorer.load() import paths.
 
-Codex PR #7 review #1: the v1 hotfix caught any ImportError, which would
-silently mask broken submodules INSIDE an installed renquant_model_patchtst
-(e.g. `transformers` missing) and fall back to the legacy file-import path.
-v2 narrows the catch to `ModuleNotFoundError` with `exc.name ==
-"renquant_model_patchtst"`. Other import failures must propagate.
+Codex PR #7 review #2: previous meta-test only exercised the exception
+logic inline. These tests monkeypatch sys.modules + builtins.__import__
+and actually call HFPatchTSTPanelScorer.load() to verify:
+
+  1. Package not installed at all (exc.name == "renquant_model_patchtst")
+     → fall back to file-import branch.
+  2. Stub package installed without hf_trainer submodule
+     (exc.name == "renquant_model_patchtst.hf_trainer")
+     → fall back to file-import branch.
+  3. hf_trainer present but internally broken (e.g. transformers missing)
+     (exc.name == "transformers")
+     → propagate; do NOT fall back.
+
+Detection strategy: when the fallback file-import branch is reached AND
+the legacy script doesn't exist on disk, the scorer raises:
+
+  ImportError: "renquant_model_patchtst.hf_trainer.HFPatchTSTRanker
+                unavailable AND legacy <path> missing."
+
+We catch that specific message to confirm fallback was entered. Conversely,
+the propagation test asserts that a ModuleNotFoundError(name='transformers')
+surfaces unchanged (not converted to the fallback ImportError).
 """
 from __future__ import annotations
 
 import sys
 import types
+import builtins
 import pytest
 
 
-def _purge_module(name: str) -> None:
-    for k in list(sys.modules):
-        if k == name or k.startswith(f"{name}."):
-            del sys.modules[k]
+@pytest.fixture
+def isolated_sys_modules():
+    """Snapshot + restore renquant_model_patchtst-related entries so tests
+    can install/uninstall fakes without polluting other tests."""
+    saved = {}
+    for key in list(sys.modules):
+        if key == "renquant_model_patchtst" or key.startswith("renquant_model_patchtst."):
+            saved[key] = sys.modules.pop(key)
+    yield
+    for key in list(sys.modules):
+        if key == "renquant_model_patchtst" or key.startswith("renquant_model_patchtst."):
+            sys.modules.pop(key, None)
+    for k, v in saved.items():
+        sys.modules[k] = v
 
 
-def test_top_level_package_missing_falls_back(monkeypatch):
-    """When renquant_model_patchtst itself is missing, the scorer falls back
-    to file-import (and ultimately raises ImportError if legacy script also
-    missing — that's the documented contract)."""
-    # We can't easily make this test self-contained without disturbing the
-    # installed package, but we can at least verify the narrow exception logic.
+def _selective_importer(rmp_top_raises: bool, hf_trainer_exc: ModuleNotFoundError | None):
+    """Build a __import__ replacement that scopes failures to rmp namespace.
+
+    Args:
+        rmp_top_raises: if True, importing `renquant_model_patchtst` itself
+                        raises ModuleNotFoundError(name='renquant_model_patchtst').
+                        If False, top-level import succeeds with a fake stub.
+        hf_trainer_exc: exception to raise when importing
+                        `renquant_model_patchtst.hf_trainer`. None = succeeds
+                        (not used by these tests, included for completeness).
+    """
+    real = builtins.__import__
+
+    def _imp(name, globals=None, locals=None, fromlist=(), level=0):
+        # When CPython does `from a.b import c`, it calls
+        # __import__("a.b", ..., fromlist=("c",)). So for the rmp namespace
+        # we have to handle BOTH bare top-level imports AND submodule
+        # imports that traverse the top.
+        if name == "renquant_model_patchtst" or name.startswith("renquant_model_patchtst."):
+            if rmp_top_raises:
+                # Top-level missing — any rmp[.*] import fails as ModuleNotFoundError
+                # with name == "renquant_model_patchtst" (Python's actual behavior
+                # when the top-level package isn't on sys.path).
+                raise ModuleNotFoundError(
+                    f"No module named {'renquant_model_patchtst'!r}",
+                    name="renquant_model_patchtst",
+                )
+            # rmp top-level "installed" (fake stub). hf_trainer behavior depends
+            # on hf_trainer_exc.
+            stub = sys.modules.get("renquant_model_patchtst")
+            if stub is None:
+                stub = types.ModuleType("renquant_model_patchtst")
+                stub.__path__ = []
+                sys.modules["renquant_model_patchtst"] = stub
+            if name == "renquant_model_patchtst":
+                return stub
+            # name == "renquant_model_patchtst.hf_trainer" (or deeper)
+            if hf_trainer_exc is not None:
+                raise hf_trainer_exc
+            return real(name, globals, locals, fromlist, level)
+        return real(name, globals, locals, fromlist, level)
+
+    return _imp
+
+
+def _setup_data_root(tmp_path, monkeypatch):
+    """Configure RENQUANT_DATA_ROOT pointing at tmp_path with sentinel present
+    but with NO scripts/patchtst_hf.py, so the fallback branch raises
+    a known ImportError we can match on."""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "sec_fundamentals_daily.parquet").write_bytes(b"\x00")
+    # Reset _data_root cache so the env-var change takes effect.
+    from renquant_pipeline.kernel.panel_pipeline import _data_root
+    _data_root._reset_cache_for_tests()
+    monkeypatch.setenv("RENQUANT_DATA_ROOT", str(tmp_path))
+
+
+def _dummy_artifact(tmp_path):
+    p = tmp_path / "model.pt"
+    p.write_bytes(b"\x00")
+    return p
+
+
+# Case 1: stub installed (top-level resolves, hf_trainer missing) → fallback expected.
+def test_stub_package_without_hf_trainer_triggers_fallback(
+    isolated_sys_modules, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(builtins, "__import__", _selective_importer(
+        rmp_top_raises=False,
+        hf_trainer_exc=ModuleNotFoundError(
+            "No module named 'renquant_model_patchtst.hf_trainer'",
+            name="renquant_model_patchtst.hf_trainer",
+        ),
+    ))
+    _setup_data_root(tmp_path, monkeypatch)
+
     from renquant_pipeline.kernel.panel_pipeline import hf_patchtst_scorer
-    # Stash the module if installed, then simulate ModuleNotFoundError with
-    # the expected exc.name on import.
-    saved = sys.modules.pop("renquant_model_patchtst", None)
-    saved_submod = sys.modules.pop("renquant_model_patchtst.hf_trainer", None)
-    try:
-        # If renquant_model_patchtst isn't installed at all, the import in
-        # scorer.load would raise ModuleNotFoundError(name="renquant_model_patchtst").
-        # The narrowed except clause checks exc.name in ("renquant_model_patchtst",).
-        try:
-            from renquant_model_patchtst.hf_trainer import HFPatchTSTRanker  # noqa: F401
-        except ModuleNotFoundError as exc:
-            assert exc.name in (
-                "renquant_model_patchtst", "renquant_model_patchtst.hf_trainer"
-            ), f"Expected exc.name to identify the missing top-level package, got {exc.name!r}"
-    finally:
-        if saved is not None:
-            sys.modules["renquant_model_patchtst"] = saved
-        if saved_submod is not None:
-            sys.modules["renquant_model_patchtst.hf_trainer"] = saved_submod
+    with pytest.raises(ImportError, match=r"hf_trainer\.HFPatchTSTRanker unavailable.*legacy.*missing"):
+        hf_patchtst_scorer.HFPatchTSTPanelScorer.load(_dummy_artifact(tmp_path))
 
 
-def test_narrowed_catch_does_not_swallow_unrelated_module_not_found(monkeypatch):
-    """If a different module name is missing (e.g. transformers), the import
-    failure must propagate — NOT fall back to file-import."""
-    # Build a fake renquant_model_patchtst.hf_trainer that itself fails to
-    # import an unrelated module.
-    fake_pkg = types.ModuleType("fake_rmp_test")
-    fake_pkg.__path__ = []
-    monkeypatch.setitem(sys.modules, "fake_rmp_test", fake_pkg)
+# Case 2: package not installed at all → fallback expected.
+def test_top_level_package_missing_triggers_fallback(
+    isolated_sys_modules, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(builtins, "__import__", _selective_importer(
+        rmp_top_raises=True, hf_trainer_exc=None,
+    ))
+    _setup_data_root(tmp_path, monkeypatch)
 
-    # Now define a fake submodule that, on import, raises ModuleNotFoundError
-    # with a name NOT in the allowlist.
-    code = (
-        "raise ModuleNotFoundError('fake transformers missing', name='transformers')"
+    from renquant_pipeline.kernel.panel_pipeline import hf_patchtst_scorer
+    with pytest.raises(ImportError, match=r"hf_trainer\.HFPatchTSTRanker unavailable.*legacy.*missing"):
+        hf_patchtst_scorer.HFPatchTSTPanelScorer.load(_dummy_artifact(tmp_path))
+
+
+# Case 3: hf_trainer present but transformers missing → propagate, do NOT fall back.
+def test_transformers_missing_propagates_not_fallback(
+    isolated_sys_modules, monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(builtins, "__import__", _selective_importer(
+        rmp_top_raises=False,
+        hf_trainer_exc=ModuleNotFoundError(
+            "No module named 'transformers'", name="transformers",
+        ),
+    ))
+    _setup_data_root(tmp_path, monkeypatch)
+
+    from renquant_pipeline.kernel.panel_pipeline import hf_patchtst_scorer
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        hf_patchtst_scorer.HFPatchTSTPanelScorer.load(_dummy_artifact(tmp_path))
+    assert excinfo.value.name == "transformers", (
+        f"Expected transformers ModuleNotFoundError to propagate, got "
+        f"exc.name={excinfo.value.name!r}; fallback path was incorrectly taken."
     )
-    spec = types.ModuleType("fake_rmp_test.hf_trainer")
-
-    # Simulate the scorer's narrow except clause directly:
-    try:
-        exec(code)
-    except ModuleNotFoundError as exc:
-        # This is what the scorer's narrow catch does:
-        if exc.name not in ("renquant_model_patchtst",):
-            # Must propagate — not fall back
-            pytest.raises(ModuleNotFoundError, lambda: (_ for _ in ()).throw(exc))
-        else:
-            pytest.fail("narrow catch incorrectly swallowed a non-rmp exception")
