@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
+import os
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,49 @@ from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
+
+
+def _resolve_umbrella_data_root() -> Path:
+    """Resolve the directory that contains `data/` (and `backtesting/`, etc.).
+
+    Production daily/live calls this module through the multirepo bridge
+    (scripts/daily_multirepo.py), where this file lives at
+    `<github>/renquant-pipeline/src/renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py`.
+    Hardcoding `parents[4]` resolves to the renquant-pipeline checkout,
+    which has no `data/` directory — fail-closed (`panel_fundamentals_missing`).
+
+    Resolution order:
+      1. ``RENQUANT_DATA_ROOT`` env var (the canonical override). Same
+         contract as codex PR renquant-model#22.
+      2. The renquant-pipeline checkout's sibling ``RenQuant`` directory
+         (``<github>/RenQuant``), if it has ``data/sec_fundamentals_daily.parquet``.
+      3. The umbrella convention ``~/git/github/RenQuant``.
+      4. Legacy ``parents[4]`` (works only when this file is loaded from
+         within the umbrella checkout — preserves rollback semantics).
+
+    The function caches the resolved root via lru_cache below.
+    """
+    raw = os.environ.get("RENQUANT_DATA_ROOT")
+    if raw:
+        cand = Path(raw).expanduser().resolve()
+        if cand.exists():
+            return cand
+    pkg_root = Path(__file__).resolve().parents[4]   # renquant-pipeline checkout
+    sibling = pkg_root.parent / "RenQuant"
+    if (sibling / "data" / "sec_fundamentals_daily.parquet").exists():
+        return sibling.resolve()
+    home_default = Path.home() / "git" / "github" / "RenQuant"
+    if (home_default / "data" / "sec_fundamentals_daily.parquet").exists():
+        return home_default.resolve()
+    # Last-resort legacy behavior (umbrella checkout):
+    return pkg_root
+
+
+from functools import lru_cache
+
+@lru_cache(maxsize=1)
+def _data_root_cached() -> Path:
+    return _resolve_umbrella_data_root()
 
 log = logging.getLogger("kernel.panel_pipeline.scoring")
 
@@ -719,7 +763,7 @@ class ApplyScoresTask(Task):
             panel_history = getattr(ctx, "_panel_history", None)
             if panel_history is None:
                 from pathlib import Path as _P  # noqa: PLC0415
-                repo = _P(__file__).resolve().parents[4]
+                repo = _data_root_cached()
                 panel_path = repo / "data" / "alpha158_291_fundamental_dataset.parquet"
                 try:
                     full_panel = pd.read_parquet(panel_path)
@@ -838,7 +882,7 @@ class ApplyScoresTask(Task):
                 needs_fund = any(fc in scorer.feature_cols for fc in fund_cols)
                 if needs_fund:
                     from pathlib import Path                                         # noqa: PLC0415
-                    repo = Path(__file__).resolve().parents[4]
+                    repo = _data_root_cached()
                     fp = repo / "data" / "sec_fundamentals_daily.parquet"
                     if not fp.exists():
                         _fail_closed_panel_scoring(ctx, "panel_fundamentals_missing")
@@ -873,7 +917,7 @@ class ApplyScoresTask(Task):
                 needs_sue  = any(sc in scorer.feature_cols for sc in sue_cols)
                 if needs_pead or needs_sue:
                     from pathlib import Path  # noqa: PLC0415
-                    repo = Path(__file__).resolve().parents[4]
+                    repo = _data_root_cached()
                     earn_dir = repo / "data" / "earnings_surprise"
                     today_ts = pd.Timestamp(today)
                     context_tickers = _stable_feature_context_tickers(
@@ -918,7 +962,7 @@ class ApplyScoresTask(Task):
                 needs_sent = any(sc in scorer.feature_cols for sc in sent_cols)
                 if needs_sent:
                     from pathlib import Path as _P  # noqa: PLC0415
-                    repo_root = _P(__file__).resolve().parents[4]
+                    repo_root = _data_root_cached()
                     sent_dir = repo_root / "data" / "news_sentiment_alpaca"
                     today_ts_sent = pd.Timestamp(today)
                     context_tickers = _stable_feature_context_tickers(
@@ -1047,7 +1091,7 @@ class ApplyScoresTask(Task):
                         # past panel-max-date. For SIM tests on dates ≤
                         # 2026-02-10 this is correct.
                         from pathlib import Path as _P  # noqa: PLC0415
-                        repo = _P(__file__).resolve().parents[4]
+                        repo = _data_root_cached()
                         panel_path = repo / "data" / "alpha158_291_fundamental_dataset.parquet"
                         try:
                             full_panel = pd.read_parquet(panel_path)
