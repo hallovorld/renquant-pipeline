@@ -98,10 +98,19 @@ class HFPatchTSTPanelScorer:
         """Load HF PatchTST checkpoint produced by renquant_model_patchtst.hf_trainer
         (formerly scripts/patchtst_hf.py — script was moved into the subrepo by
         renquant-model PR #22; the file-import path was broken in multirepo runs
-        where ``parents[4]`` resolves to ``renquant-pipeline``, not the umbrella)."""
+        where ``parents[4]`` resolves to ``renquant-pipeline``, not the umbrella).
+
+        Import ordering (v3-PR #7 codex review): the import-source decision
+        (canonical vs file-import fallback) runs FIRST, before importing
+        torch + transformers. This way:
+          - a clean install without [patchtst] extras AND without an umbrella
+            checkout fails with a clear ImportError from the fallback branch,
+            not with a confusing torch ModuleNotFoundError further up;
+          - tests that only exercise the import-source decision can stub
+            sys.modules['torch']/['transformers'] without bypassing the
+            production code path.
+        """
         import os  # noqa: PLC0415
-        import torch  # noqa: PLC0415
-        from transformers import PatchTSTConfig  # noqa: PLC0415
         # Preferred path: import HFPatchTSTRanker from the model subrepo (post PR #22).
         # Catch ONLY ModuleNotFoundError for the missing-package case. Other
         # ImportError variants (broken submodule, missing transformers, syntax
@@ -159,6 +168,14 @@ class HFPatchTSTPanelScorer:
             spec = importlib.util.spec_from_file_location("patchtst_hf_mod", legacy)
             hf_mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(hf_mod)
+
+        # Heavy runtime deps imported HERE — only after the import-source
+        # decision succeeded. Base installs without [patchtst] AND without
+        # an umbrella checkout already raised the ImportError above; reaching
+        # this line implies HFPatchTSTRanker is in scope and the artifact
+        # will actually be loaded.
+        import torch  # noqa: PLC0415
+        from transformers import PatchTSTConfig  # noqa: PLC0415
 
         path = Path(path)
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
