@@ -1,7 +1,7 @@
 """Phase 1 byte-equivalence smoke test for ``kernel/preflight_pipeline/`` lift.
 
-17 files (4 module + 13 task) → ``renquant_pipeline.kernel.preflight_pipeline``.
-Houses the T/J/P architecture for the 16 preflight checks introduced in
+18 files (4 module + 14 task) → ``renquant_pipeline.kernel.preflight_pipeline``.
+Houses the T/J/P architecture for the 17 preflight checks introduced in
 umbrella PRs #7+#8 (Track H complete).
 
 Phase 1 invariant: byte-equivalent text mirror of umbrella files. Many
@@ -42,10 +42,10 @@ def test_byte_equivalent_to_umbrella() -> None:
             f"byte-mismatch: {rel}"
         seen += 1
     # 4 module files (__init__.py, ctx.py, base.py, pipeline.py)
-    # + 13 task files (state, broker, artifact, gate, sector_map, watchlist,
+    # + 14 task files (state, broker, broker_fill_freshness, artifact, gate, sector_map, watchlist,
     #   correlation, calibrator, feature_coverage, run_id, config_fingerprint,
     #   meta_label, plus tasks/__init__.py)
-    assert seen >= 16, f"expected ≥16 lifted, saw {seen}"
+    assert seen >= 17, f"expected >=17 lifted, saw {seen}"
 
 
 def test_expected_files_present() -> None:
@@ -55,7 +55,7 @@ def test_expected_files_present() -> None:
     }
     expected_tasks = {
         "__init__.py",
-        "state.py", "broker.py",
+        "state.py", "broker.py", "broker_fill_freshness.py",
         "artifact.py",
         "gate.py",
         "sector_map.py", "watchlist.py", "correlation.py",
