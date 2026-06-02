@@ -40,9 +40,9 @@ def test_expected_files_present() -> None:
         "__init__.py", "alpha158_features.py", "ensemble_scorer.py",
         "feature_matrix.py", "feature_transform.py", "hf_patchtst_scorer.py",
         "job_panel_scoring.py", "model_contract.py", "model_registry.py", "panel_scorer.py",
-        "patchtst_scorer.py", "regime_router.py", "regime_router_scorer.py",
-        "shadow_scoring.py", "task_quality_floor.py", "tasks_feature_matrix.py",
-        "transformer_scorer.py",
+        "patchtst_scorer.py", "regime_ensemble_scorer.py", "regime_router.py",
+        "regime_router_scorer.py", "shadow_scoring.py", "task_quality_floor.py",
+        "tasks_feature_matrix.py", "transformer_scorer.py",
     }
     present = {f.name for f in _BT_PKG.glob("*.py")}
     missing = expected - present
