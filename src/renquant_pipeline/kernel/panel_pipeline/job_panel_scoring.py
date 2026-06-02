@@ -1943,7 +1943,7 @@ class ApplyGlobalCalibrationTask(Task):
         # identical rank_score → top-K selects deterministically by ticker
         # alphabetic order, no signal-driven trading.
         if n_cand >= 2:
-            from training_panel.model_contract import soft_check_score_series  # noqa: PLC0415
+            from renquant_pipeline.kernel.panel_pipeline.model_contract import soft_check_score_series  # noqa: PLC0415
             ranks = pd.Series(
                 [c.rank_score for c in ctx.candidates if c.rank_score is not None],
                 dtype=float,

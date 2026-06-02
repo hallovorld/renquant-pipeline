@@ -98,3 +98,18 @@ def test_no_artifact_contract_shim_facade() -> None:
         "renquant_pipeline.artifact_contract shim referenced:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_no_umbrella_model_contract_imports() -> None:
+    """Runtime panel scoring must use the pipeline-local model contract."""
+    offenders: list[str] = []
+    for py in _iter_py_files():
+        text = py.read_text(encoding="utf-8")
+        if "training_panel.model_contract" in text:
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if "training_panel.model_contract" in line:
+                    offenders.append(f"{py.relative_to(PKG_ROOT)}:{lineno}: {line.strip()}")
+    assert offenders == [], (
+        "umbrella training_panel.model_contract imports reintroduced:\n  "
+        + "\n  ".join(offenders)
+    )
