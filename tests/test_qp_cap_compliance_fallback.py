@@ -192,3 +192,105 @@ def test_tiny_overcap_within_numerical_tolerance_is_noop():
     )
     assert result is sol
     assert result.status.startswith("infeasible")
+
+
+# ── codex #10 blocker: cap_compliance_fallback ≠ QP failure ────────────────
+
+def test_solve_task_does_not_stamp_failure_for_cap_compliance_fallback():
+    """codex #10 blocker fix: when SolveMarkowitzQPTask returns the fallback,
+    upstream stamping must NOT mark it as a QP failure. Pre-fix, the
+    ``sol.status != "optimal"`` check treated every non-optimal status as a
+    failure → contradictory observability vs the emit-side allowlist.
+
+    Replays the failure-stamping branch from SolveMarkowitzQPTask.run with
+    a synthetic cap_compliance_fallback solution and asserts:
+
+      1. ctx._qp_solution.status == "cap_compliance_fallback"
+      2. ctx._qp_failure_reason is NOT set (no ``qp_global:*`` value).
+      3. No counters incremented in ctx.counters.
+    """
+    import types
+
+    from renquant_pipeline.kernel.portfolio_qp import tasks as qp_tasks
+
+    sol = _FakeQPSolution(
+        status="cap_compliance_fallback",
+        delta_w=np.array([-0.05, 0.0, 0.0]),
+        target_w=np.array([0.15, 0.10, 0.05]),
+        diagnostics={"c2_infeasible_policy": "cap_compliance_fallback",
+                     "cap_compliance_n_sold": 1,
+                     "cap_compliance_total_sold": 0.05},
+    )
+    ctx = types.SimpleNamespace(counters={})
+    ctx._qp_tickers = ["A", "B", "C"]                               # noqa: SLF001
+
+    # Replicate the failure-stamping branch verbatim from SolveMarkowitzQPTask.run.
+    ctx._qp_solution = sol                                          # noqa: SLF001
+    ctx._qp_status = str(sol.status)                                # noqa: SLF001
+    ctx._qp_diagnostics = dict(sol.diagnostics or {})               # noqa: SLF001
+    if sol.status not in qp_tasks.QP_EMITTABLE_STATUSES:
+        reason = (
+            "qp_no_signal" if sol.status == "optimal_no_signal"
+            else f"qp_global:{sol.status}"
+        )
+        ctx._qp_failure_reason = reason                             # noqa: SLF001
+        qp_tasks._stamp_all_qp_blocks(ctx, reason)
+        qp_tasks._stamp_qp_failure_counter(ctx, ctx._qp_status)     # noqa: SLF001
+
+    # cap_compliance_fallback is in QP_EMITTABLE_STATUSES → no failure stamping.
+    assert not hasattr(ctx, "_qp_failure_reason"), (
+        f"cap_compliance_fallback must NOT set _qp_failure_reason; "
+        f"got {getattr(ctx, '_qp_failure_reason', None)!r}"
+    )
+    # No QP failure counter incremented.
+    for key in ("qp_infeasible", "qp_missing_solution", "qp_optimal_no_signal",
+                "qp_other_nonoptimal"):
+        assert ctx.counters.get(key, 0) == 0, (
+            f"cap_compliance_fallback bumped counters.{key} = {ctx.counters[key]}"
+        )
+    # SolveMarkowitzQPTask still records the success-mode status + diagnostics.
+    assert ctx._qp_status == "cap_compliance_fallback"
+    assert ctx._qp_diagnostics["c2_infeasible_policy"] == "cap_compliance_fallback"
+
+
+def test_emit_and_solve_use_same_emittable_status_set():
+    """Codex #10 invariant: the emittable set must be a single source of
+    truth. Pin that the class-level alias on EmitOrdersFromQPSolutionTask
+    is identical to the module-level constant."""
+    from renquant_pipeline.kernel.portfolio_qp.tasks import (
+        EmitOrdersFromQPSolutionTask,
+        QP_EMITTABLE_STATUSES,
+    )
+
+    assert EmitOrdersFromQPSolutionTask._EMITTABLE_STATUSES is QP_EMITTABLE_STATUSES
+    assert "optimal" in QP_EMITTABLE_STATUSES
+    assert "cap_compliance_fallback" in QP_EMITTABLE_STATUSES
+
+
+def test_optimal_no_signal_still_treated_as_failure():
+    """Sanity guard: ``optimal_no_signal`` is NOT in QP_EMITTABLE_STATUSES, so
+    a true no-signal solve must still set _qp_failure_reason=qp_no_signal."""
+    import types
+
+    from renquant_pipeline.kernel.portfolio_qp import tasks as qp_tasks
+
+    sol = _FakeQPSolution(
+        status="optimal_no_signal",
+        delta_w=np.zeros(2),
+        target_w=np.array([0.1, 0.1]),
+    )
+    ctx = types.SimpleNamespace(counters={})
+    ctx._qp_tickers = ["A", "B"]                                    # noqa: SLF001
+
+    ctx._qp_solution = sol                                          # noqa: SLF001
+    ctx._qp_status = str(sol.status)                                # noqa: SLF001
+    if sol.status not in qp_tasks.QP_EMITTABLE_STATUSES:
+        reason = (
+            "qp_no_signal" if sol.status == "optimal_no_signal"
+            else f"qp_global:{sol.status}"
+        )
+        ctx._qp_failure_reason = reason                             # noqa: SLF001
+        qp_tasks._stamp_qp_failure_counter(ctx, ctx._qp_status)     # noqa: SLF001
+
+    assert getattr(ctx, "_qp_failure_reason", None) == "qp_no_signal"
+    assert ctx.counters.get("qp_optimal_no_signal", 0) >= 1
