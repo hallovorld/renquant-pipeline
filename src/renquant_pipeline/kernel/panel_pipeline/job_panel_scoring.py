@@ -1718,7 +1718,9 @@ class LoadGlobalCalibrationTask(Task):
         def _resolve(p: Path) -> Path:
             return p if p.is_absolute() or not strategy_dir else Path(strategy_dir) / p
 
-        from training_panel.global_calibrator import GlobalPanelCalibration  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.global_calibrator import (  # noqa: PLC0415
+            GlobalPanelCalibration,
+        )
 
         # Pooled calibrator — always attempted (acts as fallback).
         # §5.13.14: require explicit artifact_path. Pre-fix this defaulted

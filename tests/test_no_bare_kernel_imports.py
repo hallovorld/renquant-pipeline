@@ -113,3 +113,18 @@ def test_no_umbrella_model_contract_imports() -> None:
         "umbrella training_panel.model_contract imports reintroduced:\n  "
         + "\n  ".join(offenders)
     )
+
+
+def test_no_umbrella_global_calibrator_imports() -> None:
+    """Runtime panel scoring must use the pipeline-local calibrator contract."""
+    offenders: list[str] = []
+    for py in _iter_py_files():
+        text = py.read_text(encoding="utf-8")
+        if "training_panel.global_calibrator" in text:
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if "training_panel.global_calibrator" in line:
+                    offenders.append(f"{py.relative_to(PKG_ROOT)}:{lineno}: {line.strip()}")
+    assert offenders == [], (
+        "umbrella training_panel.global_calibrator imports reintroduced:\n  "
+        + "\n  ".join(offenders)
+    )
