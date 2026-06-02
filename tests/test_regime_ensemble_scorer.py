@@ -135,7 +135,7 @@ class TestHardPick:
             regime_confidence=0.9,
             regime_posterior={"BULL_CALM": 0.9, "BEAR": 0.1},
         )
-        out = ens.score(ctx, feature_matrix)
+        out = ens.score(feature_matrix, ctx=ctx)
         assert out.tolist() == [105.0, 107.0, 109.0]
 
     def test_three_of_four_high_conf_missing_specialist_falls_back(
@@ -148,7 +148,7 @@ class TestHardPick:
             regime_confidence=0.95,
             regime_posterior={"BULL_CALM": 0.95, "BEAR": 0.05},
         )
-        out = ens.score(ctx, feature_matrix)
+        out = ens.score(feature_matrix, ctx=ctx)
         assert out.tolist() == [5.0, 7.0, 9.0]
 
 
@@ -175,7 +175,7 @@ class TestBlend:
             regime_confidence=0.4,
             regime_posterior={"BULL_CALM": 0.6, "BEAR": 0.3, "CHOPPY": 0.1},
         )
-        out = ens.score(ctx, feature_matrix)
+        out = ens.score(feature_matrix, ctx=ctx)
         expected = [
             (100.0 + 5.0) * (0.6 / 0.9) + (200.0 + 5.0) * (0.3 / 0.9),
             (100.0 + 7.0) * (0.6 / 0.9) + (200.0 + 7.0) * (0.3 / 0.9),
@@ -235,5 +235,5 @@ class TestCtxNoneFallback:
             },
         }
         ens = load_panel_scorer_with_ensemble(cfg)
-        out = ens.score(None, feature_matrix)
+        out = ens.score(feature_matrix, ctx=None)
         assert out.tolist() == [5.0, 7.0, 9.0]
