@@ -342,7 +342,9 @@ class WalkForwardModelLoader:
             self._assert_calibrator_matches_entry(chosen, cal, uri)
             return cal
         resolved = self._resolve_uri(uri)
-        from training_panel.global_calibrator import GlobalPanelCalibration  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.global_calibrator import (  # noqa: PLC0415
+            GlobalPanelCalibration,
+        )
         cal = GlobalPanelCalibration.load(resolved)
         self._assert_calibrator_matches_entry(chosen, cal, resolved)
         self._calibrator_cache[uri] = cal

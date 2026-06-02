@@ -24,6 +24,7 @@ from .panel_scorer import (
     top_n_by_score,
     probability_gate,
 )
+from .global_calibrator import GlobalPanelCalibration
 from .feature_matrix import (
     build_inference_matrix,
     run_panel_inference,
@@ -42,6 +43,7 @@ from .job_panel_scoring import (
 
 __all__ = [
     "PanelScorer",
+    "GlobalPanelCalibration",
     "compute_panel_scores",
     "top_n_by_score",
     "probability_gate",
