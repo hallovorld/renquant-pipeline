@@ -30,6 +30,8 @@ Checks (each returns ok / soft-warn / hard-fail):
 	                          which is fine — first run)
 	  9. P-BROKER-CONNECT   — broker.connect() / get_account_value() works
 	                          (only if broker is provided; skipped in dry-run)
+	 10. P-BROKER-FILL-FRESHNESS
+	                       — runner-driven activity is not stale
 
 Usage in live/runner.py:
     from renquant_pipeline.kernel.preflight import run_preflight, PreflightFailed
@@ -1740,6 +1742,7 @@ _LEGACY_CHECK_ORDER: tuple[str, ...] = (
     "P-FEATURE-COVER",
     "P-STATE-FILE",
     "P-BROKER-CONNECT",
+    "P-BROKER-FILL-FRESHNESS",
     "P-RUN-ID",
     "P-META-LABEL",
     "P-CALIBRATOR-HEALTH",
@@ -1759,10 +1762,10 @@ def run_preflight(
     """Run all preflight checks via the new PreflightPipeline.
 
     Track H follow-up (2026-05-30): this function is now a thin wrapper
-    around ``kernel.preflight_pipeline.build_preflight_pipeline()``. The
-    16 ``_check_*`` legacy functions are kept in this module as the
-    implementation that the new Tasks bridge to — deleting them is a
-    later cleanup step.
+    around ``kernel.preflight_pipeline.build_preflight_pipeline()``. Most
+    checks still bridge to the legacy ``_check_*`` functions in this module;
+    newer pipeline-only checks live directly as Tasks until the legacy module
+    is retired.
 
     Contract preserved exactly:
       • Returns ``list[PreflightCheck]`` in ``_LEGACY_CHECK_ORDER`` (the
