@@ -279,7 +279,7 @@ class PanelScorer:
                 f"PanelScorer.score: feature matrix missing columns: {missing}",
             )
         # ── Input contract ──
-        from training_panel.model_contract import (  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.model_contract import (  # noqa: PLC0415
             soft_check_input, soft_check_score_series,
         )
         soft_check_input(feature_matrix, self.feature_cols, head_name="PanelScorer")
