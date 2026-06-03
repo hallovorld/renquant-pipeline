@@ -2812,6 +2812,23 @@ def _realized_vol_annualized(df, window: int):
     return std * math.sqrt(252.0)
 
 
+def _kelly_sigma_horizon_days(kelly_cfg: dict) -> float:
+    raw = kelly_cfg.get("sigma_horizon_days", 252.0)
+    try:
+        days = float(raw)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not math.isfinite(days) or days <= 0:
+        return float("nan")
+    return days
+
+
+def _rescale_annualized_sigma_for_kelly(sigma: float, horizon_days: float) -> float:
+    if horizon_days == 252.0:
+        return sigma
+    return sigma * math.sqrt(horizon_days / 252.0)
+
+
 # ── Kelly sizing (Plan C — the smart part) ───────────────────────────────────
 
 class ApplyKellySizingTask(Task):
@@ -2842,6 +2859,9 @@ class ApplyKellySizingTask(Task):
         fractional        = float(kelly_cfg.get("fractional",        0.25))
         min_edge          = float(kelly_cfg.get("min_edge",          0.0))
         max_concentration = float(kelly_cfg.get("max_concentration", 0.35))
+        # Realized-vol fallback writes annualized σ. Default 252 keeps that
+        # legacy unit; opt-in 60 aligns σ with the 60d calibrator μ horizon.
+        sigma_horizon_days = _kelly_sigma_horizon_days(kelly_cfg)
 
         # Audit fix CONF-MULT (2026-04-25): floored confidence multiplier.
         from renquant_pipeline.kernel.regime import confidence_to_size_multiplier  # noqa: PLC0415
@@ -2873,6 +2893,7 @@ class ApplyKellySizingTask(Task):
             "kelly_zero:sigma_none":     0,
             "kelly_zero:sigma_nonfinite":0,
             "kelly_zero:sigma_nonpos":   0,
+            "kelly_zero:sigma_horizon_invalid": 0,
             "kelly_zero:mu_le_min_edge": 0,
             "kelly_zero:capped_zero":    0,
         }
@@ -2890,7 +2911,10 @@ class ApplyKellySizingTask(Task):
             if not math.isfinite(mu_f):  return 0.0, "kelly_zero:mu_nonfinite"
             if not math.isfinite(sg_f):  return 0.0, "kelly_zero:sigma_nonfinite"
             if sg_f <= 0:                return 0.0, "kelly_zero:sigma_nonpos"
+            if not math.isfinite(sigma_horizon_days):
+                return 0.0, "kelly_zero:sigma_horizon_invalid"
             if mu_f <= min_edge:         return 0.0, "kelly_zero:mu_le_min_edge"
+            sg_f = _rescale_annualized_sigma_for_kelly(sg_f, sigma_horizon_days)
             target = kelly_target_pct(
                 mu_f, sg_f,
                 max_pct           = max_pct,
