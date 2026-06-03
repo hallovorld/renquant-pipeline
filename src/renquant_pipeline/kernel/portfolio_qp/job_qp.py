@@ -45,10 +45,12 @@ from .tasks import (
     ApplyExitOnlyTopupGuardTask,
     ApplyExposureScalingTask,
     ApplyGrinoldKahnTransformTask,
+    ApplyProportionalTradeTask,
     ApplySectorMetadataGuardTask,
     AlignQPHorizonUnitsTask,
     ForceMuSourceTask,
     BuildADVVectorTask,
+    BuildConstraintSnapshotTask,
     BuildCorrelationGroupConstraintTask,
     BuildSectorConstraintMatrixTask,
     BuildWeightVectorTask,
@@ -481,8 +483,23 @@ class JointPortfolioQPJob(Job):
             BuildSectorConstraintMatrixTask(),
             BuildCorrelationGroupConstraintTask(),
 
+            # ── Phase 3b: freeze the assembled constraint state ────────
+            # Step 1c of §8 plan (PR #125). The snapshot is the contract
+            # downstream allocators (current QP, simplified-QP, Hybrid,
+            # MPO, …) consume. Constructor failure short-circuits the
+            # Job before SolveMarkowitzQPTask runs — fail loud on a
+            # contradictory constraint state instead of feeding it to
+            # cvxpy.
+            BuildConstraintSnapshotTask(),
+
             # ── Phase 4: solve (domain) ────────────────────────────────
             SolveMarkowitzQPTask(),
+
+            # ── Phase 4b: partial-rebalance (research B, default off) ──
+            # Gârleanu-Pedersen 2013: if regime_params.<R>.qp_partial_trade
+            # _horizon_days > 1, shrink the QP target by 1/N for smooth
+            # multi-day rebalancing. No-op when N ≤ 1 (legacy behaviour).
+            ApplyProportionalTradeTask(),
 
             # ── Phase 5: emit (domain) ─────────────────────────────────
             EmitOrdersFromQPSolutionTask(),
