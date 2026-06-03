@@ -79,13 +79,13 @@ QP_EMITTABLE_STATUSES: frozenset[str] = frozenset({
 
 
 def _stamp_qp_failure_counter(ctx, status: str) -> None:
-    """Single source for the no-trade observability counters (codex PR #9
+    """Single source for the no-trade observability counters (codex PR #48
     review #1). Every QP failure path that sets ``ctx._qp_status`` /
     ``ctx._qp_failure_reason`` MUST also call this helper so that
     ``live.runner._why_no_trade()`` surfaces the binding QP failure instead of
     falling through to an earlier upstream drop.
 
-    Idempotent per ctx (codex PR #9 v2 review): SolveMarkowitzQPTask stamps
+    Idempotent per ctx (codex PR #48 v2 review): SolveMarkowitzQPTask stamps
     on non-optimal status but does NOT return False; the job then runs
     EmitOrdersFromQPSolutionTask which sees the same status and would stamp
     again — producing ``qp_infeasible=2`` for a single bar. Once stamped,
@@ -284,7 +284,6 @@ class ComputeFullSigmaTask(Task):
         ctx._qp_Sigma_full = None  # noqa: SLF001
         ctx._qp_status = f"infeasible:{reason}"  # noqa: SLF001
         ctx._qp_failure_reason = reason  # noqa: SLF001
-        _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #9 #1)
         ctx._qp_n_buys = 0  # noqa: SLF001
         ctx._qp_n_sells = 0  # noqa: SLF001
         ctx._qp_covariance_issue = {  # noqa: SLF001
@@ -293,6 +292,7 @@ class ComputeFullSigmaTask(Task):
             "invalid_pairs": list(invalid_pairs or [])[:25],
         }
         _stamp_all_qp_blocks(ctx, reason)
+        _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #48 #1)
         log.error(
             "ComputeFullSigmaTask: full covariance required but unavailable "
             "(reason=%s missing_pairs=%d invalid_pairs=%d); blocking QP orders",
@@ -340,6 +340,65 @@ class ComputeFullSigmaTask(Task):
             ctx._qp_corr_load_error = f"{path}:{type(exc).__name__}:{exc}"  # noqa: SLF001
             log.warning("ComputeFullSigmaTask: corr load failed from %s (%s)", path, exc)
             return None
+
+
+def _clamp_w_upper_at_w_current(ctx) -> None:
+    """Hard-cap-aware hold-flat clamp (2026-06-02 v3 fix — codex #123 review).
+
+    Used at the SOFT-scaling sites (ApplyExposureScalingTask,
+    ApplyConvictionCapTask). Preserves the hold-flat invariant
+    Δw=0 feasible **for holdings already within the hard cap**, while
+    keeping over-cap holdings exposed to the solver as a hard-cap
+    violation so ``_retry_for_per_asset_cap_compliance()`` can fire.
+
+    The hard cap is ``ctx._qp_w_upper_hard``, stamped once by
+    ``ComputeQPConstraintsTask`` before any soft scaling runs. Two cases:
+
+    * ``w_current[i] <= w_upper_hard[i]`` — the holding is within hard
+      cap, so raising ``_qp_w_upper[i]`` up to ``w_current[i]`` is
+      safe: it relaxes the SOFT target back to "hold". The hard cap
+      is unchanged; cap-compliance retry still has the original ceiling.
+    * ``w_current[i] >  w_upper_hard[i]`` — the holding is **over**
+      hard cap. Set ``_qp_w_upper[i] = w_upper_hard[i]`` so the
+      solver returns ``infeasible`` for that asset and
+      ``_retry_for_per_asset_cap_compliance()`` fires, force-selling
+      back to the hard cap. The soft-scaled value is intentionally
+      DISCARDED on this branch: conviction × vol-target × drawdown
+      multipliers are ≤ 1, so the soft-scaled cap is below the hard
+      cap; cap-compliance docstring says we sell back to the
+      *risk* cap (hard), not the soft target. Keeping the soft value
+      would force-sell ORCL from 22% straight to 7.5% under a
+      low-conviction multiplier — codex #123 v4 review. (v3 kept the
+      soft value here, which had this bug.)
+
+    Reads/writes ``ctx._qp_w_upper`` in place.
+    """
+    w_upper = _get_path(ctx, "_qp_w_upper")
+    w_curr  = _get_path(ctx, "_qp_w_current")
+    w_hard  = _get_path(ctx, "_qp_w_upper_hard")
+    if w_upper is None or w_curr is None or len(w_upper) != len(w_curr):
+        return
+    w_upper_arr = np.asarray(w_upper, dtype=float)
+    w_curr_arr  = np.asarray(w_curr, dtype=float)
+    if w_hard is None or len(w_hard) != len(w_upper_arr):
+        # No hard-cap snapshot: skip the clamp entirely. v3 invariant —
+        # ComputeQPConstraintsTask must always stamp ``_qp_w_upper_hard``
+        # before any soft scaling runs. Silently widening to ``w_current``
+        # without the hard cap is the bug codex caught on #123 v2 (raising
+        # a 15% hard cap up to a 22% over-cap holding). Skip = strict
+        # behaviour; the missing stamp is a contract bug, not a soft
+        # degradation surface.
+        return
+    w_hard_arr = np.asarray(w_hard, dtype=float)
+    # Per-asset behaviour:
+    #   within hard cap (w_curr ≤ hard) → raise soft cap to max(soft, current)
+    #                                     so hold-flat is feasible.
+    #   over    hard cap (w_curr >  hard) → restore w_hard (DISCARD soft) so
+    #                                     cap-compliance retry sells back
+    #                                     to the hard cap, not the soft cap.
+    safe_to_raise = w_curr_arr <= w_hard_arr
+    raised = np.maximum(w_upper_arr, w_curr_arr)
+    ctx._qp_w_upper = np.where(safe_to_raise, raised, w_hard_arr)  # noqa: SLF001
 
 
 def _lookup_corr_explicit_none(corr: dict, left: str, right: str, *, default: float = 0.0):
@@ -623,10 +682,19 @@ class ComputeQPConstraintsTask(Task):
 
     Reads:  ctx._qp_tickers, ctx.regime, ctx.confidence, ctx.regime_state,
              ctx.config (regime_params, regime, rotation.joint_actions)
-    Writes: ctx._qp_w_upper (np.ndarray), ctx._qp_w_lower (float),
+    Writes: ctx._qp_w_upper (np.ndarray), ctx._qp_w_upper_hard (np.ndarray),
+             ctx._qp_w_lower (float),
              ctx._qp_dw_max (np.ndarray), ctx._qp_cash_reserve (float),
              ctx._qp_drawdown (float), ctx._qp_drawdown_limit (float),
              ctx._qp_turnover_max (float | None)
+
+    ``_qp_w_upper_hard`` is the IMMUTABLE per-asset hard cap snapshot
+    (regime × confidence-scaled max_position_pct). Soft-scaling Tasks
+    (ApplyExposureScalingTask, ApplyConvictionCapTask) may lower or
+    re-raise ``_qp_w_upper`` for hold-flat purposes but MUST NOT raise
+    it above ``_qp_w_upper_hard``. The cap-compliance fallback path
+    (``_retry_for_per_asset_cap_compliance``) trusts the hard cap to
+    drive deterministic over-cap sell-downs. See codex #123 review.
     """
     name = "ComputeQPConstraintsTask"
 
@@ -640,7 +708,11 @@ class ComputeQPConstraintsTask(Task):
         max_pct = float(rp.get("max_position_pct",
                                 ctx.config.get("max_position_pct", 0.20)))
         scale = confidence_to_size_multiplier(getattr(ctx, "confidence", None))
-        ctx._qp_w_upper = np.full(n, max_pct * scale)  # noqa: SLF001
+        hard_cap = np.full(n, max_pct * scale)
+        # _qp_w_upper_hard is the immutable hard cap. Soft scalers can never
+        # raise _qp_w_upper above this; cap-compliance fallback keys off it.
+        ctx._qp_w_upper_hard = hard_cap.copy()  # noqa: SLF001
+        ctx._qp_w_upper = hard_cap  # noqa: SLF001
         self._resolve_short_constraints(ctx, scale)
         ctx._qp_dw_max = np.full(n, float(cfg.get("qp_dw_max", 0.50)))  # noqa: SLF001
         ctx._qp_cash_reserve = float(rp.get(  # noqa: SLF001
@@ -1192,8 +1264,9 @@ class ApplyExposureScalingTask(Task):
         combined = vt_scale * dd_scale
         if combined != 1.0:
             ctx._qp_w_upper = np.asarray(w_upper) * float(combined)  # noqa: SLF001
+            _clamp_w_upper_at_w_current(ctx)
             log.info(
-                "ApplyExposureScalingTask: w_upper scaled by vt=%.3f × dd=%.3f = %.3f",
+                "ApplyExposureScalingTask: w_upper scaled by vt=%.3f × dd=%.3f = %.3f (hold-flat-clamped)",
                 vt_scale, dd_scale, combined,
             )
 
@@ -1285,6 +1358,9 @@ class ApplyConvictionCapTask(Task):
             m = max(0.0, min(1.0, m))
             w_upper[i] = float(w_upper[i]) * m
             caps.append(m)
+
+        # 2026-06-02 fix: never shrink below w_current — see helper docstring.
+        _clamp_w_upper_at_w_current(ctx)
 
         ctx._qp_conviction_caps = caps  # noqa: SLF001
         return None
@@ -1600,6 +1676,67 @@ class BuildADVVectorTask(Task):
         ctx._qp_v_daily_dollar = v  # noqa: SLF001
 
 
+# ── 5b. Snapshot the assembled constraint state ─────────────────────────────
+
+class BuildConstraintSnapshotTask(Task):
+    """Stamp ``ctx._qp_constraint_snapshot`` from the upstream Tasks' output.
+
+    Step 1c of the §8 plan (PR #125). Strictly additive — runs AFTER
+    the existing 4-Task constraint-composition pipeline
+    (``ComputeQPConstraintsTask → ApplyExposureScalingTask →
+    ApplyConvictionCapTask → sector/correlation``) and freezes the
+    assembled constraint state into an immutable
+    :class:`ConstraintSnapshot` that downstream allocators consume via
+    the contract instead of via free-form ``ctx._qp_*`` reads.
+
+    On invariant violation (snapshot constructor raises
+    ``ValueError`` — e.g. soft > hard cap, shape mismatch, non-finite
+    entries) this Task logs the failure and returns ``False`` so the
+    Job short-circuits before the solver runs. Better to fail loud
+    here than to feed contradictory constraints to ``cvxpy``.
+
+    Reads:  every ctx._qp_* field built by Tasks 1-5.
+    Writes: ctx._qp_constraint_snapshot (ConstraintSnapshot | None).
+    """
+
+    name = "BuildConstraintSnapshotTask"
+    FAILURE_STATUS = "infeasible:qp_constraint_snapshot_invalid"
+    FAILURE_REASON = "qp_constraint_snapshot_invalid"
+
+    def run(self, ctx) -> bool | None:  # noqa: D401
+        from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import build_snapshot_from_ctx
+
+        # The Job has already short-circuited if there are no tickers
+        # to optimize over, but defend just in case.
+        tickers = _get_path(ctx, "_qp_tickers") or ()
+        if not tickers:
+            ctx._qp_constraint_snapshot = None  # noqa: SLF001
+            return None
+        try:
+            snap = build_snapshot_from_ctx(ctx)
+        except ValueError as exc:
+            # The snapshot's __post_init__ failed — one of the upstream
+            # Tasks produced a contradictory or malformed constraint
+            # state. Stamp this as a first-class QP failure path so
+            # ``live.runner._why_no_trade`` and downstream telemetry can
+            # see and attribute the failure (codex #129 review).
+            log.error(
+                "BuildConstraintSnapshotTask: constraint state invalid "
+                "— %s",
+                exc,
+            )
+            ctx._qp_constraint_snapshot = None  # noqa: SLF001
+            ctx._qp_constraint_snapshot_error = str(exc)  # noqa: SLF001
+            ctx._qp_status = self.FAILURE_STATUS  # noqa: SLF001
+            ctx._qp_failure_reason = self.FAILURE_REASON  # noqa: SLF001
+            ctx._qp_n_buys = 0  # noqa: SLF001
+            ctx._qp_n_sells = 0  # noqa: SLF001
+            _stamp_all_qp_blocks(ctx, self.FAILURE_REASON)
+            _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001
+            return False
+        ctx._qp_constraint_snapshot = snap  # noqa: SLF001
+
+
 # ── 6. Solve the QP ─────────────────────────────────────────────────────────
 
 class SolveMarkowitzQPTask(Task):
@@ -1623,7 +1760,7 @@ class SolveMarkowitzQPTask(Task):
                 ctx._qp_diagnostics = dict(sol.diagnostics)  # noqa: SLF001
                 ctx._qp_failure_reason = f"qp_global:{sol.status}"  # noqa: SLF001
                 _stamp_all_qp_blocks(ctx, ctx._qp_failure_reason)
-                _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #9 #1)
+                _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #48 #1)
                 ctx._qp_n_buys = 0  # noqa: SLF001
                 ctx._qp_n_sells = 0  # noqa: SLF001
                 log.error(
@@ -1661,8 +1798,8 @@ class SolveMarkowitzQPTask(Task):
         if sol.status not in QP_EMITTABLE_STATUSES:
             reason = "qp_no_signal" if sol.status == "optimal_no_signal" else f"qp_global:{sol.status}"
             ctx._qp_failure_reason = reason  # noqa: SLF001
+            _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #48 #1)
             _stamp_all_qp_blocks(ctx, reason)
-            _stamp_qp_failure_counter(ctx, ctx._qp_status)  # noqa: SLF001 (codex PR #9 #1)
         ctx._qp_n_buys = 0  # noqa: SLF001
         ctx._qp_n_sells = 0  # noqa: SLF001
 
@@ -1911,8 +2048,6 @@ def _retry_for_per_asset_cap_compliance(sol, kwargs, solve_fn):
     delta_w = np.zeros(n)
     delta_w[over_mask] = w_upper_arr[over_mask] - w_current[over_mask]  # negative (sell)
     target_w = w_current + delta_w
-    # Sanity: target should equal cap on the over-cap assets, current
-    # elsewhere. Cash freed by the sells flows into cash_reserve / slack.
     n_sold = int(over_mask.sum())
     total_sold = float(-np.sum(delta_w[over_mask]))
     log.warning(
@@ -1925,7 +2060,6 @@ def _retry_for_per_asset_cap_compliance(sol, kwargs, solve_fn):
     diagnostics["c2_infeasible_policy"] = "cap_compliance_fallback"
     diagnostics["cap_compliance_n_sold"] = n_sold
     diagnostics["cap_compliance_total_sold"] = total_sold
-    # Return a synthetic QPSolution via the same class as `sol`.
     return sol.__class__(
         delta_w=delta_w,
         target_w=target_w,
@@ -1943,24 +2077,49 @@ def _retry_for_per_asset_cap_compliance(sol, kwargs, solve_fn):
 def _passes_no_trade_band(
     dw: float, sig_i: float, min_dw: float, no_trade_factor: float,
     band_cap: float = 0.05,
+    *,
+    # Davis-Norman closed-form path (2026-05-30 C, default off):
+    band_method: str = "legacy",
+    dn_eps_oneway: float = 0.0,
+    dn_gamma: float = 0.0,
+    dn_pi_star: float = 0.0,
+    dn_floor: float = 0.0,
+    dn_ceiling: float = 1.0,
 ) -> tuple[bool, bool]:
-    """Davis-Norman 1990 / Constantinides 1979 no-trade band, capped.
+    """No-trade band gate. Two band-computation modes:
 
-    Original: skip trades inside max(min_dw, no_trade_factor × σ_i).
+    Legacy (default, ``band_method='legacy'``):
+        Davis-Norman / Constantinides ad-hoc form. Skip inside
+        ``max(min_dw, min(band_cap, no_trade_factor × σ_i))``.
 
-    2026-05-09 BUG #7 fix: with NGB now emitting σ̂ ≈ 0.10-0.30, the
-    raw `no_trade_factor × σ_i` produces bands of 10-30% of equity for
-    high-σ holdings, making them structurally uncoverable even when μ̂
-    strongly disagrees with the position. Discovered when BA at
-    edge_sharpe = -0.51 (12% expected underperformance) failed to sell
-    because σ̂_BA = 0.24 → effective band = 24% > BA's 6.7% weight.
+        2026-05-09 BUG #7 fix: band_cap protects high-σ names from
+        unreachable 10-30% bands (BA at σ=0.24).
 
-    Cap the σ-derived band at `band_cap` (default 5% of equity) so
-    high-σ holdings remain reachable. The cap is per-ticker — assets
-    with σ < band_cap are unaffected.
+    Closed-form Davis-Norman (``band_method='davis_norman'``):
+        Threshold from the literature 1/3-power formula
+        ``δ* = (1.5/γ · ε · π·(1-π)² · σ²)^(1/3)`` (Davis-Norman 1990,
+        Janeček-Shreve 2004), clamped to ``[dn_floor, dn_ceiling]``.
+        Eliminates the three hand-tuned knobs in favor of literature
+        scaling. Enable via ``rotation.joint_actions.qp_band_method`` and
+        provide γ (risk_aversion), π* (current/target weight), ε (one-way
+        cost). The 2026-05-30 research report verified DN gives ≈ 1.1%
+        at our typical params vs the hand-tuned 2% floor — ~half the
+        threshold, more trades pass through.
 
     Returns (pass, was_in_band).
     """
+    if band_method == "davis_norman":
+        from .davis_norman import davis_norman_band_clamped  # noqa: PLC0415
+        threshold = davis_norman_band_clamped(
+            eps_oneway=dn_eps_oneway, sigma=sig_i, gamma=dn_gamma,
+            pi_star=dn_pi_star, floor=dn_floor, ceiling=dn_ceiling,
+        )
+        # Preserve the legacy min_dw floor (operator can still force min absolute Δw).
+        threshold = max(min_dw, threshold)
+        if abs(dw) < threshold:
+            return False, abs(dw) >= min_dw
+        return True, False
+    # Legacy path (unchanged).
     sigma_band = min(band_cap, no_trade_factor * sig_i)
     threshold = max(min_dw, sigma_band)
     if abs(dw) < threshold:
@@ -2507,6 +2666,67 @@ def _disposed_lot_min_holding_days(
     return min_days
 
 
+class ApplyProportionalTradeTask(Task):
+    """Gârleanu-Pedersen 2013 partial-rebalance (research B).
+
+    Mutates ``ctx._qp_solution`` in place: replaces ``target_w`` (the
+    QP's frictionless one-shot target) with ``current + (target - current) / N``
+    and recomputes ``delta_w`` from the new target. Skipped (no-op) when N ≤ 1
+    or the per-regime knob is absent — preserves all-or-nothing legacy behavior.
+
+    N comes from ``regime_params.<REGIME>.qp_partial_trade_horizon_days`` per
+    PRIME DIRECTIVE, with a global default ``rotation.joint_actions.
+    qp_partial_trade_horizon_days``.
+
+    Reference: cvxportfolio.ProportionalTradeToTargets.values_in_time
+    (15-line verbatim form of GP-2013's optimal trade-rate matrix's
+    scalar projection).
+    """
+
+    def run(self, ctx) -> bool | None:
+        import numpy as np  # noqa: PLC0415
+        from .proportional_trade import (  # noqa: PLC0415
+            proportional_trade_target,
+            resolve_trade_horizon_days,
+        )
+
+        sol = _get_path(ctx, "_qp_solution")
+        if sol is None or not hasattr(sol, "target_w"):
+            return None
+        current = _get_path(ctx, "_qp_w_current")
+        if current is None:
+            return None
+
+        regime = str(getattr(ctx, "regime", "") or "")
+        regime_params = (ctx.config or {}).get("regime_params") or {}
+        cfg = ((ctx.config or {}).get("rotation") or {}).get("joint_actions") or {}
+        default_n = cfg.get("qp_partial_trade_horizon_days")
+
+        n_days = resolve_trade_horizon_days(
+            regime=regime, regime_params=regime_params, default_days=default_n,
+        )
+        if n_days <= 1.0:
+            # Legacy all-or-nothing — preserve QP target as-is.
+            ctx._qp_partial_trade_applied = False  # noqa: SLF001
+            return None
+
+        current_arr = np.asarray(current, dtype=float)
+        target_arr = np.asarray(sol.target_w, dtype=float)
+        partial = proportional_trade_target(
+            current_w=current_arr, target_w=target_arr, n_days=n_days,
+        )
+        sol.target_w = partial
+        sol.delta_w = partial - current_arr
+        ctx._qp_partial_trade_applied = True  # noqa: SLF001
+        ctx._qp_partial_trade_n_days = float(n_days)  # noqa: SLF001
+        log.info(
+            "ApplyProportionalTradeTask: regime=%s N=%.1f — shrank QP target by 1/N "
+            "(Gârleanu-Pedersen 2013 partial-rebalance, research B)",
+            regime, n_days,
+        )
+        return True
+
+
 class EmitOrdersFromQPSolutionTask(Task):
     """Translate Δw → ctx.orders (buys/top-ups) + ctx.exits (closes/trims).
 
@@ -2530,10 +2750,10 @@ class EmitOrdersFromQPSolutionTask(Task):
     """
     name = "EmitOrdersFromQPSolutionTask"
 
-    # Module-level constant ``QP_EMITTABLE_STATUSES`` is the single source
-    # of truth for "the QP solution can drive orders". Re-exported here as
-    # a class attribute for backward compatibility with any test that
-    # imports it via the class.
+    # Module-level ``QP_EMITTABLE_STATUSES`` is the single source of truth
+    # for "the QP solution can drive orders". Re-exported here as a class
+    # attribute for backward compatibility with tests that import via the
+    # class.
     _EMITTABLE_STATUSES = QP_EMITTABLE_STATUSES
 
     def run(self, ctx) -> bool | None:
@@ -2550,7 +2770,7 @@ class EmitOrdersFromQPSolutionTask(Task):
             if sol is not None:
                 ctx._qp_diagnostics = dict(getattr(sol, "diagnostics", {}) or {})  # noqa: SLF001
             _stamp_all_qp_blocks(ctx, reason)
-            # Codex PR #9 #1: route through shared helper so emit + earlier
+            # Codex PR #48 #1: route through shared helper so emit + earlier
             # short-circuit paths (ComputeFullSigma._fail_full_sigma,
             # SolveMarkowitzQP unsupported-cvxportfolio branch, non-optimal
             # solver result) all stamp the same counter set.
@@ -2620,6 +2840,16 @@ class EmitOrdersFromQPSolutionTask(Task):
             min_dw=float(cfg.get("qp_min_dw_pct", 0.005)),
             no_trade_factor=float(cfg.get("qp_no_trade_band_factor", 0.0)),
             band_cap=float(cfg.get("qp_no_trade_band_cap", 0.05)),
+            # Davis-Norman closed-form path (research C, 2026-05-30).
+            # Default 'legacy' preserves current behaviour.
+            band_method=str(cfg.get("qp_band_method", "legacy")),
+            dn_eps_oneway=float(cfg.get("qp_band_dn_eps_oneway",
+                                         (float(cfg.get("qp_cost_kappa", 0.002)) or 0.002) / 2.0)),
+            dn_gamma=float(cfg.get("qp_band_dn_gamma",
+                                     cfg.get("qp_risk_aversion", 3.0))),
+            dn_floor=float(cfg.get("qp_band_dn_floor", 0.005)),
+            dn_ceiling=float(cfg.get("qp_band_dn_ceiling",
+                                       cfg.get("qp_no_trade_band_cap", 0.05))),
             sigma_vec=_get_path(ctx, "_qp_sigma"),
             cands={c.ticker: c for c in (ctx.candidates or [])},
             score_sources=_get_path(ctx, "_qp_mu_source_map") or {},
@@ -2719,8 +2949,30 @@ class EmitOrdersFromQPSolutionTask(Task):
                 s = float(sigma_vec[i])
                 if _m.isfinite(s) and s > 0:
                     sig_i = s
-            ok, in_band = _passes_no_trade_band(dw, sig_i, env["min_dw"],
-                                                  env["no_trade_factor"], band_cap=env["band_cap"])
+            # π* for DN band: target weight from QP solve (the asset's
+            # frictionless optimum in DN-1990 terms). Fall back to a small
+            # constant when target is non-finite or zero (e.g. blocked names).
+            pi_star_i = 0.0
+            try:
+                tw_i = float(sol.target_w[i]) if hasattr(sol, "target_w") else 0.0
+                if _m.isfinite(tw_i) and tw_i > 0:
+                    pi_star_i = tw_i
+            except Exception:  # noqa: BLE001
+                pi_star_i = 0.0
+            if pi_star_i <= 0:
+                # Use a typical-name fallback so DN gives a meaningful threshold
+                # for sell-only or near-zero-target names. 0.05 = 5% portfolio weight.
+                pi_star_i = 0.05
+            ok, in_band = _passes_no_trade_band(
+                dw, sig_i, env["min_dw"],
+                env["no_trade_factor"], band_cap=env["band_cap"],
+                band_method=env.get("band_method", "legacy"),
+                dn_eps_oneway=env.get("dn_eps_oneway", 0.0),
+                dn_gamma=env.get("dn_gamma", 0.0),
+                dn_pi_star=pi_star_i,
+                dn_floor=env.get("dn_floor", 0.0),
+                dn_ceiling=env.get("dn_ceiling", 1.0),
+            )
             if not ok:
                 if in_band:
                     c["skipped_band"] += 1
