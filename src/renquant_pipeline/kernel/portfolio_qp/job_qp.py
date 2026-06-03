@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import math
 
-from kernel.pipeline.atoms import (
+from renquant_pipeline.kernel.pipeline.atoms import (
     BuildVectorFromMappingTask,
     IncrementCounterTask,
     LogSummaryTask,
@@ -33,9 +33,9 @@ from kernel.pipeline.atoms import (
     SkipIfFieldEqualsTask,
     StableTickerOrderTask,
 )
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.pipeline import Job, Task
-from kernel.pipeline.task_benchmark_sleeve import (
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
+from renquant_pipeline.kernel.pipeline.task_benchmark_sleeve import (
     benchmark_sleeve_ticker,
     exclude_benchmark_sleeve_from_alpha,
 )

@@ -35,10 +35,10 @@ from typing import Any
 
 import numpy as np
 
-from kernel.pipeline.atoms.ctx_ops import _get_path, _set_path
-from kernel.pipeline.context import InferenceContext
-from kernel.pipeline.order_attribution import stamp_order_attribution
-from kernel.pipeline.pipeline import Task
+from renquant_pipeline.kernel.pipeline.atoms.ctx_ops import _get_path, _set_path
+from renquant_pipeline.kernel.pipeline.context import InferenceContext
+from renquant_pipeline.kernel.pipeline.order_attribution import stamp_order_attribution
+from renquant_pipeline.kernel.pipeline.pipeline import Task
 
 log = logging.getLogger("kernel.portfolio_qp.tasks")
 
@@ -319,7 +319,7 @@ class ComputeFullSigmaTask(Task):
             return None
         try:
             raw = json.loads(path.read_text())
-            from kernel.walk_forward import (  # noqa: PLC0415
+            from renquant_pipeline.kernel.walk_forward import (  # noqa: PLC0415
                 assert_correlation_no_leakage,
                 parse_correlation_artifact,
             )
@@ -699,7 +699,7 @@ class ComputeQPConstraintsTask(Task):
     name = "ComputeQPConstraintsTask"
 
     def run(self, ctx) -> bool | None:
-        from kernel.regime import confidence_to_size_multiplier
+        from renquant_pipeline.kernel.regime import confidence_to_size_multiplier
         cfg = _qp_cfg(ctx)
         tickers = _get_path(ctx, "_qp_tickers") or []
         n = len(tickers)
@@ -756,7 +756,7 @@ class ComputeQPConstraintsTask(Task):
         SAFETY: ``max_gross_exposure`` hard-capped at 1.0 (no leverage
         authorized — see tests/test_no_leverage_invariant.py).
         """
-        from kernel.regime_resolver import resolve_regime_knob
+        from renquant_pipeline.kernel.regime_resolver import resolve_regime_knob
         _LEVERAGE_HARDCAP = 1.0
 
         shorts_enabled = bool(resolve_regime_knob(
@@ -1272,7 +1272,7 @@ class ApplyExposureScalingTask(Task):
 
 
 def _compute_vt_scale(ctx, vt_cfg: dict) -> float:
-    from kernel.vol_target import compute_vol_target_scale  # noqa: PLC0415
+    from renquant_pipeline.kernel.vol_target import compute_vol_target_scale  # noqa: PLC0415
     return compute_vol_target_scale(
         getattr(ctx, "spy_returns", None) or [],
         target_vol  = float(vt_cfg.get("target_vol",  0.15)),
@@ -1283,8 +1283,8 @@ def _compute_vt_scale(ctx, vt_cfg: dict) -> float:
 
 
 def _compute_dd_scale(ctx, dd_cfg: dict) -> float:
-    from kernel.kelly import compute_kelly_dd_scale  # noqa: PLC0415
-    from kernel.pipeline.task_drawdown_rebalance import compute_portfolio_drawdown  # noqa: PLC0415
+    from renquant_pipeline.kernel.kelly import compute_kelly_dd_scale  # noqa: PLC0415
+    from renquant_pipeline.kernel.pipeline.task_drawdown_rebalance import compute_portfolio_drawdown  # noqa: PLC0415
     hwm = float(getattr(ctx, "hwm", 0.0) or 0.0)
     pv  = float(getattr(ctx, "portfolio_value", 0.0) or 0.0)
     dd  = compute_portfolio_drawdown(hwm, pv)
@@ -1332,8 +1332,8 @@ class ApplyConvictionCapTask(Task):
         if not sizing_cfg or not sizing_cfg.get("enabled", False):
             return None
 
-        # Local import to keep qp module decoupled from kernel.sizing.
-        from kernel.sizing import conviction_multiplier
+        # Local import to keep qp module decoupled from renquant_pipeline.kernel.sizing.
+        from renquant_pipeline.kernel.sizing import conviction_multiplier
 
         tickers = _get_path(ctx, "_qp_tickers") or []
         w_upper = _get_path(ctx, "_qp_w_upper")
@@ -1467,7 +1467,7 @@ def _resolve_sector_weight_cap(ctx, legacy_cap: float) -> tuple[float, str]:
     diversification remains a hard ceiling while regime-level exposure
     tightening can reduce concentration in dominant regimes.
     """
-    from kernel.regime_resolver import resolve_regime_knob  # noqa: PLC0415
+    from renquant_pipeline.kernel.regime_resolver import resolve_regime_knob  # noqa: PLC0415
     cap = legacy_cap
     source = "count_x_per_name"
     configured = resolve_regime_knob(
@@ -1704,7 +1704,7 @@ class BuildConstraintSnapshotTask(Task):
     FAILURE_REASON = "qp_constraint_snapshot_invalid"
 
     def run(self, ctx) -> bool | None:  # noqa: D401
-        from kernel.portfolio_qp.constraint_snapshot import build_snapshot_from_ctx
+        from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import build_snapshot_from_ctx
 
         # The Job has already short-circuited if there are no tickers
         # to optimize over, but defend just in case.
@@ -1812,11 +1812,11 @@ class SolveMarkowitzQPTask(Task):
         """
         backend = str(cfg.get("qp_solver_backend", "cvxpy")).lower()
         if backend == "cvxportfolio":
-            from kernel.portfolio_qp.cvxportfolio_backend import (  # noqa: PLC0415
+            from renquant_pipeline.kernel.portfolio_qp.cvxportfolio_backend import (  # noqa: PLC0415
                 solve_portfolio_qp_cvxportfolio as _solve,
             )
         else:
-            from kernel.portfolio_qp.qp_solver import (  # noqa: PLC0415
+            from renquant_pipeline.kernel.portfolio_qp.qp_solver import (  # noqa: PLC0415
                 solve_portfolio_qp as _solve,
             )
         return backend, _solve
@@ -1891,7 +1891,7 @@ class SolveMarkowitzQPTask(Task):
 
     @staticmethod
     def _unsupported_cvxportfolio_solution(kwargs: dict, unsupported: list[str]):
-        from kernel.portfolio_qp.qp_solver import QPSolution  # noqa: PLC0415
+        from renquant_pipeline.kernel.portfolio_qp.qp_solver import QPSolution  # noqa: PLC0415
         w_current = np.asarray(kwargs.get("w_current"), dtype=float)
         if w_current.ndim != 1:
             w_current = np.zeros(0)
@@ -2137,7 +2137,7 @@ def _gate_buy_or_block(
         return None
     if buys_gated:
         return "buys_gated"
-    from kernel.selection import is_earnings_blocked  # noqa: PLC0415
+    from renquant_pipeline.kernel.selection import is_earnings_blocked  # noqa: PLC0415
     if today is not None and is_earnings_blocked(t, today, earnings_cal, earn_buf):
         return "earnings"
     return None
@@ -2527,7 +2527,7 @@ def _qp_soft_sell_block_reason(ctx, ticker: str, sol, i: int) -> str | None:
         ((getattr(ctx, "config", {}) or {}).get("risk", {}) or {}).get("panel_exit", {}) or {},
         guard_cfg,
     )
-    from kernel.pipeline.soft_exit_guards import (  # noqa: PLC0415
+    from renquant_pipeline.kernel.pipeline.soft_exit_guards import (  # noqa: PLC0415
         configured_soft_exit_min_days,
         lt_gate_suppression,
         resolve_current_price,
@@ -2617,7 +2617,7 @@ def _disposed_lot_min_holding_days(
     lot_method: str,
 ) -> int | None:
     """Minimum age among lots a QP soft sell would actually dispose."""
-    from kernel.pipeline.soft_exit_guards import trading_holding_days  # noqa: PLC0415
+    from renquant_pipeline.kernel.pipeline.soft_exit_guards import trading_holding_days  # noqa: PLC0415
 
     if not isinstance(today, _dt.date):
         return None
@@ -2811,7 +2811,7 @@ class EmitOrdersFromQPSolutionTask(Task):
         cfg = _qp_cfg(ctx)
         buy_blocked = bool(getattr(ctx, "buy_blocked", False))
         skip_buys = bool(getattr(ctx, "skip_buys", False))
-        from kernel.pipeline.task_benchmark_sleeve import (  # noqa: PLC0415
+        from renquant_pipeline.kernel.pipeline.task_benchmark_sleeve import (  # noqa: PLC0415
             benchmark_sleeve_alpha_funding_capacity,
             benchmark_sleeve_cash_reserve_credit,
         )
@@ -3323,7 +3323,7 @@ def _compute_qp_wash_mask(
     calibrator_saturated: bool,
 ) -> tuple[np.ndarray, int, int, int]:
     """Build QP block mask for wash-sale, anti-churn, and saturation abstain."""
-    from kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+    from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
     mask = np.zeros(len(tickers), dtype=bool)
     n_wash = n_churn = n_sat = 0
     for i, t in enumerate(tickers):
@@ -3422,7 +3422,7 @@ def _per_asset_tax_lots(hs, price, w_i, nav, today, st_rate, lt_rate,
     gain_per_share < 0 AND offset_left > 0, the harvested loss reduces
     `offset_left` and credits a NEGATIVE cost component (savings).
     """
-    from kernel.exits import ensure_lots
+    from renquant_pipeline.kernel.exits import ensure_lots
     if hs is None or price <= 0 or w_i <= 0:
         return 0.0, offset_left
     ensure_lots(hs)
@@ -3582,7 +3582,7 @@ def _emit_qp_sell(ctx, ticker, shares, dw, sol, i) -> bool:
     when the QP requested negative target weights, no short orders were
     ever generated. Sim and live ran long-only regardless.
     """
-    from kernel.exits import ExitSignal
+    from renquant_pipeline.kernel.exits import ExitSignal
     target_w = float(sol.target_w[i])
     hs = (ctx.holdings or {}).get(ticker)
     source_obj = (getattr(ctx, "_qp_mu_source_map", None) or {}).get(ticker, hs)
