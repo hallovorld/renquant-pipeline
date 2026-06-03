@@ -7,6 +7,7 @@ the parts this PR is responsible for. The pieces underneath
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -67,6 +68,58 @@ def _bars(n_bars: int, *, regime: str | None = "BULL_CALM", seed: int = 0):
             cost_per_trade_bps=0.0,
         ))
     return bars
+
+
+def _write_cli_fixture_db(db_path: Path) -> None:
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE score_distribution (
+            run_id TEXT,
+            date TEXT,
+            ticker TEXT,
+            raw_panel REAL,
+            rank_score REAL,
+            mu REAL,
+            sigma REAL,
+            regime TEXT,
+            is_holding INTEGER
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE ticker_forward_returns (
+            as_of_date TEXT,
+            ticker TEXT,
+            close_price REAL,
+            fwd_1d REAL,
+            fwd_5d REAL,
+            fwd_10d REAL,
+            fwd_20d REAL,
+            fwd_60d REAL,
+            updated_at TEXT
+        )
+    """)
+    rng = np.random.default_rng(42)
+    tickers = ["AAPL", "MSFT", "GOOG"]
+    for day in range(1, 31):
+        date = f"2024-01-{day:02d}"
+        for rank, ticker in enumerate(tickers):
+            mu = 0.03 - rank * 0.005 + float(rng.normal(0.0, 0.001))
+            sigma = 0.10 + rank * 0.02
+            fwd = 0.004 - rank * 0.001 + float(rng.normal(0.0, 0.002))
+            cur.execute(
+                "INSERT INTO score_distribution "
+                "(run_id, date, ticker, mu, sigma, regime) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                ("run-test", date, ticker, mu, sigma, "BULL_CALM"),
+            )
+            cur.execute(
+                "INSERT INTO ticker_forward_returns "
+                "(as_of_date, ticker, fwd_60d) VALUES (?, ?, ?)",
+                (date, ticker, fwd),
+            )
+    conn.commit()
+    conn.close()
 
 
 class TestRegistry:
@@ -254,14 +307,15 @@ class TestAssembleVerdict:
 
 
 class TestCLISmoke:
-    def test_main_with_placeholder_loader_writes_verdict_json(self):
-        # Uses the placeholder bars when --loader-module is absent.
+    def test_main_with_default_wf_loader_writes_verdict_json(self):
         with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "sim_runs.db"
+            _write_cli_fixture_db(db)
             out = Path(td) / "verdict.json"
             rc = main([
-                "--wf-artifact-root", "/dev/null",
+                "--wf-artifact-root", td,
                 "--start-cut", "2024-01-01",
-                "--end-cut", "2024-06-30",
+                "--end-cut", "2024-01-30",
                 "--out", str(out),
                 "--allocators", "equal_weight_top_k,inverse_vol_top_k,fractional_kelly_top_k",
                 "--incumbent", "fractional_kelly_top_k",
@@ -273,4 +327,5 @@ class TestCLISmoke:
             for key in ("as_of_date", "cut_range", "wf_artifact_root",
                         "per_allocator", "verdict"):
                 assert key in payload
-            assert payload["cut_range"] == ["2024-01-01", "2024-06-30"]
+            assert payload["cut_range"] == ["2024-01-01", "2024-01-30"]
+            assert payload["n_bars"] == 30
