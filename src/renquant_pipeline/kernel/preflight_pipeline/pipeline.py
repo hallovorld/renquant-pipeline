@@ -10,6 +10,7 @@ from .tasks.config_fingerprint import ConfigFingerprintTask
 from .tasks.correlation import CorrelationMetadataTask
 from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.gate import RegimeLayeredICTask, WfGateMetadataTask
+from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.sector_map import SectorMapCoverageTask
@@ -47,6 +48,12 @@ class _IdentityJob(PreflightJob):
     ]
 
 
+class _RiskConfigJob(PreflightJob):
+    """Pure config risk checks that do not need artifacts or broker state."""
+
+    tasks = [KellySigmaHorizonTask()]
+
+
 class _CalibratorJob(PreflightJob):
     """Calibrator health + structural flat-region checks. Sits between
     identity and state+broker because they ALL operate on the calibrator
@@ -82,7 +89,7 @@ class _StateAndBrokerJob(PreflightJob):
 
 
 def build_preflight_pipeline() -> PreflightPipeline:
-    """Return the FULL PreflightPipeline holding ALL 17 migrated checks.
+    """Return the FULL PreflightPipeline holding ALL migrated checks.
 
     P-BROKER-FILL-FRESHNESS was added for the 2026-06-02 audit finding 9.
 
@@ -100,6 +107,7 @@ def build_preflight_pipeline() -> PreflightPipeline:
         _ArtifactJob(),
         _GateJob(),
         _IdentityJob(),
+        _RiskConfigJob(),
         _CalibratorJob(),
         _NgboostAuxJob(),
         _MetaLabelJob(),
