@@ -11,13 +11,9 @@ This module wires together the pieces shipped in:
 - PR #132: DSR / PBO significance pass
 - PR #134: evidence schema spec
 
-It does NOT implement the WF cut loader or the Hybrid Option F /
-hard-only QP allocators — those land in Step 4d/4e/4f and the driver
-loads them via the standard module path. The driver is a thin
-orchestrator so its tests can pin the orchestration layer
-independently of the in-flight pieces (allocators registered by
-name; loader injected via a callable; the verdict assembly logic is
-the part this PR pins).
+The driver defaults to the WF cut loader in this package. Custom
+loader injection remains available for experiments, but the CLI must
+never silently emit decision evidence from synthetic placeholder bars.
 """
 from __future__ import annotations
 
@@ -357,7 +353,7 @@ def _regime_counts(bars: Sequence[AllocatorReplayBar]) -> dict[str, float]:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--wf-artifact-root", type=str, required=True,
-                   help="Path to walk-forward artifact root")
+                   help="Path to sim_runs.db or a directory containing sim_runs.db")
     p.add_argument("--start-cut", type=str, required=True,
                    help="Earliest cutoff date (YYYY-MM-DD)")
     p.add_argument("--end-cut", type=str, required=True,
@@ -374,7 +370,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--pbo-n-slices", type=int, default=16)
     p.add_argument("--loader-module", type=str, default=None,
                    help="Optional module:function to load WF bars "
-                        "(default uses placeholder synthetic bars)")
+                        "(default uses wf_replay_loader.load_replay_bars_from_sim_db)")
     args = p.parse_args(argv)
 
     bars = _load_bars(args)
@@ -395,53 +391,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 def _load_bars(args) -> list[AllocatorReplayBar]:
-    """Resolve --loader-module if supplied, else fall back to a tiny
-    placeholder bar set so the CLI is end-to-end runnable before
-    Step 4e's WF cut loader is merged.
-    """
+    """Resolve --loader-module if supplied, else use the real WF DB loader."""
     if args.loader_module:
         mod_name, fn_name = args.loader_module.split(":")
         mod = importlib.import_module(mod_name)
         load_fn = getattr(mod, fn_name)
         return list(load_fn(args.wf_artifact_root, args.start_cut, args.end_cut))
-    log.warning(
-        "no --loader-module supplied; using a 30-bar placeholder. "
-        "Step 4e's WF cut loader is the real implementation."
+
+    from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (
+        load_replay_bars_from_sim_db,
     )
-    return _placeholder_bars()
+
+    return load_replay_bars_from_sim_db(
+        _default_sim_db_path(args.wf_artifact_root),
+        args.start_cut,
+        args.end_cut,
+    )
 
 
-def _placeholder_bars() -> list[AllocatorReplayBar]:
-    """Minimum viable bar set so `main` is runnable end-to-end before
-    Step 4e lands. NOT for decision-grade evidence."""
-    from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
-    rng = np.random.default_rng(0)
-    bars = []
-    for i in range(30):
-        n = 3
-        bars.append(AllocatorReplayBar(
-            bar_date=f"placeholder-{i:03d}",
-            snap=ConstraintSnapshot(
-                n=n, tickers=tuple(f"T{j}" for j in range(n)),
-                w_current=np.zeros(n),
-                w_upper_hard=np.full(n, 0.50),
-                w_upper=np.full(n, 0.50),
-                w_lower=0.0,
-                dw_max=np.full(n, 1.0),
-                cash_reserve=0.0,
-                turnover_max=None,
-                drawdown=0.0,
-                drawdown_limit=0.20,
-                gross_max=None,
-                wash_sale_mask=np.zeros(n, dtype=bool),
-            ),
-            mu=rng.uniform(0.0, 0.05, n),
-            sigma=rng.uniform(0.10, 0.20, n),
-            fwd_return=rng.normal(0.001, 0.01, n),
-            regime="BULL_CALM",
-            cost_per_trade_bps=5.0,
-        ))
-    return bars
+def _default_sim_db_path(wf_artifact_root: str) -> Path:
+    root = Path(wf_artifact_root)
+    if root.is_dir():
+        return root / "sim_runs.db"
+    return root
 
 
 if __name__ == "__main__":
