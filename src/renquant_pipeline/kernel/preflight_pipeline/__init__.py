@@ -25,6 +25,7 @@ from .tasks.watchlist import WatchlistSizeTask
 from .tasks.correlation import CorrelationMetadataTask
 from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .tasks.feature_coverage import FeatureCoverageTask
+from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.config_fingerprint import ConfigFingerprintTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
@@ -49,6 +50,7 @@ __all__ = [
     "CalibratorHealthTask",
     "CalibratorFlatRegionTask",
     "FeatureCoverageTask",
+    "KellySigmaHorizonTask",
     "ArtifactRunIdAlignmentTask",
     "ConfigFingerprintTask",
     "MetaLabelArtifactContractTask",
