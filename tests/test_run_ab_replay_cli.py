@@ -27,6 +27,7 @@ from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa:
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot  # noqa: E402
 from renquant_pipeline.kernel.portfolio_qp.run_ab_replay import (  # noqa: E402
     assemble_verdict,
+    constraint_fidelity_block,
     get_allocator,
     main,
     paired_comparison_metrics,
@@ -51,6 +52,26 @@ def _snap(n: int) -> ConstraintSnapshot:
         drawdown_limit=0.20,
         gross_max=None,
         wash_sale_mask=np.zeros(n, dtype=bool),
+    )
+
+
+def _snap_with_sector(n: int) -> ConstraintSnapshot:
+    return ConstraintSnapshot(
+        n=n, tickers=tuple(f"T{i}" for i in range(n)),
+        w_current=np.zeros(n),
+        w_upper_hard=np.full(n, 0.50),
+        w_upper=np.full(n, 0.50),
+        w_lower=0.0,
+        dw_max=np.full(n, 1.0),
+        cash_reserve=0.0,
+        turnover_max=None,
+        drawdown=0.0,
+        drawdown_limit=0.20,
+        gross_max=None,
+        wash_sale_mask=np.zeros(n, dtype=bool),
+        sector_indicator=np.ones((1, n)),
+        sector_cap_vec=np.array([1.0]),
+        sector_names=("All",),
     )
 
 
@@ -166,10 +187,15 @@ class TestRunReplayEndToEnd:
         for name in ("equal_weight_top_k", "inverse_vol_top_k", "fractional_kelly_top_k"):
             sig = payload["significance"][name]
             assert sig["dsr"] is not None
+            assert "live_promotable_per_section_8" in sig
             assert "live_promotable_per_clause_7_4" in sig
         # Verdict block has the gate decision
         assert "promotion_candidate" in payload["verdict"]
         assert "next_action" in payload["verdict"]
+        # Synthetic bars omit sector constraints, so the run is not
+        # decision-grade and must fail closed for promotion.
+        assert payload["constraint_fidelity"]["decision_grade"] is False
+        assert payload["verdict"]["promotion_candidate"] is None
         # JSON-serialisable
         json.dumps(payload)
 
@@ -191,6 +217,7 @@ class TestPairedComparisonMetrics:
         assert out["n_bars"] == 5
         # a > b on 3 of 5 bars: idx 0, 1, 4 (a=0.005<b=0.01 and a=-0.01<b=-0.005 fail)
         assert abs(out["win_rate_a_beats_b"] - 0.6) < 1e-9
+        assert out["win_rate_a_beats_b_z_score"] is not None
         assert out["max_delta_daily_return"] > 0
         assert out["min_delta_daily_return"] < 0
         assert out["delta_sharpe_annual"] is not None
@@ -231,17 +258,41 @@ class TestViolationReport:
             assert block["by_allocator"][name]["rejected_for_promotion"] is False
 
 
+class TestConstraintFidelity:
+    def test_missing_sector_cap_is_not_decision_grade(self):
+        block = constraint_fidelity_block(_bars(3))
+        assert block["decision_grade"] is False
+        assert block["missing_critical_families"] == ["sector_cap"]
+
+    def test_sector_cap_present_is_decision_grade(self):
+        bars = [
+            AllocatorReplayBar(
+                bar_date="d-001",
+                snap=_snap_with_sector(3),
+                mu=np.array([0.1, 0.2, 0.3]),
+                sigma=np.array([0.2, 0.2, 0.2]),
+                fwd_return=np.array([0.01, 0.02, 0.03]),
+                regime="BULL_CALM",
+                cost_per_trade_bps=0.0,
+            )
+        ]
+        block = constraint_fidelity_block(bars)
+        assert block["decision_grade"] is True
+        assert block["missing_critical_families"] == []
+
+
 class TestAssembleVerdict:
-    def test_no_candidate_beats_incumbent_yields_reject_all(self):
+    def test_no_candidate_beats_incumbent_yields_keep_incumbent(self):
         # Incumbent wins on paired bars → no promotion
         significance = {
-            "incumbent_qp": {"live_promotable_per_clause_7_4": True},
-            "challenger": {"live_promotable_per_clause_7_4": True},
+            "incumbent_qp": {"live_promotable_per_section_8": True},
+            "challenger": {"live_promotable_per_section_8": True},
         }
         paired = {
             "incumbent_qp_vs_challenger": {
                 "delta_sharpe_annual": 0.5,  # incumbent beats
                 "win_rate_a_beats_b": 0.70,  # incumbent wins 70% of bars
+                "n_bars": 30,
             },
         }
         violations = {
@@ -255,17 +306,18 @@ class TestAssembleVerdict:
             significance, paired, violations, incumbent="incumbent_qp",
         )
         assert verdict["promotion_candidate"] is None
-        assert verdict["next_action"] == "reject_all"
+        assert verdict["next_action"] == "keep_incumbent"
 
     def test_challenger_wins_but_violates_yields_iterate(self):
         significance = {
-            "incumbent_qp": {"live_promotable_per_clause_7_4": True},
-            "challenger": {"live_promotable_per_clause_7_4": True},
+            "incumbent_qp": {"live_promotable_per_section_8": True},
+            "challenger": {"live_promotable_per_section_8": True},
         }
         paired = {
             "incumbent_qp_vs_challenger": {
                 "delta_sharpe_annual": -0.3,  # challenger beats
-                "win_rate_a_beats_b": 0.30,    # incumbent wins only 30%, challenger 70%
+                "win_rate_a_beats_b": 0.10,    # incumbent wins only 10%, challenger 90%
+                "n_bars": 30,
             },
         }
         violations = {
@@ -281,15 +333,21 @@ class TestAssembleVerdict:
         assert verdict["promotion_candidate"] is None
         assert verdict["next_action"] == "iterate"
 
-    def test_clean_challenger_wins_yields_live_shadow(self):
+    def test_clean_challenger_wins_yields_promote_to_shadow(self):
         significance = {
-            "incumbent_qp": {"live_promotable_per_clause_7_4": True},
-            "challenger": {"live_promotable_per_clause_7_4": True},
+            "incumbent_qp": {"live_promotable_per_section_8": True},
+            "challenger": {
+                "live_promotable_per_section_8": True,
+                "dsr": 0.99,
+                "pbo": 0.2,
+                "pbo_se": None,
+            },
         }
         paired = {
             "incumbent_qp_vs_challenger": {
                 "delta_sharpe_annual": -0.5,
-                "win_rate_a_beats_b": 0.30,
+                "win_rate_a_beats_b": 0.10,
+                "n_bars": 30,
             },
         }
         violations = {
@@ -303,7 +361,37 @@ class TestAssembleVerdict:
             significance, paired, violations, incumbent="incumbent_qp",
         )
         assert verdict["promotion_candidate"] == "challenger"
-        assert verdict["next_action"] == "live_shadow"
+        assert verdict["next_action"] == "promote_to_shadow"
+
+    def test_incomplete_constraints_block_promotion(self):
+        significance = {
+            "incumbent_qp": {"live_promotable_per_section_8": True},
+            "challenger": {"live_promotable_per_section_8": True},
+        }
+        paired = {
+            "incumbent_qp_vs_challenger": {
+                "delta_sharpe_annual": -0.5,
+                "win_rate_a_beats_b": 0.10,
+                "n_bars": 30,
+            },
+        }
+        violations = {
+            "any_allocator_violated_any_family": False,
+            "by_allocator": {
+                "incumbent_qp": {"rejected_for_promotion": False},
+                "challenger": {"rejected_for_promotion": False},
+            },
+        }
+        verdict = assemble_verdict(
+            significance,
+            paired,
+            violations,
+            incumbent="incumbent_qp",
+            constraints_decision_grade=False,
+        )
+        assert verdict["promotion_candidate"] is None
+        assert verdict["next_action"] == "iterate"
+        assert verdict["non_negotiable_gate_passed"]["decision_grade_constraints"] is False
 
 
 class TestCLISmoke:
@@ -329,3 +417,5 @@ class TestCLISmoke:
                 assert key in payload
             assert payload["cut_range"] == ["2024-01-01", "2024-01-30"]
             assert payload["n_bars"] == 30
+            assert payload["constraint_fidelity"]["decision_grade"] is False
+            assert payload["verdict"]["promotion_candidate"] is None

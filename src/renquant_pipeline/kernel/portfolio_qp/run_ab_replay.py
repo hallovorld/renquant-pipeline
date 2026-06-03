@@ -91,6 +91,7 @@ def paired_comparison_metrics(
         "mean_delta_daily_return": float(np.mean(delta)),
         "delta_sharpe_annual": _sharpe_annual(delta),
         "win_rate_a_beats_b": float(np.mean(a > b)),
+        "win_rate_a_beats_b_z_score": _win_rate_z_score(float(np.mean(a > b)), int(a.size)),
         "max_delta_daily_return": float(np.max(delta)),
         "min_delta_daily_return": float(np.min(delta)),
         "hac_t_stat": None,
@@ -117,6 +118,12 @@ def _sharpe_annual(returns: np.ndarray) -> Optional[float]:
     if sd < 1e-12:
         return None
     return float(np.mean(returns) / sd * np.sqrt(252.0))
+
+
+def _win_rate_z_score(win_rate: float, n_bars: int) -> Optional[float]:
+    if n_bars <= 0:
+        return None
+    return float((win_rate - 0.5) / np.sqrt(0.25 / n_bars))
 
 
 # --------- regime stratification ------------------------------------------
@@ -207,22 +214,47 @@ def assemble_verdict(
     violations: dict,
     *,
     incumbent: str,
-    win_rate_threshold: float = 0.55,
+    win_rate_z_threshold: float = 2.0,
+    constraints_decision_grade: bool = True,
 ) -> dict:
     """Apply the Step 4 non-negotiable gate + select promotion candidate.
 
     A promotion candidate must:
     1. Beat the incumbent on paired daily returns (delta_sharpe > 0
-       AND win_rate > ``win_rate_threshold``).
-    2. Pass DSR ≥ 0.95 AND (PBO is None OR PBO < 0.5).
+       AND candidate win-rate z-score > ``win_rate_z_threshold``).
+    2. Pass the stricter §8 DSR/PBO gate.
     3. Have zero hard-constraint regressions.
+    4. Be evaluated against decision-grade constraints.
     """
     candidates = [
         name for name, sig in significance.items()
         if name != incumbent
     ]
     promotion_candidate = None
-    rationale = "no allocator beat the incumbent on all three gates"
+    rationale = "no allocator beat the incumbent on all gates"
+    gate_bits = {
+        "zero_hard_constraint_regressions": not violations[
+            "any_allocator_violated_any_family"
+        ],
+        "pbo_below_0_5": False,
+        "pbo_plus_se_below_0_55": False,
+        "dsr_above_0_95": False,
+        "win_rate_z_score_above_2": False,
+        "decision_grade_constraints": bool(constraints_decision_grade),
+    }
+    if not constraints_decision_grade:
+        return {
+            "promotion_candidate": None,
+            "rationale": (
+                "not decision-grade: replay snapshots are missing required "
+                "constraint families, so promotion is blocked"
+            ),
+            "fallback_recommendation": incumbent,
+            "next_action": "iterate",
+            "non_negotiable_gate_passed": gate_bits,
+        }
+
+    any_candidate_won_pair = False
 
     for name in candidates:
         pc_key = f"{incumbent}_vs_{name}"
@@ -235,18 +267,45 @@ def assemble_verdict(
         )
         # delta_sharpe is incumbent - candidate; candidate beats = negative
         delta_sharpe = pc.get("delta_sharpe_annual")
+        candidate_win_rate = 1.0 - float(pc.get("win_rate_a_beats_b", 1.0))
+        candidate_win_rate_z = _win_rate_z_score(
+            candidate_win_rate, int(pc.get("n_bars", 0))
+        )
         beats_incumbent_paired = (
             delta_sharpe is not None and delta_sharpe < 0.0
-            and pc.get("win_rate_a_beats_b", 1.0) < (1.0 - win_rate_threshold)
+            and candidate_win_rate_z is not None
+            and candidate_win_rate_z > win_rate_z_threshold
         )
-        passes_significance = sig.get("live_promotable_per_clause_7_4", False)
+        if beats_incumbent_paired:
+            any_candidate_won_pair = True
+        passes_significance = sig.get(
+            "live_promotable_per_section_8",
+            sig.get("live_promotable_per_clause_7_4", False),
+        )
         passes_violation_gate = not violated
+        pbo = sig.get("pbo")
+        pbo_se = sig.get("pbo_se")
+        candidate_gate_bits = {
+            "zero_hard_constraint_regressions": gate_bits[
+                "zero_hard_constraint_regressions"
+            ],
+            "pbo_below_0_5": pbo is None or pbo < 0.5,
+            "pbo_plus_se_below_0_55": (
+                pbo is None or pbo_se is None or (pbo + pbo_se) < 0.55
+            ),
+            "dsr_above_0_95": sig.get("dsr") is not None and sig["dsr"] >= 0.95,
+            "win_rate_z_score_above_2": bool(beats_incumbent_paired),
+            "decision_grade_constraints": True,
+        }
         if beats_incumbent_paired and passes_significance and passes_violation_gate:
             promotion_candidate = name
+            gate_bits = candidate_gate_bits
             rationale = (
                 f"{name} beats {incumbent} on paired daily returns "
-                f"(delta_sharpe={delta_sharpe:+.3f}, win_rate={1.0 - pc['win_rate_a_beats_b']:.2f}), "
-                f"passes DSR ≥ 0.95 / PBO < 0.5, zero hard-constraint regressions."
+                f"(delta_sharpe={delta_sharpe:+.3f}, "
+                f"win_rate={candidate_win_rate:.2f}, "
+                f"win_rate_z={candidate_win_rate_z:.2f}), "
+                "passes §8 DSR/PBO, zero hard-constraint regressions."
             )
             break
 
@@ -255,19 +314,10 @@ def assemble_verdict(
         "rationale": rationale,
         "fallback_recommendation": incumbent,
         "next_action": (
-            "live_shadow" if promotion_candidate
-            else ("iterate" if any(
-                # someone won the paired gate but failed sig/violation
-                paired.get(f"{incumbent}_vs_{n}", {}).get("delta_sharpe_annual") is not None
-                and paired[f"{incumbent}_vs_{n}"]["delta_sharpe_annual"] < 0
-                for n in candidates if f"{incumbent}_vs_{n}" in paired
-            ) else "reject_all")
+            "promote_to_shadow" if promotion_candidate
+            else ("iterate" if any_candidate_won_pair else "keep_incumbent")
         ),
-        "non_negotiable_gate_passed": {
-            "zero_hard_constraint_regressions": not violations[
-                "any_allocator_violated_any_family"
-            ],
-        },
+        "non_negotiable_gate_passed": gate_bits,
     }
 
 
@@ -313,10 +363,12 @@ def run_replay(
 
     # Block 5: violation report
     violation_block = violation_report_block(results)
+    constraint_fidelity = constraint_fidelity_block(bars)
 
     # Block 6: verdict
     verdict = assemble_verdict(
         significance_block, paired_block, violation_block, incumbent=incumbent,
+        constraints_decision_grade=constraint_fidelity["decision_grade"],
     )
 
     return {
@@ -331,7 +383,41 @@ def run_replay(
         "significance": significance_block,
         "regime_stratified": regime_block,
         "violation_report": violation_block,
+        "constraint_fidelity": constraint_fidelity,
         "verdict": verdict,
+    }
+
+
+def constraint_fidelity_block(bars: Sequence[AllocatorReplayBar]) -> dict:
+    """Surface whether replay snapshots include the load-bearing hard caps.
+
+    The sim DB loader currently cannot reconstruct per-cut sector maps.
+    That output is still useful for smoke tests, but it must not drive a
+    promotion decision because sector-cap regressions would be invisible.
+    """
+    n_bars = len(bars)
+    missing_sector = 0
+    missing_corr = 0
+    for bar in bars:
+        snap = bar.snap
+        if snap.sector_indicator is None or snap.sector_cap_vec is None:
+            missing_sector += 1
+        if not snap.corr_group_pairs:
+            missing_corr += 1
+    missing_critical = []
+    if n_bars == 0 or missing_sector:
+        missing_critical.append("sector_cap")
+    return {
+        "decision_grade": not missing_critical,
+        "missing_critical_families": missing_critical,
+        "bars_missing_sector_cap": missing_sector,
+        "bars_missing_corr_group_cap": missing_corr,
+        "n_bars_checked": n_bars,
+        "note": (
+            "Promotion is blocked unless every replay bar carries the "
+            "load-bearing hard-constraint families needed for the §8 zero "
+            "hard-constraint-regression gate."
+        ),
     }
 
 
