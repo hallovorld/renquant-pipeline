@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sqlite3
 
 import pytest
@@ -131,6 +132,32 @@ def test_model_admission_rejection_is_recorded_in_runtime_trace() -> None:
     assert latest["model_admission_reason"] == "model_spy_relative_sharpe_below_floor"
 
 
+def test_runtime_regime_admission_is_recorded_in_decision_trace() -> None:
+    ctx = _ctx()
+    ctx.regime = "BULL_CALM"
+    ctx._regime_model_admission = {
+        "ok": False,
+        "reason": "regime_admission:failed:BULL_CALM",
+        "regime": "BULL_CALM",
+    }
+
+    rows = build_ticker_daily_state_rows(
+        config=ctx.strategy_config,
+        ctx=ctx,
+        selected_tickers=set(),
+        blocked_map={"AAPL": "regime_admission:failed:BULL_CALM"},
+        model_types={"AAPL": "gbdt-panel-ltr"},
+    )
+
+    latest = next(row for row in rows if row["ticker"] == "AAPL")
+    assert latest["model_admission_ok"] is False
+    assert latest["model_admission_reason"] == "regime_admission:failed:BULL_CALM"
+    assert latest["current_regime_admitted"] is False
+    assert latest["current_regime_admission_reason"] == "regime_admission:failed:BULL_CALM"
+    assert json.loads(latest["admitted_regimes"]) == []
+    assert json.loads(latest["blocked_regimes"]) == ["BULL_CALM"]
+
+
 def test_panel_scoring_job_task_order_is_explicit() -> None:
     job = PanelScoringJob(emit_orders=True)
 
@@ -243,15 +270,28 @@ def test_ticker_daily_state_persists_model_admission_trace() -> None:
                 "blocked_by": "model_spy_relative_sharpe_below_floor",
                 "model_admission_ok": 0,
                 "model_admission_reason": "model_spy_relative_sharpe_below_floor",
+                "current_regime_admitted": 0,
+                "current_regime_admission_reason": "regime_admission:failed:BULL_CALM",
+                "admitted_regimes": "[]",
+                "blocked_regimes": "[\"BULL_CALM\"]",
             }
         ],
     )
 
     assert n_rows == 1
     row = conn.execute(
-        """SELECT model_admission_ok, model_admission_reason
+        """SELECT model_admission_ok, model_admission_reason,
+                  current_regime_admitted, current_regime_admission_reason,
+                  admitted_regimes, blocked_regimes
              FROM ticker_daily_state
             WHERE run_id = ? AND ticker = ?""",
         ("daily-full-shadow-20260602", "AAPL"),
     ).fetchone()
-    assert row == (0, "model_spy_relative_sharpe_below_floor")
+    assert row == (
+        0,
+        "model_spy_relative_sharpe_below_floor",
+        0,
+        "regime_admission:failed:BULL_CALM",
+        "[]",
+        "[\"BULL_CALM\"]",
+    )

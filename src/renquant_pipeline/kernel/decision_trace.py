@@ -6,6 +6,7 @@ used by `candidate_scores` and `ticker_daily_state`.
 """
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -179,6 +180,9 @@ def build_ticker_daily_state_rows(
         getattr(ctx, "_regime_model_admission", None)
         or getattr(ctx, "model_admission", None)
     )
+    regime_admission = _runtime_regime_admission_trace(
+        getattr(ctx, "_regime_model_admission", None)
+    )
     watchlist_set = set(config.get("watchlist", []) or [])
     trace_tickers = list(decision_trace_tickers(config))
     seen_trace = set(trace_tickers)
@@ -262,6 +266,10 @@ def build_ticker_daily_state_rows(
             "qp_status": qp_status,
             "model_admission_ok": admission[0],
             "model_admission_reason": admission[1],
+            "current_regime_admitted": regime_admission[0],
+            "current_regime_admission_reason": regime_admission[1],
+            "admitted_regimes": regime_admission[2],
+            "blocked_regimes": regime_admission[3],
         })
     return rows
 
@@ -273,6 +281,26 @@ def _model_admission_trace(value: Any) -> tuple[int | None, str | None]:
     ok_int = int(ok) if isinstance(ok, bool) else None
     reason = value.get("reason")
     return ok_int, str(reason) if reason else None
+
+
+def _runtime_regime_admission_trace(
+    value: Any,
+) -> tuple[int | None, str | None, str | None, str | None]:
+    if not isinstance(value, dict) or "regime" not in value:
+        return None, None, None, None
+    regime = str(value.get("regime") or "")
+    if not regime:
+        return None, None, None, None
+    ok = value.get("ok")
+    admitted = [regime] if ok is True else []
+    blocked = [regime] if ok is False else []
+    reason = value.get("reason")
+    return (
+        int(ok) if isinstance(ok, bool) else None,
+        str(reason) if reason else None,
+        json.dumps(admitted, sort_keys=True),
+        json.dumps(blocked, sort_keys=True),
+    )
 
 
 __all__ = [

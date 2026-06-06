@@ -6,6 +6,7 @@ code.
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable
 
 
@@ -52,7 +53,13 @@ def build_ticker_daily_state_rows(
     held = _position_tickers(getattr(ctx, "account_snapshot", {}) or {})
     ticker_order = _stable_ticker_order(watchlist, held, selected, blocked, pending, extra_tickers)
     artifact_model_type = model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
-    admission = _model_admission_trace(getattr(ctx, "model_admission", None))
+    admission = _model_admission_trace(
+        getattr(ctx, "_regime_model_admission", None)
+        or getattr(ctx, "model_admission", None)
+    )
+    regime_admission = _runtime_regime_admission_trace(
+        getattr(ctx, "_regime_model_admission", None)
+    )
 
     rows: list[dict[str, Any]] = []
     for ticker in ticker_order:
@@ -78,6 +85,10 @@ def build_ticker_daily_state_rows(
                 "qp_status": qp_status,
                 "model_admission_ok": admission[0],
                 "model_admission_reason": admission[1],
+                "current_regime_admitted": regime_admission[0],
+                "current_regime_admission_reason": regime_admission[1],
+                "admitted_regimes": regime_admission[2],
+                "blocked_regimes": regime_admission[3],
             }
         )
     return rows
@@ -161,3 +172,23 @@ def _model_admission_trace(value: Any) -> tuple[bool | None, str | None]:
     ok_bool = ok if isinstance(ok, bool) else None
     reason = value.get("reason")
     return ok_bool, str(reason) if reason else None
+
+
+def _runtime_regime_admission_trace(
+    value: Any,
+) -> tuple[bool | None, str | None, str | None, str | None]:
+    if not isinstance(value, dict) or "regime" not in value:
+        return None, None, None, None
+    regime = str(value.get("regime") or "")
+    if not regime:
+        return None, None, None, None
+    ok = value.get("ok")
+    admitted = [regime] if ok is True else []
+    blocked = [regime] if ok is False else []
+    reason = value.get("reason")
+    return (
+        ok if isinstance(ok, bool) else None,
+        str(reason) if reason else None,
+        json.dumps(admitted, sort_keys=True),
+        json.dumps(blocked, sort_keys=True),
+    )
