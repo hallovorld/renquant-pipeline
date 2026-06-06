@@ -303,6 +303,10 @@ CREATE TABLE IF NOT EXISTS ticker_daily_state (
     qp_status         TEXT,           -- optimizer status attached to this row
     model_admission_ok INTEGER,       -- 1/0 if runtime model admission evaluated
     model_admission_reason TEXT,      -- admission blocker reason when rejected
+    current_regime_admitted INTEGER,  -- 1/0 if current runtime regime admitted buys
+    current_regime_admission_reason TEXT,
+    admitted_regimes TEXT,            -- JSON list from runtime regime-admission gate
+    blocked_regimes TEXT,             -- JSON list from runtime regime-admission gate
     PRIMARY KEY (run_id, ticker)
 );
 CREATE INDEX IF NOT EXISTS idx_tds_date ON ticker_daily_state(date);
@@ -462,6 +466,10 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("mu_horizon_days",    "INTEGER"),
         ("model_admission_ok", "INTEGER"),
         ("model_admission_reason", "TEXT"),
+        ("current_regime_admitted", "INTEGER"),
+        ("current_regime_admission_reason", "TEXT"),
+        ("admitted_regimes", "TEXT"),
+        ("blocked_regimes", "TEXT"),
     ],
     "score_distribution": [
         ("run_type",                    "TEXT"),
@@ -634,6 +642,10 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
             qp_status         TEXT,
             model_admission_ok INTEGER,
             model_admission_reason TEXT,
+            current_regime_admitted INTEGER,
+            current_regime_admission_reason TEXT,
+            admitted_regimes TEXT,
+            blocked_regimes TEXT,
             PRIMARY KEY (run_id, ticker)
         )"""
     )
@@ -648,7 +660,9 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
                mu, mu_horizon_days, sigma,
                in_candidates, selected, blocked_by, sector,
                qp_delta_w, qp_target_w, qp_status,
-               model_admission_ok, model_admission_reason)
+               model_admission_ok, model_admission_reason,
+               current_regime_admitted, current_regime_admission_reason,
+               admitted_regimes, blocked_regimes)
             SELECT {run_expr}, date, ticker, regime, confidence,
                    in_watchlist, in_universe, pending_at_broker,
                    has_position, position_qty, position_pct,
@@ -661,7 +675,11 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
                    {_old_col("qp_delta_w")}, {_old_col("qp_target_w")},
                    {_old_col("qp_status")},
                    {_old_col("model_admission_ok")},
-                   {_old_col("model_admission_reason")}
+                   {_old_col("model_admission_reason")},
+                   {_old_col("current_regime_admitted")},
+                   {_old_col("current_regime_admission_reason")},
+                   {_old_col("admitted_regimes")},
+                   {_old_col("blocked_regimes")}
               FROM {tmp}"""
     )
     conn.execute(f"DROP TABLE {tmp}")
@@ -1623,7 +1641,8 @@ def record_ticker_daily_state(
     expected_return, expected_return_horizon_days, kelly_target_pct,
     mu, mu_horizon_days, sigma, in_candidates, selected, blocked_by,
     sector, qp_delta_w, qp_target_w, qp_status, model_admission_ok,
-    model_admission_reason.
+    model_admission_reason, current_regime_admitted,
+    current_regime_admission_reason, admitted_regimes, blocked_regimes.
     `ticker` required.
     """
     if conn is None:
@@ -1667,6 +1686,10 @@ def record_ticker_daily_state(
             r.get("qp_status"),
             _none_or_int(r.get("model_admission_ok")),
             r.get("model_admission_reason"),
+            _none_or_int(r.get("current_regime_admitted")),
+            r.get("current_regime_admission_reason"),
+            r.get("admitted_regimes"),
+            r.get("blocked_regimes"),
         ))
     if not payload:
         return 0
@@ -1681,8 +1704,10 @@ def record_ticker_daily_state(
                mu, mu_horizon_days, sigma,
                in_candidates, selected, blocked_by, sector,
                qp_delta_w, qp_target_w, qp_status,
-               model_admission_ok, model_admission_reason)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               model_admission_ok, model_admission_reason,
+               current_regime_admitted, current_regime_admission_reason,
+               admitted_regimes, blocked_regimes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         payload,
     )
     return len(payload)
