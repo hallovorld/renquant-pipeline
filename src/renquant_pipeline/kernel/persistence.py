@@ -301,6 +301,8 @@ CREATE TABLE IF NOT EXISTS ticker_daily_state (
     qp_delta_w        REAL,           -- QP optimized delta weight for this ticker
     qp_target_w       REAL,           -- QP optimized target weight for this ticker
     qp_status         TEXT,           -- optimizer status attached to this row
+    model_admission_ok INTEGER,       -- 1/0 if runtime model admission evaluated
+    model_admission_reason TEXT,      -- admission blocker reason when rejected
     PRIMARY KEY (run_id, ticker)
 );
 CREATE INDEX IF NOT EXISTS idx_tds_date ON ticker_daily_state(date);
@@ -458,6 +460,8 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("qp_status",          "TEXT"),
         ("expected_return_horizon_days", "INTEGER"),
         ("mu_horizon_days",    "INTEGER"),
+        ("model_admission_ok", "INTEGER"),
+        ("model_admission_reason", "TEXT"),
     ],
     "score_distribution": [
         ("run_type",                    "TEXT"),
@@ -628,6 +632,8 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
             qp_delta_w        REAL,
             qp_target_w       REAL,
             qp_status         TEXT,
+            model_admission_ok INTEGER,
+            model_admission_reason TEXT,
             PRIMARY KEY (run_id, ticker)
         )"""
     )
@@ -641,7 +647,8 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
                expected_return_horizon_days, kelly_target_pct,
                mu, mu_horizon_days, sigma,
                in_candidates, selected, blocked_by, sector,
-               qp_delta_w, qp_target_w, qp_status)
+               qp_delta_w, qp_target_w, qp_status,
+               model_admission_ok, model_admission_reason)
             SELECT {run_expr}, date, ticker, regime, confidence,
                    in_watchlist, in_universe, pending_at_broker,
                    has_position, position_qty, position_pct,
@@ -652,7 +659,9 @@ def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
                    mu, {_old_col("mu_horizon_days")}, sigma,
                    in_candidates, selected, blocked_by, sector,
                    {_old_col("qp_delta_w")}, {_old_col("qp_target_w")},
-                   {_old_col("qp_status")}
+                   {_old_col("qp_status")},
+                   {_old_col("model_admission_ok")},
+                   {_old_col("model_admission_reason")}
               FROM {tmp}"""
     )
     conn.execute(f"DROP TABLE {tmp}")
@@ -1613,7 +1622,8 @@ def record_ticker_daily_state(
     model_type, model_action, sell_streak, panel_score, rank_score,
     expected_return, expected_return_horizon_days, kelly_target_pct,
     mu, mu_horizon_days, sigma, in_candidates, selected, blocked_by,
-    sector, qp_delta_w, qp_target_w, qp_status.
+    sector, qp_delta_w, qp_target_w, qp_status, model_admission_ok,
+    model_admission_reason.
     `ticker` required.
     """
     if conn is None:
@@ -1655,6 +1665,8 @@ def record_ticker_daily_state(
             _none_or_float(r.get("qp_delta_w")),
             _none_or_float(r.get("qp_target_w")),
             r.get("qp_status"),
+            _none_or_int(r.get("model_admission_ok")),
+            r.get("model_admission_reason"),
         ))
     if not payload:
         return 0
@@ -1668,8 +1680,9 @@ def record_ticker_daily_state(
                expected_return_horizon_days, kelly_target_pct,
                mu, mu_horizon_days, sigma,
                in_candidates, selected, blocked_by, sector,
-               qp_delta_w, qp_target_w, qp_status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               qp_delta_w, qp_target_w, qp_status,
+               model_admission_ok, model_admission_reason)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         payload,
     )
     return len(payload)

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import datetime as dt
+import sqlite3
+
 import pytest
 
+from renquant_pipeline.kernel.persistence import ensure_schema, record_ticker_daily_state
 from renquant_pipeline import (
     EmitAttributedOrderIntentsTask,
     InferenceContext,
@@ -99,6 +103,32 @@ def test_panel_scoring_job_admits_strong_candidates_and_records_trace() -> None:
     assert latest["model_type"] == "gbdt-panel-ltr"
     assert latest["blocked_by"] == "panel_score_below_buy_floor"
     assert latest["panel_score"] == pytest.approx(0.21)
+    assert latest["model_admission_ok"] is True
+    assert latest["model_admission_reason"] is None
+
+
+def test_model_admission_rejection_is_recorded_in_runtime_trace() -> None:
+    ctx = _ctx(
+        artifact_extra={
+            "metrics": {
+                "accepted": True,
+                "oos_mean_ic": 0.04,
+                "wf_sharpe": 1.5,
+                "spy_relative_sharpe": -0.2,
+                "spy_relative_apy": 0.02,
+                "config_fingerprint": "sha256:cfg",
+            }
+        }
+    )
+
+    RuntimeInferencePipeline([PanelScoringJob(emit_orders=True)]).run(ctx)
+
+    assert ctx.buy_blocked is True
+    assert ctx.order_intents == []
+    latest = [row for row in ctx.decision_trace if row.get("ticker") == "AAPL"][-1]
+    assert latest["blocked_by"] == "model_spy_relative_sharpe_below_floor"
+    assert latest["model_admission_ok"] is False
+    assert latest["model_admission_reason"] == "model_spy_relative_sharpe_below_floor"
 
 
 def test_panel_scoring_job_task_order_is_explicit() -> None:
@@ -196,3 +226,32 @@ def test_decision_trace_builder_includes_qp_and_broker_state() -> None:
     assert aapl["qp_delta"] == pytest.approx(0.1)
     assert msft["has_position"] is True
     assert msft["qp_target"] == pytest.approx(0.0)
+
+
+def test_ticker_daily_state_persists_model_admission_trace() -> None:
+    conn = sqlite3.connect(":memory:")
+    ensure_schema(conn)
+
+    n_rows = record_ticker_daily_state(
+        conn,
+        run_date=dt.date(2026, 6, 2),
+        run_id="daily-full-shadow-20260602",
+        rows=[
+            {
+                "ticker": "AAPL",
+                "selected": 0,
+                "blocked_by": "model_spy_relative_sharpe_below_floor",
+                "model_admission_ok": 0,
+                "model_admission_reason": "model_spy_relative_sharpe_below_floor",
+            }
+        ],
+    )
+
+    assert n_rows == 1
+    row = conn.execute(
+        """SELECT model_admission_ok, model_admission_reason
+             FROM ticker_daily_state
+            WHERE run_id = ? AND ticker = ?""",
+        ("daily-full-shadow-20260602", "AAPL"),
+    ).fetchone()
+    assert row == (0, "model_spy_relative_sharpe_below_floor")
