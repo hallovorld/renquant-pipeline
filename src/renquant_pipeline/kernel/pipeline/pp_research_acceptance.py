@@ -289,7 +289,7 @@ def _wf_gate_cmd(ctx: ResearchAcceptanceContext) -> CommandSpec:
     if ctx.artifact is None:
         raise ValueError("wf-gate target requires ctx.artifact")
     argv: list[str | Path] = [
-        ctx.python, "scripts/run_wf_gate.py",
+        ctx.python, "-m", "renquant_backtesting.wf_gate",
         "--artifact", ctx.artifact,
         "--strategy-config", ctx.strategy_config,
         "--jobs", str(ctx.wf_jobs),
