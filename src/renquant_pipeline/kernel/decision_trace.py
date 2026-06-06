@@ -175,6 +175,10 @@ def build_ticker_daily_state_rows(
     score_snapshots = getattr(ctx, "_ticker_score_snapshot", {}) or {}
     prices = getattr(ctx, "prices", {}) or {}
     holdings = getattr(ctx, "holdings", {}) or {}
+    admission = _model_admission_trace(
+        getattr(ctx, "_regime_model_admission", None)
+        or getattr(ctx, "model_admission", None)
+    )
     watchlist_set = set(config.get("watchlist", []) or [])
     trace_tickers = list(decision_trace_tickers(config))
     seen_trace = set(trace_tickers)
@@ -256,8 +260,19 @@ def build_ticker_daily_state_rows(
             "qp_delta_w": qp_delta_by_ticker.get(tk),
             "qp_target_w": qp_target_by_ticker.get(tk),
             "qp_status": qp_status,
+            "model_admission_ok": admission[0],
+            "model_admission_reason": admission[1],
         })
     return rows
+
+
+def _model_admission_trace(value: Any) -> tuple[int | None, str | None]:
+    if not isinstance(value, dict):
+        return None, None
+    ok = value.get("ok")
+    ok_int = int(ok) if isinstance(ok, bool) else None
+    reason = value.get("reason")
+    return ok_int, str(reason) if reason else None
 
 
 __all__ = [

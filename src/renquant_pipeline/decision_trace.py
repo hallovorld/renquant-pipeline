@@ -52,6 +52,7 @@ def build_ticker_daily_state_rows(
     held = _position_tickers(getattr(ctx, "account_snapshot", {}) or {})
     ticker_order = _stable_ticker_order(watchlist, held, selected, blocked, pending, extra_tickers)
     artifact_model_type = model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+    admission = _model_admission_trace(getattr(ctx, "model_admission", None))
 
     rows: list[dict[str, Any]] = []
     for ticker in ticker_order:
@@ -75,6 +76,8 @@ def build_ticker_daily_state_rows(
                 "qp_delta": _finite_or_none((qp_delta_by_ticker or {}).get(ticker)),
                 "qp_target": _finite_or_none((qp_target_by_ticker or {}).get(ticker)),
                 "qp_status": qp_status,
+                "model_admission_ok": admission[0],
+                "model_admission_reason": admission[1],
             }
         )
     return rows
@@ -149,3 +152,12 @@ def _finite_or_none(value: Any) -> float | None:
     if number != number or number in (float("inf"), float("-inf")):
         return None
     return number
+
+
+def _model_admission_trace(value: Any) -> tuple[bool | None, str | None]:
+    if not isinstance(value, dict):
+        return None, None
+    ok = value.get("ok")
+    ok_bool = ok if isinstance(ok, bool) else None
+    reason = value.get("reason")
+    return ok_bool, str(reason) if reason else None
