@@ -181,7 +181,8 @@ class SizeAndEmitTask(Task):
         base_max_pct *= cooldown_mult
         reserve_pct   = float(regime_p.get("cash_reserve_pct", 0.0))  * _conf_mult
         bear_def_pct  = float(ctx.config.get("bear_defensive_pct", 0.15))
-        override_pct  = bear_def_pct if ctx.bear_only else None
+        bear_def_slots = max(int(ctx.config.get("bear_defensive_slots", 1)), 1)
+        override_pct  = (bear_def_pct / bear_def_slots) if ctx.bear_only else None
         sizing_cfg    = (ctx.config.get("ranking", {})
                           .get("panel_scoring", {}).get("sizing", {}))
         sigma_cfg     = (ctx.config.get("ranking", {})
@@ -284,6 +285,10 @@ class SizeAndEmitTask(Task):
                 max_pct, reserve_pct, price,
                 override_pct=override_pct,
             )
+            if override_pct is not None and shares * price > (override_pct * ctx.portfolio_value) + 1e-6:
+                log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
+                _block(ticker, "bear_defensive_slot_cap")
+                continue
             if shares < 1:
                 log.info("SizeAndEmitTask: %s insufficient cash — skip "
                          "(remaining_cash=$%.0f price=$%.2f)",
@@ -394,13 +399,14 @@ class ApplyBearDefensiveSleeveTask(Task):
         defensive_set = set(defensive_tickers)
         held_defensive = held & defensive_set
         ordered = self._ordered_tickers(ctx)
-        ordered_defensive = ordered & defensive_set
+        long_ordered = self._long_entry_order_tickers(ctx)
+        ordered_defensive = long_ordered & defensive_set
         regime_params = (cfg.get("regime_params", {}) or {}).get(getattr(ctx, "regime", None), {}) or {}
         max_positions = self._positive_int(
             regime_params.get("max_concurrent_positions", cfg.get("max_concurrent_positions", 8)),
             default=8,
         )
-        portfolio_open_slots = max(max_positions - len(held) - len(ordered), 0)
+        portfolio_open_slots = max(max_positions - len(held) - len(long_ordered), 0)
         defensive_open_slots = max(slots - len(held_defensive) - len(ordered_defensive), 0)
         open_slots = min(portfolio_open_slots, defensive_open_slots)
         if open_slots <= 0:
@@ -513,6 +519,25 @@ class ApplyBearDefensiveSleeveTask(Task):
             if ticker:
                 out.add(str(ticker).upper())
         return out
+
+    @staticmethod
+    def _long_entry_order_tickers(ctx: InferenceContext) -> set[str]:
+        out: set[str] = set()
+        for order in getattr(ctx, "orders", []) or []:
+            if not isinstance(order, dict):
+                continue
+            if ApplyBearDefensiveSleeveTask._is_non_long_entry_order(order):
+                continue
+            ticker = order.get("ticker")
+            if ticker:
+                out.add(str(ticker).upper())
+        return out
+
+    @staticmethod
+    def _is_non_long_entry_order(order: dict) -> bool:
+        order_type = str(order.get("order_type") or "").upper()
+        side = str((order.get("decision_inputs") or {}).get("side") or "").lower()
+        return order_type.startswith("BUY_TO_COVER") or side == "buy_to_close"
 
     @staticmethod
     def _remaining_cash(ctx: InferenceContext) -> float:
