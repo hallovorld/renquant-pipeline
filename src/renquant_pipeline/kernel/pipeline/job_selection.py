@@ -3,15 +3,27 @@ from __future__ import annotations
 
 from .context import InferenceContext
 from .pipeline import Job, Task
-from .task_selection import PrepareSelectionTask, RunSelectionTask, SizeAndEmitTask
+from .task_selection import (
+    ApplyBearDefensiveSleeveTask,
+    PrepareSelectionTask,
+    RunSelectionTask,
+    SizeAndEmitTask,
+)
 
 
 class SelectionJob(Job):
-    """Task chain: PrepareSelection → RunSelection → SizeAndEmit"""
+    """Task chain: PrepareSelection → RunSelection → SizeAndEmit → BEAR sleeve."""
 
     def should_skip(self, ctx: InferenceContext) -> bool:
-        return not ctx.ranked
+        if ctx.ranked:
+            return False
+        return not ApplyBearDefensiveSleeveTask.is_enabled(ctx)
 
     @property
     def tasks(self) -> list[Task]:
-        return [PrepareSelectionTask(), RunSelectionTask(), SizeAndEmitTask()]
+        return [
+            PrepareSelectionTask(),
+            RunSelectionTask(),
+            SizeAndEmitTask(),
+            ApplyBearDefensiveSleeveTask(),
+        ]

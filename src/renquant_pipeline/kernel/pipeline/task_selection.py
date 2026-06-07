@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from typing import Any
 
 from .context import InferenceContext
 from .order_attribution import stamp_order_attribution
@@ -43,6 +45,9 @@ class PrepareSelectionTask(Task):
 
         if open_slots <= 0:
             log.info("PrepareSelectionTask: no open slots")
+            if ApplyBearDefensiveSleeveTask.is_enabled(ctx):
+                ctx._sel_ctx = None  # noqa: SLF001
+                return True
             return False
 
         if ctx.bear_only:
@@ -50,6 +55,12 @@ class PrepareSelectionTask(Task):
             defensive_held = sum(1 for t in held if t in defensive_set)
             remaining      = max(bear_slots - defensive_held, 0)
             open_slots     = min(open_slots, remaining)
+            if open_slots <= 0:
+                log.info("PrepareSelectionTask: no BEAR defensive alpha slots")
+                if ApplyBearDefensiveSleeveTask.is_enabled(ctx):
+                    ctx._sel_ctx = None  # noqa: SLF001
+                    return True
+                return False
 
         ctx._sel_ctx = SelectionContext(  # noqa: SLF001
             today             = ctx.today,
@@ -83,11 +94,17 @@ class RunSelectionTask(Task):
     def run(self, ctx: InferenceContext) -> bool | None:
         from renquant_pipeline.kernel.selection import run_selection_loop  # noqa: PLC0415
 
+        sel_ctx = getattr(ctx, "_sel_ctx", None)
+        if sel_ctx is None:
+            ctx._selected = []  # noqa: SLF001
+            ctx._blocks = {}  # noqa: SLF001
+            return True
+
         blocked_by_ticker = getattr(ctx, "_blocked_by_ticker", None)
         if blocked_by_ticker is None:
             blocked_by_ticker = {}
         selected, blocks = run_selection_loop(
-            ctx.ranked, ctx._sel_ctx,  # noqa: SLF001
+            ctx.ranked, sel_ctx,
             blocked_by_ticker=blocked_by_ticker,
         )
         ctx._selected          = selected            # noqa: SLF001
@@ -164,7 +181,8 @@ class SizeAndEmitTask(Task):
         base_max_pct *= cooldown_mult
         reserve_pct   = float(regime_p.get("cash_reserve_pct", 0.0))  * _conf_mult
         bear_def_pct  = float(ctx.config.get("bear_defensive_pct", 0.15))
-        override_pct  = bear_def_pct if ctx.bear_only else None
+        bear_def_slots = max(int(ctx.config.get("bear_defensive_slots", 1)), 1)
+        override_pct  = (bear_def_pct / bear_def_slots) if ctx.bear_only else None
         sizing_cfg    = (ctx.config.get("ranking", {})
                           .get("panel_scoring", {}).get("sizing", {}))
         sigma_cfg     = (ctx.config.get("ranking", {})
@@ -267,6 +285,10 @@ class SizeAndEmitTask(Task):
                 max_pct, reserve_pct, price,
                 override_pct=override_pct,
             )
+            if override_pct is not None and shares * price > (override_pct * ctx.portfolio_value) + 1e-6:
+                log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
+                _block(ticker, "bear_defensive_slot_cap")
+                continue
             if shares < 1:
                 log.info("SizeAndEmitTask: %s insufficient cash — skip "
                          "(remaining_cash=$%.0f price=$%.2f)",
@@ -339,3 +361,226 @@ class SizeAndEmitTask(Task):
             "SizeAndEmitTask: %d orders placed (spent=$%.0f / starting_cash=$%.0f)",
             len(ctx.orders), spent, starting_cash,
         )
+
+
+class ApplyBearDefensiveSleeveTask(Task):
+    """Append default-off fixed-slot defensive buys in BEAR without alpha models."""
+
+    SOURCE_TASK = "ApplyBearDefensiveSleeveTask"
+
+    @staticmethod
+    def is_enabled(ctx: InferenceContext) -> bool:
+        cfg = (getattr(ctx, "config", None) or {}).get("bear_defensive_sleeve", {}) or {}
+        return bool(getattr(ctx, "bear_only", False)) and bool(cfg.get("enabled", False))
+
+    def run(self, ctx: InferenceContext) -> bool | None:
+        if not self.is_enabled(ctx):
+            return True
+
+        cfg = getattr(ctx, "config", None) or {}
+        defensive_tickers = [
+            str(t).upper()
+            for t in (cfg.get("defensive_tickers", []) or [])
+            if str(t).strip()
+        ]
+        if not defensive_tickers:
+            log.info("%s: no defensive_tickers configured", self.SOURCE_TASK)
+            return True
+
+        slots = self._positive_int(cfg.get("bear_defensive_slots", 1), default=1)
+        sleeve_pct = self._positive_float(cfg.get("bear_defensive_pct", 0.15), default=0.15)
+        slot_pct = sleeve_pct / slots
+        portfolio_value = float(getattr(ctx, "portfolio_value", 0.0) or 0.0)
+        if portfolio_value <= 0 or not math.isfinite(portfolio_value):
+            log.warning("%s: invalid portfolio_value=%s", self.SOURCE_TASK, portfolio_value)
+            return True
+
+        held = {str(t).upper() for t in (getattr(ctx, "holdings", {}) or {}).keys()}
+        defensive_set = set(defensive_tickers)
+        held_defensive = held & defensive_set
+        ordered = self._ordered_tickers(ctx)
+        long_ordered = self._long_entry_order_tickers(ctx)
+        ordered_defensive = long_ordered & defensive_set
+        regime_params = (cfg.get("regime_params", {}) or {}).get(getattr(ctx, "regime", None), {}) or {}
+        max_positions = self._positive_int(
+            regime_params.get("max_concurrent_positions", cfg.get("max_concurrent_positions", 8)),
+            default=8,
+        )
+        portfolio_open_slots = max(max_positions - len(held) - len(long_ordered), 0)
+        defensive_open_slots = max(slots - len(held_defensive) - len(ordered_defensive), 0)
+        open_slots = min(portfolio_open_slots, defensive_open_slots)
+        if open_slots <= 0:
+            log.info("%s: defensive slots full", self.SOURCE_TASK)
+            return True
+
+        reserve_pct = self._nonnegative_float(regime_params.get("cash_reserve_pct", 0.0), default=0.0)
+        remaining_cash = self._remaining_cash(ctx)
+        investable_cash = max(remaining_cash - portfolio_value * reserve_pct, 0.0)
+        if investable_cash <= 0:
+            log.info("%s: cash reserve leaves no investable cash", self.SOURCE_TASK)
+            return True
+
+        emitted = 0
+        for ticker in defensive_tickers:
+            if emitted >= open_slots:
+                break
+            if ticker in held or ticker in ordered:
+                continue
+            price = self._price_for(ctx, ticker)
+            if price is None:
+                self._block(ctx, ticker, "bear_defensive_bad_price")
+                continue
+
+            cap_dollars = min(slot_pct * portfolio_value, investable_cash)
+            shares = int(cap_dollars / price)
+            if shares < 1:
+                self._block(ctx, ticker, "bear_defensive_insufficient_cash")
+                continue
+
+            invest = shares * price
+            target_pct = invest / portfolio_value
+            order = stamp_order_attribution({
+                "ticker": ticker,
+                "shares": shares,
+                "price": price,
+                "invest": invest,
+                "target_pct": target_pct,
+                "regime": getattr(ctx, "regime", None),
+                "confidence": getattr(ctx, "confidence", None),
+                "rank_score": None,
+                "rs_score": None,
+                "panel_score": None,
+                "sigma": None,
+                "mu": None,
+                "kelly_target_pct": None,
+                "detail": "BEAR defensive sleeve fixed-slot buy",
+                "order_type": "BEAR_DEFENSIVE_SLEEVE",
+            }, ctx=ctx, source_job="SelectionJob",
+                source_task=self.SOURCE_TASK,
+                acceptance_reason="bear_defensive_sleeve_enabled",
+                decision_inputs={
+                    "slot_pct": slot_pct,
+                    "sleeve_pct": sleeve_pct,
+                    "slots": slots,
+                    "open_slots_before": open_slots,
+                    "cash_reserve_pct": reserve_pct,
+                    "remaining_cash_before": remaining_cash,
+                    "investable_cash_before": investable_cash,
+                })
+            order["order_source"] = "BEAR_DEFENSIVE_SLEEVE"
+            order["source"] = "BEAR_DEFENSIVE_SLEEVE"
+            order["decision_inputs"]["order_source"] = "BEAR_DEFENSIVE_SLEEVE"
+            ctx.orders.append(order)
+            emitted += 1
+            ordered.add(ticker)
+            investable_cash -= invest
+            remaining_cash -= invest
+            ctx.counters["bear_defensive_sleeve_orders"] = (
+                ctx.counters.get("bear_defensive_sleeve_orders", 0) + 1
+            )
+            log.info(
+                "%s: %s %d shares @ %.2f ($%.0f, %.1f%% target)",
+                self.SOURCE_TASK, ticker, shares, price, invest, target_pct * 100,
+            )
+
+        return True
+
+    @staticmethod
+    def _positive_int(value: Any, *, default: int) -> int:
+        try:
+            out = int(value)
+        except (TypeError, ValueError):
+            return default
+        return out if out > 0 else default
+
+    @staticmethod
+    def _positive_float(value: Any, *, default: float) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return default
+        return out if math.isfinite(out) and out > 0 else default
+
+    @staticmethod
+    def _nonnegative_float(value: Any, *, default: float) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return default
+        return out if math.isfinite(out) and out >= 0 else default
+
+    @staticmethod
+    def _ordered_tickers(ctx: InferenceContext) -> set[str]:
+        out: set[str] = set()
+        for order in getattr(ctx, "orders", []) or []:
+            if not isinstance(order, dict):
+                continue
+            ticker = order.get("ticker")
+            if ticker:
+                out.add(str(ticker).upper())
+        return out
+
+    @staticmethod
+    def _long_entry_order_tickers(ctx: InferenceContext) -> set[str]:
+        out: set[str] = set()
+        for order in getattr(ctx, "orders", []) or []:
+            if not isinstance(order, dict):
+                continue
+            if ApplyBearDefensiveSleeveTask._is_non_long_entry_order(order):
+                continue
+            ticker = order.get("ticker")
+            if ticker:
+                out.add(str(ticker).upper())
+        return out
+
+    @staticmethod
+    def _is_non_long_entry_order(order: dict) -> bool:
+        order_type = str(order.get("order_type") or "").upper()
+        side = str((order.get("decision_inputs") or {}).get("side") or "").lower()
+        return order_type.startswith("BUY_TO_COVER") or side == "buy_to_close"
+
+    @staticmethod
+    def _remaining_cash(ctx: InferenceContext) -> float:
+        cash = float(getattr(ctx, "cash", 0.0) or 0.0)
+        for order in getattr(ctx, "orders", []) or []:
+            if not isinstance(order, dict):
+                continue
+            try:
+                cash -= float(order.get("invest", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return max(cash, 0.0)
+
+    @staticmethod
+    def _price_for(ctx: InferenceContext, ticker: str) -> float | None:
+        value = (getattr(ctx, "prices", {}) or {}).get(ticker)
+        if value is None:
+            value = (getattr(ctx, "prices", {}) or {}).get(ticker.upper())
+        price = ApplyBearDefensiveSleeveTask._finite_positive(value)
+        if price is not None:
+            return price
+        frame = (getattr(ctx, "ohlcv", {}) or {}).get(ticker)
+        if frame is None:
+            frame = (getattr(ctx, "ohlcv", {}) or {}).get(ticker.upper())
+        try:
+            close = frame["close"].dropna().iloc[-1]
+        except Exception:
+            return None
+        return ApplyBearDefensiveSleeveTask._finite_positive(close)
+
+    @staticmethod
+    def _finite_positive(value: Any) -> float | None:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        return out if math.isfinite(out) and out > 0 else None
+
+    @staticmethod
+    def _block(ctx: InferenceContext, ticker: str, reason: str) -> None:
+        blocked_map = getattr(ctx, "_blocked_by_ticker", None)
+        if blocked_map is None:
+            blocked_map = {}
+            ctx._blocked_by_ticker = blocked_map  # noqa: SLF001
+        blocked_map.setdefault(ticker, reason)
+        ctx.counters[reason] = ctx.counters.get(reason, 0) + 1
