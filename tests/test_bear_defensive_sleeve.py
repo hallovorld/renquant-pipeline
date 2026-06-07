@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 
 from renquant_pipeline.context import InferenceContext
+from renquant_pipeline.kernel.selection import CandidateResult
 from renquant_pipeline.kernel.pipeline.job_selection import SelectionJob
 from renquant_pipeline.kernel.pipeline.task_selection import ApplyBearDefensiveSleeveTask
 
@@ -73,6 +74,26 @@ def test_bear_defensive_sleeve_uses_fixed_slot_cap_and_excludes_held() -> None:
     assert ctx.orders[0]["target_pct"] == 0.10
 
 
+def test_bear_defensive_sleeve_caps_ranked_defensive_and_additive_sleeve() -> None:
+    ctx = _ctx(
+        ranked=[
+            CandidateResult(
+                ticker="GLD",
+                raw_score=1.0,
+                rank_score=1.0,
+                rs_score=1.0,
+                panel_score=1.0,
+            ),
+        ],
+    )
+
+    SelectionJob().run(ctx)
+
+    assert [order["ticker"] for order in ctx.orders] == ["GLD", "TLT"]
+    assert [order["target_pct"] for order in ctx.orders] == [0.10, 0.10]
+    assert sum(order["target_pct"] for order in ctx.orders) == 0.20
+
+
 def test_bear_defensive_sleeve_respects_remaining_cash_and_reserve() -> None:
     ctx = _ctx(
         cash=1_500.0,
@@ -118,6 +139,36 @@ def test_bear_defensive_sleeve_respects_total_position_slots() -> None:
     SelectionJob().run(ctx)
 
     assert ctx.orders == []
+
+
+def test_bear_defensive_sleeve_buy_to_cover_does_not_consume_long_slot() -> None:
+    ctx = _ctx(
+        cash=10_000.0,
+        config={
+            "bear_defensive_slots": 1,
+            "regime_params": {
+                "BEAR": {
+                    "cash_reserve_pct": 0.0,
+                    "max_concurrent_positions": 1,
+                },
+            },
+        },
+        orders=[
+            {
+                "ticker": "GLD",
+                "shares": 3.0,
+                "price": 50.0,
+                "invest": 150.0,
+                "order_type": "BUY_TO_COVER_short_cover_stop",
+                "decision_inputs": {"side": "buy_to_close"},
+            },
+        ],
+    )
+
+    ApplyBearDefensiveSleeveTask().run(ctx)
+
+    assert [order["ticker"] for order in ctx.orders] == ["GLD", "TLT"]
+    assert ctx.orders[-1]["order_type"] == "BEAR_DEFENSIVE_SLEEVE"
 
 
 def test_bear_defensive_sleeve_stamps_auditable_order_attribution() -> None:
