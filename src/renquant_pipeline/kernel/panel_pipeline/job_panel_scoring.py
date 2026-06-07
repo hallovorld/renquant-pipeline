@@ -454,6 +454,50 @@ def _ensure_blocked_map(ctx: Any) -> dict[str, str]:
     return blocked
 
 
+def _panel_model_type(panel_cfg: dict, scorer: Any | None = None) -> str:
+    metadata = getattr(scorer, "metadata", {}) or {}
+    return str(
+        metadata.get("kind")
+        or metadata.get("model_family")
+        or metadata.get("model_type")
+        or panel_cfg.get("kind")
+        or "xgb"
+    )
+
+
+def _stamp_active_panel_scorer(
+    ctx: Any,
+    panel_cfg: dict,
+    scorer: Any | None,
+    path: Path | None,
+) -> None:
+    """Persist the active scorer identity for trace/order attribution."""
+    model_type = _panel_model_type(panel_cfg, scorer)
+    artifact_path = str(path) if path is not None else None
+    ctx._active_panel_model_type = model_type  # noqa: SLF001
+    ctx._active_panel_artifact_path = artifact_path  # noqa: SLF001
+    ctx._active_panel_scorer = {  # noqa: SLF001
+        "kind": model_type,
+        "artifact_path": artifact_path,
+        "requires_history": bool(getattr(scorer, "requires_history", False)),
+        "shadow_models": [
+            {
+                "name": str(sm.get("name", "")),
+                "kind": str(sm.get("kind", "")),
+                "artifact_path": str(sm.get("artifact_path", "")),
+            }
+            for sm in (panel_cfg.get("shadow_models") or [])
+            if isinstance(sm, dict)
+        ],
+    }
+
+
+def _annotate_panel_model(obj: Any, ctx: Any) -> None:
+    model_type = getattr(ctx, "_active_panel_model_type", None)
+    if model_type:
+        setattr(obj, "model_type", model_type)
+
+
 def _snapshot_buy_candidates(ctx: Any) -> list[Any]:
     """Preserve the candidate pool so decision-trace persistence can explain drops."""
     existing = list(getattr(ctx, "_full_candidate_snapshot", None) or [])
@@ -603,6 +647,7 @@ class LoadScorerTask(Task):
             p = self._resolve_artifact_path(ctx, panel_cfg, scorer)
             if not self._assert_config_consistency(ctx, panel_cfg, scorer, p):
                 return False
+            _stamp_active_panel_scorer(ctx, panel_cfg, scorer, p)
             return
 
         p = self._resolve_artifact_path(ctx, panel_cfg)
@@ -662,6 +707,7 @@ class LoadScorerTask(Task):
                 ctx, panel_cfg, ctx._panel_scorer, p,
             ):
                 return False
+            _stamp_active_panel_scorer(ctx, panel_cfg, ctx._panel_scorer, p)
             return
 
         # 2026-05-18 Model registry dispatch — supports XGB/PatchTST/future kinds
@@ -698,6 +744,7 @@ class LoadScorerTask(Task):
         # enabled; only explicit staged migrations may opt into log-only mode.
         if not self._assert_config_consistency(ctx, panel_cfg, ctx._panel_scorer, p):
             return False
+        _stamp_active_panel_scorer(ctx, panel_cfg, ctx._panel_scorer, p)
 
 
 class BuildFeatureMatrixTask(Task):
@@ -813,6 +860,7 @@ class ApplyScoresTask(Task):
                 v = scores.get(cand.ticker)
                 if v is None or pd.isna(v):
                     continue
+                _annotate_panel_model(cand, ctx)
                 cand.rank_score = float(v)
                 cand.panel_score = float(v)
                 n_cand_scored += 1
@@ -827,6 +875,7 @@ class ApplyScoresTask(Task):
                 v = scores.get(ticker)
                 if v is None or pd.isna(v):
                     continue
+                _annotate_panel_model(hs, ctx)
                 hs.panel_score = float(v)
                 n_held_scored += 1
             log.info(
@@ -1190,6 +1239,7 @@ class ApplyScoresTask(Task):
             v = scores.get(cand.ticker)
             if v is None or pd.isna(v):
                 continue
+            _annotate_panel_model(cand, ctx)
             cand.rank_score  = float(v)
             cand.panel_score = float(v)
             n_cand_scored += 1
@@ -1222,6 +1272,7 @@ class ApplyScoresTask(Task):
             v = scores.get(ticker)
             if v is None or pd.isna(v):
                 continue
+            _annotate_panel_model(hs, ctx)
             hs.panel_score = float(v)
             n_held_scored += 1
 

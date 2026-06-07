@@ -510,9 +510,12 @@ def _sector_map(ctx: Any) -> dict[str, str]:
 
 def _model_type(ctx: Any) -> str | None:
     artifact = getattr(ctx, "artifact_manifest", {}) or {}
-    for key in ("model_type", "model_family", "kind"):
+    for key in ("kind", "model_type", "model_family"):
         if artifact.get(key):
             return str(artifact[key])
+    panel_kind = _panel_cfg(ctx).get("kind")
+    if panel_kind:
+        return str(panel_kind)
     return None
 
 
