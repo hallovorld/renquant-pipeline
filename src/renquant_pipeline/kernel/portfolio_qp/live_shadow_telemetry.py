@@ -9,6 +9,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -18,6 +19,9 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     check_snapshot_feasibility,
 )
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
+from renquant_pipeline.kernel.pipeline.pipeline import Task
+
+log = logging.getLogger("kernel.portfolio_qp.live_shadow_telemetry")
 
 
 def _float(value: Any) -> float | None:
@@ -238,7 +242,239 @@ def append_live_shadow_telemetry_jsonl(
     return out
 
 
+class EmitQPLiveShadowTelemetryTask(Task):
+    """Emit readonly QP live-shadow telemetry after live QP order emission.
+
+    Disabled by default. When enabled, the task runs a configured candidate
+    allocator on the already-built ``ConstraintSnapshot`` and writes one JSONL
+    row comparing it with the live incumbent QP solution. It never mutates
+    ``ctx.orders`` / ``ctx.exits`` and never changes the incumbent solution.
+    """
+
+    name = "EmitQPLiveShadowTelemetryTask"
+
+    def run(self, ctx) -> bool | None:
+        cfg = self._config(ctx)
+        if not cfg.get("enabled", False):
+            return None
+
+        try:
+            snap = getattr(ctx, "_qp_constraint_snapshot", None)
+            incumbent = getattr(ctx, "_qp_solution", None)
+            mu = getattr(ctx, "_qp_mu", None)
+            sigma = getattr(ctx, "_qp_sigma", None)
+            if snap is None or incumbent is None or mu is None or sigma is None:
+                self._stamp_skip(ctx, "missing_qp_shadow_inputs")
+                return None
+
+            candidate_name = str(cfg.get("candidate_name") or "hybrid_option_f_allocator")
+            candidate = _run_candidate_allocator(
+                candidate_name,
+                snap=snap,
+                mu=mu,
+                sigma=sigma,
+                Sigma=getattr(ctx, "_qp_Sigma_full", None),
+            )
+            envelope = build_live_shadow_telemetry_envelope(
+                snap=snap,
+                mu=mu,
+                sigma=sigma,
+                incumbent_solution=incumbent,
+                candidate_solution=candidate,
+                candidate_name=candidate_name,
+                as_of_date=getattr(ctx, "today", None) or dt.date.today(),
+                as_of_time=dt.datetime.now(dt.timezone.utc),
+                broker=str(getattr(ctx, "broker_name", None) or cfg.get("broker") or "unknown"),
+                incumbent_name=str(cfg.get("incumbent_name") or "current_qp"),
+                live_orders_emitted=_live_qp_orders(ctx),
+                would_have_orders=_would_have_weight_intents(snap, candidate),
+                broker_fidelity=dict(getattr(ctx, "_broker_fidelity", {}) or {}),
+                regime=getattr(ctx, "regime", None),
+                regime_confidence=getattr(ctx, "confidence", None),
+                panel_artifact=_panel_artifact_id(ctx),
+                anomalies=list(getattr(ctx, "_qp_shadow_anomalies", []) or []),
+            )
+            path = self._resolve_path(ctx, cfg)
+            append_live_shadow_telemetry_jsonl(path, envelope)
+            ctx._qp_live_shadow_telemetry_path = str(path)  # noqa: SLF001
+            ctx._qp_live_shadow_telemetry_last = envelope  # noqa: SLF001
+            ctx._qp_live_shadow_telemetry_status = "written"  # noqa: SLF001
+            _inc_counter(ctx, "qp_live_shadow_telemetry_rows", 1)
+        except Exception as exc:  # noqa: BLE001
+            self._stamp_skip(ctx, f"qp_live_shadow_telemetry_error:{type(exc).__name__}")
+            log.exception("EmitQPLiveShadowTelemetryTask: failed")
+        return None
+
+    @staticmethod
+    def _config(ctx) -> dict[str, Any]:
+        joint = ((getattr(ctx, "config", None) or {}).get("rotation", {})
+                 .get("joint_actions", {}) or {})
+        nested = joint.get("qp_live_shadow_telemetry") or {}
+        if not isinstance(nested, dict):
+            nested = {}
+        return {
+            "enabled": bool(
+                nested.get(
+                    "enabled",
+                    joint.get("qp_live_shadow_telemetry_enabled", False),
+                )
+            ),
+            "candidate_name": (
+                nested.get("candidate_name")
+                or nested.get("candidate")
+                or joint.get("qp_live_shadow_candidate")
+                or "hybrid_option_f_allocator"
+            ),
+            "path": (
+                nested.get("path")
+                or nested.get("jsonl_path")
+                or joint.get("qp_live_shadow_jsonl_path")
+            ),
+            "broker": nested.get("broker") or joint.get("qp_live_shadow_broker"),
+            "incumbent_name": (
+                nested.get("incumbent_name")
+                or joint.get("qp_live_shadow_incumbent_name")
+                or "current_qp"
+            ),
+        }
+
+    @staticmethod
+    def _resolve_path(ctx, cfg: dict[str, Any]) -> Path:
+        raw = cfg.get("path")
+        if raw:
+            path = Path(str(raw))
+        else:
+            path = Path("artifacts/live-shadow/qp-live-shadow.jsonl")
+        if path.is_absolute():
+            return path
+        root = (
+            getattr(ctx, "strategy_dir", None)
+            or (getattr(ctx, "config", None) or {}).get("_strategy_dir")
+            or "."
+        )
+        return Path(root) / path
+
+    @staticmethod
+    def _stamp_skip(ctx, reason: str) -> None:
+        ctx._qp_live_shadow_telemetry_status = reason  # noqa: SLF001
+        _inc_counter(ctx, "qp_live_shadow_telemetry_skipped", 1)
+
+
+def _run_candidate_allocator(
+    name: str,
+    *,
+    snap: ConstraintSnapshot,
+    mu: Any,
+    sigma: Any,
+    Sigma: np.ndarray | None,
+) -> Any:
+    from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa: PLC0415
+        equal_weight_top_k,
+        fractional_kelly_top_k,
+        hard_only_qp_allocator,
+        hybrid_option_f_allocator,
+        inverse_vol_top_k,
+    )
+
+    registry = {
+        "equal_weight_top_k": lambda: equal_weight_top_k(snap, mu=mu),
+        "inverse_vol_top_k": lambda: inverse_vol_top_k(snap, mu=mu, sigma=sigma),
+        "fractional_kelly_top_k": lambda: fractional_kelly_top_k(
+            snap, mu=mu, sigma=sigma,
+        ),
+        "hybrid_option_f_allocator": lambda: hybrid_option_f_allocator(
+            snap, mu=mu, sigma=sigma, Sigma=Sigma,
+        ),
+        "hard_only_qp_allocator": lambda: hard_only_qp_allocator(
+            snap, mu=mu, sigma=sigma, Sigma=Sigma,
+        ),
+    }
+    if name not in registry:
+        raise KeyError(
+            f"unknown qp live-shadow candidate {name!r}; "
+            f"registered={sorted(registry)}"
+        )
+    return registry[name]()
+
+
+def _would_have_weight_intents(
+    snap: ConstraintSnapshot,
+    solution: Any,
+    *,
+    tol: float = 1e-9,
+) -> list[dict[str, Any]]:
+    delta_w = _array(getattr(solution, "delta_w"), snap.n)
+    target_w = _array(getattr(solution, "target_w"), snap.n)
+    out: list[dict[str, Any]] = []
+    for idx, ticker in enumerate(snap.tickers):
+        dw = float(delta_w[idx])
+        if abs(dw) <= tol:
+            continue
+        out.append({
+            "ticker": str(ticker),
+            "side": "buy" if dw > 0 else "sell",
+            "delta_w": _float(dw),
+            "target_w": _float(target_w[idx]),
+            "source": "qp_live_shadow",
+        })
+    return out
+
+
+def _live_qp_orders(ctx) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for order in getattr(ctx, "orders", None) or []:
+        if not isinstance(order, dict):
+            continue
+        if (
+            order.get("source_job") == "JointPortfolioQPJob"
+            or str(order.get("order_type", "")).startswith("QP_")
+            or order.get("source") == "qp"
+        ):
+            out.append(order)
+    for item in getattr(ctx, "exits", None) or []:
+        try:
+            ticker, signal = item
+        except (TypeError, ValueError):
+            continue
+        if getattr(signal, "source_job", None) != "JointPortfolioQPJob":
+            continue
+        out.append({
+            "ticker": ticker,
+            "side": "sell",
+            "quantity": _float(getattr(signal, "quantity", None)),
+            "exit_type": getattr(signal, "exit_type", None),
+            "reason": getattr(signal, "reason", None),
+            "source_job": getattr(signal, "source_job", None),
+            "source_task": getattr(signal, "source_task", None),
+            "decision_inputs": getattr(signal, "decision_inputs", None),
+        })
+    return out
+
+
+def _panel_artifact_id(ctx) -> str | None:
+    active = getattr(ctx, "_active_panel_scorer", None)
+    if isinstance(active, dict):
+        value = active.get("artifact_path") or active.get("artifact_id")
+        if value:
+            return str(value)
+    manifest = getattr(ctx, "artifact_manifest", None)
+    if isinstance(manifest, dict):
+        value = manifest.get("artifact_id") or manifest.get("uri")
+        if value:
+            return str(value)
+    return None
+
+
+def _inc_counter(ctx, key: str, amount: int) -> None:
+    counters = getattr(ctx, "counters", None)
+    if counters is None:
+        counters = {}
+        ctx.counters = counters
+    counters[key] = int(counters.get(key, 0)) + int(amount)
+
+
 __all__ = [
     "append_live_shadow_telemetry_jsonl",
     "build_live_shadow_telemetry_envelope",
+    "EmitQPLiveShadowTelemetryTask",
 ]

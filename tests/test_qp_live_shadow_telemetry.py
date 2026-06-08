@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+from types import SimpleNamespace
 
 import numpy as np
 
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import AllocatorResult
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
 from renquant_pipeline.kernel.portfolio_qp.live_shadow_telemetry import (
+    EmitQPLiveShadowTelemetryTask,
     append_live_shadow_telemetry_jsonl,
     build_live_shadow_telemetry_envelope,
 )
@@ -131,3 +133,76 @@ def test_append_live_shadow_telemetry_jsonl(tmp_path) -> None:
 
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert rows == [envelope]
+
+
+def test_emit_qp_live_shadow_telemetry_task_writes_jsonl(tmp_path) -> None:
+    snap = _snap()
+    incumbent = _Solution(
+        delta_w=np.array([0.02, -0.01, 0.00]),
+        target_w=np.array([0.12, 0.04, 0.00]),
+    )
+    ctx = SimpleNamespace(
+        config={
+            "rotation": {
+                "joint_actions": {
+                    "qp_live_shadow_telemetry": {
+                        "enabled": True,
+                        "candidate_name": "hybrid_option_f_allocator",
+                        "path": "shadow/qp-live-shadow.jsonl",
+                    }
+                }
+            }
+        },
+        strategy_dir=tmp_path,
+        today="2026-06-08",
+        broker_name="alpaca-paper",
+        regime="BULL_CALM",
+        confidence=0.72,
+        counters={},
+        orders=[
+            {
+                "ticker": "AAPL",
+                "order_type": "QP_BUY",
+                "source_job": "JointPortfolioQPJob",
+                "shares": 2,
+            }
+        ],
+        exits=[],
+        _qp_constraint_snapshot=snap,
+        _qp_solution=incumbent,
+        _qp_mu=np.array([0.03, 0.02, 0.05]),
+        _qp_sigma=np.array([0.30, 0.31, 0.32]),
+        _qp_Sigma_full=None,
+        _active_panel_scorer={"artifact_id": "hf_patchtst_seed44"},
+    )
+
+    before_orders = list(ctx.orders)
+    rc = EmitQPLiveShadowTelemetryTask().run(ctx)
+
+    assert rc is None
+    assert ctx.orders == before_orders
+    assert ctx.counters["qp_live_shadow_telemetry_rows"] == 1
+    out = tmp_path / "shadow" / "qp-live-shadow.jsonl"
+    rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["incumbent_name"] == "current_qp"
+    assert row["candidate_name"] == "hybrid_option_f_allocator"
+    assert row["panel_artifact"] == "hf_patchtst_seed44"
+    assert row["incumbent"]["live_orders_emitted"][0]["ticker"] == "AAPL"
+    assert row["candidate"]["would_have_orders"]
+    assert ctx._qp_live_shadow_telemetry_status == "written"
+
+
+def test_emit_qp_live_shadow_telemetry_task_default_disabled(tmp_path) -> None:
+    ctx = SimpleNamespace(
+        config={},
+        strategy_dir=tmp_path,
+        counters={},
+    )
+
+    rc = EmitQPLiveShadowTelemetryTask().run(ctx)
+
+    assert rc is None
+    assert not (tmp_path / "artifacts").exists()
+    assert ctx.counters == {}

@@ -29,8 +29,6 @@ from renquant_pipeline.kernel.pipeline.atoms import (
     BuildVectorFromMappingTask,
     IncrementCounterTask,
     LogSummaryTask,
-    SkipIfConfigDisabledTask,
-    SkipIfFieldEqualsTask,
     StableTickerOrderTask,
 )
 from renquant_pipeline.kernel.pipeline.context import InferenceContext
@@ -38,6 +36,9 @@ from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 from renquant_pipeline.kernel.pipeline.task_benchmark_sleeve import (
     benchmark_sleeve_ticker,
     exclude_benchmark_sleeve_from_alpha,
+)
+from renquant_pipeline.kernel.portfolio_qp.live_shadow_telemetry import (
+    EmitQPLiveShadowTelemetryTask,
 )
 
 from .tasks import (
@@ -503,6 +504,7 @@ class JointPortfolioQPJob(Job):
 
             # ── Phase 5: emit (domain) ─────────────────────────────────
             EmitOrdersFromQPSolutionTask(),
+            EmitQPLiveShadowTelemetryTask(),
 
             # ── Phase 6: telemetry (atoms) ─────────────────────────────
             IncrementCounterTask("qp_buys",  amount="_qp_n_buys"),
