@@ -32,7 +32,6 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     replay_all,
 )
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (
-    AllocatorResult,
     equal_weight_top_k,
     fractional_kelly_top_k,
     hard_only_qp_allocator,
@@ -467,6 +466,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "(must match a populated ticker_forward_returns column: "
              "1, 5, 10, 20, or 60). Default 60 matches the prod label.",
     )
+    p.add_argument(
+        "--allow-overlapping-forward-horizon",
+        action="store_true",
+        help="research-only escape hatch: allow fwd_horizon_days > 1 even "
+             "though replay metrics treat each bar return as a daily return",
+    )
     p.add_argument("--loader-module", type=str, default=None,
                    help="Optional module:function to load WF bars "
                         "(default uses wf_replay_loader.load_replay_bars_from_sim_db)")
@@ -477,6 +482,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "ConstraintSnapshot carries sector caps so the "
                         "verdict can be decision-grade (#136 / #154 Option 2).")
     args = p.parse_args(argv)
+
+    if args.fwd_horizon_days != 1 and not args.allow_overlapping_forward_horizon:
+        invalid = {
+            "invalid_experiment": True,
+            "reason": "forward_horizon_not_daily",
+            "detail": (
+                "The A/B replay reports paired daily returns, annualized Sharpe, "
+                "and cumulative return. Using fwd_horizon_days > 1 would treat "
+                "overlapping multi-day forward returns as daily bar returns and "
+                "inflate promotion evidence. Use --fwd-horizon-days 1 for "
+                "decision-grade replay, or pass "
+                "--allow-overlapping-forward-horizon for research-only diagnostics."
+            ),
+            "wf_artifact_root": args.wf_artifact_root,
+            "cut_range": [args.start_cut, args.end_cut],
+            "fwd_horizon_days": args.fwd_horizon_days,
+            "allocators": args.allocators.split(","),
+        }
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(invalid, indent=2, sort_keys=True))
+        log.error(
+            "blocked replay with fwd_%dd as daily-return evidence — wrote "
+            "invalid_experiment to %s",
+            args.fwd_horizon_days,
+            out_path,
+        )
+        return 2
 
     bars = _load_bars(args)
     # Fail loud on zero bars (#204 Task 4): the loader returns 0 bars when
@@ -522,6 +555,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     payload["wf_artifact_root"] = args.wf_artifact_root
     payload["cut_range"] = [args.start_cut, args.end_cut]
     payload["fwd_horizon_days"] = args.fwd_horizon_days
+    payload["forward_return_semantics"] = {
+        "fwd_horizon_days": args.fwd_horizon_days,
+        "overlapping_forward_horizon_allowed": bool(
+            args.allow_overlapping_forward_horizon
+        ),
+        "decision_grade_daily_return": args.fwd_horizon_days == 1,
+    }
     # Step-4h provenance (#154 contract): record where the sector caps
     # came from so reviewers can distinguish "cap matches the bar" from
     # "today's-map approximation". Option 2 snapshots today's map for all
