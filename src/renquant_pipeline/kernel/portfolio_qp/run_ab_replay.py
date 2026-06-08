@@ -32,6 +32,7 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     replay_all,
 )
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (
+    current_qp_allocator,
     equal_weight_top_k,
     fractional_kelly_top_k,
     hard_only_qp_allocator,
@@ -53,6 +54,7 @@ log = logging.getLogger("qp-ab-replay")
 #: assembling the run set. Step 4d/4e/4f register their entries via
 #: ``register_allocator()``.
 _ALLOCATOR_REGISTRY: dict[str, Callable] = {
+    "current_qp": current_qp_allocator,
     "equal_weight_top_k": equal_weight_top_k,
     "inverse_vol_top_k": inverse_vol_top_k,
     "fractional_kelly_top_k": fractional_kelly_top_k,
@@ -384,6 +386,7 @@ def run_replay(
         "regime_distribution": _regime_counts(bars),
         "constraint_snapshot_contract_version": "v1-2026-06-03",
         "allocators": list(allocator_names),
+        "incumbent": incumbent,
         "per_allocator": per_allocator,
         "paired_comparisons": paired_block,
         "significance": significance_block,
@@ -454,10 +457,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="Output path for the verdict JSON")
     p.add_argument(
         "--allocators", type=str,
-        default="equal_weight_top_k,inverse_vol_top_k,fractional_kelly_top_k",
+        default=(
+            "current_qp,equal_weight_top_k,inverse_vol_top_k,"
+            "fractional_kelly_top_k,hybrid_option_f_allocator,"
+            "hard_only_qp_allocator"
+        ),
         help="Comma-separated allocator names from the registry",
     )
-    p.add_argument("--incumbent", type=str, default="fractional_kelly_top_k",
+    p.add_argument("--incumbent", type=str, default="current_qp",
                    help="Incumbent allocator name for paired comparisons")
     p.add_argument("--pbo-n-slices", type=int, default=16)
     p.add_argument(
@@ -529,6 +536,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cut_range": [args.start_cut, args.end_cut],
             "fwd_horizon_days": args.fwd_horizon_days,
             "allocators": args.allocators.split(","),
+            "incumbent": args.incumbent,
         }
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -565,6 +573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cut_range": [args.start_cut, args.end_cut],
             "fwd_horizon_days": args.fwd_horizon_days,
             "allocators": args.allocators.split(","),
+            "incumbent": args.incumbent,
         }
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)

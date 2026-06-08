@@ -20,6 +20,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from renquant_pipeline.kernel.portfolio_qp.allocator_replay import AllocatorReplayBar  # noqa: E402
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa: E402
+    current_qp_allocator,
     equal_weight_top_k,
     fractional_kelly_top_k,
     inverse_vol_top_k,
@@ -145,6 +146,7 @@ def _write_cli_fixture_db(db_path: Path) -> None:
 
 class TestRegistry:
     def test_default_allocators_resolvable(self):
+        assert get_allocator("current_qp") is current_qp_allocator
         assert get_allocator("equal_weight_top_k") is equal_weight_top_k
         assert get_allocator("inverse_vol_top_k") is inverse_vol_top_k
         assert get_allocator("fractional_kelly_top_k") is fractional_kelly_top_k
@@ -190,6 +192,7 @@ class TestRunReplayEndToEnd:
         assert set(payload["per_allocator"]) == {
             "equal_weight_top_k", "inverse_vol_top_k", "fractional_kelly_top_k",
         }
+        assert payload["incumbent"] == "fractional_kelly_top_k"
         # Paired comparisons key incumbent vs each other allocator
         assert "fractional_kelly_top_k_vs_equal_weight_top_k" in payload["paired_comparisons"]
         assert "fractional_kelly_top_k_vs_inverse_vol_top_k" in payload["paired_comparisons"]
@@ -571,6 +574,17 @@ class TestCLISmoke:
             payload = json.loads(out.read_text())
             assert payload["fwd_horizon_days"] == 1
             assert payload["n_bars"] == 10
+            assert payload["incumbent"] == "current_qp"
+            assert payload["allocators"] == [
+                "current_qp",
+                "equal_weight_top_k",
+                "inverse_vol_top_k",
+                "fractional_kelly_top_k",
+                "hybrid_option_f_allocator",
+                "hard_only_qp_allocator",
+            ]
+            assert "current_qp_vs_equal_weight_top_k" in payload["paired_comparisons"]
+            assert "current_qp_vs_hard_only_qp_allocator" in payload["paired_comparisons"]
 
     def test_main_blocks_multiday_forward_horizon_without_research_escape(self):
         with tempfile.TemporaryDirectory() as td:
@@ -590,6 +604,7 @@ class TestCLISmoke:
             assert payload["invalid_experiment"] is True
             assert payload["reason"] == "forward_horizon_not_daily"
             assert payload["fwd_horizon_days"] == 60
+            assert payload["incumbent"] == "current_qp"
             assert "verdict" not in payload
 
 

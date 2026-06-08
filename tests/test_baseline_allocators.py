@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa: E402
     AllocatorResult,
+    current_qp_allocator,
     equal_weight_top_k,
     fractional_kelly_top_k,
     hard_only_qp_allocator,
@@ -562,6 +563,48 @@ class TestHardOnlyQPAllocator:
         daily = gross - cost
         assert np.isfinite(daily), "daily P&L must be finite"
         assert turn >= 0.0
+
+
+class TestCurrentQPAllocator:
+    """Replay incumbent: current QP wrapper defaults via ConstraintSnapshot."""
+
+    def test_basic_feasible_solve(self):
+        snap = _snap(4, w_upper_hard=np.full(4, 0.40), turnover_max=None)
+        mu = np.array([0.05, 0.04, 0.03, 0.02])
+        sigma = np.array([0.10, 0.10, 0.10, 0.10])
+
+        res = current_qp_allocator(snap, mu=mu, sigma=sigma)
+
+        assert isinstance(res, AllocatorResult)
+        assert res.status == "optimal"
+        assert (res.target_w <= snap.w_upper_hard + 1e-6).all()
+        assert (res.target_w >= -1e-6).all()
+        assert res.target_w.sum() <= 1.0 - snap.cash_reserve + 1e-6
+        np.testing.assert_allclose(
+            res.target_w, snap.w_current + res.delta_w, atol=1e-9,
+        )
+        assert res.selected_indices == tuple(
+            int(i) for i in np.where(np.abs(res.delta_w) > 1e-9)[0]
+        )
+
+    def test_over_cap_holding_infeasible_status_names_current_qp(self):
+        snap = _snap(
+            3,
+            w_current=np.array([0.20, 0.20, 0.10]),
+            w_upper_hard=np.full(3, 0.30),
+            w_upper=np.full(3, 0.30),
+            cash_reserve=0.95,
+            dw_max=np.zeros(3),
+            turnover_max=None,
+        )
+        mu = np.array([0.05, 0.04, 0.03])
+        sigma = np.array([0.10, 0.10, 0.10])
+
+        res = current_qp_allocator(snap, mu=mu, sigma=sigma)
+
+        assert res.status.startswith("infeasible:current_qp:"), res.status
+        np.testing.assert_allclose(res.delta_w, np.zeros(3), atol=1e-9)
+        np.testing.assert_allclose(res.target_w, snap.w_current, atol=1e-9)
 
 
 class TestHybridOptionFAllocator:
