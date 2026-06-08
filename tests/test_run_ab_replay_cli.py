@@ -439,6 +439,54 @@ class TestAssembleVerdict:
 
 
 class TestCLISmoke:
+    def test_main_diagnose_readiness_writes_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "sim_runs.db"
+            _write_cli_fixture_db(db)
+            cfg = Path(td) / "strategy_config.json"
+            cfg.write_text(json.dumps({
+                "sector_map": {"AAPL": "tech", "MSFT": "tech", "GOOG": "comm"},
+                "max_positions_per_sector": 2,
+            }))
+            out = Path(td) / "readiness.json"
+
+            rc = main([
+                "--wf-artifact-root", td,
+                "--start-cut", "2024-01-01",
+                "--end-cut", "2024-01-30",
+                "--out", str(out),
+                "--strategy-config", str(cfg),
+                "--diagnose-readiness",
+            ])
+
+            assert rc == 0
+            payload = json.loads(out.read_text())
+            assert payload["schema_version"] == "qp-replay-readiness-v1"
+            assert payload["ok"] is True
+            assert payload["overlap"]["bars_loadable"] == 30
+            assert payload["constraint_fidelity"]["decision_grade"] is True
+            assert payload["sector_snapshot_source"] == "today_snapshot"
+
+    def test_main_diagnose_readiness_fails_closed_without_sector_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "sim_runs.db"
+            _write_cli_fixture_db(db)
+            out = Path(td) / "readiness.json"
+
+            rc = main([
+                "--wf-artifact-root", td,
+                "--start-cut", "2024-01-01",
+                "--end-cut", "2024-01-30",
+                "--out", str(out),
+                "--diagnose-readiness",
+            ])
+
+            assert rc == 2
+            payload = json.loads(out.read_text())
+            assert payload["ok"] is False
+            assert "sector_cap_snapshot_missing" in payload["failure_reasons"]
+            assert payload["overlap"]["bars_loadable"] == 30
+
     def test_main_with_default_wf_loader_writes_verdict_json(self):
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "sim_runs.db"

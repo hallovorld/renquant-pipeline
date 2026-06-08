@@ -36,8 +36,8 @@ from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa:
     fractional_kelly_top_k,
     inverse_vol_top_k,
 )
-from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot  # noqa: E402
 from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (  # noqa: E402
+    diagnose_replay_readiness_from_sim_db,
     load_replay_bars_from_sim_db,
 )
 
@@ -250,6 +250,68 @@ class TestReplayHarnessIntegration:
             assert len(res.daily_returns_net) == 3
 
 
+class TestReplayReadinessDiagnostic:
+    def test_reports_decision_grade_ready_when_overlap_and_sector_caps_exist(self, fixture_db):
+        report = diagnose_replay_readiness_from_sim_db(
+            fixture_db,
+            "2026-01-01",
+            "2026-01-03",
+            sector_map={"AAPL": "tech", "MSFT": "tech", "GOOG": "comm"},
+            max_per_sector=2,
+        )
+
+        assert report["ok"] is True
+        assert report["failure_reasons"] == []
+        assert report["score_distribution"]["rows_with_mu_sigma"] == 8
+        assert report["ticker_forward_returns"]["rows_with_forward_return"] == 8
+        assert report["overlap"]["bars_loadable"] == 3
+        assert report["constraint_fidelity"]["decision_grade"] is True
+
+    def test_reports_missing_forward_returns_and_overlap(self, tmp_path):
+        db = tmp_path / "sim_runs.db"
+        _build_fixture_db(
+            db,
+            dates=["2026-01-01"],
+            tickers_per_date={"2026-01-01": ["AAPL", "MSFT"]},
+            regime_per_date={"2026-01-01": "BULL_CALM"},
+            fwd_60_per_pair={
+                ("2026-01-01", "AAPL"): None,
+                ("2026-01-01", "MSFT"): None,
+            },
+        )
+
+        report = diagnose_replay_readiness_from_sim_db(
+            db,
+            "2026-01-01",
+            "2026-01-01",
+            sector_map={"AAPL": "tech", "MSFT": "tech"},
+            max_per_sector=2,
+        )
+
+        assert report["ok"] is False
+        assert "fwd_60d_missing" in report["failure_reasons"]
+        assert "date_ticker_overlap_missing" in report["failure_reasons"]
+        assert "no_loadable_replay_bars" in report["failure_reasons"]
+        assert report["score_distribution"]["rows_with_mu_sigma"] == 2
+        assert report["ticker_forward_returns"]["rows_with_forward_return"] == 0
+        assert report["overlap"]["rows_with_mu_sigma_and_forward_return"] == 0
+
+    def test_reports_sector_snapshot_missing_as_not_decision_grade(self, fixture_db):
+        report = diagnose_replay_readiness_from_sim_db(
+            fixture_db,
+            "2026-01-01",
+            "2026-01-03",
+        )
+
+        assert report["ok"] is False
+        assert report["overlap"]["bars_loadable"] == 3
+        assert report["constraint_fidelity"]["decision_grade"] is False
+        assert report["constraint_fidelity"]["missing_critical_families"] == [
+            "sector_cap"
+        ]
+        assert "sector_cap_snapshot_missing" in report["failure_reasons"]
+
+
 class TestStep4hSectorSnapshot:
     def test_build_sector_matrix_from_map(self):
         """#136/#154 Step-4h: today's sector_map -> (S, cap_vec, names)."""
@@ -282,8 +344,6 @@ class TestStep4hSectorSnapshot:
         assert snap.sector_indicator is not None
         assert snap.sector_cap_vec is not None
         # one bar carrying sector caps -> decision_grade True
-        from renquant_pipeline.kernel.portfolio_qp.allocator_replay import AllocatorReplayBar
-        import numpy as np
         bar = AllocatorReplayBar(
             bar_date="d-0", snap=snap,
             mu=np.array([0.02, 0.01, 0.015]),
@@ -297,8 +357,6 @@ class TestStep4hSectorSnapshot:
     def test_build_snapshot_without_sector_not_decision_grade(self):
         from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import _build_snapshot
         from renquant_pipeline.kernel.portfolio_qp.run_ab_replay import constraint_fidelity_block
-        from renquant_pipeline.kernel.portfolio_qp.allocator_replay import AllocatorReplayBar
-        import numpy as np
         snap = _build_snapshot(["AAPL", "MSFT"], "BULL_CALM")  # no sector args
         assert snap.sector_indicator is None
         bar = AllocatorReplayBar(

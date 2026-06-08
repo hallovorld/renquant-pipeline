@@ -342,4 +342,221 @@ def load_replay_bars_from_sim_db(
     return bars
 
 
-__all__ = ["load_replay_bars_from_sim_db"]
+def _scalar(cur: sqlite3.Cursor, sql: str, params: tuple = ()) -> int:
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    return int(row[0] or 0)
+
+
+def _table_exists(cur: sqlite3.Cursor, table: str) -> bool:
+    cur.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    )
+    return cur.fetchone() is not None
+
+
+def _per_date_overlap_stats(cur: sqlite3.Cursor, fwd_col: str, params: tuple) -> dict:
+    cur.execute(
+        f"""
+        SELECT s.date, COUNT(*) AS n
+        FROM score_distribution s
+        INNER JOIN ticker_forward_returns t
+            ON s.date = t.as_of_date AND s.ticker = t.ticker
+        WHERE s.date BETWEEN ? AND ?
+          AND s.mu IS NOT NULL
+          AND s.sigma IS NOT NULL
+          AND t.{fwd_col} IS NOT NULL
+        GROUP BY s.date
+        ORDER BY s.date ASC
+        """,
+        params,
+    )
+    counts = [(str(date), int(n)) for date, n in cur.fetchall()]
+    loadable = [(date, n) for date, n in counts if n >= 2]
+    values = [n for _, n in counts]
+    return {
+        "dates_with_any_overlap": len(counts),
+        "bars_loadable": len(loadable),
+        "dates_with_lt2_tickers": [
+            {"date": date, "usable_tickers": n}
+            for date, n in counts
+            if n < 2
+        ][:25],
+        "usable_tickers_per_date": {
+            "min": min(values) if values else 0,
+            "max": max(values) if values else 0,
+            "mean": float(np.mean(values)) if values else 0.0,
+        },
+    }
+
+
+def diagnose_replay_readiness_from_sim_db(
+    db_path: "str | Path",
+    start_date: str,
+    end_date: str,
+    *,
+    fwd_horizon_days: int = 60,
+    sector_map: Optional[dict] = None,
+    max_per_sector: int = 0,
+) -> dict:
+    """Report whether ``sim_runs.db`` can produce decision-grade QP replay bars.
+
+    This is read-only and intentionally separate from ``load_replay_bars`` so an
+    operator can diagnose missing mu/sigma, missing forward returns, or overlap
+    gaps before running the full A/B replay.
+    """
+    db_path = Path(db_path)
+    fwd_col = _fwd_column(fwd_horizon_days)
+    report = {
+        "schema_version": "qp-replay-readiness-v1",
+        "db_path": str(db_path),
+        "date_range": [start_date, end_date],
+        "fwd_horizon_days": int(fwd_horizon_days),
+        "fwd_column": fwd_col,
+        "ok": False,
+        "failure_reasons": [],
+        "tables": {},
+        "score_distribution": {},
+        "ticker_forward_returns": {},
+        "overlap": {},
+        "constraint_fidelity": {},
+    }
+    if not db_path.exists():
+        report["failure_reasons"].append("db_missing")
+        return report
+
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        has_score = _table_exists(cur, "score_distribution")
+        has_fwd = _table_exists(cur, "ticker_forward_returns")
+        report["tables"] = {
+            "score_distribution": has_score,
+            "ticker_forward_returns": has_fwd,
+        }
+        if not has_score or not has_fwd:
+            if not has_score:
+                report["failure_reasons"].append("score_distribution_missing")
+            if not has_fwd:
+                report["failure_reasons"].append("ticker_forward_returns_missing")
+            return report
+
+        params = (start_date, end_date)
+        report["score_distribution"] = {
+            "rows_in_range": _scalar(
+                cur,
+                "SELECT COUNT(*) FROM score_distribution WHERE date BETWEEN ? AND ?",
+                params,
+            ),
+            "rows_with_mu": _scalar(
+                cur,
+                "SELECT COUNT(*) FROM score_distribution "
+                "WHERE date BETWEEN ? AND ? AND mu IS NOT NULL",
+                params,
+            ),
+            "rows_with_sigma": _scalar(
+                cur,
+                "SELECT COUNT(*) FROM score_distribution "
+                "WHERE date BETWEEN ? AND ? AND sigma IS NOT NULL",
+                params,
+            ),
+            "rows_with_mu_sigma": _scalar(
+                cur,
+                "SELECT COUNT(*) FROM score_distribution "
+                "WHERE date BETWEEN ? AND ? AND mu IS NOT NULL AND sigma IS NOT NULL",
+                params,
+            ),
+            "distinct_dates_with_mu_sigma": _scalar(
+                cur,
+                "SELECT COUNT(DISTINCT date) FROM score_distribution "
+                "WHERE date BETWEEN ? AND ? AND mu IS NOT NULL AND sigma IS NOT NULL",
+                params,
+            ),
+            "distinct_tickers_with_mu_sigma": _scalar(
+                cur,
+                "SELECT COUNT(DISTINCT ticker) FROM score_distribution "
+                "WHERE date BETWEEN ? AND ? AND mu IS NOT NULL AND sigma IS NOT NULL",
+                params,
+            ),
+        }
+        report["ticker_forward_returns"] = {
+            "rows_in_range": _scalar(
+                cur,
+                "SELECT COUNT(*) FROM ticker_forward_returns "
+                "WHERE as_of_date BETWEEN ? AND ?",
+                params,
+            ),
+            "rows_with_forward_return": _scalar(
+                cur,
+                f"SELECT COUNT(*) FROM ticker_forward_returns "
+                f"WHERE as_of_date BETWEEN ? AND ? AND {fwd_col} IS NOT NULL",
+                params,
+            ),
+            "distinct_dates_with_forward_return": _scalar(
+                cur,
+                f"SELECT COUNT(DISTINCT as_of_date) FROM ticker_forward_returns "
+                f"WHERE as_of_date BETWEEN ? AND ? AND {fwd_col} IS NOT NULL",
+                params,
+            ),
+            "distinct_tickers_with_forward_return": _scalar(
+                cur,
+                f"SELECT COUNT(DISTINCT ticker) FROM ticker_forward_returns "
+                f"WHERE as_of_date BETWEEN ? AND ? AND {fwd_col} IS NOT NULL",
+                params,
+            ),
+        }
+        overlap_rows = _scalar(
+            cur,
+            f"""
+            SELECT COUNT(*)
+            FROM score_distribution s
+            INNER JOIN ticker_forward_returns t
+                ON s.date = t.as_of_date AND s.ticker = t.ticker
+            WHERE s.date BETWEEN ? AND ?
+              AND s.mu IS NOT NULL
+              AND s.sigma IS NOT NULL
+              AND t.{fwd_col} IS NOT NULL
+            """,
+            params,
+        )
+        report["overlap"] = {
+            "rows_with_mu_sigma_and_forward_return": overlap_rows,
+            **_per_date_overlap_stats(cur, fwd_col, params),
+        }
+    finally:
+        conn.close()
+
+    score = report["score_distribution"]
+    fwd = report["ticker_forward_returns"]
+    overlap = report["overlap"]
+    sector_supplied = bool(sector_map) and max_per_sector > 0
+    report["constraint_fidelity"] = {
+        "decision_grade": bool(sector_supplied and overlap["bars_loadable"] > 0),
+        "sector_map_supplied": bool(sector_map),
+        "max_per_sector": int(max_per_sector or 0),
+        "missing_critical_families": [] if sector_supplied else ["sector_cap"],
+        "note": (
+            "Decision-grade QP replay requires loadable bars plus sector caps "
+            "in each ConstraintSnapshot."
+        ),
+    }
+    if score["rows_with_mu_sigma"] == 0:
+        report["failure_reasons"].append("score_distribution_mu_sigma_missing")
+    if fwd["rows_with_forward_return"] == 0:
+        report["failure_reasons"].append(f"{fwd_col}_missing")
+    if overlap["rows_with_mu_sigma_and_forward_return"] == 0:
+        report["failure_reasons"].append("date_ticker_overlap_missing")
+    if overlap["bars_loadable"] == 0:
+        report["failure_reasons"].append("no_loadable_replay_bars")
+    if not sector_supplied:
+        report["failure_reasons"].append("sector_cap_snapshot_missing")
+    report["failure_reasons"] = sorted(set(report["failure_reasons"]))
+    report["ok"] = not report["failure_reasons"]
+    return report
+
+
+__all__ = [
+    "diagnose_replay_readiness_from_sim_db",
+    "load_replay_bars_from_sim_db",
+]
