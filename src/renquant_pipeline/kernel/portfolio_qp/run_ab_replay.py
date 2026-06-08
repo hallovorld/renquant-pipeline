@@ -32,7 +32,6 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     replay_all,
 )
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (
-    AllocatorResult,
     equal_weight_top_k,
     fractional_kelly_top_k,
     hard_only_qp_allocator,
@@ -476,7 +475,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         "max_positions_per_sector). When set, the replay "
                         "ConstraintSnapshot carries sector caps so the "
                         "verdict can be decision-grade (#136 / #154 Option 2).")
+    p.add_argument(
+        "--diagnose-readiness",
+        action="store_true",
+        help="write a read-only replay readiness report to --out and exit "
+             "without running allocators",
+    )
     args = p.parse_args(argv)
+
+    if args.diagnose_readiness:
+        from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (
+            diagnose_replay_readiness_from_sim_db,
+        )
+
+        sector_map, max_per_sector = _load_sector_config(args)
+        report = diagnose_replay_readiness_from_sim_db(
+            _default_sim_db_path(args.wf_artifact_root),
+            args.start_cut,
+            args.end_cut,
+            fwd_horizon_days=args.fwd_horizon_days,
+            sector_map=sector_map,
+            max_per_sector=max_per_sector,
+        )
+        report["wf_artifact_root"] = args.wf_artifact_root
+        report["sector_snapshot_source"] = (
+            "today_snapshot" if args.strategy_config else "none_sector_blind"
+        )
+        out_path = Path(args.out)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+        log.info("wrote replay readiness report to %s", out_path)
+        return 0 if report["ok"] else 2
 
     bars = _load_bars(args)
     # Fail loud on zero bars (#204 Task 4): the loader returns 0 bars when
