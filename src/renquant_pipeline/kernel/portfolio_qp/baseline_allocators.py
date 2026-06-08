@@ -539,6 +539,59 @@ def hybrid_option_f_allocator(
     return _build_result(snap, qp.target_w, selected, "optimal:qp_fallback")
 
 
+def current_qp_allocator(
+    snap: ConstraintSnapshot,
+    *,
+    mu: Sequence[float],
+    sigma: Optional[Sequence[float]] = None,
+    Sigma: Optional[np.ndarray] = None,
+) -> AllocatorResult:
+    """Current QP candidate for the §8 Step 4 replay incumbent.
+
+    This allocator routes through :func:`solve_portfolio_qp_from_snapshot`
+    without zeroing the wrapper's soft-objective defaults. It is therefore
+    the replay harness' current-QP comparison point; the separate
+    :func:`hard_only_qp_allocator` intentionally disables soft terms and
+    must remain a challenger/baseline, not the incumbent alias.
+
+    The replay loader supplies the immutable hard-constraint snapshot and
+    forecast vectors. Strategy-config-specific soft coefficients are not
+    plumbed through this allocator yet; until they are, this name means
+    "current snapshot QP wrapper defaults" and is the only defensible
+    incumbent available inside ``run_ab_replay``.
+    """
+    sigma_eff = sigma
+    if sigma_eff is None and Sigma is None:
+        sigma_eff = np.full(snap.n, 0.05, dtype=float)
+
+    sol = solve_portfolio_qp_from_snapshot(
+        snap,
+        mu=mu,
+        sigma=sigma_eff,
+        Sigma=Sigma,
+    )
+
+    if sol.status == "optimal" or sol.status == "optimal_no_signal":
+        out_status = "optimal"
+    elif sol.status.startswith("infeasible"):
+        out_status = f"infeasible:current_qp:{sol.status}"
+    else:
+        out_status = sol.status
+
+    delta_w = np.asarray(sol.delta_w, dtype=float)
+    target_w = np.asarray(sol.target_w, dtype=float)
+    selected = tuple(
+        int(i) for i in np.where(np.abs(delta_w) > 1e-9)[0]
+    )
+
+    return AllocatorResult(
+        delta_w=delta_w,
+        target_w=target_w,
+        status=out_status,
+        selected_indices=selected,
+    )
+
+
 def hard_only_qp_allocator(
     snap: ConstraintSnapshot,
     *,
