@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .decision_trace import model_type_from_artifact
+from .decision_trace import active_panel_model_type, model_type_from_artifact
 
 
 ATTRIBUTION_VERSION = "order_attribution_v1"
@@ -33,7 +33,8 @@ def score_snapshot(
     return {
         "ticker": ticker,
         "model_type": _attr(source_obj, "model_type")
-        or model_type_from_artifact(artifact),
+        or model_type_from_artifact(artifact)
+        or active_panel_model_type(config, ctx),
         "sector": sectors.get(ticker, "UNKNOWN"),
         "score": _finite_or_none(scores.get(ticker)),
         "panel_score": _finite_or_none(panel_scores.get(ticker)),

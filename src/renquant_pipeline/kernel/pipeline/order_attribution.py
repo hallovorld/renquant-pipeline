@@ -37,11 +37,17 @@ def _model_type_for(ctx: Any, ticker: str | None) -> str | None:
     if not ticker or ctx is None:
         return None
     try:
-        from renquant_pipeline.kernel.decision_trace import model_type_from_artifact  # noqa: PLC0415
+        from renquant_pipeline.kernel.decision_trace import (  # noqa: PLC0415
+            active_panel_model_type,
+            model_type_from_artifact,
+        )
     except Exception:
         return None
     models = getattr(ctx, "models", None) or {}
-    return model_type_from_artifact(models.get(ticker))
+    return (
+        model_type_from_artifact(models.get(ticker))
+        or active_panel_model_type(getattr(ctx, "config", None), ctx)
+    )
 
 
 def _sector_for(ctx: Any, ticker: str | None) -> str | None:

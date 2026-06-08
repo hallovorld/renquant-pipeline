@@ -21,7 +21,11 @@ from typing import Any
 
 import numpy as np
 
-from renquant_pipeline.kernel.decision_trace import candidate_trace_pool, model_types_from_models
+from renquant_pipeline.kernel.decision_trace import (
+    active_panel_model_type,
+    candidate_trace_pool,
+    model_types_from_models,
+)
 
 from .context import InferenceContext
 from .pipeline import Task
@@ -66,6 +70,7 @@ class RecordScoreDistributionTask(Task):
         blocked_map = getattr(ctx, "_blocked_by_ticker", None) or {}
         sector_map = (ctx.config or {}).get("sector_map", {}) or {}
         model_types = model_types_from_models(getattr(ctx, "models", None) or {})
+        active_model_type = active_panel_model_type(ctx.config, ctx)
         candidate_tickers = {getattr(c, "ticker", None) for c in cand_pool}
 
         rows: list[tuple] = []
@@ -81,7 +86,7 @@ class RecordScoreDistributionTask(Task):
                 getattr(c, "sigma", None),
                 regime,
                 0,  # is_holding=False
-                model_types.get(ticker),
+                getattr(c, "model_type", None) or model_types.get(ticker) or active_model_type,
                 _sector_for(ticker, sector_map),
                 blocked_map.get(ticker),
             ))
@@ -98,7 +103,7 @@ class RecordScoreDistributionTask(Task):
                 getattr(hs, "sigma", None),
                 regime,
                 1,  # is_holding=True
-                model_types.get(ticker),
+                getattr(hs, "model_type", None) or model_types.get(ticker) or active_model_type,
                 _sector_for(ticker, sector_map),
                 blocked_map.get(ticker),
             ))

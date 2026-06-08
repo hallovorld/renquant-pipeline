@@ -14,17 +14,32 @@ def model_type_from_artifact(artifact: dict[str, Any] | None) -> str | None:
     """Infer a stable model-type label from an artifact manifest."""
     if not isinstance(artifact, dict):
         return None
-    for key in ("model_type", "model_family", "kind", "backend"):
+    for key in ("kind", "model_type", "model_family", "backend"):
         value = artifact.get(key)
         if value:
             return str(value)
     metadata = artifact.get("metadata")
     if isinstance(metadata, dict):
-        for key in ("model_type", "model_family", "kind", "backend"):
+        for key in ("kind", "model_type", "model_family", "backend"):
             value = metadata.get(key)
             if value:
                 return str(value)
     return None
+
+
+def active_panel_model_type(config: dict[str, Any] | None, ctx: Any | None = None) -> str | None:
+    if ctx is not None:
+        value = getattr(ctx, "_active_panel_model_type", None)
+        if isinstance(value, str) and value:
+            return value
+    panel_cfg = (
+        ((config or {}).get("ranking", {}) or {})
+        .get("panel_scoring", {})
+        or {}
+    )
+    if panel_cfg.get("enabled") is False:
+        return None
+    return str(panel_cfg.get("kind") or (config or {}).get("panel_ltr", {}).get("backend") or "xgb")
 
 
 def build_ticker_daily_state_rows(
@@ -51,8 +66,13 @@ def build_ticker_daily_state_rows(
     rank_scores = getattr(ctx, "rank_scores", None) or scores
     watchlist = list(config.get("watchlist") or [])
     held = _position_tickers(getattr(ctx, "account_snapshot", {}) or {})
-    ticker_order = _stable_ticker_order(watchlist, held, selected, blocked, pending, extra_tickers)
-    artifact_model_type = model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+    ticker_order = _stable_ticker_order(
+        watchlist, held, selected, blocked, pending, extra_tickers,
+    )
+    artifact_model_type = (
+        model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+        or active_panel_model_type(config, ctx)
+    )
     admission = _model_admission_trace(
         getattr(ctx, "_regime_model_admission", None)
         or getattr(ctx, "model_admission", None)

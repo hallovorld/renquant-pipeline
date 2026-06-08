@@ -41,6 +41,23 @@ def model_types_from_models(models: dict[str, Any] | None) -> dict[str, str | No
     }
 
 
+def active_panel_model_type(config: dict | None, ctx: Any | None = None) -> str | None:
+    """Return the active panel scorer family used for buy-side ranking."""
+    if ctx is not None:
+        value = getattr(ctx, "_active_panel_model_type", None)
+        if isinstance(value, str) and value:
+            return value
+    panel_cfg = (
+        ((config or {}).get("ranking", {}) or {})
+        .get("panel_scoring", {})
+        or {}
+    )
+    if panel_cfg.get("enabled") is False:
+        return None
+    kind = panel_cfg.get("kind") or (config or {}).get("panel_ltr", {}).get("backend")
+    return str(kind or "xgb")
+
+
 def selected_buy_tickers(trade_events: list[dict[str, Any]] | None) -> set[str]:
     """Return tickers with buy trade/order events."""
     return {
@@ -244,7 +261,12 @@ def build_ticker_daily_state_rows(
             "has_position": has_pos,
             "position_qty": pos_qty,
             "position_pct": pos_pct,
-            "model_type": model_types.get(tk),
+            "model_type": (
+                model_types.get(tk)
+                or getattr(src, "model_type", None)
+                or snap.get("model_type")
+                or active_panel_model_type(config, ctx)
+            ),
             "model_action": model_action,
             "sell_streak": int(getattr(hs, "sell_streak", 0)) if hs else None,
             "panel_score": _score_value(src, snap, "panel_score"),
@@ -305,6 +327,7 @@ def _runtime_regime_admission_trace(
 
 __all__ = [
     "build_ticker_daily_state_rows",
+    "active_panel_model_type",
     "candidate_score_excluded_holding_tickers",
     "candidate_trace_pool",
     "model_type_from_artifact",
