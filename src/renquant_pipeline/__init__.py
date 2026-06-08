@@ -1,6 +1,11 @@
 """RenQuant runtime decision pipeline package."""
 
-from .inference import InferenceContext, RuntimeInferencePipeline
+from .inference import (
+    InferenceContext,
+    RuntimeInferencePipeline,
+    runtime_inference_payload,
+    write_runtime_inference_payload,
+)
 from .model_admission import ModelAdmissionResult, evaluate_model_admission
 from .decision_trace import (
     append_ticker_daily_state_rows,
@@ -75,6 +80,7 @@ __all__ = [
     "live_state_path",
     "model_type_from_artifact",
     "resolve_live_state_read",
+    "runtime_inference_payload",
     "runs_db_legacy_path",
     "runs_db_path",
     "score_snapshot",
@@ -84,4 +90,5 @@ __all__ = [
     "validate_model_evidence_contract",
     "validate_order_attribution",
     "validate_panel_artifact_contract",
+    "write_runtime_inference_payload",
 ]
