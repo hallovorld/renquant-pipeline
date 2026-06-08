@@ -192,6 +192,7 @@ class TestRunReplayEndToEnd:
         assert set(payload["per_allocator"]) == {
             "equal_weight_top_k", "inverse_vol_top_k", "fractional_kelly_top_k",
         }
+        assert payload["incumbent"] == "fractional_kelly_top_k"
         # Paired comparisons key incumbent vs each other allocator
         assert "fractional_kelly_top_k_vs_equal_weight_top_k" in payload["paired_comparisons"]
         assert "fractional_kelly_top_k_vs_inverse_vol_top_k" in payload["paired_comparisons"]
@@ -525,6 +526,7 @@ class TestCLISmoke:
             payload = json.loads(out.read_text())
             assert payload["fwd_horizon_days"] == 1
             assert payload["n_bars"] == 10
+            assert payload["incumbent"] == "current_qp"
             assert payload["allocators"] == [
                 "current_qp",
                 "equal_weight_top_k",
@@ -554,6 +556,7 @@ class TestCLISmoke:
             assert payload["invalid_experiment"] is True
             assert payload["reason"] == "forward_horizon_not_daily"
             assert payload["fwd_horizon_days"] == 60
+            assert payload["incumbent"] == "current_qp"
             assert "verdict" not in payload
 
 

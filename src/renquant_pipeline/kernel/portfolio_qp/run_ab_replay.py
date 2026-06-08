@@ -386,6 +386,7 @@ def run_replay(
         "regime_distribution": _regime_counts(bars),
         "constraint_snapshot_contract_version": "v1-2026-06-03",
         "allocators": list(allocator_names),
+        "incumbent": incumbent,
         "per_allocator": per_allocator,
         "paired_comparisons": paired_block,
         "significance": significance_block,
@@ -505,6 +506,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cut_range": [args.start_cut, args.end_cut],
             "fwd_horizon_days": args.fwd_horizon_days,
             "allocators": args.allocators.split(","),
+            "incumbent": args.incumbent,
         }
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -541,6 +543,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "cut_range": [args.start_cut, args.end_cut],
             "fwd_horizon_days": args.fwd_horizon_days,
             "allocators": args.allocators.split(","),
+            "incumbent": args.incumbent,
         }
         out_path = Path(args.out)
         out_path.parent.mkdir(parents=True, exist_ok=True)
