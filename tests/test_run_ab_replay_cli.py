@@ -499,6 +499,7 @@ class TestCLISmoke:
                 "--out", str(out),
                 "--allocators", "equal_weight_top_k,inverse_vol_top_k,fractional_kelly_top_k",
                 "--incumbent", "fractional_kelly_top_k",
+                "--allow-overlapping-forward-horizon",
             ])
             assert rc == 0
             assert out.exists()
@@ -512,6 +513,11 @@ class TestCLISmoke:
             assert payload["constraint_fidelity"]["decision_grade"] is False
             assert payload["verdict"]["promotion_candidate"] is None
             assert payload["fwd_horizon_days"] == 60  # default
+            assert payload["forward_return_semantics"] == {
+                "decision_grade_daily_return": False,
+                "fwd_horizon_days": 60,
+                "overlapping_forward_horizon_allowed": True,
+            }
 
     def test_main_with_fwd_horizon_days_flag(self):
         """--fwd-horizon-days plumbs through to the WF loader."""
@@ -566,6 +572,26 @@ class TestCLISmoke:
             assert payload["fwd_horizon_days"] == 1
             assert payload["n_bars"] == 10
 
+    def test_main_blocks_multiday_forward_horizon_without_research_escape(self):
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "sim_runs.db"
+            _write_cli_fixture_db(db)
+            out = Path(td) / "verdict.json"
+
+            rc = main([
+                "--wf-artifact-root", td,
+                "--start-cut", "2024-01-01",
+                "--end-cut", "2024-01-30",
+                "--out", str(out),
+            ])
+
+            assert rc == 2
+            payload = json.loads(out.read_text())
+            assert payload["invalid_experiment"] is True
+            assert payload["reason"] == "forward_horizon_not_daily"
+            assert payload["fwd_horizon_days"] == 60
+            assert "verdict" not in payload
+
 
     def test_main_loader_module_receives_fwd_horizon_kwarg(self, tmp_path):
         """--loader-module + --fwd-horizon-days plumbs the kwarg through."""
@@ -610,6 +636,7 @@ class TestCLISmoke:
                 "--end-cut", "2024-02-08",
                 "--out", str(out),
                 "--fwd-horizon-days", "5",
+                "--allow-overlapping-forward-horizon",
                 "--loader-module", "stubloader.loader:load",
             ])
             assert rc == 0
@@ -640,6 +667,7 @@ class TestCLISmoke:
                     "--end-cut", "2024-02-08",
                     "--out", str(tmp_path / "verdict.json"),
                     "--fwd-horizon-days", "5",
+                    "--allow-overlapping-forward-horizon",
                     "--loader-module", "badloader.loader:load",
                 ])
         finally:
@@ -667,6 +695,7 @@ class TestZeroBarsGuard:
                 "--end-cut", "2024-12-31",
                 "--out", str(out),
                 "--fwd-horizon-days", "60",
+                "--allow-overlapping-forward-horizon",
                 "--loader-module", "emptyloader.loader:load",
             ])
             assert rc == 2
