@@ -9,7 +9,9 @@ from renquant_pipeline import (
     InferenceContext,
     RuntimeInferencePipeline,
     runtime_inference_payload,
+    runtime_inference_payload_from_live_context,
     write_runtime_inference_payload,
+    write_runtime_inference_payload_from_live_context,
 )
 
 
@@ -78,6 +80,85 @@ def test_runtime_inference_payload_is_native_bundle_ready(tmp_path) -> None:
     assert payload["buy_blocked"] is False
     assert written == out
     assert json.loads(out.read_text(encoding="utf-8")) == payload
+
+
+def test_runtime_inference_payload_from_live_context_prefers_existing_trace() -> None:
+    ctx = {
+        "config": {"watchlist": ["AAPL"]},
+        "market_snapshot": {"as_of": "2026-06-08"},
+        "decision_trace": [{"ticker": "AAPL", "stage": "score"}],
+        "orders": [{"ticker": "AAPL", "action": "buy", "quantity": 1}],
+        "_blocked_by_ticker": {"MSFT": "not_in_watchlist"},
+        "_ticker_score_snapshot": {"AAPL": {"rank_score": 0.72}},
+    }
+
+    payload = runtime_inference_payload_from_live_context(ctx)
+
+    assert payload["source"] == "renquant_pipeline.live_context_inference"
+    assert payload["market_as_of"] == "2026-06-08"
+    assert payload["decision_trace"] == [{"ticker": "AAPL", "stage": "score"}]
+    assert payload["order_intents"] == [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
+    assert payload["blocked_by"] == {"MSFT": "not_in_watchlist"}
+    assert payload["scores"] == {"AAPL": 0.72}
+
+
+def test_write_runtime_inference_payload_from_live_context_writes_json(tmp_path) -> None:
+    output = tmp_path / "native-inference.json"
+    ctx = {
+        "config": {"watchlist": ["AAPL"]},
+        "decision_trace": [],
+        "orders": [],
+        "today": "2026-06-08",
+    }
+
+    written = write_runtime_inference_payload_from_live_context(
+        ctx,
+        output,
+        market_snapshot={"as_of": "2026-06-08"},
+    )
+
+    assert written == output
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["source"] == "renquant_pipeline.live_context_inference"
+    assert payload["market_as_of"] == "2026-06-08"
+    assert payload["decision_trace"] == []
+    assert payload["order_intents"] == []
+
+
+def test_runtime_inference_payload_from_live_context_builds_fallback_trace() -> None:
+    class LiveCtx:
+        config = {
+            "watchlist": ["AAPL", "MSFT"],
+            "sector_map": {"AAPL": "TECH", "MSFT": "TECH"},
+        }
+        market_snapshot = {"as_of": "2026-06-08", "regime": "BULL_CALM"}
+        account_snapshot = {"positions": {"MSFT": {"quantity": 5}}}
+        orders = [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
+        pending_broker_tickers = ["AAPL"]
+        _blocked_by_ticker = {"MSFT": "risk_gate"}
+        _ticker_score_snapshot = {
+            "AAPL": {"panel_score": 0.8},
+            "MSFT": {"panel_score": 0.3},
+        }
+
+    payload = runtime_inference_payload_from_live_context(LiveCtx())
+
+    assert payload["order_intents"] == [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
+    assert payload["scores"] == {"AAPL": 0.8, "MSFT": 0.3}
+    rows = {row["ticker"]: row for row in payload["decision_trace"]}
+    assert rows["AAPL"]["selected"] is True
+    assert rows["AAPL"]["pending_at_broker"] is True
+    assert rows["MSFT"]["has_position"] is True
+    assert rows["MSFT"]["blocked_by"] == "risk_gate"
+
+
+def test_runtime_inference_payload_from_live_context_rejects_bad_fields() -> None:
+    with pytest.raises(ValueError, match="decision_trace"):
+        runtime_inference_payload_from_live_context({
+            "config": {"watchlist": ["AAPL"]},
+            "market_snapshot": {"as_of": "2026-06-08"},
+            "decision_trace": {"ticker": "AAPL"},
+        })
 
 
 def test_runtime_pipeline_requires_artifact_manifest() -> None:

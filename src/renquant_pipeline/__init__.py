@@ -4,7 +4,9 @@ from .inference import (
     InferenceContext,
     RuntimeInferencePipeline,
     runtime_inference_payload,
+    runtime_inference_payload_from_live_context,
     write_runtime_inference_payload,
+    write_runtime_inference_payload_from_live_context,
 )
 from .model_admission import ModelAdmissionResult, evaluate_model_admission
 from .decision_trace import (
@@ -81,6 +83,7 @@ __all__ = [
     "model_type_from_artifact",
     "resolve_live_state_read",
     "runtime_inference_payload",
+    "runtime_inference_payload_from_live_context",
     "runs_db_legacy_path",
     "runs_db_path",
     "score_snapshot",
@@ -91,4 +94,5 @@ __all__ = [
     "validate_order_attribution",
     "validate_panel_artifact_contract",
     "write_runtime_inference_payload",
+    "write_runtime_inference_payload_from_live_context",
 ]
