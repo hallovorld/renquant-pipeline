@@ -7,6 +7,7 @@ operational parity. It does not run allocators and does not emit orders.
 from __future__ import annotations
 
 import datetime as dt
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -242,6 +243,106 @@ def append_live_shadow_telemetry_jsonl(
     return out
 
 
+def load_live_shadow_telemetry_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    """Load live-shadow telemetry JSONL rows."""
+    rows: list[dict[str, Any]] = []
+    with Path(path).open("r", encoding="utf-8") as fh:
+        for line in fh:
+            raw = line.strip()
+            if raw:
+                rows.append(json.loads(raw))
+    return rows
+
+
+def _mean(values: Sequence[float | None]) -> float | None:
+    cleaned = [float(value) for value in values if value is not None]
+    if not cleaned:
+        return None
+    return float(np.mean(cleaned))
+
+
+def summarize_live_shadow_telemetry(
+    rows: Sequence[dict[str, Any]],
+    *,
+    shadow_days_needed: int = 30,
+) -> dict[str, Any]:
+    """Summarize QP live-shadow JSONL rows for promotion review."""
+    anomaly_counts = Counter(
+        str(anomaly)
+        for row in rows
+        for anomaly in (row.get("anomalies") or [])
+    )
+    days = sorted({str(row.get("as_of_date")) for row in rows if row.get("as_of_date")})
+    candidate_statuses = [
+        str((row.get("candidate") or {}).get("status") or "")
+        for row in rows
+    ]
+    incumbent_statuses = [
+        str((row.get("incumbent") or {}).get("status") or "")
+        for row in rows
+    ]
+    divergence_rows = [row.get("divergence") or {} for row in rows]
+    snapshot_invalid = int(anomaly_counts.get("qp_constraint_snapshot_invalid", 0))
+    return {
+        "schema_version": "qp-live-shadow-summary-v1",
+        "source_schema_version": "qp-live-shadow-v1",
+        "n_rows": len(rows),
+        "incumbent": str(rows[0].get("incumbent_name") or "unknown") if rows else None,
+        "candidate": str(rows[0].get("candidate_name") or "unknown") if rows else None,
+        "shadow_days_logged": len(days),
+        "shadow_days_needed": int(shadow_days_needed),
+        "dates": days,
+        "metrics": {
+            "abs_target_w_l1_mean": _mean([
+                _float(row.get("abs_target_w_l1"))
+                for row in divergence_rows
+            ]),
+            "ticker_overlap_pct_mean": _mean([
+                _float(row.get("ticker_overlap_pct"))
+                for row in divergence_rows
+            ]),
+            "delta_w_sign_agreement_pct_mean": _mean([
+                _float(row.get("delta_w_sign_agreement_pct"))
+                for row in divergence_rows
+            ]),
+            "incumbent_qp_fallback_fired_pct": (
+                None if not rows else sum(
+                    status == "cap_compliance_fallback"
+                    for status in incumbent_statuses
+                ) / len(rows)
+            ),
+            "candidate_infeasible_pct": (
+                None if not rows else sum(
+                    status.startswith("infeasible")
+                    for status in candidate_statuses
+                ) / len(rows)
+            ),
+        },
+        "anomaly_count_by_type": dict(sorted(anomaly_counts.items())),
+        "promotion_gate": {
+            "ready_for_review": len(days) >= int(shadow_days_needed) and snapshot_invalid == 0,
+            "snapshot_invalid_count": snapshot_invalid,
+        },
+    }
+
+
+def write_live_shadow_summary_json(
+    *,
+    input_jsonl: str | Path,
+    output_json: str | Path,
+    shadow_days_needed: int = 30,
+) -> Path:
+    """Write a summary JSON for a QP live-shadow telemetry JSONL file."""
+    summary = summarize_live_shadow_telemetry(
+        load_live_shadow_telemetry_jsonl(input_jsonl),
+        shadow_days_needed=shadow_days_needed,
+    )
+    out = Path(output_json)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return out
+
+
 class EmitQPLiveShadowTelemetryTask(Task):
     """Emit readonly QP live-shadow telemetry after live QP order emission.
 
@@ -474,7 +575,10 @@ def _inc_counter(ctx, key: str, amount: int) -> None:
 
 
 __all__ = [
+    "EmitQPLiveShadowTelemetryTask",
     "append_live_shadow_telemetry_jsonl",
     "build_live_shadow_telemetry_envelope",
-    "EmitQPLiveShadowTelemetryTask",
+    "load_live_shadow_telemetry_jsonl",
+    "summarize_live_shadow_telemetry",
+    "write_live_shadow_summary_json",
 ]
