@@ -12,6 +12,9 @@ from renquant_pipeline.kernel.portfolio_qp.live_shadow_telemetry import (
     EmitQPLiveShadowTelemetryTask,
     append_live_shadow_telemetry_jsonl,
     build_live_shadow_telemetry_envelope,
+    load_live_shadow_telemetry_jsonl,
+    summarize_live_shadow_telemetry,
+    write_live_shadow_summary_json,
 )
 
 
@@ -183,6 +186,76 @@ def test_append_live_shadow_telemetry_jsonl(tmp_path) -> None:
 
     rows = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
     assert rows == [envelope]
+
+
+def test_live_shadow_summary_rolls_up_jsonl_rows(tmp_path) -> None:
+    snap = _snap()
+    incumbent = _Solution(
+        delta_w=np.array([0.02, -0.01, 0.00]),
+        target_w=np.array([0.12, 0.04, 0.00]),
+    )
+    candidate = _Solution(
+        delta_w=np.array([0.00, -0.01, 0.08]),
+        target_w=np.array([0.10, 0.04, 0.08]),
+    )
+    rows = []
+    for day in ("2026-06-08", "2026-06-09"):
+        rows.append(build_live_shadow_telemetry_envelope(
+            snap=snap,
+            mu=np.array([0.03, 0.02, 0.05]),
+            sigma=np.array([0.10, 0.11, 0.12]),
+            incumbent_solution=incumbent,
+            candidate_solution=candidate,
+            candidate_name="hybrid_option_f_allocator",
+            as_of_date=day,
+        ))
+    jsonl = tmp_path / "qp-live-shadow.jsonl"
+    for row in rows:
+        append_live_shadow_telemetry_jsonl(jsonl, row)
+
+    loaded = load_live_shadow_telemetry_jsonl(jsonl)
+    summary = summarize_live_shadow_telemetry(loaded, shadow_days_needed=2)
+    out = write_live_shadow_summary_json(
+        input_jsonl=jsonl,
+        output_json=tmp_path / "qp-live-shadow-summary.json",
+        shadow_days_needed=2,
+    )
+
+    assert loaded == rows
+    assert summary["schema_version"] == "qp-live-shadow-summary-v1"
+    assert summary["n_rows"] == 2
+    assert summary["shadow_days_logged"] == 2
+    assert summary["candidate"] == "hybrid_option_f_allocator"
+    assert summary["metrics"]["candidate_infeasible_pct"] == 0.0
+    assert summary["promotion_gate"]["ready_for_review"] is True
+    assert json.loads(out.read_text(encoding="utf-8")) == summary
+
+
+def test_live_shadow_summary_blocks_ready_when_snapshot_invalid() -> None:
+    summary = summarize_live_shadow_telemetry(
+        [{
+            "schema_version": "qp-live-shadow-v1",
+            "as_of_date": "2026-06-08",
+            "incumbent_name": "current_qp",
+            "candidate_name": "hybrid_option_f_allocator",
+            "incumbent": {"status": "optimal"},
+            "candidate": {"status": "infeasible:hard_cap"},
+            "divergence": {
+                "abs_target_w_l1": 0.3,
+                "ticker_overlap_pct": 0.5,
+                "delta_w_sign_agreement_pct": 0.0,
+            },
+            "anomalies": ["qp_constraint_snapshot_invalid"],
+        }],
+        shadow_days_needed=1,
+    )
+
+    assert summary["metrics"]["candidate_infeasible_pct"] == 1.0
+    assert summary["anomaly_count_by_type"] == {"qp_constraint_snapshot_invalid": 1}
+    assert summary["promotion_gate"] == {
+        "ready_for_review": False,
+        "snapshot_invalid_count": 1,
+    }
 
 
 def test_emit_qp_live_shadow_telemetry_task_writes_jsonl(tmp_path) -> None:
