@@ -280,9 +280,9 @@ def test_candidate_scores_annotated_candidate_wins_over_stale_map() -> None:
         conn, "run-1", [cand], {}, set(), model_types={"AAPL": "XGBoost"},
     )
     row = conn.execute(
-        "SELECT model_type, legacy_model_type FROM candidate_scores"
+        "SELECT model_type, active_scorer, legacy_model_type FROM candidate_scores"
     ).fetchone()
-    assert row == ("hf_patchtst", "XGBoost")
+    assert row == ("hf_patchtst", "hf_patchtst", "XGBoost")
 
 
 def test_candidate_scores_legacy_only_without_panel_scoring() -> None:
@@ -397,6 +397,24 @@ def test_live_bridge_score_snapshot_stamps_active_scorer() -> None:
     assert snap["legacy_model_type"] == "XGBoost"
 
 
+def test_live_bridge_score_snapshot_does_not_treat_artifact_as_active_scorer() -> None:
+    from renquant_pipeline.order_attribution import (
+        score_snapshot as live_score_snapshot,
+    )
+
+    ctx = SimpleNamespace(
+        strategy_config=_config(None),
+        scores={"AAPL": 0.5},
+        blocked_by={},
+        artifact_manifest={"kind": "hf_patchtst"},
+    )
+    source = SimpleNamespace(ticker="AAPL", model_type="XGBoost")
+    snap = live_score_snapshot({"ticker": "AAPL"}, ctx, source_obj=source)
+    assert snap["model_type"] == "XGBoost"
+    assert snap["active_scorer"] is None
+    assert snap["legacy_model_type"] == "XGBoost"
+
+
 def test_live_bridge_daily_state_rows_stamp_active_scorer() -> None:
     from renquant_pipeline.decision_trace import (
         build_ticker_daily_state_rows as live_build_rows,
@@ -422,3 +440,29 @@ def test_live_bridge_daily_state_rows_stamp_active_scorer() -> None:
     assert by_ticker["AAPL"]["legacy_model_type"] == "XGBoost"
     assert by_ticker["MSFT"]["model_type"] == "hf_patchtst"
     assert by_ticker["MSFT"]["legacy_model_type"] == "QLearning"
+
+
+def test_live_bridge_daily_state_rows_do_not_treat_artifact_as_active_scorer() -> None:
+    from renquant_pipeline.decision_trace import (
+        build_ticker_daily_state_rows as live_build_rows,
+    )
+
+    ctx = SimpleNamespace(
+        scores={"AAPL": 0.5, "MSFT": 0.4},
+        account_snapshot={},
+        market_snapshot={},
+        regime="BULL_CALM",
+        confidence=0.9,
+        artifact_manifest={"kind": "hf_patchtst"},
+    )
+    rows = live_build_rows(
+        _config(None),
+        ctx,
+        selected_tickers=["AAPL"],
+        model_types={"AAPL": "XGBoost", "MSFT": "QLearning"},
+    )
+    by_ticker = {row["ticker"]: row for row in rows}
+    assert by_ticker["AAPL"]["model_type"] == "XGBoost"
+    assert by_ticker["AAPL"]["active_scorer"] is None
+    assert by_ticker["MSFT"]["model_type"] == "QLearning"
+    assert by_ticker["MSFT"]["active_scorer"] is None
