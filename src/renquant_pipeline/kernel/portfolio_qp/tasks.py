@@ -1366,6 +1366,99 @@ class ApplyConvictionCapTask(Task):
         return None
 
 
+# ── 5c. Soft-sell guard ↔ solver alignment ──────────────────────────────────
+
+class ApplySoftSellGuardMaskTask(Task):
+    """Align the solver with the emission-side soft-sell horizon guard.
+
+    ``EmitOrdersFromQPSolutionTask`` suppresses QP trims of holdings
+    younger than ``qp_soft_sell_guard.min_holding_days*`` (thesis-age
+    horizon). Without this Task the solver still PLANS those sells,
+    spending ``qp_turnover_max`` budget on trades that never execute —
+    which starves new buys below ``qp_min_dw_pct`` (2026-06-09 deadlock:
+    planned-but-suppressed trims consumed the turnover budget; every new
+    buy solved to ≈1.5% < 2% min Δw and was skipped, every day).
+
+    For each held name whose sell would be horizon-suppressed at
+    emission AND whose w_current is within the hard cap:
+      * mask Δw ≥ 0 (``_qp_no_sell_mask`` → solver may not sell it), and
+      * raise its SOFT cap to w_current (hold-flat stays feasible; this
+        is exactly the ``safe_to_raise`` branch of
+        ``_clamp_w_upper_at_w_current``).
+
+    OVER-hard-cap holdings are NEVER masked: the #123 cap-compliance
+    contract requires them to stay sellable. Their turnover impact is
+    handled by ``qp_turnover_exempt_forced_trims`` in the solver instead.
+
+    Default OFF — opt-in via ``qp_soft_sell_guard.align_solver=true``.
+    """
+    name = "ApplySoftSellGuardMaskTask"
+
+    def run(self, ctx) -> bool | None:
+        cfg = _qp_cfg(ctx)
+        guard_cfg = cfg.get("qp_soft_sell_guard", {})
+        if not isinstance(guard_cfg, dict):
+            return None
+        if not bool(guard_cfg.get("align_solver", False)):
+            return None
+        if guard_cfg.get("enabled") is False:
+            return None
+        tickers = _get_path(ctx, "_qp_tickers") or []
+        w_curr  = _get_path(ctx, "_qp_w_current")
+        w_upper = _get_path(ctx, "_qp_w_upper")
+        w_hard  = _get_path(ctx, "_qp_w_upper_hard")
+        if (not tickers or w_curr is None or w_upper is None or w_hard is None
+                or len(w_curr) != len(tickers) or len(w_upper) != len(tickers)):
+            return None
+        holdings = getattr(ctx, "holdings", None) or {}
+
+        from renquant_pipeline.kernel.pipeline.soft_exit_guards import (  # noqa: PLC0415
+            soft_exit_horizon_suppression,
+            soft_exit_thesis_regime,
+        )
+        panel_cfg = _qp_soft_sell_effective_panel_cfg(
+            ((getattr(ctx, "config", {}) or {}).get("risk", {}) or {})
+            .get("panel_exit", {}) or {},
+            guard_cfg,
+        )
+
+        w_curr_arr  = np.asarray(w_curr, dtype=float)
+        w_upper_arr = np.asarray(w_upper, dtype=float)
+        w_hard_arr  = np.asarray(w_hard, dtype=float)
+        mask = np.zeros(len(tickers), dtype=bool)
+        for i, t in enumerate(tickers):
+            if w_curr_arr[i] <= 0.0:
+                continue
+            if w_curr_arr[i] > w_hard_arr[i] + 1e-9:
+                continue  # over hard cap → must stay sellable (#123)
+            hs = holdings.get(t)
+            if hs is None:
+                continue
+            thesis_regime = soft_exit_thesis_regime(hs, getattr(ctx, "regime", None))
+            suppress, _why = soft_exit_horizon_suppression(
+                panel_cfg=panel_cfg,
+                regime=thesis_regime,
+                today=getattr(ctx, "today", None),
+                holding=hs,
+            )
+            if suppress:
+                mask[i] = True
+
+        if not mask.any():
+            return None
+        ctx._qp_w_upper = np.where(  # noqa: SLF001
+            mask, np.maximum(w_upper_arr, w_curr_arr), w_upper_arr,
+        )
+        ctx._qp_no_sell_mask = mask  # noqa: SLF001
+        log.info(
+            "ApplySoftSellGuardMaskTask: %d holding(s) horizon-protected — "
+            "no-sell mask + hold-flat soft caps: %s",
+            int(mask.sum()),
+            [tickers[i] for i in range(len(tickers)) if mask[i]],
+        )
+        return None
+
+
 # ── 5a. Sector cap → per-sector indicator matrix + cap vector ───────────────
 
 class BuildSectorConstraintMatrixTask(Task):
@@ -1861,6 +1954,7 @@ class SolveMarkowitzQPTask(Task):
         "fixed_cost_per_trade", "fixed_cost_beta",
         "budget_mode", "min_invested_pct", "cash_drag_lambda",
         "allow_optimal_inaccurate",
+        "turnover_exempt_forced_trims",
     )
 
     def _initial_solve(self, ctx, backend: str, kwargs: dict, _solve):
@@ -1911,6 +2005,10 @@ class SolveMarkowitzQPTask(Task):
             w_lower=_get_path(ctx, "_qp_w_lower"),
             dw_max=_get_path(ctx, "_qp_dw_max"),
             wash_sale_mask=_get_path(ctx, "_qp_wash_mask"),
+            no_sell_mask=_get_path(ctx, "_qp_no_sell_mask"),
+            turnover_exempt_forced_trims=bool(
+                cfg.get("qp_turnover_exempt_forced_trims", False)
+            ),
             signal_decay=float(cfg.get("qp_signal_decay", 0.0)),
             drawdown=_get_path(ctx, "_qp_drawdown"),
             drawdown_limit=_get_path(ctx, "_qp_drawdown_limit"),

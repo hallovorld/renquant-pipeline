@@ -45,6 +45,7 @@ from .tasks import (
     ApplyConvictionCapTask,
     ApplyExitOnlyTopupGuardTask,
     ApplyExposureScalingTask,
+    ApplySoftSellGuardMaskTask,
     ApplyGrinoldKahnTransformTask,
     ApplyProportionalTradeTask,
     ApplySectorMetadataGuardTask,
@@ -468,6 +469,13 @@ class JointPortfolioQPJob(Job):
             # Held names that are not current buy candidates stay available
             # for trims/closes, but QP must not add fresh risk to them.
             ApplyExitOnlyTopupGuardTask(),
+            # Solver ↔ emission alignment: holdings whose sells the
+            # emission-stage soft-sell horizon guard would suppress are
+            # masked Δw ≥ 0 (within hard cap only) so planned-but-
+            # suppressed trims cannot spend the turnover budget and starve
+            # new buys (2026-06-09 deadlock). Opt-in:
+            # qp_soft_sell_guard.align_solver.
+            ApplySoftSellGuardMaskTask(),
             # Missing sector metadata cannot be an implicit exemption from
             # sector constraints. Cap unmapped names at current weight before
             # building sector/correlation matrices.

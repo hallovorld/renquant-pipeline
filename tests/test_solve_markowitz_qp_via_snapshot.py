@@ -296,7 +296,7 @@ class TestSnapshotForecastKwargsCoverage:
 
     SNAPSHOT_OWNED = frozenset({
         "w_current", "w_upper", "w_lower", "dw_max",
-        "cash_reserve", "wash_sale_mask",
+        "cash_reserve", "wash_sale_mask", "no_sell_mask",
         "drawdown", "drawdown_limit",
         "turnover_max", "gross_max",
         "sector_indicator", "sector_cap_vec",
