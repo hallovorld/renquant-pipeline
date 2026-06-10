@@ -41,15 +41,26 @@ from renquant_pipeline.kernel.portfolio_qp.e1_tc_decomposition import (
 class HorizonHeldWrapper:
     """Re-solve the base every ``hold_bars`` bars; hold the book between.
 
-    **Path-consistent turnover.** The replay harness charges cost on the
-    allocator's reported ``delta_w``. The bar snapshot's ``w_current`` is
-    the *production sim's* book, not this measurement book — charging the
-    held book against it every bar would bill phantom turnover. The
-    wrapper therefore tracks its OWN previous target and reports
-    Δw = target_t − own_book_{t−1}: a held bar trades nothing (Δw = 0),
-    a rebalance bar pays exactly the book change. State advances via
-    ``observe`` (one call per bar from ``replay_with_observer``) — no
-    lookahead.
+    **Ticker-keyed holding (not index-keyed).** A real horizon-held book
+    holds *positions in names*, and the bar universe changes day to day
+    (names enter/leave on coverage). An index-keyed hold silently
+    misaligns when the universe membership changes (same n, different
+    tickers) and degenerates to daily rebalancing when n changes — which
+    made every E2 horizon collapse to the daily result on the PatchTST
+    clean-signal bars (found 2026-06-10). This wrapper instead remembers
+    the held book as a ``{ticker: weight}`` map and projects it onto each
+    bar's tickers between rebalances:
+
+      * a held name still present → keep its held weight (Δw = 0 vs the
+        wrapper's own previous projection on that name);
+      * a held name that left the universe → its position is gone (sold);
+      * a new name → 0 weight until the next rebalance.
+
+    **Path-consistent turnover.** Δw is reported against the wrapper's own
+    previous per-ticker book, so a fully-held bar with a stable universe
+    trades nothing, and only genuine rebalances or universe churn cost
+    turnover. State advances via ``observe`` (one call per bar from
+    ``replay_with_observer``) — no lookahead.
     """
 
     def __init__(self, base: Callable, *, hold_bars: int):
@@ -58,36 +69,51 @@ class HorizonHeldWrapper:
         self.base = base
         self.hold_bars = int(hold_bars)
         self._bar_index = 0
-        self._held_target: Optional[np.ndarray] = None
-        self._prev_book: Optional[np.ndarray] = None
+        self._held_by_ticker: Optional[dict[str, float]] = None
+        self._prev_by_ticker: dict[str, float] = {}
+
+    def _project(self, snap, held: dict[str, float]) -> np.ndarray:
+        """Map a {ticker: weight} book onto this bar's ticker order."""
+        return np.array(
+            [float(held.get(t, 0.0)) for t in snap.tickers], dtype=float
+        )
 
     def _result(self, snap, target: np.ndarray, status: str) -> AllocatorResult:
-        if self._prev_book is not None and len(self._prev_book) == len(target):
-            prev = self._prev_book
-        else:
-            prev = snap.w_current
+        # Δw against the wrapper's own previous per-ticker book (0 for
+        # names it has never held / that have left).
+        prev_vec = np.array(
+            [float(self._prev_by_ticker.get(t, 0.0)) for t in snap.tickers],
+            dtype=float,
+        )
         res = AllocatorResult(
-            delta_w=target - prev,
+            delta_w=target - prev_vec,
             target_w=target.copy(),
             status=status,
             selected_indices=tuple(
                 i for i in range(len(target)) if target[i] != 0.0
             ),
         )
-        self._prev_book = target.copy()
+        self._prev_by_ticker = {
+            t: float(target[i]) for i, t in enumerate(snap.tickers)
+            if target[i] != 0.0
+        }
         return res
 
     def __call__(self, snap, *, mu, sigma=None) -> AllocatorResult:
-        rebalance = (self._bar_index % self.hold_bars == 0) or self._held_target is None
-        if not rebalance and len(self._held_target) != snap.n:
-            # Universe changed mid-hold (names enter/leave the bar
-            # universe). Fail safe: re-solve rather than misalign indices.
-            rebalance = True
+        rebalance = (
+            self._bar_index % self.hold_bars == 0 or self._held_by_ticker is None
+        )
         if rebalance:
             base_res = self.base(snap, mu=mu, sigma=sigma)
-            self._held_target = base_res.target_w.copy()
-            return self._result(snap, self._held_target, base_res.status)
-        return self._result(snap, self._held_target, "optimal")
+            self._held_by_ticker = {
+                t: float(base_res.target_w[i])
+                for i, t in enumerate(snap.tickers)
+                if base_res.target_w[i] != 0.0
+            }
+            return self._result(snap, base_res.target_w.copy(), base_res.status)
+        # held: project the remembered book onto this bar's universe
+        target = self._project(snap, self._held_by_ticker)
+        return self._result(snap, target, "optimal")
 
     def observe(self, bar: AllocatorReplayBar, daily_net_return: float) -> None:  # noqa: ARG002
         self._bar_index += 1
