@@ -31,6 +31,7 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     paired_daily_returns,
     replay_all,
 )
+from renquant_pipeline.kernel.portfolio_qp.alpha_portfolio import alpha_tilt_long_only
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (
     current_qp_allocator,
     equal_weight_top_k,
@@ -64,6 +65,15 @@ _ALLOCATOR_REGISTRY: dict[str, Callable] = {
     # / equal-weight) can actually be compared.
     "hybrid_option_f_allocator": hybrid_option_f_allocator,
     "hard_only_qp_allocator": hard_only_qp_allocator,
+    # IC→Sharpe investigation candidate (orchestrator synthesis 2026-06-10):
+    # Stage-A A2 long-only α-tilt (Grinold 1994 α=IC·σ·z, projected onto
+    # the long-only box). The diagnostic clean-signal replay found it
+    # dominates current_qp at >2.7σ (HAC) with DSR 1.0 / PBO 0.0; this
+    # registration lets it face the same WF manifold + DSR/PBO as the
+    # baselines for a promotion-grade verdict. Stateless (daily) form —
+    # the E2 horizon-held (~3-bar) refinement needs observe-aware replay,
+    # tracked separately; daily A2 is the conservative floor (still ≫ QP).
+    "stage_a_a2_long_only": alpha_tilt_long_only,
 }
 
 
