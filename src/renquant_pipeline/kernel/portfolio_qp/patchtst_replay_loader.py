@@ -300,6 +300,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
         results = run_e2(bars, horizons=args.horizons)
     else:
         results = run_e1(bars, windows_label=label, floor_quantile=args.floor_quantile)
+    experiment_label = args.experiment.upper()
     pins = {}
     for spec in args.repo_pin:
         name, _, path = spec.partition("=")
@@ -308,8 +309,9 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
             pins[name] = sha
     paths = write_results(
         Path(args.out_dir), results, windows_label=label,
+        experiment=experiment_label,
         params={
-            "experiment": args.experiment,
+            "experiment": experiment_label,
             "signal": "pt07_clean_oos_ic",
             "fwd_horizon_days": args.fwd_horizon_days, "cap": args.cap,
             "cost_bps": args.cost_bps, "floor_quantile": args.floor_quantile,
