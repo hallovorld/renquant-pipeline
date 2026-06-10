@@ -250,6 +250,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
         run_e1,
         write_results,
     )
+    from renquant_pipeline.kernel.portfolio_qp.alpha_portfolio import (
+        MEASUREMENT_PREFIX,
+        alpha_tilt_long_only,
+        decile_long_short,
+    )
     from renquant_pipeline.kernel.portfolio_qp.e2_horizon_sweep import run_e2
 
     p = argparse.ArgumentParser(description=main.__doc__)
@@ -272,6 +277,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
     p.add_argument("--floor-quantile", type=float, default=0.55)
     p.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20, 40, 60],
                    help="E2 holding horizons in bars (default 1 5 20 40 60)")
+    p.add_argument("--e2-base", choices=("a0_decile", "a2_long_only"),
+                   default="a0_decile",
+                   help="E2 base book: a0_decile (dollar-neutral measurement "
+                        "ceiling) or a2_long_only (the deployable book — use "
+                        "this to pick the production rebalance horizon)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--repo-pin", action="append", default=[])
     args = p.parse_args(argv)
@@ -297,7 +307,18 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
         return 2
     label = f"patchtst_clean_{bars[0].bar_date}..{bars[-1].bar_date}"
     if args.experiment == "e2":
-        results = run_e2(bars, horizons=args.horizons)
+        if args.e2_base == "a2_long_only":
+            results = run_e2(
+                bars, horizons=args.horizons,
+                base_factory=lambda: alpha_tilt_long_only,
+                name_prefix="A2_long_only",  # deployable: no measurement:: prefix
+            )
+        else:
+            results = run_e2(
+                bars, horizons=args.horizons,
+                base_factory=lambda: decile_long_short,
+                name_prefix=f"{MEASUREMENT_PREFIX}A0_decile_ls",
+            )
     else:
         results = run_e1(bars, windows_label=label, floor_quantile=args.floor_quantile)
     experiment_label = args.experiment.upper()
