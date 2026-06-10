@@ -214,10 +214,10 @@ class E1StepResult:
         vals = [t for t in self.tc_per_bar if t is not None]
         return float(np.std(vals, ddof=1)) if len(vals) > 1 else None
 
-    def to_row(self, *, windows: str) -> dict:
+    def to_row(self, *, windows: str, experiment: str = "E1") -> dict:
         r = self.replay
         return {
-            "experiment": "E1",
+            "experiment": experiment,
             "step": self.step,
             "allocator": self.name,
             "windows": windows,
@@ -357,9 +357,11 @@ def write_results(
     windows_label: str,
     params: dict,
     input_descriptor: dict,
+    experiment: str = "E1",
     repo_pins: dict[str, str] | None = None,
 ) -> dict[str, Path]:
-    """Persist one E1 run per RFC §A.6: raw traces + manifest + tidy CSV."""
+    """Persist one RFC experiment run: raw traces + manifest + tidy CSV."""
+    experiment = str(experiment).upper()
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = out_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -380,8 +382,8 @@ def write_results(
         )
 
     # tidy results CSV — the only file analyses should read
-    rows = [r.to_row(windows=windows_label) for r in results]
-    csv_path = run_dir / "e1_results.csv"
+    rows = [r.to_row(windows=windows_label, experiment=experiment) for r in results]
+    csv_path = run_dir / f"{experiment.lower()}_results.csv"
     cols = list(rows[0].keys())
     lines = [",".join(cols)]
     for row in rows:
@@ -389,7 +391,7 @@ def write_results(
     csv_path.write_text("\n".join(lines) + "\n")
 
     manifest = {
-        "experiment": "E1",
+        "experiment": experiment,
         "run_id": run_id,
         "command": " ".join(sys.argv),
         "python": platform.python_version(),

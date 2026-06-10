@@ -53,7 +53,8 @@ class HorizonHeldWrapper:
 
       * a held name still present → keep its held weight (Δw = 0 vs the
         wrapper's own previous projection on that name);
-      * a held name that left the universe → its position is gone (sold);
+      * a held name that left the universe → its position is gone (sold)
+        and it stays out until the next scheduled rebalance;
       * a new name → 0 weight until the next rebalance.
 
     **Path-consistent turnover.** Δw is reported against the wrapper's own
@@ -113,6 +114,10 @@ class HorizonHeldWrapper:
             return self._result(snap, base_res.target_w.copy(), base_res.status)
         # held: project the remembered book onto this bar's universe
         target = self._project(snap, self._held_by_ticker)
+        self._held_by_ticker = {
+            t: float(target[i]) for i, t in enumerate(snap.tickers)
+            if target[i] != 0.0
+        }
         return self._result(snap, target, "optimal")
 
     def observe(self, bar: AllocatorReplayBar, daily_net_return: float) -> None:  # noqa: ARG002
@@ -190,6 +195,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover — t
     paths = write_results(
         Path(args.out_dir), results,
         windows_label=label,
+        experiment="E2",
         params={
             "experiment": "E2",
             "horizons": list(args.horizons),

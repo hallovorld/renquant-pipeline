@@ -7,8 +7,8 @@ Pins:
    fixed bar sequence (longer holds = fewer re-solves).
 3. hold_bars=1 reproduces the unwrapped allocator exactly (same targets
    every bar).
-4. Universe-size change mid-hold triggers a safe re-solve instead of an
-   index misalignment.
+4. Universe changes mid-hold project by ticker instead of by index; names
+   that leave stay out until the next rebalance.
 5. run_e2 emits one result per horizon with step = horizon.
 """
 from __future__ import annotations
@@ -110,6 +110,35 @@ def test_universe_change_projects_by_ticker_not_index():
             assert res2.target_w[i] == pytest.approx(held[t])  # ticker-aligned
         else:
             assert res2.target_w[i] == 0.0                      # new name, unheld
+
+
+def test_name_that_leaves_does_not_reenter_until_rebalance():
+    """A sold name must not be resurrected just because it reappears."""
+    w = HorizonHeldWrapper(decile_long_short, hold_bars=10)
+
+    def call(tickers):
+        n = len(tickers)
+        snap = ConstraintSnapshot(
+            n=n, tickers=tuple(tickers), w_current=np.zeros(n),
+            w_upper_hard=np.full(n, 0.2), w_upper=np.full(n, 0.2),
+            w_lower=0.0, dw_max=np.full(n, 1.0), cash_reserve=0.0,
+            turnover_max=None, drawdown=0.0, drawdown_limit=0.2,
+            gross_max=None, wash_sale_mask=np.zeros(n, dtype=bool),
+        )
+        mu = np.arange(n, dtype=float)
+        res = w(snap, mu=mu, sigma=np.full(n, 0.2))
+        bar = AllocatorReplayBar(
+            bar_date="x", snap=snap, mu=mu, sigma=np.full(n, 0.2),
+            fwd_return=np.zeros(n), regime="BULL_CALM",
+        )
+        w.observe(bar, 0.0)
+        return dict(zip(tickers, res.target_w))
+
+    day0 = call(("A", "B", "C", "D", "E", "F", "G", "H", "I", "J"))
+    assert day0["A"] != 0.0
+    assert "A" not in call(("B", "C", "D", "E", "F", "G", "H", "I", "J", "K"))
+    day2 = call(("A", "B", "C", "D", "E", "F", "G", "H", "I", "J"))
+    assert day2["A"] == 0.0
 
 
 def _changing_universe_bars(n_bars=40, base_n=24, seed=3):

@@ -32,6 +32,7 @@ from renquant_pipeline.kernel.portfolio_qp.e1_tc_decomposition import (
     run_e1,
     write_results,
 )
+from renquant_pipeline.kernel.portfolio_qp.e2_horizon_sweep import run_e2
 
 
 def _snap(n: int):
@@ -154,6 +155,7 @@ def test_write_results_manifest_and_csv(tmp_path):
     assert manifest["experiment"] == "E1"
     assert manifest["basis"] == "replay_net_of_cost"
     assert manifest["repo_pins"]["renquant-pipeline"] == "deadbeef"
+    assert paths["csv"].name == "e1_results.csv"
     # every trace/csv output is fingerprinted (manifest itself excluded —
     # it is written last and cannot contain its own hash)
     files = {p.name for p in paths["run_dir"].iterdir()} - {"manifest.json"}
@@ -161,5 +163,23 @@ def test_write_results_manifest_and_csv(tmp_path):
     assert all(v.startswith("sha256:") for v in manifest["outputs"].values())
     rows = list(csv.DictReader(paths["csv"].open()))
     assert len(rows) == 7
+    assert all(r["experiment"] == "E1" for r in rows)
     assert all(r["basis"] == "replay_net_of_cost" for r in rows)
     assert rows[0]["is_measurement"] == "True" and rows[2]["is_measurement"] == "False"
+
+
+def test_write_results_can_emit_e2_metadata(tmp_path):
+    results = run_e2(_bars(n_bars=10), horizons=(5,))
+    paths = write_results(
+        tmp_path, results,
+        windows_label="synthetic",
+        experiment="E2",
+        params={"experiment": "E2", "horizons": [5]},
+        input_descriptor={"source": "synthetic", "n_bars": 10},
+    )
+    manifest = json.loads(paths["manifest"].read_text())
+    assert manifest["experiment"] == "E2"
+    assert paths["csv"].name == "e2_results.csv"
+    rows = list(csv.DictReader(paths["csv"].open()))
+    assert len(rows) == 1
+    assert rows[0]["experiment"] == "E2"
