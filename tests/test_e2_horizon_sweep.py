@@ -93,15 +93,56 @@ def test_turnover_monotone_in_horizon():
     assert turnovers[0] > turnovers[1] > turnovers[2]
 
 
-def test_universe_change_triggers_safe_resolve():
+def test_universe_change_projects_by_ticker_not_index():
     w = HorizonHeldWrapper(decile_long_short, hold_bars=10)
     b20 = _bars(n_bars=1, n=20)[0]
     res = w(b20.snap, mu=b20.mu, sigma=b20.sigma)
     assert len(res.target_w) == 20
     w.observe(b20, 0.0)
+    # next bar: 30 names, T00..T29 — held T-names keep their weights,
+    # new T20..T29 are 0 (held book projected by ticker, not re-solved)
     b30 = _bars(n_bars=1, n=30, seed=9)[0]
     res2 = w(b30.snap, mu=b30.mu, sigma=b30.sigma)
-    assert len(res2.target_w) == 30  # re-solved, not misaligned
+    assert len(res2.target_w) == 30
+    held = {t: float(res.target_w[i]) for i, t in enumerate(b20.snap.tickers)}
+    for i, t in enumerate(b30.snap.tickers):
+        if t in held:
+            assert res2.target_w[i] == pytest.approx(held[t])  # ticker-aligned
+        else:
+            assert res2.target_w[i] == 0.0                      # new name, unheld
+
+
+def _changing_universe_bars(n_bars=40, base_n=24, seed=3):
+    """Bars whose ticker membership rotates each day (same n, shifting names)."""
+    rng = np.random.default_rng(seed)
+    bars = []
+    for d in range(n_bars):
+        tickers = tuple(f"T{(d + i) % 60:02d}" for i in range(base_n))  # window slides
+        snap = ConstraintSnapshot(
+            n=base_n, tickers=tickers, w_current=np.zeros(base_n),
+            w_upper_hard=np.full(base_n, 0.2), w_upper=np.full(base_n, 0.2),
+            w_lower=0.0, dw_max=np.full(base_n, 1.0), cash_reserve=0.0,
+            turnover_max=None, drawdown=0.0, drawdown_limit=0.2, gross_max=None,
+            wash_sale_mask=np.zeros(base_n, dtype=bool),
+        )
+        bars.append(AllocatorReplayBar(
+            bar_date=f"b{d:03d}", snap=snap, mu=rng.normal(0, 0.03, base_n),
+            sigma=np.full(base_n, 0.2), fwd_return=rng.normal(0, 0.01, base_n),
+            regime="BULL_CALM",
+        ))
+    return bars
+
+
+def test_horizons_differ_under_changing_universe():
+    """Regression for the 2026-06-10 bug: with a rotating universe the old
+    index-keyed wrapper degenerated every horizon to the daily result
+    (hold=5 ≡ hold=20 ≡ hold=40 byte-identical). By-ticker holding must
+    make distinct horizons produce distinct return streams."""
+    bars = _changing_universe_bars()
+    results = run_e2(bars, horizons=(5, 20))
+    r5 = np.asarray(results[0].replay.daily_returns_net)
+    r20 = np.asarray(results[1].replay.daily_returns_net)
+    assert not np.array_equal(r5, r20)
 
 
 def test_run_e2_one_result_per_horizon():

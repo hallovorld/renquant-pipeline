@@ -250,8 +250,12 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
         run_e1,
         write_results,
     )
+    from renquant_pipeline.kernel.portfolio_qp.e2_horizon_sweep import run_e2
 
     p = argparse.ArgumentParser(description=main.__doc__)
+    p.add_argument("--experiment", choices=("e1", "e2"), default="e1",
+                   help="e1 = TC-decomposition ladder; e2 = holding-horizon "
+                        "sweep (horizon-held A0, settles the A0-cost question)")
     p.add_argument("--predictions", required=True,
                    help="PatchTST OOS predictions.parquet (date,ticker,pred)")
     p.add_argument("--clean-oos-manifest", required=True,
@@ -266,6 +270,8 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
     p.add_argument("--cost-bps", type=float, default=5.0)
     p.add_argument("--min-names", type=int, default=20)
     p.add_argument("--floor-quantile", type=float, default=0.55)
+    p.add_argument("--horizons", type=int, nargs="+", default=[1, 5, 20, 40, 60],
+                   help="E2 holding horizons in bars (default 1 5 20 40 60)")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--repo-pin", action="append", default=[])
     args = p.parse_args(argv)
@@ -290,7 +296,10 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
         print("no bars loaded — check coverage", file=sys.stderr)
         return 2
     label = f"patchtst_clean_{bars[0].bar_date}..{bars[-1].bar_date}"
-    results = run_e1(bars, windows_label=label, floor_quantile=args.floor_quantile)
+    if args.experiment == "e2":
+        results = run_e2(bars, horizons=args.horizons)
+    else:
+        results = run_e1(bars, windows_label=label, floor_quantile=args.floor_quantile)
     pins = {}
     for spec in args.repo_pin:
         name, _, path = spec.partition("=")
@@ -300,9 +309,11 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
     paths = write_results(
         Path(args.out_dir), results, windows_label=label,
         params={
+            "experiment": args.experiment,
             "signal": "pt07_clean_oos_ic",
             "fwd_horizon_days": args.fwd_horizon_days, "cap": args.cap,
             "cost_bps": args.cost_bps, "floor_quantile": args.floor_quantile,
+            "horizons": args.horizons if args.experiment == "e2" else None,
             "snapshot": "minimal long-only (not a production decision-trace reproduction)",
             "promotion_grade": bool(args.fwd_horizon_days == 1),
             "allow_overlap_horizon": bool(args.allow_overlap_horizon),
