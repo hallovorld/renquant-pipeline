@@ -337,6 +337,7 @@ def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin 
             "fwd_horizon_days": args.fwd_horizon_days, "cap": args.cap,
             "cost_bps": args.cost_bps, "floor_quantile": args.floor_quantile,
             "horizons": args.horizons if args.experiment == "e2" else None,
+            "e2_base": args.e2_base if args.experiment == "e2" else None,
             "snapshot": "minimal long-only (not a production decision-trace reproduction)",
             "promotion_grade": bool(args.fwd_horizon_days == 1),
             "allow_overlap_horizon": bool(args.allow_overlap_horizon),
