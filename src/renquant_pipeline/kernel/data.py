@@ -83,14 +83,35 @@ def _yf_translate(symbol: str) -> str:
     return symbol
 
 
-# Repo-root-anchored default OHLCV store. 2026-05-27: the old cwd-relative
-# default ("data/ohlcv") silently pointed at a different, truncated store when a
-# sim/script ran from the strategy dir (backtesting/renquant_104/data/ohlcv has
-# only the last ~year), vs the deep repo-root store. That produced spurious
-# empty-feature/zero-trade runs. Anchoring to the repo root makes the default
-# cwd-independent; production (which cd's to repo root) is unaffected. Callers
-# can still pass an explicit data_dir to override.
-_REPO_ROOT_OHLCV = Path(__file__).resolve().parents[3] / "data" / "ohlcv"
+# Default OHLCV store resolution (2026-06-09 fix, supersedes 2026-05-27):
+#
+# 2026-05-27 anchored the default to "this module's repo root"
+# (``Path(__file__).parents[3]``) to stop a cwd-relative default from
+# silently pointing at a truncated store. That held while the kernel
+# lived inside the umbrella. After the multirepo migration the module
+# runs from ``.subrepo_runtime/repos/renquant-pipeline/`` — parents[3]
+# then resolves to the RUNTIME CLONE's own ``data/ohlcv``, a fresh
+# near-empty cache, NOT the umbrella's full-history store. On
+# 2026-06-09 this zeroed every weekly_wf_promote sim cut: SPY came back
+# with ~1y of rows, the feature cache clipped to empty, no candidates,
+# "zero trades across all WF cuts".
+#
+# Resolution order:
+#   1. ``RENQUANT_OHLCV_DIR``  — explicit store override
+#   2. ``RENQUANT_REPO_ROOT``  — the operator-declared umbrella root
+#      (already exported by sim_driver / daily scripts) + /data/ohlcv
+#   3. module-anchored fallback — correct when this repo IS the root
+# Callers can still pass an explicit data_dir to override everything.
+
+
+def _resolve_default_ohlcv_dir() -> Path:
+    env_store = os.environ.get("RENQUANT_OHLCV_DIR")
+    if env_store:
+        return Path(env_store)
+    env_root = os.environ.get("RENQUANT_REPO_ROOT")
+    if env_root:
+        return Path(env_root) / "data" / "ohlcv"
+    return Path(__file__).resolve().parents[3] / "data" / "ohlcv"
 
 
 class LocalStore:
@@ -102,7 +123,10 @@ class LocalStore:
     """
 
     def __init__(self, data_dir: Path | str | None = None):
-        self.data_dir = Path(data_dir) if data_dir is not None else _REPO_ROOT_OHLCV
+        self.data_dir = (
+            Path(data_dir) if data_dir is not None
+            else _resolve_default_ohlcv_dir()
+        )
 
     def _path(self, symbol: str, timeframe: str = "1d") -> Path:
         return self.data_dir / symbol.upper() / f"{timeframe}.parquet"
