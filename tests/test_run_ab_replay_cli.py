@@ -165,6 +165,14 @@ class TestRegistry:
         assert get_allocator("hybrid_option_f_allocator") is hybrid_option_f_allocator
         assert get_allocator("hard_only_qp_allocator") is hard_only_qp_allocator
 
+    def test_stage_a_a2_registered(self):
+        # IC→Sharpe synthesis candidate must be nameable in --allocators so
+        # it faces the WF manifold + DSR/PBO alongside the QP and baselines.
+        from renquant_pipeline.kernel.portfolio_qp.alpha_portfolio import (
+            alpha_tilt_long_only,
+        )
+        assert get_allocator("stage_a_a2_long_only") is alpha_tilt_long_only
+
     def test_register_overrides(self):
         def fake(snap, *, mu, sigma=None):  # noqa: ARG001
             return None
