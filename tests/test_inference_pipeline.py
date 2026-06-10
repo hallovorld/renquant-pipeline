@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from renquant_common import Task
 from renquant_pipeline import (
     InferenceContext,
+    LiveContextSnapshot,
     RuntimeInferencePipeline,
+    live_context_snapshot_from_live_context,
     runtime_inference_payload,
     runtime_inference_payload_from_live_context,
     write_runtime_inference_payload,
@@ -100,6 +103,117 @@ def test_runtime_inference_payload_from_live_context_prefers_existing_trace() ->
     assert payload["order_intents"] == [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
     assert payload["blocked_by"] == {"MSFT": "not_in_watchlist"}
     assert payload["scores"] == {"AAPL": 0.72}
+
+
+def test_live_context_snapshot_is_native_payload_contract() -> None:
+    ctx = {
+        "config": {"watchlist": ["AAPL"]},
+        "market_snapshot": {"as_of": "2026-06-08"},
+        "decision_trace": [{"ticker": "AAPL", "stage": "score"}],
+        "orders": [{"ticker": "AAPL", "action": "buy", "quantity": 1}],
+        "_blocked_by_ticker": {"MSFT": "not_in_watchlist"},
+        "_ticker_score_snapshot": {"AAPL": {"rank_score": 0.72}},
+        "buy_blocked": True,
+    }
+
+    snapshot = live_context_snapshot_from_live_context(ctx)
+
+    assert isinstance(snapshot, LiveContextSnapshot)
+    assert snapshot.strategy_config == {"watchlist": ["AAPL"]}
+    assert snapshot.market_snapshot == {"as_of": "2026-06-08"}
+    assert snapshot.account_snapshot == {}
+    assert snapshot.market_as_of == "2026-06-08"
+    assert snapshot.decision_trace == [{"ticker": "AAPL", "stage": "score"}]
+    assert snapshot.order_intents == [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
+    assert snapshot.scores == {"AAPL": 0.72}
+    assert snapshot.blocked_by == {"MSFT": "not_in_watchlist"}
+    assert snapshot.pending_broker_tickers == []
+    assert snapshot.buy_blocked is True
+    assert snapshot.to_runtime_payload() == runtime_inference_payload_from_live_context(ctx)
+
+
+def test_live_context_snapshot_derives_account_snapshot_from_legacy_holdings() -> None:
+    class LiveCtx:
+        config = {
+            "watchlist": ["AAPL", "MSFT"],
+            "sector_map": {"AAPL": "TECH", "MSFT": "TECH"},
+        }
+        market_snapshot = {"as_of": "2026-06-08", "regime": "BULL_CALM"}
+        holdings = {"MSFT": SimpleNamespace(shares=5, avg_entry_price=101.5)}
+        prices = {"MSFT": 120.0}
+        cash = 1000.0
+        portfolio_value = 1600.0
+        orders = [{"ticker": "AAPL", "action": "buy", "quantity": 1}]
+        pending_broker_tickers = ("AAPL",)
+        _ticker_score_snapshot = {
+            "AAPL": {"panel_score": 0.8},
+            "MSFT": {"panel_score": 0.3},
+        }
+
+    snapshot = live_context_snapshot_from_live_context(LiveCtx())
+
+    assert snapshot.account_snapshot == {
+        "positions": {
+            "MSFT": {
+                "avg_entry_price": 101.5,
+                "price": 120.0,
+                "quantity": 5,
+                "ticker": "MSFT",
+            }
+        },
+        "cash": 1000.0,
+        "portfolio_value": 1600.0,
+    }
+    assert snapshot.pending_broker_tickers == ["AAPL"]
+    rows = {row["ticker"]: row for row in snapshot.decision_trace}
+    assert rows["MSFT"]["has_position"] is True
+    assert rows["AAPL"]["pending_at_broker"] is True
+
+
+def test_live_context_snapshot_prefers_explicit_account_snapshot() -> None:
+    class LiveCtx:
+        config = {"watchlist": ["AAPL", "MSFT"]}
+        market_snapshot = {"as_of": "2026-06-08"}
+        account_snapshot = {"positions": {"AAPL": {"quantity": 2}}}
+        holdings = {"MSFT": SimpleNamespace(shares=5)}
+
+    snapshot = live_context_snapshot_from_live_context(LiveCtx())
+
+    assert snapshot.account_snapshot == {"positions": {"AAPL": {"quantity": 2}}}
+    rows = {row["ticker"]: row for row in snapshot.decision_trace}
+    assert rows["AAPL"]["has_position"] is True
+    assert rows["MSFT"]["has_position"] is False
+
+
+def test_live_context_snapshot_rejects_bad_account_snapshot() -> None:
+    with pytest.raises(ValueError, match="account_snapshot"):
+        live_context_snapshot_from_live_context({
+            "config": {"watchlist": ["AAPL"]},
+            "market_snapshot": {"as_of": "2026-06-08"},
+            "account_snapshot": ["not", "a", "dict"],
+        })
+
+
+def test_runtime_payload_from_legacy_runner_shape_keeps_schema_v1() -> None:
+    payload = runtime_inference_payload_from_live_context({
+        "config": {"watchlist": ["AAPL"]},
+        "market_snapshot": {"as_of": "2026-06-08"},
+        "holdings": {"AAPL": {"quantity": 2}},
+        "pending_broker_tickers": ["AAPL"],
+    })
+
+    assert set(payload) == {
+        "blocked_by",
+        "buy_blocked",
+        "decision_trace",
+        "market_as_of",
+        "order_intents",
+        "schema_version",
+        "scores",
+        "source",
+    }
+    assert payload["schema_version"] == 1
+    assert payload["source"] == "renquant_pipeline.live_context_inference"
 
 
 def test_write_runtime_inference_payload_from_live_context_writes_json(tmp_path) -> None:

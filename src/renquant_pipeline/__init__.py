@@ -2,7 +2,9 @@
 
 from .inference import (
     InferenceContext,
+    LiveContextSnapshot,
     RuntimeInferencePipeline,
+    live_context_snapshot_from_live_context,
     runtime_inference_payload,
     runtime_inference_payload_from_live_context,
     write_runtime_inference_payload,
@@ -58,6 +60,7 @@ from .state_paths import (
 __all__ = [
     "ContractResult",
     "InferenceContext",
+    "LiveContextSnapshot",
     "ModelAdmissionResult",
     "ATTRIBUTION_VERSION",
     "ApplyGlobalCalibrationTask",
@@ -80,6 +83,7 @@ __all__ = [
     "hash_jsonable",
     "live_state_legacy_path",
     "live_state_path",
+    "live_context_snapshot_from_live_context",
     "model_type_from_artifact",
     "resolve_live_state_read",
     "runtime_inference_payload",

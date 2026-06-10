@@ -33,6 +33,39 @@ class InferenceContext:
     buy_blocked: bool = False
 
 
+@dataclass(frozen=True)
+class LiveContextSnapshot:
+    """Normalized readonly view of a live-like context.
+
+    This is the smallest contract needed to lift RunnerAdapter.make_context
+    callers toward native code without copying the umbrella adapter wholesale.
+    """
+
+    strategy_config: dict[str, Any]
+    market_snapshot: dict[str, Any]
+    account_snapshot: dict[str, Any]
+    market_as_of: Any
+    decision_trace: list[dict[str, Any]]
+    order_intents: list[dict[str, Any]]
+    scores: dict[str, float]
+    blocked_by: dict[str, Any]
+    pending_broker_tickers: list[str]
+    buy_blocked: bool
+
+    def to_runtime_payload(self) -> dict[str, Any]:
+        """Return the native inference payload consumed by live-run tooling."""
+        return {
+            "schema_version": 1,
+            "source": "renquant_pipeline.live_context_inference",
+            "market_as_of": self.market_as_of,
+            "decision_trace": list(self.decision_trace),
+            "order_intents": list(self.order_intents),
+            "scores": dict(self.scores),
+            "blocked_by": dict(self.blocked_by),
+            "buy_blocked": self.buy_blocked,
+        }
+
+
 class ValidateRuntimeInputsTask(Task):
     """Require auditable config/artifact/market inputs before scoring."""
 
@@ -127,6 +160,82 @@ def _list_of_dicts(value: Any, *, field_name: str) -> list[dict[str, Any]]:
     return rows
 
 
+def _list_of_strings(value: Any, *, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list | tuple | set):
+        raise ValueError(f"live context field must be a list: {field_name}")
+    return [str(item) for item in value if item]
+
+
+def _holding_value(position: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(position, dict) and name in position:
+            return position[name]
+        if hasattr(position, name):
+            return getattr(position, name)
+    return None
+
+
+def _holding_snapshot(
+    ticker: str,
+    position: Any,
+    *,
+    price: Any = None,
+) -> dict[str, Any] | None:
+    if isinstance(position, dict):
+        row = dict(position)
+    else:
+        row = {}
+        for source_key, output_key in (
+            ("quantity", "quantity"),
+            ("qty", "quantity"),
+            ("shares", "quantity"),
+            ("market_value", "market_value"),
+            ("avg_entry_price", "avg_entry_price"),
+            ("cost_basis", "cost_basis"),
+        ):
+            value = _holding_value(position, source_key)
+            if value is not None and output_key not in row:
+                row[output_key] = value
+    quantity = row.get("quantity", row.get("qty", row.get("shares")))
+    if quantity is not None:
+        try:
+            if float(quantity) == 0.0:
+                return None
+        except (TypeError, ValueError):
+            pass
+        row["quantity"] = quantity
+    if price is not None and "price" not in row:
+        row["price"] = price
+    row.setdefault("ticker", ticker)
+    return row
+
+
+def _account_snapshot_from_live_context(ctx: Any) -> dict[str, Any]:
+    explicit = _get_field(ctx, "account_snapshot")
+    if explicit is not None:
+        return _dict_field(explicit, field_name="account_snapshot")
+    holdings = _get_field(ctx, "holdings")
+    if not isinstance(holdings, dict):
+        return {}
+    prices = _get_field(ctx, "prices", default={}) or {}
+    if not isinstance(prices, dict):
+        prices = {}
+    positions: dict[str, dict[str, Any]] = {}
+    for raw_ticker, position in holdings.items():
+        ticker = str(raw_ticker)
+        row = _holding_snapshot(ticker, position, price=prices.get(ticker))
+        if row:
+            positions[ticker] = row
+    snapshot: dict[str, Any] = {"positions": positions}
+    for field_name in ("cash", "portfolio_value"):
+        value = _get_field(ctx, field_name)
+        if value is not None:
+            snapshot[field_name] = value
+    return snapshot
+
+
 def _ticker(row: Any) -> str | None:
     if isinstance(row, dict):
         value = row.get("ticker") or row.get("symbol")
@@ -186,13 +295,13 @@ def _market_as_of(ctx: Any, market_snapshot: dict[str, Any]) -> Any:
     return today
 
 
-def runtime_inference_payload_from_live_context(
+def live_context_snapshot_from_live_context(
     ctx: Any,
     *,
     strategy_config: dict[str, Any] | None = None,
     market_snapshot: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Extract a parity-ready inference payload from a live-like runtime context.
+) -> LiveContextSnapshot:
+    """Extract a normalized readonly snapshot from a live-like runtime context.
 
     This adapter only reads the supplied context. It does not run scoring,
     submit orders, connect to a broker, or mutate persistent state.
@@ -204,6 +313,11 @@ def runtime_inference_payload_from_live_context(
     market = market_snapshot or _get_field(ctx, "market_snapshot", default={}) or {}
     if not isinstance(market, dict):
         raise ValueError("live context market_snapshot must be a dict")
+    account_snapshot = _account_snapshot_from_live_context(ctx)
+    pending_broker_tickers = _list_of_strings(
+        _get_field(ctx, "pending_broker_tickers", default=[]),
+        field_name="pending_broker_tickers",
+    )
 
     explicit_trace = _get_field(ctx, "decision_trace")
     if explicit_trace is None:
@@ -220,14 +334,14 @@ def runtime_inference_payload_from_live_context(
             setattr(ctx_obj, "scores", scores)
         if market_snapshot is not None or not hasattr(ctx_obj, "market_snapshot"):
             setattr(ctx_obj, "market_snapshot", market)
+        if not hasattr(ctx_obj, "account_snapshot"):
+            setattr(ctx_obj, "account_snapshot", account_snapshot)
         decision_trace = build_ticker_daily_state_rows(
             config,
             ctx_obj,
             selected_tickers=[ticker for row in order_intents if (ticker := _ticker(row))],
             blocked_map=blocked_by,
-            pending_broker_tickers=_get_field(
-                ctx, "pending_broker_tickers", default=[],
-            ) or [],
+            pending_broker_tickers=pending_broker_tickers,
             extra_tickers=scores.keys(),
         )
     else:
@@ -242,16 +356,32 @@ def runtime_inference_payload_from_live_context(
         )
         scores = _scores_from_live_context(ctx)
 
-    return {
-        "schema_version": 1,
-        "source": "renquant_pipeline.live_context_inference",
-        "market_as_of": _market_as_of(ctx, market),
-        "decision_trace": decision_trace,
-        "order_intents": order_intents,
-        "scores": scores,
-        "blocked_by": blocked_by,
-        "buy_blocked": bool(_get_field(ctx, "buy_blocked", default=False)),
-    }
+    return LiveContextSnapshot(
+        strategy_config=dict(config),
+        market_snapshot=dict(market),
+        account_snapshot=account_snapshot,
+        market_as_of=_market_as_of(ctx, market),
+        decision_trace=decision_trace,
+        order_intents=order_intents,
+        scores=scores,
+        blocked_by=blocked_by,
+        pending_broker_tickers=pending_broker_tickers,
+        buy_blocked=bool(_get_field(ctx, "buy_blocked", default=False)),
+    )
+
+
+def runtime_inference_payload_from_live_context(
+    ctx: Any,
+    *,
+    strategy_config: dict[str, Any] | None = None,
+    market_snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Extract a parity-ready inference payload from a live-like runtime context."""
+    return live_context_snapshot_from_live_context(
+        ctx,
+        strategy_config=strategy_config,
+        market_snapshot=market_snapshot,
+    ).to_runtime_payload()
 
 
 def write_runtime_inference_payload_from_live_context(
