@@ -126,6 +126,7 @@ def solve_portfolio_qp_from_snapshot(
     min_invested_pct: float = 0.0,
     cash_drag_lambda: float = 0.05,
     allow_optimal_inaccurate: bool = False,
+    turnover_exempt_forced_trims: bool = False,
 ) -> "QPSolution":
     """Solve the QP from a :class:`ConstraintSnapshot` + forecast / cost kwargs.
 
@@ -151,6 +152,7 @@ def solve_portfolio_qp_from_snapshot(
         dw_max=snap.dw_max,
         cash_reserve=snap.cash_reserve,
         wash_sale_mask=snap.wash_sale_mask,
+        no_sell_mask=getattr(snap, "no_sell_mask", None),
         drawdown=snap.drawdown,
         drawdown_limit=snap.drawdown_limit,
         turnover_max=snap.turnover_max,
@@ -178,6 +180,7 @@ def solve_portfolio_qp_from_snapshot(
         min_invested_pct=min_invested_pct,
         cash_drag_lambda=cash_drag_lambda,
         allow_optimal_inaccurate=allow_optimal_inaccurate,
+        turnover_exempt_forced_trims=turnover_exempt_forced_trims,
     )
 
 
@@ -194,6 +197,8 @@ def solve_portfolio_qp(
     w_lower:        Sequence[float] | float = 0.0,
     dw_max:         Sequence[float] | float = 0.50,
     wash_sale_mask: Sequence[bool] | None = None,
+    no_sell_mask:   Sequence[bool] | None = None,
+    turnover_exempt_forced_trims: bool = False,
     signal_decay:   float = 0.0,
     drawdown:       float = 0.0,
     drawdown_limit: float = 0.20,
@@ -352,8 +357,32 @@ def solve_portfolio_qp(
         # Δwᵢ ≤ 0 ∀ i ∈ wash_sale_mask  → cannot re-buy
         if wsm.any():
             constraints.append(dw[wsm] <= 0.0)
+    if no_sell_mask is not None:
+        nsm = np.asarray(no_sell_mask, dtype=bool)
+        # Δwᵢ ≥ 0 ∀ i ∈ no_sell_mask — order emission suppresses sells of
+        # these holdings (qp_soft_sell_guard thesis-age horizon), so the
+        # solver must not plan one: planned-but-suppressed sells spend
+        # turnover budget on trades that never execute. Feasibility
+        # contract: callers mask only holdings with w_current ≤ w_upper
+        # (ApplySoftSellGuardMaskTask — within hard cap only).
+        if nsm.any():
+            constraints.append(dw[nsm] >= 0.0)
     if turnover_max is not None and float(turnover_max) > 0.0:
-        constraints.append(cp.norm(dw, 1) <= float(turnover_max))
+        if turnover_exempt_forced_trims:
+            # A mandatory sell-down to the per-asset cap is a risk-
+            # constraint trade, not discretionary alpha trading; charging
+            # it against the turnover budget lets a single over-cap
+            # holding starve every new buy below qp_min_dw_pct
+            # (2026-06-09 deadlock: an 11.1% forced ORCL trim consumed
+            # most of the 20% budget → all new buys pinned ≈1.5% < 2%
+            # min Δw and were skipped, while emission then suppressed
+            # the trim itself). Exempt exactly the forced component;
+            # turnover budgets bound discretionary trading costs
+            # (Grinold-Kahn ch.16).
+            forced = np.minimum(0.0, w_upper_arr - w_current)
+            constraints.append(cp.norm(dw - forced, 1) <= float(turnover_max))
+        else:
+            constraints.append(cp.norm(dw, 1) <= float(turnover_max))
     # ── Long-Short Phase 2A: gross-exposure cap (Σ|wp| ≤ gross_max) ──────
     # When shorts are enabled (w_lower < 0), without this constraint the
     # optimizer can naively select max long AND max short on every name,

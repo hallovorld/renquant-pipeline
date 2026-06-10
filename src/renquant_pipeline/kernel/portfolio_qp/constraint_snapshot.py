@@ -71,8 +71,17 @@ class ConstraintSnapshot:
 
     # ── Masks (per-asset, dtype bool) ─────────────────────────────
     wash_sale_mask: np.ndarray       # True ⇒ Δwᵢ ≤ 0 hard
-    # Future masks (no_rebuy / forced_sells / soft_sell_thesis_age)
-    # surface here when their consumer Tasks land in this contract.
+    # Future masks (no_rebuy / forced_sells) surface here when their
+    # consumer Tasks land in this contract.
+
+    # ── Soft-sell horizon mask (optional, per-asset bool) ─────────
+    # True ⇒ Δwᵢ ≥ 0: order emission would suppress a sell of this
+    # holding (qp_soft_sell_guard thesis-age horizon), so the solver
+    # must not plan one. Contract: masked names are within hard cap
+    # AND w_upper ≥ w_current (hold-flat feasible) — enforced in
+    # _validate. Set by ApplySoftSellGuardMaskTask
+    # (qp_soft_sell_guard.align_solver opt-in).
+    no_sell_mask: Optional[np.ndarray] = None        # shape (n,)
 
     # ── Sector cap (optional) ─────────────────────────────────────
     sector_indicator: Optional[np.ndarray] = None    # shape (S, n)
@@ -105,7 +114,7 @@ class ConstraintSnapshot:
         # in-place attribute replacement.
         for attr in (
             "w_current", "w_upper_hard", "w_upper",
-            "dw_max", "wash_sale_mask",
+            "dw_max", "wash_sale_mask", "no_sell_mask",
             "sector_indicator", "sector_cap_vec",
         ):
             arr = getattr(self, attr)
@@ -165,6 +174,42 @@ def _validate(snap: "ConstraintSnapshot") -> None:
             "This is the #123 v1/v2/v3 bug class; building the "
             "snapshot must not produce a soft cap above the hard cap."
         )
+
+    # Soft-sell no-sell mask: shape + the hold-flat feasibility contract.
+    # A masked name (Δw ≥ 0 forced) MUST have w_upper ≥ w_current, or the
+    # solve is structurally infeasible; and per the #123 cap contract the
+    # producer Task only masks within-hard-cap holdings, so w_current must
+    # not exceed w_upper_hard either.
+    if snap.no_sell_mask is not None:
+        if not isinstance(snap.no_sell_mask, np.ndarray):
+            raise TypeError(
+                f"no_sell_mask must be np.ndarray, got {type(snap.no_sell_mask)}"
+            )
+        if snap.no_sell_mask.shape != (n,):
+            raise ValueError(
+                f"no_sell_mask shape {snap.no_sell_mask.shape} != ({n},)"
+            )
+        nsm = snap.no_sell_mask.astype(bool)
+        if nsm.any():
+            over_hard = nsm & (snap.w_current > snap.w_upper_hard + 1e-9)
+            if over_hard.any():
+                bad = np.where(over_hard)[0].tolist()
+                raise ValueError(
+                    "ConstraintSnapshot: no_sell_mask set on OVER-hard-cap "
+                    f"holdings at indices {bad} — over-cap names must stay "
+                    "sellable for the cap-compliance contract (#123); use "
+                    "turnover_exempt_forced_trims for their budget impact."
+                )
+            infeas = nsm & (snap.w_current > snap.w_upper + 1e-9)
+            if infeas.any():
+                bad = np.where(infeas)[0].tolist()
+                raise ValueError(
+                    "ConstraintSnapshot: no_sell_mask set on names whose "
+                    f"w_current exceeds w_upper at indices {bad} — Δw ≥ 0 "
+                    "with w_current > w_upper is structurally infeasible; "
+                    "the producer Task must raise the soft cap to "
+                    "w_current (within hard cap) before masking."
+                )
 
     # Cash reserve and drawdown bounds
     if not (0.0 <= snap.cash_reserve <= 1.0):
@@ -233,6 +278,7 @@ def build_snapshot_from_ctx(ctx) -> ConstraintSnapshot:
         drawdown_limit=float(_get(ctx, "_qp_drawdown_limit") or 1.0),
         gross_max=_get(ctx, "_qp_gross_max"),
         wash_sale_mask=wash_mask,
+        no_sell_mask=_to_ndarray_or_none(_get(ctx, "_qp_no_sell_mask")),
         sector_indicator=_to_ndarray_or_none(_get(ctx, "_qp_sector_indicator")),
         sector_cap_vec=_to_ndarray_or_none(_get(ctx, "_qp_sector_cap_vec")),
         sector_names=_to_tuple_or_none(_get(ctx, "_qp_sector_names")),
