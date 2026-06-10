@@ -58,10 +58,13 @@ class LiveContextSnapshot:
             "schema_version": 1,
             "source": "renquant_pipeline.live_context_inference",
             "market_as_of": self.market_as_of,
+            "market_snapshot": dict(self.market_snapshot),
+            "account_snapshot": dict(self.account_snapshot),
             "decision_trace": list(self.decision_trace),
             "order_intents": list(self.order_intents),
             "scores": dict(self.scores),
             "blocked_by": dict(self.blocked_by),
+            "pending_broker_tickers": list(self.pending_broker_tickers),
             "buy_blocked": self.buy_blocked,
         }
 

@@ -130,6 +130,8 @@ def test_live_context_snapshot_is_native_payload_contract() -> None:
     assert snapshot.pending_broker_tickers == []
     assert snapshot.buy_blocked is True
     assert snapshot.to_runtime_payload() == runtime_inference_payload_from_live_context(ctx)
+    assert snapshot.to_runtime_payload()["market_snapshot"] == {"as_of": "2026-06-08"}
+    assert snapshot.to_runtime_payload()["account_snapshot"] == {}
 
 
 def test_live_context_snapshot_derives_account_snapshot_from_legacy_holdings() -> None:
@@ -261,17 +263,24 @@ def test_runtime_payload_from_legacy_runner_shape_keeps_schema_v1() -> None:
     })
 
     assert set(payload) == {
+        "account_snapshot",
         "blocked_by",
         "buy_blocked",
         "decision_trace",
         "market_as_of",
+        "market_snapshot",
         "order_intents",
+        "pending_broker_tickers",
         "schema_version",
         "scores",
         "source",
     }
     assert payload["schema_version"] == 1
     assert payload["source"] == "renquant_pipeline.live_context_inference"
+    assert payload["account_snapshot"] == {
+        "positions": {"AAPL": {"quantity": 2, "ticker": "AAPL"}}
+    }
+    assert payload["pending_broker_tickers"] == ["AAPL"]
 
 
 def test_write_runtime_inference_payload_from_live_context_writes_json(tmp_path) -> None:
