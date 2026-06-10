@@ -9,9 +9,13 @@ every weekly_wf_promote sim cut reported zero trades.
 """
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 
-from renquant_pipeline.kernel.data import LocalStore, _resolve_default_ohlcv_dir
+from renquant_pipeline.kernel.data import (
+    LocalStore,
+    _resolve_default_ohlcv_dir,
+)
 
 
 def test_explicit_ohlcv_dir_env_wins(monkeypatch, tmp_path):
@@ -41,3 +45,18 @@ def test_explicit_data_dir_overrides_everything(monkeypatch, tmp_path):
     monkeypatch.setenv("RENQUANT_OHLCV_DIR", str(tmp_path / "ignored"))
     store = LocalStore(data_dir=tmp_path / "explicit")
     assert store.data_dir == tmp_path / "explicit"
+
+
+def test_default_store_refreshes_when_repo_root_env_changes(monkeypatch, tmp_path):
+    monkeypatch.delenv("RENQUANT_OHLCV_DIR", raising=False)
+    monkeypatch.delenv("RENQUANT_REPO_ROOT", raising=False)
+    import renquant_pipeline.kernel.data as data_mod
+
+    data_mod = importlib.reload(data_mod)
+    initial = data_mod._get_default_store().data_dir
+
+    monkeypatch.setenv("RENQUANT_REPO_ROOT", str(tmp_path))
+    refreshed = data_mod._get_default_store().data_dir
+
+    assert refreshed == tmp_path / "data" / "ohlcv"
+    assert refreshed != initial

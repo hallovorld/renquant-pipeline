@@ -1394,7 +1394,16 @@ class ApplySoftSellGuardMaskTask(Task):
     """
     name = "ApplySoftSellGuardMaskTask"
 
+    @staticmethod
+    def _clear_mask(ctx) -> None:
+        if hasattr(ctx, "_qp_no_sell_mask"):
+            delattr(ctx, "_qp_no_sell_mask")
+
     def run(self, ctx) -> bool | None:
+        # This task owns ``_qp_no_sell_mask``. Clear stale state first so a
+        # reused context cannot carry a prior bar's hold-flat mask forward when
+        # the suppression condition disappears.
+        self._clear_mask(ctx)
         cfg = _qp_cfg(ctx)
         guard_cfg = cfg.get("qp_soft_sell_guard", {})
         if not isinstance(guard_cfg, dict):

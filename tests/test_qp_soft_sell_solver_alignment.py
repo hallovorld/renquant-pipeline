@@ -258,3 +258,26 @@ def test_task_noop_when_align_solver_off():
     ApplySoftSellGuardMaskTask().run(ctx)
     assert getattr(ctx, "_qp_no_sell_mask", None) is None
     assert ctx._qp_w_upper[0] == pytest.approx(0.04)
+
+
+def test_task_clears_stale_mask_when_suppression_disappears():
+    ctx = _Ctx(
+        config=_guard_config(),
+        tickers=["YOUNG"],
+        w_current=[0.05],
+        w_upper=[0.04],
+        w_hard=[0.083],
+        holdings={"YOUNG": _Holding("2026-06-01")},
+    )
+    ApplySoftSellGuardMaskTask().run(ctx)
+    assert getattr(ctx, "_qp_no_sell_mask", None) is not None
+
+    # Emulate the next bar after upstream constraint tasks recomputed w_upper
+    # and the holding aged out of the soft-sell suppression window.
+    ctx._qp_w_upper = np.asarray([0.04], dtype=float)
+    ctx.holdings = {"YOUNG": _Holding("2026-01-01")}
+
+    ApplySoftSellGuardMaskTask().run(ctx)
+
+    assert getattr(ctx, "_qp_no_sell_mask", None) is None
+    assert ctx._qp_w_upper[0] == pytest.approx(0.04)
