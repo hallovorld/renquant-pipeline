@@ -139,6 +139,36 @@ def _ctx_object(ctx: Any) -> Any:
     return ctx
 
 
+def _trace_context(
+    ctx: Any,
+    *,
+    scores: dict[str, float],
+    market_snapshot: dict[str, Any],
+    account_snapshot: dict[str, Any],
+) -> Any:
+    source = _ctx_object(ctx)
+    values = dict(vars(source)) if hasattr(source, "__dict__") else {}
+    for field_name in (
+        "artifact_manifest",
+        "panel_scores",
+        "rank_scores",
+        "regime",
+        "confidence",
+        "_active_panel_model_type",
+        "_regime_model_admission",
+        "model_admission",
+    ):
+        value = _get_field(source, field_name)
+        if value is not None:
+            values.setdefault(field_name, value)
+    values.update({
+        "scores": scores,
+        "market_snapshot": market_snapshot,
+        "account_snapshot": account_snapshot,
+    })
+    return SimpleNamespace(**values)
+
+
 def _dict_field(value: Any, *, field_name: str) -> dict[str, Any]:
     if value is None:
         return {}
@@ -256,13 +286,14 @@ def _score(row: Any) -> float | None:
 
 
 def _scores_from_live_context(ctx: Any) -> dict[str, float]:
-    scores = _get_field(ctx, "scores")
-    if isinstance(scores, dict):
-        return {
-            str(ticker): float(score)
-            for ticker, score in scores.items()
-            if isinstance(score, int | float)
-        }
+    for score_field in ("scores", "panel_scores", "rank_scores"):
+        scores = _get_field(ctx, score_field)
+        if isinstance(scores, dict):
+            return {
+                str(ticker): float(score)
+                for ticker, score in scores.items()
+                if isinstance(score, int | float)
+            }
     score_snapshot = _get_field(ctx, "_ticker_score_snapshot", "ticker_score_snapshot")
     if isinstance(score_snapshot, dict):
         parsed: dict[str, float] = {}
@@ -332,15 +363,14 @@ def live_context_snapshot_from_live_context(
             field_name="blocked_by",
         )
         scores = _scores_from_live_context(ctx)
-        if not hasattr(ctx_obj, "scores"):
-            setattr(ctx_obj, "scores", scores)
-        if market_snapshot is not None or not hasattr(ctx_obj, "market_snapshot"):
-            setattr(ctx_obj, "market_snapshot", market)
-        if not hasattr(ctx_obj, "account_snapshot"):
-            setattr(ctx_obj, "account_snapshot", account_snapshot)
         decision_trace = build_ticker_daily_state_rows(
             config,
-            ctx_obj,
+            _trace_context(
+                ctx_obj,
+                scores=scores,
+                market_snapshot=market,
+                account_snapshot=account_snapshot,
+            ),
             selected_tickers=[ticker for row in order_intents if (ticker := _ticker(row))],
             blocked_map=blocked_by,
             pending_broker_tickers=pending_broker_tickers,
