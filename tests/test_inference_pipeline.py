@@ -170,6 +170,48 @@ def test_live_context_snapshot_derives_account_snapshot_from_legacy_holdings() -
     assert rows["AAPL"]["pending_at_broker"] is True
 
 
+def test_live_context_snapshot_does_not_mutate_object_context() -> None:
+    class LiveCtx:
+        config = {"watchlist": ["AAPL"]}
+        market_snapshot = {"as_of": "2026-06-08"}
+        holdings = {"AAPL": {"quantity": 2}}
+        _ticker_score_snapshot = {"AAPL": {"panel_score": 0.8}}
+
+    ctx = LiveCtx()
+
+    snapshot = live_context_snapshot_from_live_context(ctx)
+
+    assert snapshot.scores == {"AAPL": 0.8}
+    assert "scores" not in vars(ctx)
+    assert "account_snapshot" not in vars(ctx)
+    assert "market_snapshot" not in vars(ctx)
+
+
+def test_live_context_snapshot_accepts_lifted_kernel_context_shape() -> None:
+    class KernelCtx:
+        config = {
+            "watchlist": ["AAPL", "MSFT"],
+            "sector_map": {"AAPL": "TECH", "MSFT": "TECH"},
+        }
+        today = "2026-06-08"
+        regime = "BULL_CALM"
+        confidence = 0.7
+        panel_scores = {"AAPL": 0.8, "MSFT": 0.3}
+        orders = [{"ticker": "AAPL", "action": "buy", "shares": 2}]
+        _blocked_by_ticker = {"MSFT": "risk_gate"}
+
+    snapshot = live_context_snapshot_from_live_context(KernelCtx())
+
+    assert snapshot.market_as_of == "2026-06-08"
+    assert snapshot.order_intents == [{"ticker": "AAPL", "action": "buy", "shares": 2}]
+    assert snapshot.scores == {"AAPL": 0.8, "MSFT": 0.3}
+    rows = {row["ticker"]: row for row in snapshot.decision_trace}
+    assert rows["AAPL"]["selected"] is True
+    assert rows["AAPL"]["regime"] == "BULL_CALM"
+    assert rows["AAPL"]["confidence"] == pytest.approx(0.7)
+    assert rows["MSFT"]["blocked_by"] == "risk_gate"
+
+
 def test_live_context_snapshot_prefers_explicit_account_snapshot() -> None:
     class LiveCtx:
         config = {"watchlist": ["AAPL", "MSFT"]}
