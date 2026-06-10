@@ -219,3 +219,36 @@ def test_cli_blocks_overlap_horizon_without_research_override(tmp_path, capsys):
     ])
     assert rc == 2
     assert "overlapping multi-day returns" in capsys.readouterr().err
+
+
+def test_cli_e2_a2_base_records_provenance(tmp_path):
+    rng = np.random.default_rng(7)
+    dates = ["2025-03-13", "2025-03-14", "2025-03-17"]
+    tickers = [f"T{i:02d}" for i in range(25)]
+    pred = tmp_path / "p.parquet"
+    db = tmp_path / "sim.db"
+    out = tmp_path / "out"
+    _write_predictions(pred, dates, tickers, rng)
+    _write_fwd_db(db, dates, tickers, rng)
+    manifest = tmp_path / "manifest.json"
+    _write_clean_manifest(manifest, pred)
+
+    rc = main([
+        "--experiment", "e2",
+        "--e2-base", "a2_long_only",
+        "--horizons", "1", "3",
+        "--predictions", str(pred),
+        "--clean-oos-manifest", str(manifest),
+        "--sim-db", str(db),
+        "--out-dir", str(out),
+    ])
+
+    assert rc == 0
+    run_dirs = list(out.iterdir())
+    assert len(run_dirs) == 1
+    run_manifest = json.loads((run_dirs[0] / "manifest.json").read_text())
+    rows = (run_dirs[0] / "e2_results.csv").read_text().splitlines()
+    assert run_manifest["experiment"] == "E2"
+    assert run_manifest["params"]["e2_base"] == "a2_long_only"
+    assert rows[1].startswith("E2,1,A2_long_only_hold1,")
+    assert rows[2].startswith("E2,3,A2_long_only_hold3,")
