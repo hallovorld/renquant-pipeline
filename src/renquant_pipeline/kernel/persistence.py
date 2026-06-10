@@ -1086,13 +1086,27 @@ def record_candidate_scores(
         # active scorer on .model_type; the stale per-ticker label is
         # preserved as legacy_model_type.
         obj_model_type = getattr(obj, "model_type", None)
+        obj_active = getattr(obj, "active_scorer", None)
         legacy = (
             getattr(obj, "legacy_model_type", None)
             or model_types.get(ticker)
             or (obj_model_type if not active_scorer else None)
         )
-        model_type = active_scorer or obj_model_type or model_types.get(ticker)
-        return model_type, active_scorer, legacy
+        inferred_active = (
+            active_scorer
+            or (obj_active if isinstance(obj_active, str) and obj_active else None)
+            or (
+                obj_model_type
+                if (
+                    isinstance(obj_model_type, str)
+                    and obj_model_type
+                    and getattr(obj, "legacy_model_type", None)
+                )
+                else None
+            )
+        )
+        model_type = inferred_active or obj_model_type or model_types.get(ticker)
+        return model_type, inferred_active, legacy
 
     for c in candidates:
         selected = c.ticker in selected_tickers

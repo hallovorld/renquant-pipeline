@@ -94,12 +94,10 @@ def build_ticker_daily_state_rows(
     # 2026-06-07 audit follow-up: the active panel scorer is the model that
     # actually selected/ranked this bar — it must win over stale per-ticker
     # labels, which are preserved separately as legacy_model_type.
-    active_scorer = (
-        active_scorer_identity(config, ctx)
-        or model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
-    )
+    active_scorer = active_scorer_identity(config, ctx)
     artifact_model_type = (
         active_scorer
+        or model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
         or active_panel_model_type(config, ctx)
     )
     admission = _model_admission_trace(
