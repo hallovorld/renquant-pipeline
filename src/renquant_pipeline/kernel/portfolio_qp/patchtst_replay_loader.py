@@ -1,0 +1,226 @@
+"""Build replay bars from a clean PatchTST OOS prediction export.
+
+Bridges the P0 clean-IC artifact (renquant-model
+``doc/evidence/2026-06-10-pt07-clean-oos-ic/``, placebo-clean OOS IC
++0.0724) into the E1–E4 experiment harness, so the IC→Sharpe RFC
+experiments can finally run on the **verified** signal rather than the
+provenance-unknown sim-DB μ̂ (RFC §7.1 prerequisite #1, now met).
+
+Inputs:
+- ``predictions.parquet`` — (date, ticker, pred, label) from the OOS
+  export; ``pred`` is the model's cross-sectional score, used as μ̂.
+- ``ticker_forward_returns`` (in ``sim_runs.db``) — the **raw** realised
+  per-asset forward return at the requested horizon, used as the replay
+  PnL driver. Raw returns (not the standardized ``label``, per-day
+  std≈1.06) keep the harness Sharpe in real return units and — at
+  ``fwd_horizon_days=1`` — avoid the 60d-overlap inflation the E1-v1 run
+  flagged.
+
+Each emitted :class:`AllocatorReplayBar` carries a **minimal**
+:class:`ConstraintSnapshot` (zero start book, flat per-name cap, no
+sector/corr/wash constraints). This is deliberate: the E1 ladder ADDS
+production gates one at a time as wrappers, so the base snapshot must be
+near-unconstrained to isolate each gate's transfer-coefficient cost. The
+``step 6 current_qp`` rung therefore measures QP-on-this-signal under the
+minimal snapshot — NOT a reproduction of a PatchTST production decision
+trace (none exists; PatchTST has only ever run sell-only). That caveat is
+the loader's documented limitation and must be restated in any verdict.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+from renquant_pipeline.kernel.portfolio_qp.allocator_replay import AllocatorReplayBar
+from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
+
+_FWD_COLS = {1: "fwd_1d", 5: "fwd_5d", 10: "fwd_10d", 20: "fwd_20d", 60: "fwd_60d"}
+
+
+def minimal_snapshot(tickers: tuple[str, ...], *, cap: float = 0.20) -> ConstraintSnapshot:
+    """Near-unconstrained snapshot: zero book, flat cap, no group caps."""
+    n = len(tickers)
+    return ConstraintSnapshot(
+        n=n,
+        tickers=tickers,
+        w_current=np.zeros(n),
+        w_upper_hard=np.full(n, float(cap)),
+        w_upper=np.full(n, float(cap)),
+        w_lower=-float(cap),  # allow shorts so A0/A1 measurement books are feasible
+        dw_max=np.full(n, 1.0),
+        cash_reserve=0.0,
+        turnover_max=None,
+        drawdown=0.0,
+        drawdown_limit=0.20,
+        gross_max=None,
+        wash_sale_mask=np.zeros(n, dtype=bool),
+    )
+
+
+def _load_forward_returns(
+    sim_db: "str | Path",
+    start: str,
+    end: str,
+    fwd_col: str,
+) -> dict[tuple[str, str], float]:
+    con = sqlite3.connect(str(sim_db))
+    try:
+        cur = con.execute(
+            f"SELECT as_of_date, ticker, {fwd_col} FROM ticker_forward_returns "
+            "WHERE as_of_date BETWEEN ? AND ? AND "
+            f"{fwd_col} IS NOT NULL",
+            (start, end),
+        )
+        out: dict[tuple[str, str], float] = {}
+        for d, t, v in cur.fetchall():
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(fv):
+                out[(str(d), str(t))] = fv
+        return out
+    finally:
+        con.close()
+
+
+def load_patchtst_replay_bars(
+    predictions_parquet: "str | Path",
+    sim_db: "str | Path",
+    *,
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    fwd_horizon_days: int = 1,
+    cap: float = 0.20,
+    cost_per_trade_bps: float = 5.0,
+    min_names: int = 20,
+    regime: Optional[str] = None,
+) -> list[AllocatorReplayBar]:
+    """Join PatchTST predictions with raw forward returns into replay bars.
+
+    One bar per date with ≥ ``min_names`` names carrying both a prediction
+    and a finite forward return. ``min_names`` defaults to 20 so the A0
+    decile book always has ≥ 2 names per leg.
+    """
+    import pandas as pd  # noqa: PLC0415 — heavy optional dep, lazy
+
+    if fwd_horizon_days not in _FWD_COLS:
+        raise ValueError(
+            f"fwd_horizon_days must be one of {sorted(_FWD_COLS)}, "
+            f"got {fwd_horizon_days}"
+        )
+    fwd_col = _FWD_COLS[fwd_horizon_days]
+
+    preds = pd.read_parquet(predictions_parquet)
+    preds = preds[["date", "ticker", "pred"]].copy()
+    preds["date"] = pd.to_datetime(preds["date"]).dt.strftime("%Y-%m-%d")
+    if start:
+        preds = preds[preds["date"] >= start]
+    if end:
+        preds = preds[preds["date"] <= end]
+    if preds.empty:
+        return []
+
+    win_start = start or str(preds["date"].min())
+    win_end = end or str(preds["date"].max())
+    fwd = _load_forward_returns(sim_db, win_start, win_end, fwd_col)
+
+    bars: list[AllocatorReplayBar] = []
+    for date, grp in preds.groupby("date", sort=True):
+        rows = [
+            (str(t), float(p), fwd[(date, str(t))])
+            for t, p in zip(grp["ticker"], grp["pred"])
+            if (date, str(t)) in fwd and np.isfinite(float(p))
+        ]
+        if len(rows) < int(min_names):
+            continue
+        rows.sort(key=lambda r: r[0])  # stable ticker order
+        tickers = tuple(r[0] for r in rows)
+        mu = np.array([r[1] for r in rows], dtype=float)
+        fwd_ret = np.array([r[2] for r in rows], dtype=float)
+        snap = minimal_snapshot(tickers, cap=cap)
+        bars.append(AllocatorReplayBar(
+            bar_date=date,
+            snap=snap,
+            mu=mu,
+            sigma=np.full(len(rows), 0.20),
+            fwd_return=fwd_ret,
+            regime=regime,
+            cost_per_trade_bps=cost_per_trade_bps,
+        ))
+    return bars
+
+
+def main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — thin CLI
+    """Promotion-grade E1 on the clean PatchTST signal (RFC §7 path).
+
+    Loads bars from the OOS prediction export, runs the E1 ladder, and
+    persists via the §A.6 writer — one command from artifact to evidence.
+    """
+    import argparse
+    import sys
+
+    from renquant_pipeline.kernel.portfolio_qp.e1_tc_decomposition import (
+        _git_sha,
+        run_e1,
+        write_results,
+    )
+
+    p = argparse.ArgumentParser(description=main.__doc__)
+    p.add_argument("--predictions", required=True,
+                   help="PatchTST OOS predictions.parquet (date,ticker,pred)")
+    p.add_argument("--sim-db", required=True, help="sim_runs.db for forward returns")
+    p.add_argument("--start", default=None)
+    p.add_argument("--end", default=None)
+    p.add_argument("--fwd-horizon-days", type=int, default=1)
+    p.add_argument("--cap", type=float, default=0.20)
+    p.add_argument("--cost-bps", type=float, default=5.0)
+    p.add_argument("--min-names", type=int, default=20)
+    p.add_argument("--floor-quantile", type=float, default=0.55)
+    p.add_argument("--out-dir", required=True)
+    p.add_argument("--repo-pin", action="append", default=[])
+    args = p.parse_args(argv)
+
+    bars = load_patchtst_replay_bars(
+        args.predictions, args.sim_db,
+        start=args.start, end=args.end,
+        fwd_horizon_days=args.fwd_horizon_days,
+        cap=args.cap, cost_per_trade_bps=args.cost_bps, min_names=args.min_names,
+    )
+    if not bars:
+        print("no bars loaded — check coverage", file=sys.stderr)
+        return 2
+    label = f"patchtst_clean_{bars[0].bar_date}..{bars[-1].bar_date}"
+    results = run_e1(bars, windows_label=label, floor_quantile=args.floor_quantile)
+    pins = {}
+    for spec in args.repo_pin:
+        name, _, path = spec.partition("=")
+        sha = _git_sha(Path(path)) if path else None
+        if sha:
+            pins[name] = sha
+    paths = write_results(
+        Path(args.out_dir), results, windows_label=label,
+        params={
+            "signal": "pt07_clean_oos_ic",
+            "fwd_horizon_days": args.fwd_horizon_days, "cap": args.cap,
+            "cost_bps": args.cost_bps, "floor_quantile": args.floor_quantile,
+            "snapshot": "minimal (not a production decision-trace reproduction)",
+        },
+        input_descriptor={
+            "predictions": str(args.predictions), "sim_db": str(args.sim_db),
+            "n_bars": len(bars), "window": label,
+        },
+        repo_pins=pins,
+    )
+    for r in results:
+        print(f"step {r.step} {r.name:42s} sharpe={r.replay.sharpe_annual} "
+              f"tc={r.tc_mean}")
+    print(f"run dir: {paths['run_dir']}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())
