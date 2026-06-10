@@ -249,7 +249,22 @@ class LocalStore:
         return True
 
 
-_default_store = LocalStore()
+_default_store: LocalStore | None = None
+
+
+def _get_default_store() -> LocalStore:
+    """Return the process-default OHLCV store, refreshing on env changes.
+
+    The multirepo drivers export ``RENQUANT_REPO_ROOT`` before launching
+    Python, but long-lived processes, tests, and REPLs can update the env
+    after this module has already been imported. The process-default store
+    therefore cannot be fixed once at import time.
+    """
+    global _default_store
+    resolved = _resolve_default_ohlcv_dir()
+    if _default_store is None or _default_store.data_dir != resolved:
+        _default_store = LocalStore(data_dir=resolved)
+    return _default_store
 
 
 def fetch_ohlcv(
@@ -267,7 +282,7 @@ def fetch_ohlcv(
     returns None instead of blocking forever. Notebook was observed
     hanging 4 hours on a yfinance call 2026-04-24 — this prevents that.
     """
-    store = _default_store
+    store = _get_default_store()
 
     if cache and store.has_range(symbol, start=start, end=end):
         cached = store.load(symbol, start=start, end=end)
@@ -363,7 +378,7 @@ def fetch_ohlcv_incremental(
     import threading
     _log_local = _logging.getLogger("kernel.data.incremental")
 
-    store = store or _default_store
+    store = store or _get_default_store()
 
     # ── Single-process dedup: don't fetch the same symbol twice at once
     with _inflight_lock:
