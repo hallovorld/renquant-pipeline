@@ -185,6 +185,22 @@ def test_live_context_snapshot_prefers_explicit_account_snapshot() -> None:
     assert rows["MSFT"]["has_position"] is False
 
 
+def test_live_context_snapshot_normalizes_legacy_position_aliases() -> None:
+    snapshot = live_context_snapshot_from_live_context({
+        "config": {"watchlist": ["AAPL"]},
+        "market_snapshot": {"as_of": "2026-06-08"},
+        "holdings": {"AAPL": {"qty": 2, "shares": 2, "cost_basis": 101.0}},
+        "prices": {"AAPL": 120.0},
+    })
+
+    assert snapshot.account_snapshot["positions"]["AAPL"] == {
+        "cost_basis": 101.0,
+        "price": 120.0,
+        "quantity": 2,
+        "ticker": "AAPL",
+    }
+
+
 def test_live_context_snapshot_rejects_bad_account_snapshot() -> None:
     with pytest.raises(ValueError, match="account_snapshot"):
         live_context_snapshot_from_live_context({

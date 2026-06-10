@@ -206,6 +206,8 @@ def _holding_snapshot(
         except (TypeError, ValueError):
             pass
         row["quantity"] = quantity
+        row.pop("qty", None)
+        row.pop("shares", None)
     if price is not None and "price" not in row:
         row["price"] = price
     row.setdefault("ticker", ticker)
