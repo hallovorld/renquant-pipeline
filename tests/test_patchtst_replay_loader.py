@@ -120,15 +120,25 @@ def test_invalid_horizon_rejected(tmp_path):
         )
 
 
-def _write_clean_manifest(path, predictions_path, *, passed=True):
-    path.write_text(json.dumps({
+def _sha(path):
+    import hashlib
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _write_clean_manifest(path, predictions_path, *, passed=True, with_hash=True):
+    manifest = {
         "kind": "patchtst_oos_ic_export",
         "run_id": "test-run",
         "outputs": {"predictions_parquet": str(predictions_path.resolve())},
         "oos_contract": {"passed": passed},
         "sanity_battery": {"passed": passed},
         "metrics": {"mean_oos_ic": 0.07},
-    }))
+    }
+    if with_hash:
+        manifest["output_hashes"] = {
+            "predictions_parquet_sha256": _sha(predictions_path),
+        }
+    path.write_text(json.dumps(manifest))
 
 
 def test_manifest_validation_requires_clean_contract(tmp_path):
@@ -153,6 +163,40 @@ def test_manifest_validation_rejects_wrong_predictions_path(tmp_path):
 
     with pytest.raises(ValueError, match="does not match"):
         validate_clean_oos_manifest(manifest, other)
+
+
+def test_manifest_validation_passes_with_matching_content_hash(tmp_path):
+    rng = np.random.default_rng(40)
+    pred = tmp_path / "p.parquet"
+    _write_predictions(pred, ["2025-03-13"], [f"T{i:02d}" for i in range(25)], rng)
+    manifest = tmp_path / "manifest.json"
+    _write_clean_manifest(manifest, pred)
+    out = validate_clean_oos_manifest(manifest, pred)
+    assert out["_predictions_sha256"] == _sha(pred)
+
+
+def test_manifest_validation_detects_same_path_tamper(tmp_path):
+    """codex pipeline#73 blocker: a same-path swap must be caught."""
+    rng = np.random.default_rng(41)
+    pred = tmp_path / "p.parquet"
+    _write_predictions(pred, ["2025-03-13"], [f"T{i:02d}" for i in range(25)], rng)
+    manifest = tmp_path / "manifest.json"
+    _write_clean_manifest(manifest, pred)  # stamps the original hash
+    # overwrite predictions at the SAME path with different content
+    _write_predictions(pred, ["2025-03-13"], [f"T{i:02d}" for i in range(25)],
+                       np.random.default_rng(999))
+    with pytest.raises(ValueError, match="content hash does not match"):
+        validate_clean_oos_manifest(manifest, pred)
+
+
+def test_manifest_validation_fails_closed_without_content_hash(tmp_path):
+    rng = np.random.default_rng(42)
+    pred = tmp_path / "p.parquet"
+    _write_predictions(pred, ["2025-03-13"], [f"T{i:02d}" for i in range(25)], rng)
+    manifest = tmp_path / "manifest.json"
+    _write_clean_manifest(manifest, pred, with_hash=False)
+    with pytest.raises(ValueError, match="missing output_hashes"):
+        validate_clean_oos_manifest(manifest, pred)
 
 
 def test_cli_blocks_overlap_horizon_without_research_override(tmp_path, capsys):

@@ -86,9 +86,32 @@ def validate_clean_oos_manifest(
             f"{pred_path} != {expected_path}"
         )
 
+    # Chain-of-custody: a path match is not enough — a same-path swap of
+    # predictions.parquet would otherwise pass. Require the upstream manifest
+    # to carry the predictions CONTENT hash (renquant-model export
+    # output_hashes.predictions_parquet_sha256) and verify the bytes we load
+    # are byte-identical to the placebo-clean export. Fail closed if the hash
+    # is absent (an older manifest is not promotion-grade) or mismatches.
+    actual_sha = _sha256_file(pred_path)
+    expected_sha = (manifest.get("output_hashes") or {}).get(
+        "predictions_parquet_sha256"
+    )
+    if not expected_sha:
+        raise ValueError(
+            "clean-OOS manifest missing output_hashes.predictions_parquet_sha256; "
+            "regenerate the export with the content-hash stamp before a "
+            "promotion-grade run (renquant-model oos_ic_export)."
+        )
+    if actual_sha != expected_sha:
+        raise ValueError(
+            "predictions.parquet content hash does not match the clean-OOS "
+            f"manifest: loaded {actual_sha} != manifest {expected_sha}. The "
+            "predictions file was modified after the placebo-clean export."
+        )
+
     manifest["_manifest_path"] = str(mpath)
     manifest["_manifest_sha256"] = _sha256_file(mpath)
-    manifest["_predictions_sha256"] = _sha256_file(pred_path)
+    manifest["_predictions_sha256"] = actual_sha
     return manifest
 
 
