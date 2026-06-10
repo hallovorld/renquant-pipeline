@@ -45,6 +45,8 @@ def test_candidate_set_shares_bar_count():
 def test_run_significance_has_all_blocks():
     out = run_significance(_bars(), a2_hold_bars=3, pbo_n_slices=8)
     assert out["incumbent"] == INCUMBENT
+    assert out["promotion_decision_grade"] is False
+    assert out["pbo_n_slices"] == 8
     assert set(out) >= {
         "per_allocator", "paired_vs_incumbent", "significance_dsr_pbo",
         "per_regime", "caveats",
@@ -56,6 +58,8 @@ def test_run_significance_has_all_blocks():
     assert "A2_long_only_hold3" in sig
     pbo_values = {v.get("pbo") for v in sig.values()}
     assert len(pbo_values) == 1  # one shared PBO number
+    assert all(v["diagnostic_only"] is True for v in sig.values())
+    assert all(v["live_promotable_per_section_8"] is False for v in sig.values())
 
 
 def test_paired_block_reports_hac_and_delta_sharpe():
@@ -71,3 +75,18 @@ def test_per_regime_block_present():
     out = run_significance(_bars(), a2_hold_bars=3, pbo_n_slices=8)
     # both regimes appear (PRIME DIRECTIVE: by-regime first)
     assert set(out["per_regime"]) & {"BULL_CALM", "BEAR"}
+    assert out["per_regime_available"] is True
+
+
+def test_missing_regimes_are_explicitly_marked_unavailable():
+    bars = [
+        AllocatorReplayBar(
+            bar_date=b.bar_date, snap=b.snap, mu=b.mu, sigma=b.sigma,
+            fwd_return=b.fwd_return, regime=None,
+        )
+        for b in _bars()
+    ]
+    out = run_significance(bars, a2_hold_bars=3, pbo_n_slices=8)
+    assert out["per_regime"] == {}
+    assert out["per_regime_available"] is False
+    assert "do not carry regime labels" in out["per_regime_unavailable_reason"]

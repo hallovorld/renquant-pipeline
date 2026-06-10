@@ -11,8 +11,9 @@ existing step-4g machinery:
 - **DSR** per candidate and **PBO** across the candidate matrix
   (Bailey-Borwein-López de Prado-Zhu 2015 CSCV) — multiple-comparison
   correction so a lucky ordering cannot masquerade as skill.
-- **Per-regime stratification** (CLAUDE.md PRIME DIRECTIVE: by-regime
-  first, pooled second).
+- **Per-regime stratification** when replay bars carry regimes; otherwise
+  the output explicitly marks regime analysis unavailable instead of
+  silently implying it was performed.
 
 Stage-A A2 is horizon-held (the E2 finding: ~3-bar cadence), so it needs
 the observe-aware replay; the QP / equal-weight / inverse-vol baselines are
@@ -21,7 +22,8 @@ is well-defined.
 
 This is NOT a promotion: same caveats as the synthesis (minimal long-only
 snapshot, single OOS holdout, gross of tax). It upgrades the synthesis's
-"strong directional" ordering to a multiple-comparison-corrected one.
+"strong directional" ordering to a multiple-comparison-corrected one, and
+the artifact disables live-promotable flags fail-closed.
 """
 from __future__ import annotations
 
@@ -126,20 +128,32 @@ def run_significance(
                 a, b, name_a=INCUMBENT, name_b=name,
             )
 
-    significance = verdicts_to_dict(
+    significance = _diagnostic_verdicts_to_dict(
         compute_significance_verdicts(results, pbo_n_slices=pbo_n_slices)
     )
     regime_block = regime_stratified_block(results, bars)
+    regime_available = bool(regime_block)
 
     return {
         "experiment": "stage_a_significance",
+        "promotion_decision_grade": False,
+        "promotion_block_reason": (
+            "diagnostic clean-signal replay only: minimal long-only snapshot, "
+            "single fixed OOS holdout, gross of tax"
+        ),
         "incumbent": INCUMBENT,
         "a2_hold_bars": a2_hold_bars,
+        "pbo_n_slices": pbo_n_slices,
         "n_bars": len(bars),
         "per_allocator": per_allocator,
         "paired_vs_incumbent": paired_block,
         "significance_dsr_pbo": significance,
         "per_regime": regime_block,
+        "per_regime_available": regime_available,
+        "per_regime_unavailable_reason": (
+            None if regime_available
+            else "clean PatchTST replay bars do not carry regime labels"
+        ),
         "basis": "replay_net_of_cost",
         "caveats": [
             "minimal long-only snapshot — not a production decision-trace reproduction",
@@ -150,9 +164,23 @@ def run_significance(
     }
 
 
+def _diagnostic_verdicts_to_dict(verdicts: dict) -> dict:
+    """Return DSR/PBO values but force promotion flags off for this diagnostic."""
+    out = verdicts_to_dict(verdicts)
+    for block in out.values():
+        block["diagnostic_only"] = True
+        block["live_promotable_per_section_8"] = False
+        block["live_promotable_per_clause_7_4"] = False
+        block["promotion_block_reason"] = (
+            "stage_a_significance is not decision-grade promotion evidence"
+        )
+    return out
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover — thin CLI
     import argparse
     import json
+    import platform
     import sys
     from datetime import datetime, timezone
     from pathlib import Path
@@ -205,10 +233,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover — t
         "experiment": "stage_a_significance",
         "run_id": run_id,
         "command": " ".join(sys.argv),
+        "python": platform.python_version(),
+        "params": {
+            "a2_hold_bars": args.a2_hold_bars,
+            "pbo_n_slices": args.pbo_n_slices,
+            "fwd_horizon_days": 1,
+            "basis": "replay_net_of_cost",
+            "promotion_decision_grade": False,
+        },
         "input": {
             "predictions": str(args.predictions),
             "clean_oos_manifest": manifest["_manifest_path"],
+            "clean_oos_manifest_sha256": manifest["_manifest_sha256"],
             "predictions_sha256": manifest["_predictions_sha256"],
+            "clean_oos_run_id": manifest.get("run_id"),
+            "clean_oos_mean_ic": (manifest.get("metrics") or {}).get("mean_oos_ic"),
+            "clean_oos_sanity_passed": (manifest.get("sanity_battery") or {}).get("passed"),
+            "clean_oos_contract_passed": (manifest.get("oos_contract") or {}).get("passed"),
             "n_bars": len(bars),
         },
         "repo_pins": pins,
