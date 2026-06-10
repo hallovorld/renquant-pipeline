@@ -339,6 +339,41 @@ def assemble_verdict(
     }
 
 
+def apply_promotion_gate_to_significance(
+    significance: dict,
+    violations: dict,
+    *,
+    constraints_decision_grade: bool,
+) -> dict:
+    """Fail closed significance flags once non-statistical gates are known.
+
+    DSR/PBO answers "is this return stream statistically credible?"  It is
+    not, by itself, a live promotion verdict.  The JSON should therefore not
+    leave ``live_promotable_*`` true when the replay manifold is missing
+    load-bearing constraints or the allocator violates hard caps.
+    """
+    out: dict = {}
+    by_allocator = violations.get("by_allocator", {})
+    for name, sig in significance.items():
+        block = dict(sig)
+        block_reasons: list[str] = []
+        if not constraints_decision_grade:
+            block_reasons.append("replay constraints are not decision-grade")
+        if by_allocator.get(name, {}).get("rejected_for_promotion", True):
+            block_reasons.append("allocator has hard-constraint violations")
+
+        if block_reasons:
+            block["diagnostic_only"] = True
+            block["live_promotable_per_clause_7_4"] = False
+            block["live_promotable_per_section_8"] = False
+            block["promotion_block_reason"] = "; ".join(block_reasons)
+        else:
+            block["diagnostic_only"] = False
+            block.pop("promotion_block_reason", None)
+        out[name] = block
+    return out
+
+
 # --------- top-level runner -----------------------------------------------
 
 def run_replay(
@@ -382,6 +417,11 @@ def run_replay(
     # Block 5: violation report
     violation_block = violation_report_block(results)
     constraint_fidelity = constraint_fidelity_block(bars)
+    significance_block = apply_promotion_gate_to_significance(
+        significance_block,
+        violation_block,
+        constraints_decision_grade=constraint_fidelity["decision_grade"],
+    )
 
     # Block 6: verdict
     verdict = assemble_verdict(

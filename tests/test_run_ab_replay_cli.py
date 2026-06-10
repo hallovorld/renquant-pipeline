@@ -27,6 +27,7 @@ from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa:
 )
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot  # noqa: E402
 from renquant_pipeline.kernel.portfolio_qp.run_ab_replay import (  # noqa: E402
+    apply_promotion_gate_to_significance,
     assemble_verdict,
     constraint_fidelity_block,
     get_allocator,
@@ -217,6 +218,14 @@ class TestRunReplayEndToEnd:
         # decision-grade and must fail closed for promotion.
         assert payload["constraint_fidelity"]["decision_grade"] is False
         assert payload["verdict"]["promotion_candidate"] is None
+        assert all(
+            sig["diagnostic_only"] is True
+            for sig in payload["significance"].values()
+        )
+        assert all(
+            sig["live_promotable_per_section_8"] is False
+            for sig in payload["significance"].values()
+        )
         # JSON-serialisable
         json.dumps(payload)
 
@@ -277,6 +286,66 @@ class TestViolationReport:
         assert block["any_allocator_violated_any_family"] is False
         for name in ("eq", "iv"):
             assert block["by_allocator"][name]["rejected_for_promotion"] is False
+
+
+class TestSignificancePromotionGate:
+    def test_incomplete_constraints_force_diagnostic_only(self):
+        significance = {
+            "current_qp": {
+                "live_promotable_per_clause_7_4": True,
+                "live_promotable_per_section_8": True,
+            },
+            "challenger": {
+                "live_promotable_per_clause_7_4": True,
+                "live_promotable_per_section_8": True,
+            },
+        }
+        violations = {
+            "by_allocator": {
+                "current_qp": {"rejected_for_promotion": False},
+                "challenger": {"rejected_for_promotion": False},
+            }
+        }
+
+        block = apply_promotion_gate_to_significance(
+            significance, violations, constraints_decision_grade=False,
+        )
+
+        for sig in block.values():
+            assert sig["diagnostic_only"] is True
+            assert sig["live_promotable_per_clause_7_4"] is False
+            assert sig["live_promotable_per_section_8"] is False
+            assert "not decision-grade" in sig["promotion_block_reason"]
+
+    def test_allocator_violations_force_diagnostic_only_for_that_allocator(self):
+        significance = {
+            "current_qp": {
+                "live_promotable_per_clause_7_4": True,
+                "live_promotable_per_section_8": True,
+            },
+            "challenger": {
+                "live_promotable_per_clause_7_4": True,
+                "live_promotable_per_section_8": True,
+            },
+        }
+        violations = {
+            "by_allocator": {
+                "current_qp": {"rejected_for_promotion": False},
+                "challenger": {"rejected_for_promotion": True},
+            }
+        }
+
+        block = apply_promotion_gate_to_significance(
+            significance, violations, constraints_decision_grade=True,
+        )
+
+        assert block["current_qp"]["diagnostic_only"] is False
+        assert block["current_qp"]["live_promotable_per_section_8"] is True
+        assert "promotion_block_reason" not in block["current_qp"]
+        assert block["challenger"]["diagnostic_only"] is True
+        assert block["challenger"]["live_promotable_per_clause_7_4"] is False
+        assert block["challenger"]["live_promotable_per_section_8"] is False
+        assert "hard-constraint violations" in block["challenger"]["promotion_block_reason"]
 
 
 class TestConstraintFidelity:
