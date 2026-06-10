@@ -23,6 +23,7 @@ import numpy as np
 
 from renquant_pipeline.kernel.decision_trace import (
     active_panel_model_type,
+    active_scorer_identity,
     candidate_trace_pool,
     model_types_from_models,
 )
@@ -71,11 +72,31 @@ class RecordScoreDistributionTask(Task):
         sector_map = (ctx.config or {}).get("sector_map", {}) or {}
         model_types = model_types_from_models(getattr(ctx, "models", None) or {})
         active_model_type = active_panel_model_type(ctx.config, ctx)
+        # 2026-06-07 audit follow-up: when panel scoring is active, the
+        # active scorer (e.g. hf_patchtst) selected every row — stamp it as
+        # model_type instead of the stale per-ticker label, which is
+        # preserved separately as legacy_model_type.
+        active_scorer = active_scorer_identity(ctx.config, ctx)
         candidate_tickers = {getattr(c, "ticker", None) for c in cand_pool}
+
+        def _model_fields(obj: Any, ticker: Any) -> tuple[Any, Any, Any]:
+            legacy = (
+                getattr(obj, "legacy_model_type", None)
+                or model_types.get(ticker)
+                or getattr(obj, "model_type", None)
+            )
+            model_type = (
+                active_scorer
+                or getattr(obj, "model_type", None)
+                or model_types.get(ticker)
+                or active_model_type
+            )
+            return model_type, active_scorer, legacy
 
         rows: list[tuple] = []
         for c in cand_pool:
             ticker = getattr(c, "ticker", None)
+            model_type, scorer, legacy = _model_fields(c, ticker)
             rows.append((
                 run_id, date_iso, run_type, ticker,
                 getattr(c, "panel_score", None),
@@ -86,13 +107,16 @@ class RecordScoreDistributionTask(Task):
                 getattr(c, "sigma", None),
                 regime,
                 0,  # is_holding=False
-                getattr(c, "model_type", None) or model_types.get(ticker) or active_model_type,
+                model_type,
+                scorer,
+                legacy,
                 _sector_for(ticker, sector_map),
                 blocked_map.get(ticker),
             ))
         for ticker, hs in ctx.holdings.items():
             if ticker in candidate_tickers:
                 continue
+            model_type, scorer, legacy = _model_fields(hs, ticker)
             rows.append((
                 run_id, date_iso, run_type, ticker,
                 getattr(hs, "panel_score", None),
@@ -103,7 +127,9 @@ class RecordScoreDistributionTask(Task):
                 getattr(hs, "sigma", None),
                 regime,
                 1,  # is_holding=True
-                getattr(hs, "model_type", None) or model_types.get(ticker) or active_model_type,
+                model_type,
+                scorer,
+                legacy,
                 _sector_for(ticker, sector_map),
                 blocked_map.get(ticker),
             ))
@@ -114,8 +140,9 @@ class RecordScoreDistributionTask(Task):
                 """INSERT OR REPLACE INTO score_distribution
                    (run_id, date, run_type, ticker, raw_panel, rank_score,
                     expected_return_horizon_days, mu, mu_horizon_days, sigma,
-                    regime, is_holding, model_type, sector, blocked_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    regime, is_holding, model_type, active_scorer,
+                    legacy_model_type, sector, blocked_by)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
 

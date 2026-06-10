@@ -42,6 +42,28 @@ def active_panel_model_type(config: dict[str, Any] | None, ctx: Any | None = Non
     return str(panel_cfg.get("kind") or (config or {}).get("panel_ltr", {}).get("backend") or "xgb")
 
 
+def active_scorer_identity(config: dict[str, Any] | None, ctx: Any | None = None) -> str | None:
+    """Identity of the ACTIVE panel scorer, or None when panel scoring is off.
+
+    Unlike :func:`active_panel_model_type` this never falls back to a
+    default ``"xgb"`` label, so per-ticker model labels survive for
+    strategies that do not run panel scoring (2026-06-07 audit follow-up).
+    """
+    if ctx is not None:
+        value = getattr(ctx, "_active_panel_model_type", None)
+        if isinstance(value, str) and value:
+            return value
+    panel_cfg = (
+        ((config or {}).get("ranking", {}) or {})
+        .get("panel_scoring", {})
+        or {}
+    )
+    if panel_cfg.get("enabled") is False:
+        return None
+    kind = panel_cfg.get("kind")
+    return str(kind) if kind else None
+
+
 def build_ticker_daily_state_rows(
     config: dict[str, Any],
     ctx: Any,
@@ -69,8 +91,15 @@ def build_ticker_daily_state_rows(
     ticker_order = _stable_ticker_order(
         watchlist, held, selected, blocked, pending, extra_tickers,
     )
+    # 2026-06-07 audit follow-up: the active panel scorer is the model that
+    # actually selected/ranked this bar — it must win over stale per-ticker
+    # labels, which are preserved separately as legacy_model_type.
+    active_scorer = (
+        active_scorer_identity(config, ctx)
+        or model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+    )
     artifact_model_type = (
-        model_type_from_artifact(getattr(ctx, "artifact_manifest", None))
+        active_scorer
         or active_panel_model_type(config, ctx)
     )
     admission = _model_admission_trace(
@@ -83,7 +112,8 @@ def build_ticker_daily_state_rows(
 
     rows: list[dict[str, Any]] = []
     for ticker in ticker_order:
-        model_type = (model_types or {}).get(ticker) or artifact_model_type
+        legacy_model_type = (model_types or {}).get(ticker)
+        model_type = active_scorer or legacy_model_type or artifact_model_type
         rows.append(
             {
                 "ticker": ticker,
@@ -92,6 +122,8 @@ def build_ticker_daily_state_rows(
                 "confidence": _finite_or_none(_get_value(ctx, "confidence")),
                 "sector": sectors.get(ticker, "UNKNOWN"),
                 "model_type": model_type,
+                "active_scorer": active_scorer,
+                "legacy_model_type": legacy_model_type,
                 "score": _finite_or_none(scores.get(ticker)),
                 "panel_score": _finite_or_none(panel_scores.get(ticker)),
                 "rank_score": _finite_or_none(rank_scores.get(ticker)),

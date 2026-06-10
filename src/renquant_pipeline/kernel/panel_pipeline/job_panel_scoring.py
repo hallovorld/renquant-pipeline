@@ -495,6 +495,16 @@ def _stamp_active_panel_scorer(
 def _annotate_panel_model(obj: Any, ctx: Any) -> None:
     model_type = getattr(ctx, "_active_panel_model_type", None)
     if model_type:
+        # 2026-06-07 audit follow-up: the active panel scorer is the model
+        # that actually selected/ranked this row. Preserve the stale
+        # per-ticker label (Manual/XGBoost/QLearning/Classification) as
+        # `legacy_model_type` instead of silently dropping it.
+        previous = getattr(obj, "model_type", None)
+        if (
+            isinstance(previous, str) and previous and previous != model_type
+            and getattr(obj, "legacy_model_type", None) is None
+        ):
+            setattr(obj, "legacy_model_type", previous)
         setattr(obj, "model_type", model_type)
 
 
