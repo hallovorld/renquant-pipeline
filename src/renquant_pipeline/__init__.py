@@ -11,6 +11,7 @@ from .inference import (
     write_runtime_inference_payload_from_live_context,
 )
 from .model_admission import ModelAdmissionResult, evaluate_model_admission
+from .native_inference import run_native_inference_snapshot
 from .decision_trace import (
     append_ticker_daily_state_rows,
     build_ticker_daily_state_rows,
@@ -88,6 +89,7 @@ __all__ = [
     "resolve_live_state_read",
     "runtime_inference_payload",
     "runtime_inference_payload_from_live_context",
+    "run_native_inference_snapshot",
     "runs_db_legacy_path",
     "runs_db_path",
     "score_snapshot",
