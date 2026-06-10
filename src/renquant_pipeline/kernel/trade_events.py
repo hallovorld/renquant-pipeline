@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime
 from typing import Any
 
+from renquant_pipeline.kernel.decision_trace import resolve_model_attribution
 from renquant_pipeline.kernel.pipeline.exit_params import apply_stop_loss_anchor_policy
 
 
@@ -43,6 +44,8 @@ def _score_snapshot(order: dict[str, Any], regime: str | None,
         "confidence": order.get("confidence", confidence),
         "regime": order.get("regime", regime),
         "model_type": order.get("model_type"),
+        "active_scorer": order.get("active_scorer"),
+        "legacy_model_type": order.get("legacy_model_type"),
         "sector": order.get("sector"),
         "blocked_by": order.get("blocked_by"),
     }
@@ -139,6 +142,8 @@ def build_buy_trade_event(
         "confidence": confidence,
         "regime": regime,
         "model_type": _score_field(order, snap, "model_type"),
+        "active_scorer": _score_field(order, snap, "active_scorer"),
+        "legacy_model_type": _score_field(order, snap, "legacy_model_type"),
         "sector": _score_field(order, snap, "sector"),
         "blocked_by": _score_field(order, snap, "blocked_by"),
         "qp_delta_w": _decision_field(inputs, "delta_w"),
@@ -153,7 +158,8 @@ def _fill_payload_from_source(payload: dict[str, Any], source_obj: Any) -> None:
     for key in (
         "rank_score", "panel_score", "rs_score", "mu", "mu_horizon_days",
         "sigma", "expected_return", "expected_return_horizon_days",
-        "kelly_target_pct", "model_type", "sector", "blocked_by",
+        "kelly_target_pct", "model_type", "active_scorer",
+        "legacy_model_type", "sector", "blocked_by",
     ):
         if payload.get(key) is None:
             value = getattr(source_obj, key, None)
@@ -236,6 +242,8 @@ def build_short_open_trade_event(
         ),
         "kelly_target_pct": _score_field(payload, snap, "kelly_target_pct"),
         "model_type": _score_field(payload, snap, "model_type"),
+        "active_scorer": _score_field(payload, snap, "active_scorer"),
+        "legacy_model_type": _score_field(payload, snap, "legacy_model_type"),
         "sector": _score_field(payload, snap, "sector"),
         "blocked_by": _score_field(payload, snap, "blocked_by"),
         "order_type": f"SHORT_OPEN_{exit_type}",
@@ -344,6 +352,17 @@ def build_sell_trade_event(
         config=config or {},
     )
     sig_inputs = getattr(sig, "decision_inputs", None) or {}
+    # 2026-06-07 audit follow-up: stamp the ACTIVE panel scorer identity
+    # instead of inheriting only the holding's stale per-ticker label.
+    model_ident = resolve_model_attribution(
+        config,
+        None,
+        legacy_model_type=(
+            getattr(holding, "legacy_model_type", None)
+            or getattr(holding, "model_type", None)
+        ),
+    )
+    model_type = model_ident["model_type"] or getattr(holding, "model_type", None)
     return {
         "ticker": ticker,
         "action": "sell",
@@ -378,7 +397,9 @@ def build_sell_trade_event(
         "attribution_version": attribution_version,
         "confidence": confidence,
         "regime": regime,
-        "model_type": getattr(holding, "model_type", None),
+        "model_type": model_type,
+        "active_scorer": model_ident["active_scorer"],
+        "legacy_model_type": model_ident["legacy_model_type"],
         "sector": getattr(holding, "sector", None),
         "blocked_by": getattr(sig, "blocked_by", None) or getattr(
             holding, "blocked_by", None,
@@ -399,7 +420,9 @@ def build_sell_trade_event(
             "kelly_target_pct": getattr(holding, "kelly_target_pct", None),
             "confidence": confidence,
             "regime": regime,
-            "model_type": getattr(holding, "model_type", None),
+            "model_type": model_type,
+            "active_scorer": model_ident["active_scorer"],
+            "legacy_model_type": model_ident["legacy_model_type"],
             "sector": getattr(holding, "sector", None),
         },
         "decision_inputs": {

@@ -58,6 +58,56 @@ def active_panel_model_type(config: dict | None, ctx: Any | None = None) -> str 
     return str(kind or "xgb")
 
 
+def active_scorer_identity(config: dict | None, ctx: Any | None = None) -> str | None:
+    """Identity of the ACTIVE panel scorer, or None when panel scoring is off.
+
+    Unlike :func:`active_panel_model_type` (which defaults to ``"xgb"`` as a
+    last-resort fallback), this returns None when no panel scorer is
+    configured, so per-ticker model labels are not overridden for
+    non-panel strategies.
+    """
+    if ctx is not None:
+        value = getattr(ctx, "_active_panel_model_type", None)
+        if isinstance(value, str) and value:
+            return value
+    panel_cfg = (
+        ((config or {}).get("ranking", {}) or {})
+        .get("panel_scoring", {})
+        or {}
+    )
+    if panel_cfg.get("enabled") is False:
+        return None
+    kind = panel_cfg.get("kind")
+    return str(kind) if kind else None
+
+
+def resolve_model_attribution(
+    config: dict | None,
+    ctx: Any | None = None,
+    *,
+    legacy_model_type: str | None = None,
+) -> dict[str, str | None]:
+    """Resolve attribution identity for emitted candidate/trade/trace rows.
+
+    Audit fix (2026-06-07 prod/shadow status audit): ``model_type`` must
+    carry the ACTIVE panel scorer identity (e.g. ``hf_patchtst``) when panel
+    scoring selects/ranks, instead of silently inheriting the stale
+    per-ticker XGB-era label. The per-ticker label is preserved separately
+    as ``legacy_model_type`` so existing per-ticker analytics keep working.
+    """
+    active = active_scorer_identity(config, ctx)
+    legacy = (
+        legacy_model_type
+        if isinstance(legacy_model_type, str) and legacy_model_type
+        else None
+    )
+    return {
+        "model_type": active or legacy,
+        "active_scorer": active,
+        "legacy_model_type": legacy,
+    }
+
+
 def selected_buy_tickers(trade_events: list[dict[str, Any]] | None) -> set[str]:
     """Return tickers with buy trade/order events."""
     return {
@@ -251,6 +301,16 @@ def build_ticker_daily_state_rows(
         else:
             model_action = snap.get("model_action", "hold")
 
+        model_ident = resolve_model_attribution(
+            config,
+            ctx,
+            legacy_model_type=(
+                model_types.get(tk)
+                or getattr(src, "legacy_model_type", None)
+                or getattr(src, "model_type", None)
+                or snap.get("model_type")
+            ),
+        )
         rows.append({
             "ticker": tk,
             "regime": getattr(ctx, "regime", None),
@@ -262,11 +322,11 @@ def build_ticker_daily_state_rows(
             "position_qty": pos_qty,
             "position_pct": pos_pct,
             "model_type": (
-                model_types.get(tk)
-                or getattr(src, "model_type", None)
-                or snap.get("model_type")
+                model_ident["model_type"]
                 or active_panel_model_type(config, ctx)
             ),
+            "active_scorer": model_ident["active_scorer"],
+            "legacy_model_type": model_ident["legacy_model_type"],
             "model_action": model_action,
             "sell_streak": int(getattr(hs, "sell_streak", 0)) if hs else None,
             "panel_score": _score_value(src, snap, "panel_score"),
@@ -328,6 +388,8 @@ def _runtime_regime_admission_trace(
 __all__ = [
     "build_ticker_daily_state_rows",
     "active_panel_model_type",
+    "active_scorer_identity",
+    "resolve_model_attribution",
     "candidate_score_excluded_holding_tickers",
     "candidate_trace_pool",
     "model_type_from_artifact",

@@ -83,7 +83,9 @@ CREATE TABLE IF NOT EXISTS candidate_scores (
     expected_return    REAL,        -- calibrated ER (drives rotation)
     expected_return_horizon_days INTEGER,
     kelly_target_pct   REAL,        -- Kelly sizing target (μ/σ²)
-    model_type         TEXT,        -- per-ticker model: 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
+    model_type         TEXT,        -- selecting model: active panel scorer (e.g. 'hf_patchtst' | 'xgb') when panel scoring is on, else per-ticker model
+    active_scorer      TEXT,        -- ACTIVE panel scorer identity (2026-06-07 audit); NULL when panel scoring off
+    legacy_model_type  TEXT,        -- stale per-ticker label: 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
     sector             TEXT,        -- from sector_map, easier than join
     panel_ltr_artifact TEXT,        -- 'panel-ltr.json' filename or full path
     mu_horizon_days    INTEGER,
@@ -126,6 +128,8 @@ CREATE TABLE IF NOT EXISTS trades (
     expected_return_horizon_days INTEGER,
     kelly_target_pct REAL,
     model_type     TEXT,
+    active_scorer  TEXT,
+    legacy_model_type TEXT,
     sector         TEXT,
     blocked_by     TEXT,
     qp_delta_w     REAL,
@@ -280,8 +284,11 @@ CREATE TABLE IF NOT EXISTS ticker_daily_state (
     has_position      INTEGER,        -- 1 if currently held
     position_qty      REAL,           -- shares held (NULL if not held)
     position_pct      REAL,           -- pct of portfolio (NULL if not held)
-    -- Per-ticker model output
-    model_type        TEXT,           -- 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
+    -- Model identity (2026-06-07 audit: model_type = ACTIVE panel scorer
+    -- when panel scoring is on; legacy per-ticker label kept separately)
+    model_type        TEXT,           -- 'hf_patchtst' | 'xgb' | per-ticker label when panel scoring off
+    active_scorer     TEXT,           -- active panel scorer identity, NULL when off
+    legacy_model_type TEXT,           -- 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
     model_action      TEXT,           -- 'buy' | 'hold' | 'sell'
     sell_streak       INTEGER,        -- only meaningful when has_position=1
     -- Panel scores (when computed)
@@ -326,6 +333,8 @@ CREATE TABLE IF NOT EXISTS score_distribution (
     regime        TEXT,                 -- BULL_CALM / etc.
     is_holding    INTEGER DEFAULT 0,    -- 0 = candidate, 1 = held
     model_type    TEXT,
+    active_scorer TEXT,
+    legacy_model_type TEXT,
     sector        TEXT,
     blocked_by    TEXT,
     PRIMARY KEY (run_id, ticker)
@@ -457,6 +466,8 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("qp_delta_w",         "REAL"),
         ("qp_target_w",        "REAL"),
         ("qp_status",          "TEXT"),
+        ("active_scorer",      "TEXT"),
+        ("legacy_model_type",  "TEXT"),
     ],
     "ticker_daily_state": [
         ("qp_delta_w",         "REAL"),
@@ -470,12 +481,16 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("current_regime_admission_reason", "TEXT"),
         ("admitted_regimes", "TEXT"),
         ("blocked_regimes", "TEXT"),
+        ("active_scorer", "TEXT"),
+        ("legacy_model_type", "TEXT"),
     ],
     "score_distribution": [
         ("run_type",                    "TEXT"),
         ("expected_return_horizon_days", "INTEGER"),
         ("mu_horizon_days",             "INTEGER"),
         ("model_type",                  "TEXT"),
+        ("active_scorer",               "TEXT"),
+        ("legacy_model_type",           "TEXT"),
         ("sector",                      "TEXT"),
         ("blocked_by",                  "TEXT"),
     ],
@@ -509,6 +524,8 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("expected_return_horizon_days", "INTEGER"),
         ("kelly_target_pct",      "REAL"),
         ("model_type",            "TEXT"),
+        ("active_scorer",         "TEXT"),
+        ("legacy_model_type",     "TEXT"),
         ("sector",                "TEXT"),
         ("blocked_by",            "TEXT"),
         ("qp_delta_w",            "REAL"),
@@ -801,6 +818,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _apply_column_migrations(conn)
     _rebuild_ticker_daily_state_if_needed(conn)
     _rebuild_score_tables_if_needed(conn)
+    # Rebuilds recreate legacy-shaped tables from their historical column
+    # list; re-apply (idempotent) so later-added columns exist again.
+    _apply_column_migrations(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_run ON ticker_daily_state(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_run ON score_distribution(run_id)")
@@ -1010,6 +1030,7 @@ def record_candidate_scores(
     *,
     sector_map:    dict[str, str] | None = None,
     model_types:   dict[str, str] | None = None,
+    active_scorer: str | None = None,
     panel_artifact: str | None = None,
     qp_delta_by_ticker: dict[str, float] | None = None,
     qp_target_by_ticker: dict[str, float] | None = None,
@@ -1026,6 +1047,10 @@ def record_candidate_scores(
     `selected_tickers`: set of candidate tickers that ended up in orders this run
     `blocked_map`: optional dict of ticker → reason ("sector_cap", "correlation",
                    "wash_sale", "below_threshold", etc.)
+    `active_scorer`: ACTIVE panel scorer identity (e.g. "hf_patchtst"). When
+                   provided it is stamped as `model_type` (the model that
+                   actually selected/ranked rows — 2026-06-07 audit) while the
+                   per-ticker label is preserved as `legacy_model_type`.
     """
     if conn is None or run_id is None:
         return
@@ -1055,9 +1080,24 @@ def record_candidate_scores(
         value = sector_map.get(str(ticker).upper())
         return value if isinstance(value, str) and value else None
 
+    def _model_fields(obj: Any, ticker: str) -> tuple[str | None, str | None, str | None]:
+        # 2026-06-07 audit: model_type carries the model that actually
+        # selected this row. Panel-annotated objects already carry the
+        # active scorer on .model_type; the stale per-ticker label is
+        # preserved as legacy_model_type.
+        obj_model_type = getattr(obj, "model_type", None)
+        legacy = (
+            getattr(obj, "legacy_model_type", None)
+            or model_types.get(ticker)
+            or (obj_model_type if not active_scorer else None)
+        )
+        model_type = active_scorer or obj_model_type or model_types.get(ticker)
+        return model_type, active_scorer, legacy
+
     for c in candidates:
         selected = c.ticker in selected_tickers
         role = str(getattr(c, "trace_role", None) or "candidate")
+        c_model_type, c_active, c_legacy = _model_fields(c, c.ticker)
         rows.append((
             run_id, c.ticker, role,
             _none_or_float(getattr(c, "raw_score",  None)),
@@ -1072,7 +1112,9 @@ def record_candidate_scores(
             _none_or_float(getattr(c, "expected_return", None)),
             _none_or_int(getattr(c, "expected_return_horizon_days", None)),
             _none_or_float(getattr(c, "kelly_target_pct", None)),
-            model_types.get(c.ticker),
+            c_model_type,
+            c_active,
+            c_legacy,
             _sector_for(c.ticker),
             panel_artifact,
             _none_or_int(getattr(c, "mu_horizon_days", None)),
@@ -1083,6 +1125,7 @@ def record_candidate_scores(
     for ticker, hs in holdings.items():
         if str(ticker).upper() in excluded_holding_keys:
             continue
+        h_model_type, h_active, h_legacy = _model_fields(hs, ticker)
         rows.append((
             run_id, ticker, "holding",
             None,
@@ -1096,7 +1139,9 @@ def record_candidate_scores(
             _none_or_float(getattr(hs, "expected_return", None)),
             _none_or_int(getattr(hs, "expected_return_horizon_days", None)),
             _none_or_float(getattr(hs, "kelly_target_pct", None)),
-            model_types.get(ticker),
+            h_model_type,
+            h_active,
+            h_legacy,
             _sector_for(ticker),
             panel_artifact,
             _none_or_int(getattr(hs, "mu_horizon_days", None)),
@@ -1110,10 +1155,11 @@ def record_candidate_scores(
                   (run_id, ticker, role, raw_score, rank_score, panel_score, rs_score,
                    mu, sigma, selected, blocked_by,
                    expected_return, expected_return_horizon_days,
-                   kelly_target_pct, model_type, sector,
+                   kelly_target_pct, model_type, active_scorer,
+                   legacy_model_type, sector,
                    panel_ltr_artifact, mu_horizon_days,
                    qp_delta_w, qp_target_w, qp_status)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
@@ -1132,7 +1178,8 @@ def record_trades(
       net_pnl_after_tax, tax_cash_debited, tax_cash_debit_mode,
       tax_lot_method, rank_score, conviction, sigma_mult, mu,
       mu_horizon_days, sigma, panel_score, rs_score, expected_return,
-      expected_return_horizon_days, kelly_target_pct, model_type, sector,
+      expected_return_horizon_days, kelly_target_pct, model_type,
+      active_scorer, legacy_model_type, sector,
       blocked_by, qp_delta_w, qp_target_w, qp_status, regime, confidence,
       order_type/source/source_job/source_task/
       order_source/attribution_version, score_snapshot, decision_inputs.
@@ -1153,7 +1200,8 @@ def record_trades(
             "rank_score", "panel_score", "rs_score", "mu", "sigma",
             "mu_horizon_days", "kelly_target_pct", "expected_return",
             "expected_return_horizon_days", "confidence", "regime",
-            "model_type", "sector", "blocked_by",
+            "model_type", "active_scorer", "legacy_model_type",
+            "sector", "blocked_by",
         )
         fallback = {k: t.get(k) for k in keys if k in t and t.get(k) is not None}
         if fallback:
@@ -1225,6 +1273,8 @@ def record_trades(
             _none_or_int(t.get("expected_return_horizon_days")),
             _none_or_float(t.get("kelly_target_pct")),
             t.get("model_type"),
+            t.get("active_scorer"),
+            t.get("legacy_model_type"),
             t.get("sector"),
             t.get("blocked_by"),
             _none_or_float(t.get("qp_delta_w")),
@@ -1251,12 +1301,13 @@ def record_trades(
                    rank_score, conviction, sigma_mult, mu, mu_horizon_days, sigma,
                    panel_score, rs_score, expected_return,
                    expected_return_horizon_days, kelly_target_pct,
-                   model_type, sector, blocked_by,
+                   model_type, active_scorer, legacy_model_type,
+                   sector, blocked_by,
                    qp_delta_w, qp_target_w, qp_status,
                    regime, confidence,
                    order_type, source, source_job, source_task, order_source,
                    attribution_version, score_snapshot_json, decision_inputs_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
@@ -1637,7 +1688,8 @@ def record_ticker_daily_state(
 
     Each row dict supports: regime, confidence, in_watchlist, in_universe,
     pending_at_broker, has_position, position_qty, position_pct,
-    model_type, model_action, sell_streak, panel_score, rank_score,
+    model_type, active_scorer, legacy_model_type,
+    model_action, sell_streak, panel_score, rank_score,
     expected_return, expected_return_horizon_days, kelly_target_pct,
     mu, mu_horizon_days, sigma, in_candidates, selected, blocked_by,
     sector, qp_delta_w, qp_target_w, qp_status, model_admission_ok,
@@ -1667,6 +1719,8 @@ def record_ticker_daily_state(
             _none_or_float(r.get("position_qty")),
             _none_or_float(r.get("position_pct")),
             r.get("model_type"),
+            r.get("active_scorer"),
+            r.get("legacy_model_type"),
             r.get("model_action"),
             _none_or_int(r.get("sell_streak")),
             _none_or_float(r.get("panel_score")),
@@ -1698,7 +1752,8 @@ def record_ticker_daily_state(
               (run_id, date, ticker, regime, confidence,
                in_watchlist, in_universe, pending_at_broker,
                has_position, position_qty, position_pct,
-               model_type, model_action, sell_streak,
+               model_type, active_scorer, legacy_model_type,
+               model_action, sell_streak,
                panel_score, rank_score, expected_return,
                expected_return_horizon_days, kelly_target_pct,
                mu, mu_horizon_days, sigma,
@@ -1707,7 +1762,7 @@ def record_ticker_daily_state(
                model_admission_ok, model_admission_reason,
                current_regime_admitted, current_regime_admission_reason,
                admitted_regimes, blocked_regimes)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         payload,
     )
     return len(payload)

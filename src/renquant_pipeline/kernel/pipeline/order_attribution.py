@@ -33,21 +33,43 @@ def _pick(order: dict, obj: Any, key: str) -> Any:
     return getattr(obj, key, None) if obj is not None else None
 
 
-def _model_type_for(ctx: Any, ticker: str | None) -> str | None:
+def _legacy_model_type_for(ctx: Any, ticker: str | None) -> str | None:
+    """Stale per-ticker artifact label (XGB-era); kept for audit continuity."""
     if not ticker or ctx is None:
         return None
     try:
         from renquant_pipeline.kernel.decision_trace import (  # noqa: PLC0415
-            active_panel_model_type,
             model_type_from_artifact,
         )
     except Exception:
         return None
     models = getattr(ctx, "models", None) or {}
-    return (
-        model_type_from_artifact(models.get(ticker))
-        or active_panel_model_type(getattr(ctx, "config", None), ctx)
+    return model_type_from_artifact(models.get(ticker))
+
+
+def _model_attribution_for(
+    ctx: Any,
+    legacy_model_type: str | None,
+) -> dict[str, str | None]:
+    """Active-scorer-first model identity (2026-06-07 audit follow-up)."""
+    try:
+        from renquant_pipeline.kernel.decision_trace import (  # noqa: PLC0415
+            active_panel_model_type,
+            resolve_model_attribution,
+        )
+    except Exception:
+        return {
+            "model_type": legacy_model_type,
+            "active_scorer": None,
+            "legacy_model_type": legacy_model_type,
+        }
+    config = getattr(ctx, "config", None) if ctx is not None else None
+    ident = resolve_model_attribution(
+        config, ctx, legacy_model_type=legacy_model_type,
     )
+    if ident["model_type"] is None:
+        ident["model_type"] = active_panel_model_type(config, ctx)
+    return ident
 
 
 def _sector_for(ctx: Any, ticker: str | None) -> str | None:
@@ -69,6 +91,12 @@ def _blocked_by_for(ctx: Any, ticker: str | None) -> str | None:
 def score_snapshot(order: dict, *, source_obj: Any = None, ctx: Any = None) -> dict[str, Any]:
     """Capture the model/risk score state visible when an order is emitted."""
     ticker = order.get("ticker") or getattr(source_obj, "ticker", None)
+    model_ident = _model_attribution_for(
+        ctx,
+        _pick(order, source_obj, "legacy_model_type")
+        or _pick(order, source_obj, "model_type")
+        or _legacy_model_type_for(ctx, ticker),
+    )
     return {
         "rank_score": _finite_or_none(_pick(order, source_obj, "rank_score")),
         "panel_score": _finite_or_none(_pick(order, source_obj, "panel_score")),
@@ -87,7 +115,11 @@ def score_snapshot(order: dict, *, source_obj: Any = None, ctx: Any = None) -> d
         "mu_horizon_days": _pick(order, source_obj, "mu_horizon_days"),
         "confidence": _finite_or_none(order.get("confidence", getattr(ctx, "confidence", None))),
         "regime": order.get("regime", getattr(ctx, "regime", None)),
-        "model_type": _pick(order, source_obj, "model_type") or _model_type_for(ctx, ticker),
+        # Active scorer first (2026-06-07 audit): when panel scoring selects,
+        # rows must say e.g. `hf_patchtst`, not a stale per-ticker label.
+        "model_type": model_ident["model_type"],
+        "active_scorer": model_ident["active_scorer"],
+        "legacy_model_type": model_ident["legacy_model_type"],
         "sector": _pick(order, source_obj, "sector") or _sector_for(ctx, ticker),
         "blocked_by": _pick(order, source_obj, "blocked_by") or _blocked_by_for(ctx, ticker),
     }
@@ -116,9 +148,13 @@ def stamp_order_attribution(
     merged_inputs.setdefault("source_job", source_job)
     merged_inputs.setdefault("source_task", source_task)
     snap = score_snapshot(order, source_obj=source_obj, ctx=ctx)
-    for key in ("model_type", "sector", "blocked_by"):
+    for key in ("model_type", "sector", "blocked_by", "active_scorer", "legacy_model_type"):
         if snap.get(key) is not None:
             order.setdefault(key, snap.get(key))
+    if snap.get("active_scorer"):
+        # The selecting model wins even when the emitter pre-stamped a stale
+        # per-ticker model_type (preserved above as legacy_model_type).
+        order["model_type"] = snap["model_type"]
     order.update({
         "attribution_version": ATTRIBUTION_VERSION,
         "source_job": source_job,

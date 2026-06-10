@@ -13,6 +13,7 @@ from .inference import (
 from .model_admission import ModelAdmissionResult, evaluate_model_admission
 from .native_inference import run_native_inference_snapshot
 from .decision_trace import (
+    active_scorer_identity,
     append_ticker_daily_state_rows,
     build_ticker_daily_state_rows,
     model_type_from_artifact,
@@ -76,6 +77,7 @@ __all__ = [
     "SelectionJob",
     "ValidateSelectionDoesNotPromoteTask",
     "VetoWeakBuysTask",
+    "active_scorer_identity",
     "append_ticker_daily_state_rows",
     "build_run_bundle",
     "build_runtime_feature_frame",

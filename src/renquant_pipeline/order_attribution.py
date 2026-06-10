@@ -8,7 +8,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .decision_trace import active_panel_model_type, model_type_from_artifact
+from .decision_trace import (
+    active_panel_model_type,
+    active_scorer_identity,
+    model_type_from_artifact,
+)
 
 
 ATTRIBUTION_VERSION = "order_attribution_v1"
@@ -30,11 +34,24 @@ def score_snapshot(
     blocked = getattr(ctx, "blocked_by", {}) or {}
     artifact = getattr(ctx, "artifact_manifest", {}) or {}
 
+    # 2026-06-07 audit follow-up: the ACTIVE panel scorer (e.g. hf_patchtst)
+    # is the model that selected this intent — it must win over the stale
+    # per-ticker label, which is preserved as legacy_model_type.
+    active_scorer = (
+        active_scorer_identity(config, ctx)
+        or model_type_from_artifact(artifact)
+    )
+    legacy_model_type = (
+        _attr(source_obj, "legacy_model_type")
+        or _attr(source_obj, "model_type")
+    )
     return {
         "ticker": ticker,
-        "model_type": _attr(source_obj, "model_type")
-        or model_type_from_artifact(artifact)
+        "model_type": active_scorer
+        or legacy_model_type
         or active_panel_model_type(config, ctx),
+        "active_scorer": active_scorer,
+        "legacy_model_type": legacy_model_type,
         "sector": sectors.get(ticker, "UNKNOWN"),
         "score": _finite_or_none(scores.get(ticker)),
         "panel_score": _finite_or_none(panel_scores.get(ticker)),
