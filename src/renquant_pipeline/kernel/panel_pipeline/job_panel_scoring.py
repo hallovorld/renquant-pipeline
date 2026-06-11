@@ -496,13 +496,39 @@ def _build_live_panel_history(
     extra_cols = [c for c in feature_cols if c not in a158_set]
     today_ts = pd.Timestamp(today)
 
+    # BL-1 (2026-06-10) CSRankNorm cross-section fix. PatchTST was trained
+    # with per-day CSRankNorm over the FULL panel cross-section (the 142-name
+    # watchlist / up to 291 training names). At inference the model expects
+    # the same broad cross-section; if we build sequences over only the
+    # post-gate candidate subset (often 1–3 survivors), the per-day rank-pct
+    # collapses to a handful of values wildly out-of-distribution vs training
+    # and the model emits uniformly negative / degenerate scores. So we build
+    # the sequence panel over the STABLE context (watchlist / training
+    # universe / holdings) — mirroring the XGB extra-feature path's
+    # `_stable_feature_context_tickers` guard — and the caller still extracts
+    # scores for `target_tickers` only. `score_with_history` applies the
+    # per-day CSRankNorm over every ticker present in this panel, so a broad
+    # panel restores the trained rank distribution.
+    panel_cfg = ((getattr(ctx, "config", {}) or {})
+                 .get("ranking", {}).get("panel_scoring", {}))
+    context_mode = str(
+        panel_cfg.get("csranknorm_context_mode", "stable") or "stable"
+    ).lower()
+    context_tickers = _stable_feature_context_tickers(ctx, target_tickers, scorer)
+    if context_mode == "candidates":
+        # Legacy behaviour (degenerate rank cross-section); for sims/backtests
+        # that pin a golden snapshot. NOT recommended for live PatchTST.
+        seq_universe = list(target_tickers)
+    else:
+        seq_universe = context_tickers
+
     # 1) Live alpha158 sequence per ticker (last seq_len bars ≤ today).
     frames: list[pd.DataFrame] = []
     a158_cache = getattr(ctx, "_alpha158_frame_cache", None)
     if not isinstance(a158_cache, dict):
         a158_cache = {}
         ctx._alpha158_frame_cache = a158_cache  # noqa: SLF001
-    for tkr in target_tickers:
+    for tkr in seq_universe:
         ohlcv_t = ohlcv_dict.get(tkr)
         if ohlcv_t is None or len(ohlcv_t) < seq_len:
             continue
@@ -526,21 +552,31 @@ def _build_live_panel_history(
 
     if not frames:
         log.error(
-            "ApplyScoresTask: 0/%d target tickers had ≥%d live OHLCV bars for "
-            "alpha158 sequence build.",
-            len(target_tickers), seq_len,
+            "ApplyScoresTask: 0/%d cross-section tickers had ≥%d live OHLCV "
+            "bars for alpha158 sequence build (targets=%d).",
+            len(seq_universe), seq_len, len(target_tickers),
         )
         return None
 
     panel = pd.concat(frames, ignore_index=True)
     built_tickers = list(panel["ticker"].unique())
+    # BL-1 guard: if the stable context still collapsed to a near-degenerate
+    # cross-section (≤ a few names with live OHLCV), CSRankNorm cannot match
+    # training. Surface it loudly so the operator sees a thin-universe day.
+    n_targets_in_panel = sum(1 for t in target_tickers if t in set(built_tickers))
+    if context_mode != "candidates" and len(built_tickers) <= 5:
+        log.warning(
+            "ApplyScoresTask: CSRankNorm cross-section is THIN — only %d "
+            "tickers have live OHLCV (targets in panel=%d). PatchTST scores "
+            "may be out-of-distribution; check OHLCV ingest breadth.",
+            len(built_tickers), n_targets_in_panel,
+        )
 
     # 2) As-of-today extra features (fundamental / PEAD / SUE / sentiment),
     #    reusing the same live point-in-time helpers the XGB path uses, then
     #    broadcast each ticker's value across its sequence window.
     if extra_cols:
         rows: dict[str, dict[str, float]] = {t: {} for t in built_tickers}
-        context_tickers = _stable_feature_context_tickers(ctx, built_tickers, scorer)
         repo = _data_root_cached()
 
         fund_cols = [c for c in ("earnings_yield", "book_to_price",
@@ -584,9 +620,11 @@ def _build_live_panel_history(
     panel = panel[ordered]
     log.info(
         "ApplyScoresTask: built LIVE sequence panel (%d rows × %d tickers × "
-        "%d bars, asof=%s) — %d alpha158 + %d extra features.",
+        "%d bars, asof=%s) — %d alpha158 + %d extra features; CSRankNorm "
+        "cross-section=%s (%d/%d targets in panel).",
         len(panel), panel["ticker"].nunique(), seq_len,
         today_ts.date().isoformat(), len(a158_cols), len(extra_cols),
+        context_mode, n_targets_in_panel, len(target_tickers),
     )
     return panel
 
