@@ -210,6 +210,7 @@ class _BuildSourceMapTask(Task):
                 src[t] = c
                 exit_only_tickers.discard(t)
         ctx._qp_mu_source_map = src   # noqa: SLF001
+        ctx._qp_admitted_new_tickers = admitted_new_tickers  # noqa: SLF001
         ctx._qp_exit_only_tickers = exit_only_tickers  # noqa: SLF001
         self._sync_ticker_order(ctx, src)
 

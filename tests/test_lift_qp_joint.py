@@ -94,6 +94,58 @@ def _qp_admission_reason(gate: dict, *, regime: str = "CHOPPY", source=None) -> 
     return _qp_buy_admission_block_reason(ctx, env, "AAPL")
 
 
+def test_qp_emit_env_carries_pre_admitted_new_tickers() -> None:
+    from renquant_pipeline.kernel.portfolio_qp.tasks import EmitOrdersFromQPSolutionTask
+
+    ctx = SimpleNamespace(
+        config={"rotation": {"joint_actions": {}}},
+        candidates=[],
+        holdings={},
+        prices={},
+        portfolio_value=100_000.0,
+        cash=10_000.0,
+        _qp_admitted_new_tickers={"AAA"},
+        _qp_mu_source_map={},
+    )
+
+    env = EmitOrdersFromQPSolutionTask._build_env(ctx, sol=SimpleNamespace())
+
+    assert env["admitted_new_tickers"] == {"AAA"}
+
+
+def test_qp_admission_slot_gate_counts_pre_admitted_new_tickers() -> None:
+    from renquant_pipeline.kernel.portfolio_qp.tasks import _qp_buy_admission_block_reason
+
+    source = SimpleNamespace(
+        ticker="BBB",
+        rank_score=1.0,
+        panel_score=1.0,
+        sigma=0.20,
+        expected_return=0.02,
+        expected_return_horizon_days=5,
+        mu=0.02,
+        mu_horizon_days=5,
+    )
+    ctx = SimpleNamespace(regime="CHOPPY", config={})
+    env = {
+        "cfg": {
+            "qp_mu_horizon_days": 5,
+            "qp_admission_gate": {
+                "enabled": True,
+                "respect_open_slots": True,
+            },
+        },
+        "holdings_set": {"HOLD"},
+        "preexisting_exit_tickers": set(),
+        "admitted_new_tickers": {"AAA"},
+        "emitted_new_tickers": set(),
+        "max_positions": 2,
+        "score_sources": {"BBB": source},
+    }
+
+    assert _qp_buy_admission_block_reason(ctx, env, "BBB") == "qp_admission_no_slot"
+
+
 def test_qp_admission_expected_return_by_regime_missing_regime_fails_closed() -> None:
     reason = _qp_admission_reason({
         "min_expected_return_by_regime": {"BULL_CALM": 0.01},
