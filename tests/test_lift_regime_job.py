@@ -104,8 +104,8 @@ def test_regime_job_is_deterministic() -> None:
 #
 # The 5-day route was OR(vol, ret): a lone vol spike with no real drop flipped
 # the whole book to hard_bear on routine pullback chop. These tests pin the two
-# config-gated guards (require-both + trend filter) and prove the 20-day GFC
-# routes stay unconditional.
+# config-gated guards (confirmed-vol + trend filter) and prove the 20-day GFC
+# and acute 5-day return-loss routes stay unconditional.
 
 # Reproduces 2026-06-11: elevated 5d vol (~0.30 > 0.25) but only a ~-0.5%
 # cumulative move (NOT < -4%), sitting on a calm prior window so the 20d route
@@ -132,8 +132,8 @@ def test_5d_vol_spike_alone_triggers_under_legacy_or_default() -> None:
 
 
 def test_require_both_suppresses_vol_only_false_bear() -> None:
-    """P0: require_both demands vol AND a real drop — the 2026-06-11 case is no
-    longer a false BEAR (vol breached but the -0.5% move did not)."""
+    """P0: confirmed-vol demands vol AND a real drop — the 2026-06-11 case is
+    no longer a false BEAR (vol breached but the -0.5% move did not)."""
     rets = np.concatenate([np.full(40, 0.0003), _VOL_SPIKE_5D])
     st = _run_bear(rets, {"bear_short_route_require_both": True})
     assert st.vol_5d > 0.25 and st.ret_5d > -0.04
@@ -146,6 +146,15 @@ def test_require_both_still_fires_on_genuine_both_breach() -> None:
     rets = np.concatenate([np.full(40, 0.0003), crash5])
     st = _run_bear(rets, {"bear_short_route_require_both": True})
     assert st.vol_5d > 0.25 and st.ret_5d < -0.04
+    assert st.hard_bear is True
+
+
+def test_require_both_does_not_disable_acute_return_loss_route() -> None:
+    """A 5-day return shock remains fail-safe even when vol confirmation is on."""
+    ret_shock = [-0.01, -0.01, -0.01, -0.01, -0.01]       # cumret ~-4.9%, low vol
+    rets = np.concatenate([np.full(240, 0.0015), ret_shock])
+    st = _run_bear(rets, {"bear_short_route_require_both": True})
+    assert st.vol_5d < 0.25 and st.ret_5d < -0.04
     assert st.hard_bear is True
 
 
@@ -164,6 +173,15 @@ def test_trend_filter_suppresses_5d_route_above_ma() -> None:
     st = _run_bear(rets, {"bear_trend_filter": {"enabled": True, "ma_window": 200}})
     assert st.vol_5d > 0.25
     assert st.hard_bear is False
+
+
+def test_trend_filter_does_not_suppress_acute_return_loss_above_ma() -> None:
+    """Trend confirmation gates vol-only false positives, not 5d return shocks."""
+    ret_shock = [-0.01, -0.01, -0.01, -0.01, -0.01]       # cumret ~-4.9%, low vol
+    rets = np.concatenate([np.full(240, 0.0015), ret_shock])
+    st = _run_bear(rets, {"bear_trend_filter": {"enabled": True, "ma_window": 200}})
+    assert st.vol_5d < 0.25 and st.ret_5d < -0.04
+    assert st.hard_bear is True
 
 
 def test_trend_filter_does_not_suppress_5d_route_below_ma() -> None:
