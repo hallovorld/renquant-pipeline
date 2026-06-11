@@ -241,14 +241,38 @@ class ApplyShadowScoringTask(Task):
             target_tickers = list(primary_scores.keys())
             try:
                 if getattr(scorer, "requires_history", False):
+                    # 2026-06-10 FROZEN-SCORE FIX (shadow path). Same bug as
+                    # the primary ApplyScoresTask path: lazy-loading the
+                    # sequence panel from the STATIC training parquet
+                    # (max date 2026-02-10) and slicing `date < today` froze
+                    # shadow scores for every live date past the parquet's
+                    # last bar. Build the sequence from live ctx.ohlcv ending
+                    # at `today` via the shared helper; only fall back to the
+                    # static parquet for in-range (sim) dates.
+                    from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (  # noqa: PLC0415
+                        _build_live_panel_history,
+                    )
+                    today_ts = pd.Timestamp(getattr(ctx, "today",
+                                                      datetime.date.today()))
                     panel_history = getattr(ctx, "_panel_history", None)
+                    if panel_history is None:
+                        panel_history = _build_live_panel_history(
+                            ctx, scorer, target_tickers, today_ts,
+                        )
                     if panel_history is None:
                         panel_parquet = (repo / "data"
                                           / "alpha158_291_fundamental_dataset.parquet")
                         full = pd.read_parquet(panel_parquet)
                         full["date"] = pd.to_datetime(full["date"])
-                        today_ts = pd.Timestamp(getattr(ctx, "today",
-                                                          datetime.date.today()))
+                        if today_ts > full["date"].max():
+                            log.warning(
+                                "ApplyShadowScoringTask: shadow %s has no live "
+                                "OHLCV and as-of %s is past static panel max "
+                                "%s — skipping (refusing stale frozen shadow "
+                                "scores).",
+                                name, today_ts.date().isoformat(),
+                                full["date"].max().date().isoformat())
+                            continue
                         past = full[full["date"] < today_ts]
                         dates = sorted(past["date"].unique())[-scorer.seq_len:]
                         panel_history = past[past["date"].isin(dates)]
