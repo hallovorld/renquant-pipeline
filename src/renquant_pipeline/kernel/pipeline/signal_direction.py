@@ -62,6 +62,31 @@ def _require_positive_er_cfg(config: dict | None) -> bool:
     return True if v is None else bool(v)
 
 
+def _prefer_calibrated_mu_cfg(config: dict | None) -> bool:
+    """Whether the signal-direction test should use the CALIBRATED μ, not raw>0.
+
+    2026-06-10 root-cause finding: the prod PatchTST model is a cross-sectional
+    ranker whose raw ``panel_score`` is intrinsically all-negative (the output
+    head centres near raw≈−0.20; the signal lives in the relative ordering,
+    OOS IC≈0.13). The calibrator correctly maps this — its ER=0 neutral sits at
+    raw≈−0.198 — so a positive calibrated μ means "ranked above the model's
+    neutral", i.e. genuinely bullish. But the legacy raw>0 conjunct assumes
+    0=neutral, so it blocks 100% of names and the book can never open a long
+    (structural sell-only). Verified on real data (142 names, asof 2026-06-10):
+    raw>0 admits 0/142, μ>0 admits 80/142.
+
+    When this is ON and a calibrated μ is present, the gate becomes ``μ>0``
+    alone (μ>0 ⟺ raw>neutral_raw, the offset-corrected direction test) and the
+    raw>0 conjunct is NOT applied. Default OFF preserves the legacy raw>0 AND
+    μ>0 behaviour byte-for-byte. Enable with
+    ``ranking.panel_scoring.signal_gate_prefer_calibrated_mu: true``.
+    """
+    sel = ((config or {}).get("ranking", {}) or {}).get("panel_scoring", {}) or {}
+    if not bool(sel.get("enabled", False)):
+        return False
+    return bool(sel.get("signal_gate_prefer_calibrated_mu", False))
+
+
 def _finite(value: Any) -> float | None:
     try:
         out = float(value)
@@ -82,12 +107,25 @@ def long_signal_ok(
     (or μ) when available so the ER-sign conjunct can apply; omit it (or pass
     ``None``) and only the raw-sign gate is enforced.
     """
+    er = _finite(expected_return)
+
+    # Calibrated-μ direction mode (root-cause fix for the all-negative ranker).
+    # When enabled AND a calibrated μ is present, μ>0 is the SOLE direction
+    # test — μ>0 ⟺ raw>neutral_raw, so it is the offset-corrected version of
+    # "the model is bullish on this name". The raw>0 conjunct is deliberately
+    # NOT applied here: for a ranker whose output centres negative it would
+    # block every name. Falls through to the legacy raw gate only when μ is
+    # absent (calibrator off), so there is always a direction test.
+    if _prefer_calibrated_mu_cfg(config) and er is not None:
+        if er <= 0.0:
+            return False, REASON_NONPOSITIVE_ER
+        return True, ""
+
     if require_positive_raw_signal_cfg(config):
         ps = _finite(panel_score)
         if ps is None or ps <= 0.0:
             return False, REASON_NEGATIVE_RAW
     if _require_positive_er_cfg(config):
-        er = _finite(expected_return)
         # Only enforce when an expected return is actually present; a missing
         # ER (calibrator off) must not block on this conjunct.
         if er is not None and er <= 0.0:
