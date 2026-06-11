@@ -441,156 +441,6 @@ def _apply_sentiment_features(
     return n_hit, n_miss, gate_applied
 
 
-def _build_live_panel_history(
-    ctx: Any,
-    scorer: Any,
-    target_tickers: list[str],
-    today: Any,
-) -> pd.DataFrame | None:
-    """Build a CURRENT-date sequence panel for history-requiring scorers.
-
-    2026-06-10 FROZEN-SCORE FIX. The prior hf_patchtst dispatch lazy-loaded
-    ``panel_history`` from the *static training* parquet
-    ``data/alpha158_291_fundamental_dataset.parquet`` (max date 2026-02-10).
-    Because the slice was ``full_panel[date < today]`` and ``today`` is months
-    past the parquet's last bar, every live run re-sliced the SAME final
-    ``seq_len`` historical dates → byte-identical sequences → byte-identical
-    panel_score for every ticker, every day. (Proven: SPOT panel_score was a
-    single distinct value across all runs since 2026-05-20.)
-
-    This builder instead computes the alpha158 feature sequence from LIVE
-    ``ctx.ohlcv`` via :func:`compute_alpha158_frame`, sliced to the last
-    ``seq_len`` bars ending at ``today``. The 14 non-alpha158 features
-    (fundamental / PEAD / SUE / sentiment) are looked up as-of ``today`` using
-    the same point-in-time helpers the XGB path uses and broadcast across the
-    window (they are slow-moving point-in-time series; the alpha158 OHLCV
-    block carries the per-bar cross-sectional variation the model needs).
-
-    Returns a long DataFrame with columns ``ticker``, ``date`` and the
-    scorer's ``feature_cols``, or ``None`` if no live OHLCV is available
-    (caller fails closed). Missing per-feature values are left for the
-    scorer's own ``fillna(0.0)`` to handle.
-    """
-    from renquant_pipeline.kernel.panel_pipeline.alpha158_features import (  # noqa: PLC0415
-        alpha158_feature_names,
-        compute_alpha158_frame,
-    )
-
-    ohlcv_dict = getattr(ctx, "ohlcv", None) or getattr(ctx, "ohlcv_all", None)
-    if not ohlcv_dict:
-        log.error(
-            "ApplyScoresTask[%s]: ctx.ohlcv unavailable — cannot build live "
-            "sequence panel for history scorer.",
-            _panel_model_type(
-                (getattr(ctx, "config", {}) or {})
-                .get("ranking", {}).get("panel_scoring", {}),
-                scorer,
-            ),
-        )
-        return None
-
-    seq_len = int(scorer.seq_len)
-    feature_cols = list(scorer.feature_cols)
-    a158_set = set(alpha158_feature_names())
-    a158_cols = [c for c in feature_cols if c in a158_set]
-    extra_cols = [c for c in feature_cols if c not in a158_set]
-    today_ts = pd.Timestamp(today)
-
-    # 1) Live alpha158 sequence per ticker (last seq_len bars ≤ today).
-    frames: list[pd.DataFrame] = []
-    a158_cache = getattr(ctx, "_alpha158_frame_cache", None)
-    if not isinstance(a158_cache, dict):
-        a158_cache = {}
-        ctx._alpha158_frame_cache = a158_cache  # noqa: SLF001
-    for tkr in target_tickers:
-        ohlcv_t = ohlcv_dict.get(tkr)
-        if ohlcv_t is None or len(ohlcv_t) < seq_len:
-            continue
-        frame = a158_cache.get(tkr)
-        if frame is None:
-            frame = compute_alpha158_frame(ohlcv_t)
-            a158_cache[tkr] = frame
-        window = frame.loc[:today_ts]
-        if len(window) < seq_len:
-            continue
-        window = window.tail(seq_len)
-        data = {
-            col: (window[col].to_numpy() if col in window.columns
-                  else np.zeros(len(window)))
-            for col in a158_cols
-        }
-        sub = pd.DataFrame(data, index=window.index)
-        sub["ticker"] = tkr
-        sub["date"] = pd.to_datetime(window.index)
-        frames.append(sub.reset_index(drop=True))
-
-    if not frames:
-        log.error(
-            "ApplyScoresTask: 0/%d target tickers had ≥%d live OHLCV bars for "
-            "alpha158 sequence build.",
-            len(target_tickers), seq_len,
-        )
-        return None
-
-    panel = pd.concat(frames, ignore_index=True)
-    built_tickers = list(panel["ticker"].unique())
-
-    # 2) As-of-today extra features (fundamental / PEAD / SUE / sentiment),
-    #    reusing the same live point-in-time helpers the XGB path uses, then
-    #    broadcast each ticker's value across its sequence window.
-    if extra_cols:
-        rows: dict[str, dict[str, float]] = {t: {} for t in built_tickers}
-        context_tickers = _stable_feature_context_tickers(ctx, built_tickers, scorer)
-        repo = _data_root_cached()
-
-        fund_cols = [c for c in ("earnings_yield", "book_to_price",
-                                  "gross_profitability", "roe", "asset_growth")
-                     if c in extra_cols]
-        if fund_cols:
-            fp = repo / "data" / "sec_fundamentals_daily.parquet"
-            if fp.exists():
-                fund_panel = _cached_parquet(
-                    ctx, ("sec_fundamentals_daily", str(fp)), fp)
-                if fund_panel is not None and not fund_panel.empty:
-                    _apply_fund_features(
-                        rows, fund_panel, today, context_tickers, fund_cols)
-
-        pead_cols = [c for c in ("days_since_earnings", "pead_signal",
-                                  "pead_quintile_rank") if c in extra_cols]
-        sue_cols = [c for c in ("sue_signal", "surprise_momentum",
-                                 "surprise_streak") if c in extra_cols]
-        if pead_cols or sue_cols:
-            earn_dir = repo / "data" / "earnings_surprise"
-            if pead_cols:
-                _apply_pead_features(
-                    ctx, rows, earn_dir, today_ts, context_tickers, pead_cols)
-            if sue_cols:
-                _apply_sue_features(
-                    ctx, rows, earn_dir, today_ts, context_tickers, sue_cols)
-
-        sent_cols = [c for c in SENTIMENT_FEATURE_COLS if c in extra_cols]
-        if sent_cols:
-            sent_dir = repo / "data" / "news_sentiment_alpaca"
-            _apply_sentiment_features(
-                ctx, scorer, rows, sent_dir, today_ts, context_tickers, sent_cols)
-
-        for col in extra_cols:
-            panel[col] = panel["ticker"].map(
-                lambda t: float(rows.get(t, {}).get(col, 0.0))
-            )
-
-    # Order columns: ticker, date, then feature_cols (scorer slices by name).
-    ordered = ["ticker", "date"] + [c for c in feature_cols if c in panel.columns]
-    panel = panel[ordered]
-    log.info(
-        "ApplyScoresTask: built LIVE sequence panel (%d rows × %d tickers × "
-        "%d bars, asof=%s) — %d alpha158 + %d extra features.",
-        len(panel), panel["ticker"].nunique(), seq_len,
-        today_ts.date().isoformat(), len(a158_cols), len(extra_cols),
-    )
-    return panel
-
-
 def _candidate_ticker(candidate: Any) -> str | None:
     ticker = getattr(candidate, "ticker", None)
     return str(ticker) if ticker else None
@@ -980,27 +830,8 @@ class ApplyScoresTask(Task):
                 and _scorer_requires_history(scorer)):
             today = getattr(ctx, "today", None)
             target_tickers = list(X.index)
-            # 2026-06-10 FROZEN-SCORE FIX. Order of preference for the
-            # sequence panel fed to score_with_history:
-            #   1) explicit ctx._panel_history (sim/test injection),
-            #   2) LIVE alpha158 sequence built from ctx.ohlcv ending at
-            #      `today` (the production path),
-            #   3) the static training parquet — ONLY when `today` falls
-            #      inside its date range (legacy sim ≤ panel-max-date).
-            # Previously the code went straight to (3) and sliced
-            # `full_panel[date < today]`, which for any live date past the
-            # parquet's last bar (2026-02-10) re-selected the SAME final
-            # seq_len dates every run → identical sequences → frozen scores.
             panel_history = getattr(ctx, "_panel_history", None)
             if panel_history is None:
-                panel_history = _build_live_panel_history(
-                    ctx, scorer, target_tickers, today,
-                )
-            if panel_history is None:
-                # Live OHLCV unavailable — fall back to the static training
-                # parquet, but ONLY for in-range (sim) dates. Serving the
-                # parquet's final window for an out-of-range live date is the
-                # exact freeze bug, so that case fails closed instead.
                 from pathlib import Path as _P  # noqa: PLC0415
                 repo = _data_root_cached()
                 panel_path = repo / "data" / "alpha158_291_fundamental_dataset.parquet"
@@ -1013,20 +844,10 @@ class ApplyScoresTask(Task):
                     _fail_closed_panel_scoring(ctx, "panel_history_load_failed")
                     return None
                 today_ts = pd.Timestamp(today)
-                panel_max = full_panel["date"].max()
-                if today_ts > panel_max:
-                    log.error(
-                        "ApplyScoresTask[%s]: no live OHLCV and as-of date %s is "
-                        "past static panel max %s — refusing stale frozen scores.",
-                        scorer_kind_early, today_ts.date().isoformat(),
-                        panel_max.date().isoformat(),
-                    )
-                    _fail_closed_panel_scoring(ctx, "panel_history_stale_out_of_range")
-                    return None
                 past = full_panel[full_panel["date"] < today_ts]
                 recent_dates = sorted(past["date"].unique())[-scorer.seq_len:]
                 panel_history = past[past["date"].isin(recent_dates)]
-                log.info("ApplyScoresTask[%s]: in-range static panel history "
+                log.info("ApplyScoresTask[%s]: lazy-loaded panel history "
                          "(%d rows × %d tickers × %d dates) for %d candidates",
                          scorer_kind_early, len(panel_history),
                          panel_history["ticker"].nunique(),
