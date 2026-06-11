@@ -41,6 +41,7 @@ from renquant_pipeline.kernel.pipeline.order_attribution import stamp_order_attr
 from renquant_pipeline.kernel.pipeline.pipeline import Task
 
 log = logging.getLogger("kernel.portfolio_qp.tasks")
+_QP_ADMISSION_MISSING_REGIME = object()
 
 
 def _ensure_blocked_map(ctx) -> dict:
@@ -2435,6 +2436,8 @@ def _qp_buy_admission_block_reason(ctx, env: dict, ticker: str) -> str | None:
         "topup_max_sigma" if is_held else "max_sigma",
         getattr(ctx, "regime", None),
     )
+    if sigma_cap is _QP_ADMISSION_MISSING_REGIME:
+        return "qp_admission_sigma_missing_regime"
     if sigma_cap is not None:
         cap = float(sigma_cap)
         sigma = _source_float(source, "sigma")
@@ -2442,6 +2445,8 @@ def _qp_buy_admission_block_reason(ctx, env: dict, ticker: str) -> str | None:
             return "qp_admission_sigma"
 
     er_floor = _qp_admission_expected_return_floor(gate, is_held, getattr(ctx, "regime", None))
+    if er_floor is _QP_ADMISSION_MISSING_REGIME:
+        return "qp_admission_expected_return_missing_regime"
     if er_floor is not None:
         floor = float(er_floor)
         expected_return = _source_float(source, "expected_return")
@@ -2461,6 +2466,8 @@ def _qp_buy_admission_block_reason(ctx, env: dict, ticker: str) -> str | None:
         is_held,
         getattr(ctx, "regime", None),
     )
+    if er_over_sigma_floor is _QP_ADMISSION_MISSING_REGIME:
+        return "qp_admission_expected_return_over_sigma_missing_regime"
     if er_over_sigma_floor is not None:
         floor = float(er_over_sigma_floor)
         signal = _source_float(source, er_over_sigma_metric)
@@ -2503,8 +2510,9 @@ def _qp_admission_gate_value(gate: dict, key: str, regime: str | None):
       1. exact ``regime`` entry
       2. explicit ``default`` / ``_default`` key in the map (operator's
          baseline for un-listed regimes)
-      3. flat global ``gate[key]`` — but LOG it (deduped), so a missing regime
-         is observable instead of silently disabling the gate.
+      3. explicit flat global ``gate[key]`` — but LOG it (deduped), so a
+         missing regime is observable.
+      4. fail-closed sentinel when no explicit fallback exists.
     """
     by_regime = gate.get(f"{key}_by_regime")
     if isinstance(by_regime, dict):
@@ -2513,6 +2521,17 @@ def _qp_admission_gate_value(gate: dict, key: str, regime: str | None):
         for default_key in ("default", "_default"):
             if default_key in by_regime:
                 return by_regime[default_key]
+        if key not in gate:
+            warn_id = (key, regime)
+            if warn_id not in _QP_REGIME_FALLTHROUGH_WARNED:
+                _QP_REGIME_FALLTHROUGH_WARNED.add(warn_id)
+                log.warning(
+                    "_qp_admission_gate_value: '%s_by_regime' is configured "
+                    "but regime=%s is absent and no 'default' or flat '%s' "
+                    "fallback is set; failing this admission gate closed.",
+                    key, regime, key,
+                )
+            return _QP_ADMISSION_MISSING_REGIME
         flat = gate.get(key)
         warn_id = (key, regime)
         if warn_id not in _QP_REGIME_FALLTHROUGH_WARNED:
@@ -2520,10 +2539,8 @@ def _qp_admission_gate_value(gate: dict, key: str, regime: str | None):
             log.warning(
                 "_qp_admission_gate_value: '%s_by_regime' is configured but "
                 "regime=%s is absent and no 'default' key is set; falling back "
-                "to flat '%s'=%r. PRIME DIRECTIVE: a per-regime map with a "
-                "missing regime silently disables this gate wherever the global "
-                "is None. Set '%s_by_regime.default' or add the regime "
-                "explicitly to restore the floor.",
+                "to explicit flat '%s'=%r. Add '%s_by_regime.default' or the "
+                "regime key if that fallback is not intended.",
                 key, regime, key, flat, key,
             )
         return flat
@@ -2550,6 +2567,8 @@ def _qp_admission_expected_return_floor(
     )
     for key in keys:
         value = _qp_admission_gate_value(gate, key, regime)
+        if value is _QP_ADMISSION_MISSING_REGIME:
+            return value
         if value is not None:
             return value
     return None
@@ -2578,6 +2597,8 @@ def _qp_admission_expected_return_over_sigma_floor(
     )
     for key in keys:
         value = _qp_admission_gate_value(gate, key, regime)
+        if value is _QP_ADMISSION_MISSING_REGIME:
+            return value, "expected_return"
         if value is not None:
             metric = "mu" if "_mu_" in key or key.startswith("min_mu") else "expected_return"
             return value, metric

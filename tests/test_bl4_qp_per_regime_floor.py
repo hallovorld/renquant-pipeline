@@ -6,7 +6,7 @@ returned the flat global when a ``{key}_by_regime`` map lacked the live regime.
 Prod set ``min_expected_return_by_regime={BULL_CALM: 0.01}`` with NO global, so
 the expected-return floor disabled itself in BULL_VOLATILE / CHOPPY / BEAR.
 These tests pin the corrected resolution order: exact regime → ``default`` key
-→ observable fallback to global (with a deduped warning).
+→ explicit flat global fallback (with a deduped warning) → fail closed.
 """
 from __future__ import annotations
 
@@ -40,15 +40,15 @@ def test_underscore_default_key_also_supported() -> None:
     assert T._qp_admission_gate_value(gate, "min_expected_return", "CHOPPY") == 0.004
 
 
-def test_missing_regime_no_default_warns_and_falls_back(caplog) -> None:
+def test_missing_regime_no_default_fails_closed(caplog) -> None:
     """The BL-4 bug surfaced: map present, regime absent, no default, no
-    global → returns None (gate off) BUT now logs a warning."""
+    global used to return None and turn the gate off. It must now fail closed."""
     _reset_warn_dedup()
     gate = {"min_expected_return_by_regime": {"BULL_CALM": 0.01}}  # the prod shape
     with caplog.at_level(logging.WARNING):
         val = T._qp_admission_gate_value(gate, "min_expected_return", "BULL_VOLATILE")
-    assert val is None  # behaviour preserved (no invented value)…
-    assert any("silently disables this gate" in r.message for r in caplog.records)
+    assert val is T._QP_ADMISSION_MISSING_REGIME
+    assert any("failing this admission gate closed" in r.message for r in caplog.records)
 
 
 def test_fallback_uses_flat_global_when_present(caplog) -> None:
@@ -71,7 +71,7 @@ def test_warning_is_deduped_per_key_regime(caplog) -> None:
         T._qp_admission_gate_value(gate, "min_expected_return", "BEAR")
         T._qp_admission_gate_value(gate, "min_expected_return", "BEAR")
     warnings = [r for r in caplog.records
-                if "silently disables this gate" in r.message]
+                if "failing this admission gate closed" in r.message]
     assert len(warnings) == 1
 
 
