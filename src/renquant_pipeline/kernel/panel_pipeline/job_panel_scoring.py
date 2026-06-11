@@ -433,7 +433,22 @@ def _apply_sentiment_features(
         except Exception:
             n_miss += 1
             continue
-        exact = sdf[pd.to_datetime(sdf["date"]) == today_ts]
+        # R2 audit (2026-06-11): match at DATE granularity (strip any time/tz
+        # component) so a timestamp/tz mismatch between ctx.today and the
+        # parquet's date index cannot SILENTLY zero out sentiment for the whole
+        # universe (the prior `== today_ts` compared full timestamps). Keeps the
+        # exact-DATE semantics training used — NOT an as-of fallback (which
+        # would skew train vs serve).
+        _sd = pd.to_datetime(sdf["date"], errors="coerce")
+        try:
+            if _sd.dt.tz is not None:
+                _sd = _sd.dt.tz_localize(None)
+        except (AttributeError, TypeError):
+            pass
+        _today = pd.Timestamp(today_ts)
+        if _today.tzinfo is not None:
+            _today = _today.tz_localize(None)
+        exact = sdf[_sd.dt.normalize() == _today.normalize()]
         if len(exact) == 0:
             n_miss += 1
             continue
