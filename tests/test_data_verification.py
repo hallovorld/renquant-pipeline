@@ -79,6 +79,32 @@ def test_missing_feed_flagged(tmp_path) -> None:
     assert any("missing" in r for r in rep["fundamentals"]["reasons"])
 
 
+def test_fundamentals_missing_date_column_fail_closed(tmp_path) -> None:
+    root = _make_data_root(tmp_path)
+    data = root / "data"
+    pd.DataFrame(
+        {
+            "ticker": ["AAA", "BBB", "CCC"],
+            "earnings_yield": [0.05, 0.06, 0.07],
+        }
+    ).to_parquet(data / "sec_fundamentals_daily.parquet")
+    rep = verify_feature_data_sources(
+        root, ["AAA", "BBB", "CCC"], pd.Timestamp("2026-06-11"), {})
+    assert not rep["fundamentals"]["ok"]
+    assert any("staleness unavailable" in r for r in rep["fundamentals"]["reasons"])
+
+
+def test_sentiment_missing_date_column_fail_closed(tmp_path) -> None:
+    root = _make_data_root(tmp_path)
+    sent_dir = root / "data" / "news_sentiment_alpaca"
+    for path in sent_dir.glob("*.parquet"):
+        pd.DataFrame({"mean_sentiment": [0.1]}).to_parquet(path)
+    rep = verify_feature_data_sources(
+        root, ["AAA", "BBB", "CCC"], pd.Timestamp("2026-06-11"), {})
+    assert not rep["sentiment"]["ok"]
+    assert any("staleness unavailable" in r for r in rep["sentiment"]["reasons"])
+
+
 def test_task_warns_by_default_does_not_raise(tmp_path, monkeypatch) -> None:
     root = _make_data_root(tmp_path, fund_max="2026-02-10")
     monkeypatch.setattr(
