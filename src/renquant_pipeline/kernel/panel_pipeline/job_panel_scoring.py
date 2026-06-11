@@ -1114,6 +1114,31 @@ class ApplyScoresTask(Task):
                 return None
             log.info("ApplyScoresTask[%s]: scored %d via score_with_history "
                      "(seq_len=%d)", scorer_kind_early, len(scores), scorer.seq_len)
+            # R2 audit (2026-06-11): the sequence (PatchTST) scorer bypassed the
+            # model-contract collapse guard that PanelScorer.score applies on
+            # the XGB path. A degenerate cross-section (thin-OHLCV day, feature-
+            # builder regression) yields uniform/constant scores that rank
+            # nothing — the BL-1 failure mode. Check the RAW scores here and
+            # FAIL CLOSED on collapse (the calibrated-rank_score check in
+            # ApplyGlobalCalibrationTask only fires when the calibrator is on);
+            # a model that cannot differentiate names must not drive buys.
+            if scores is not None and len(scores) >= 2:
+                from renquant_pipeline.kernel.panel_pipeline.model_contract import (  # noqa: PLC0415
+                    soft_check_score_series,
+                )
+                _chk = soft_check_score_series(
+                    pd.Series(scores, dtype=float),
+                    model_name=f"ApplyScoresTask[{scorer_kind_early}]",
+                )
+                if not _chk.ok:
+                    log.error(
+                        "ApplyScoresTask[%s]: raw score surface COLLAPSED "
+                        "(%s) — failing closed, no buys on a non-discriminating "
+                        "model.", scorer_kind_early,
+                        "; ".join(_chk.warnings) or "degenerate",
+                    )
+                    _fail_closed_panel_scoring(ctx, "panel_score_collapsed")
+                    return None
             ctx._panel_scores_all = scores  # noqa: SLF001
             n_cand_scored = 0
             scored_tickers: set[str] = set()
