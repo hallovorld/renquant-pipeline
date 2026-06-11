@@ -97,3 +97,62 @@ def apply_stop_loss_anchor_policy(
     exit_params["stop_loss_entry_regime"] = entry_regime
     exit_params["stop_loss_entry_pct"] = entry_stop
     return exit_params
+
+
+# Single-day-loss config keys anchored as a unit (the SDL gate reads both).
+_SDL_ANCHOR_KEYS = ("max_single_day_loss_pct", "sdl_n_sigma")
+
+
+def apply_single_day_loss_anchor_policy(
+    exit_params: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    current_regime: str | None,
+    entry_regime: str | None,
+    entry_regime_params: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Optionally anchor the single-day-loss gate to the ENTRY regime.
+
+    H-1 (2026-06-10 deep audit): the SDL params are read from the CURRENT
+    regime, so a BULL_CALM thesis (σ-adaptive ``sdl_n_sigma=3``, no absolute
+    cap) re-labeled BULL_VOLATILE inherits that regime's tight absolute 6%
+    single-day stop — a whipsaw exit on a position whose thesis never changed.
+    The SDL discipline should follow the entry thesis, not a transient relabel.
+
+    Default ``current_regime`` preserves legacy behaviour. ``entry_regime``
+    sources the SDL config (``max_single_day_loss_pct``, ``sdl_n_sigma``) from
+    the entry-thesis regime so a relabel cannot retighten it. Opt-in.
+
+    Fails SAFE like :func:`apply_stop_loss_anchor_policy` — it runs inside the
+    un-guarded per-holding sell comprehension, so a bad config must never raise
+    and take the whole book's sell pass dark (the caller also wraps it).
+    """
+    policy = ((config.get("risk") or {}).get("sdl_anchor_policy") or {})
+    mode = str(policy.get("mode", "current_regime") or "current_regime").lower()
+    if mode in {"current", "current_regime", "disabled", "off"}:
+        return exit_params
+    if mode != "entry_regime":
+        raise ValueError(f"unknown risk.sdl_anchor_policy.mode={mode!r}")
+
+    if not entry_regime:
+        return exit_params
+    if not _regime_allowed(entry_regime, policy.get("entry_regimes")):
+        return exit_params
+    if not _regime_allowed(current_regime, policy.get("current_regimes")):
+        return exit_params
+
+    erp = entry_regime_params or {}
+    if not isinstance(erp, dict):
+        return exit_params
+    anchored: dict[str, Any] = {}
+    for key in _SDL_ANCHOR_KEYS:
+        # Only override keys the entry regime actually defines; absent keys
+        # keep the current value (this can only loosen, never invent a stop).
+        if key in erp:
+            exit_params[key] = erp[key]
+            anchored[key] = erp[key]
+    if anchored:
+        exit_params["sdl_anchor_policy"] = mode
+        exit_params["sdl_anchor_regime"] = entry_regime
+        exit_params["sdl_current_regime"] = current_regime
+    return exit_params

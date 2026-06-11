@@ -24,7 +24,10 @@ from .job_selection      import SelectionJob
 from .job_joint_actions  import JointActionJob
 from .job_panel_veto     import PanelRankVetoJob
 from .job_score_distribution import ScoreDistributionJob
-from .exit_params import apply_stop_loss_anchor_policy
+from .exit_params import (
+    apply_single_day_loss_anchor_policy,
+    apply_stop_loss_anchor_policy,
+)
 from .soft_exit_guards import configured_soft_exit_min_days, soft_exit_thesis_regime
 
 # PanelScoringJob is imported lazily inside run() to avoid a circular import:
@@ -112,6 +115,23 @@ def _make_sell_tctx(ctx: InferenceContext, ticker: str) -> TickerInferenceContex
         log.exception(
             "stop_loss_anchor_policy raised for %s; using base exit_params so "
             "the whole-book sell pass and its stops are not taken dark",
+            ticker,
+        )
+    # H-1: anchor the single-day-loss gate to the entry thesis (opt-in) so a
+    # regime relabel cannot retighten it mid-hold. Same defensive wrap — this
+    # runs in the un-guarded per-holding comprehension.
+    try:
+        apply_single_day_loss_anchor_policy(
+            exit_params,
+            config=ctx.config,
+            current_regime=ctx.regime,
+            entry_regime=entry_regime,
+            entry_regime_params=entry_regime_p,
+        )
+    except Exception:  # noqa: BLE001 — risk path must not fail closed
+        log.exception(
+            "sdl_anchor_policy raised for %s; using base exit_params so the "
+            "whole-book sell pass and its stops are not taken dark",
             ticker,
         )
     return TickerInferenceContext(
