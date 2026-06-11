@@ -8,13 +8,18 @@ be non-negative, regardless of the calibrated μ.
 from __future__ import annotations
 
 import datetime as dt
+from types import SimpleNamespace
 
 from renquant_pipeline.context import InferenceContext
+from renquant_pipeline.kernel.rotation import RotationPair
 from renquant_pipeline.kernel.selection import CandidateResult
+from renquant_pipeline.kernel.pipeline.task_joint_actions import JointActionTask
+from renquant_pipeline.kernel.pipeline.task_rotation import EmitRotationsTask
 from renquant_pipeline.kernel.pipeline.task_selection import (
     SizeAndEmitTask,
     _require_positive_raw_signal_cfg,
 )
+from renquant_pipeline.kernel.pipeline.task_topup import TopUpHeldTask
 
 
 def _cand(ticker, panel_score, *, expected_return=0.04, mu=0.04, sigma=0.2):
@@ -63,6 +68,14 @@ def test_positive_panel_score_allowed():
     ctx = _ctx([pos], ["POS"])
     SizeAndEmitTask().run(ctx)
     assert "POS" in [o["ticker"] for o in ctx.orders]  # bullish signal trades
+
+
+def test_positive_raw_with_nonpositive_expected_return_blocked():
+    cand = _cand("POS_BAD_ER", panel_score=0.05, expected_return=-0.01, mu=-0.01)
+    ctx = _ctx([cand], ["POS_BAD_ER"])
+    SizeAndEmitTask().run(ctx)
+    assert ctx.orders == []
+    assert ctx._blocked_by_ticker["POS_BAD_ER"] == "nonpositive_expected_return_no_long"
 
 
 def test_all_negative_universe_buys_nothing():
@@ -118,3 +131,93 @@ def test_disabled_panel_scoring_does_not_apply_raw_signal_gate():
     ctx = _ctx([cand], ["AAA"], config=cfg)
     SizeAndEmitTask().run(ctx)
     assert "AAA" in [o["ticker"] for o in ctx.orders]
+
+
+def test_rotation_buy_leg_uses_signal_direction_gate():
+    bad = _cand("NEG", panel_score=-0.11)
+    ctx = _ctx([bad], [])
+    ctx.holdings = {
+        "OLD": SimpleNamespace(shares=10, entry_date=dt.date(2026, 1, 1), entry_price=90.0)
+    }
+    ctx.prices = {"NEG": 100.0, "OLD": 100.0}
+    ctx.cash = 10_000.0
+    ctx.rotations = [
+        RotationPair(
+            sell_ticker="OLD",
+            buy_ticker="NEG",
+            sell_score=0.2,
+            buy_score=0.7,
+            sell_er=-0.02,
+            buy_er=0.04,
+            horizon_days=60,
+            raw_advantage=0.06,
+            tax_drag=0.0,
+            transaction_cost=0.0,
+            net_advantage=0.06,
+            threshold=0.0,
+            margin_realized=0.06,
+        )
+    ]
+
+    EmitRotationsTask().run(ctx)
+
+    assert ctx.orders == []
+    assert ctx.exits == []
+    assert ctx._blocked_by_ticker["NEG"] == "negative_raw_signal_no_long"
+    assert ctx.rotations_blocked[0]["reason"] == "negative_raw_signal_no_long"
+
+
+def test_topup_uses_signal_direction_gate():
+    ctx = _ctx([], [])
+    ctx.config["ranking"]["kelly_sizing"] = {
+        "enabled": True,
+        "top_up_threshold": 0.01,
+        "topup_conviction_floor": 0.0,
+    }
+    ctx.holdings = {
+        "NEG": SimpleNamespace(
+            shares=1,
+            panel_score=-0.11,
+            expected_return=0.04,
+            mu=0.04,
+            rank_score=0.9,
+            kelly_target_pct=0.50,
+        )
+    }
+    ctx.prices = {"NEG": 100.0}
+    ctx.cash = 10_000.0
+
+    TopUpHeldTask().run(ctx)
+
+    assert ctx.orders == []
+    assert ctx._blocked_by_ticker["NEG"] == "negative_raw_signal_no_long"
+
+
+def test_joint_action_buy_and_rotation_menu_use_signal_direction_gate():
+    bad = _cand("NEG", panel_score=-0.11)
+    ctx = _ctx([bad], [])
+    ctx.config["rotation"] = {
+        "joint_actions": {"enabled": True, "solver": "greedy"},
+        "panel_buy_floor": 0.1,
+        "panel_sell_floor": 0.3,
+        "max_rotations_per_bar": 1,
+    }
+    ctx.config["max_positions_per_sector"] = 0
+    ctx.config["wash_sale_days"] = 0
+    ctx.holdings = {
+        "OLD": SimpleNamespace(
+            shares=10,
+            entry_date=dt.date(2026, 1, 1),
+            entry_price=90.0,
+            rank_score=0.1,
+            expected_return=-0.02,
+        )
+    }
+    ctx.prices = {"NEG": 100.0, "OLD": 100.0}
+    ctx.cash = 10_000.0
+
+    JointActionTask().run(ctx)
+
+    assert ctx.orders == []
+    assert ctx.rotations == []
+    assert ctx._blocked_by_ticker["NEG"] == "negative_raw_signal_no_long"

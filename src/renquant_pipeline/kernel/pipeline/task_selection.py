@@ -8,26 +8,12 @@ from typing import Any
 from .context import InferenceContext
 from .order_attribution import stamp_order_attribution
 from .pipeline import Task
+from .signal_direction import (
+    long_signal_ok_for_object,
+    require_positive_raw_signal_cfg as _require_positive_raw_signal_cfg,
+)
 
 log = logging.getLogger("kernel.pipeline.selection")
-
-
-def _require_positive_raw_signal_cfg(config: dict | None) -> bool:
-    """Whether new longs require a positive raw panel_score.
-
-    The signal-direction gate (2026-06-10). Default ON: the system must not
-    open a long on a name the model scores bearish, regardless of what the
-    calibrator extrapolates for μ. Opt out explicitly with
-    ``ranking.panel_scoring.require_positive_raw_signal_for_buy: false``.
-
-    The gate only applies when panel scoring itself is enabled. If the run is
-    using a non-panel ranker, there is no raw panel_score contract to enforce.
-    """
-    sel = ((config or {}).get("ranking", {}) or {}).get("panel_scoring", {}) or {}
-    if not bool(sel.get("enabled", False)):
-        return False
-    v = sel.get("require_positive_raw_signal_for_buy")
-    return True if v is None else bool(v)
 
 
 class PrepareSelectionTask(Task):
@@ -261,17 +247,18 @@ class SizeAndEmitTask(Task):
             # is negative (model bug or genuine universe-bearish), NO new long
             # is admitted — the book holds/sells, it does not long bearish
             # signals. Opt-out only via explicit config (default ON).
-            if bool(_require_positive_raw_signal_cfg(ctx.config)):
-                ps = getattr(c, "panel_score", None) if c is not None else None
-                if ps is None or not _math.isfinite(float(ps)) or float(ps) <= 0.0:
-                    log.info(
-                        "SizeAndEmitTask: %s BLOCKED new long — raw panel_score "
-                        "%s ≤ 0 (model not bullish; refusing to long a bearish "
-                        "signal even if the calibrator extrapolates positive μ)",
-                        ticker, ps,
-                    )
-                    _block(ticker, "negative_raw_signal_no_long")
-                    continue
+            signal_ok, signal_reason = long_signal_ok_for_object(c, ctx.config)
+            if not signal_ok:
+                log.info(
+                    "SizeAndEmitTask: %s BLOCKED new long — %s "
+                    "(panel_score=%s expected_return=%s)",
+                    ticker,
+                    signal_reason,
+                    getattr(c, "panel_score", None) if c is not None else None,
+                    getattr(c, "expected_return", None) if c is not None else None,
+                )
+                _block(ticker, signal_reason)
+                continue
 
             if kelly_on and kelly_pure:
                 # Pure-Kelly mode — neutralise extra multipliers that

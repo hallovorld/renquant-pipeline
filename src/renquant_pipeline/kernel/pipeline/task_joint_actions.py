@@ -71,6 +71,7 @@ from typing import Any
 from .context import InferenceContext
 from .order_attribution import stamp_order_attribution
 from .pipeline import Task
+from .signal_direction import long_signal_ok_for_object
 
 log = logging.getLogger("kernel.pipeline.joint_actions")
 
@@ -337,6 +338,29 @@ class JointActionTask(Task):
 
         n_pass_floor = 0
         n_pass_rank  = 0
+
+        signal_ok_cands: list = []
+        signal_blocked = 0
+        for c in eligible_cands:
+            signal_ok, signal_reason = long_signal_ok_for_object(c, ctx.config)
+            if signal_ok:
+                signal_ok_cands.append(c)
+                continue
+            signal_blocked += 1
+            blocked = getattr(ctx, "_blocked_by_ticker", None)
+            if blocked is None:
+                blocked = {}
+                ctx._blocked_by_ticker = blocked  # noqa: SLF001
+            blocked.setdefault(c.ticker, signal_reason)
+            ctx.counters[f"joint_{signal_reason}"] = (
+                ctx.counters.get(f"joint_{signal_reason}", 0) + 1
+            )
+        if signal_blocked:
+            log.info(
+                "JointActionJob: signal-direction gate blocked %d long candidate(s)",
+                signal_blocked,
+            )
+        eligible_cands = signal_ok_cands
 
         # BUY actions — candidate must clear panel_buy_floor OR be in top-N
         for c in eligible_cands:
