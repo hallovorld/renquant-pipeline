@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,3 +65,76 @@ def test_qp_and_joint_jobs_wire_task_chains() -> None:
         assert isinstance(tasks, list) and tasks, f"{job_cls.__name__} has no tasks"
         for t in tasks:
             assert isinstance(t, renquant_common.Task)
+
+
+def _qp_admission_reason(gate: dict, *, regime: str = "CHOPPY", source=None) -> str | None:
+    from renquant_pipeline.kernel.portfolio_qp.tasks import _qp_buy_admission_block_reason
+
+    if source is None:
+        source = SimpleNamespace(
+            ticker="AAPL",
+            rank_score=1.0,
+            panel_score=1.0,
+            sigma=0.20,
+            expected_return=0.02,
+            expected_return_horizon_days=5,
+            mu=0.02,
+            mu_horizon_days=5,
+        )
+    ctx = SimpleNamespace(regime=regime, config={})
+    env = {
+        "cfg": {
+            "qp_mu_horizon_days": 5,
+            "qp_admission_gate": {"enabled": True, "respect_open_slots": False, **gate},
+        },
+        "holdings_set": set(),
+        "score_sources": {"AAPL": source},
+        "ignore_slots": True,
+    }
+    return _qp_buy_admission_block_reason(ctx, env, "AAPL")
+
+
+def test_qp_admission_expected_return_by_regime_missing_regime_fails_closed() -> None:
+    reason = _qp_admission_reason({
+        "min_expected_return_by_regime": {"BULL_CALM": 0.01},
+    })
+
+    assert reason == "qp_admission_expected_return_missing_regime"
+
+
+def test_qp_admission_sigma_by_regime_missing_regime_fails_closed() -> None:
+    reason = _qp_admission_reason({
+        "max_sigma_by_regime": {"BULL_CALM": 0.30},
+    })
+
+    assert reason == "qp_admission_sigma_missing_regime"
+
+
+def test_qp_admission_expected_return_over_sigma_missing_regime_fails_closed() -> None:
+    reason = _qp_admission_reason({
+        "min_expected_return_over_sigma_by_regime": {"BULL_CALM": 0.05},
+    })
+
+    assert reason == "qp_admission_expected_return_over_sigma_missing_regime"
+
+
+def test_qp_admission_by_regime_allows_explicit_global_fallback() -> None:
+    gate = {
+        "min_expected_return_by_regime": {"BULL_CALM": 0.01},
+        "min_expected_return": 0.005,
+    }
+
+    assert _qp_admission_reason(gate) is None
+    assert _qp_admission_reason(
+        gate,
+        source=SimpleNamespace(
+            ticker="AAPL",
+            rank_score=1.0,
+            panel_score=1.0,
+            sigma=0.20,
+            expected_return=0.004,
+            expected_return_horizon_days=5,
+            mu=0.004,
+            mu_horizon_days=5,
+        ),
+    ) == "qp_admission_expected_return"
