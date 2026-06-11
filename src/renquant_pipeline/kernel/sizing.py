@@ -120,9 +120,9 @@ def compute_position_size(
 
     override_pct: bypass reserve calc (BEAR defensive branch).
 
-    Returns (0.0, 0) if there is insufficient cash for at least 1 share.
-    Falls back to 25% cap if confidence-scaled pct can't cover 1 share
-    (prevents high-priced stocks like LLY from being silently skipped).
+    Returns (0.0, 0) if there is insufficient cash for at least 1 share within
+    the effective cap. Fallback sizing is still bounded by the same cap, so a
+    high-priced stock cannot turn a small Kelly target into an oversized order.
     """
     # Audit fix S-1 (Round 5, 2026-04-25): pre-fix, NaN price/portfolio
     # passed `<= 0` (NaN comparisons False) but then `int(NaN)` later in
@@ -156,14 +156,21 @@ def compute_position_size(
         investable   = max(available_cash - cash_reserve, 0.0)
         max_pct      = max_position_pct
 
+    if max_pct <= 0:
+        return 0.0, 0
+
     target_pct = min(max_pct, investable / portfolio_value)
+    if target_pct <= 0:
+        return 0.0, 0
 
     # Compute shares
     target_dollars = target_pct * portfolio_value
     shares = int(target_dollars / price)
 
     if shares < 1:
-        # Oversize fallback: try 25% of portfolio
+        # Oversize fallback: try 25% of portfolio, then re-apply the sizing
+        # cap below. The fallback must not turn a capped Kelly target into an
+        # oversized high-priced-stock position.
         fallback_dollars = 0.25 * portfolio_value
         shares = int(min(fallback_dollars, investable) / price)
 
@@ -180,6 +187,12 @@ def compute_position_size(
         if investable >= price:
             shares = 1
 
+    if shares < 1:
+        return 0.0, 0
+
+    cap_shares = int((target_pct * portfolio_value) / price)
+    if shares > cap_shares:
+        shares = cap_shares
     if shares < 1:
         return 0.0, 0
 
