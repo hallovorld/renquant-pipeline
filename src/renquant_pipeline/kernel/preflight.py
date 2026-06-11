@@ -1493,10 +1493,43 @@ def _check_kelly_sigma_horizon_config(
             f"> 0, got {raw!r}",
             details={"sigma_horizon_days": days},
         )
+
+    # R2 audit guard (2026-06-11): σ and μ must share a horizon for the Kelly
+    # f*=μ/σ². The original Kelly bug shipped SILENTLY because σ was annualized
+    # (252d) while the calibrator μ is 60d — a ~4.2× variance error. When Kelly
+    # consumes the calibrator μ (kelly enabled + use_calibrator_mu), require
+    # sigma_horizon_days == the μ horizon (qp_mu_horizon_days, else
+    # panel_ltr.lookahead_days). Mirrors job_panel_scoring._qp_mu_horizon_days'
+    # config chain (the calibrator-native leg can't be resolved without loading
+    # the artifact, so it is not enforced here). Inert when horizons already
+    # match (prod 60==60).
+    def _pos_int(v: Any) -> int | None:
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if iv > 0 else None
+
+    kelly_on = bool(kelly_cfg.get("enabled", False))
+    uses_cal_mu = bool(kelly_cfg.get("use_calibrator_mu", False))
+    joint_cfg = ((config.get("rotation") or {}).get("joint_actions") or {})
+    mu_h = (_pos_int(joint_cfg.get("qp_mu_horizon_days"))
+            or _pos_int((config.get("panel_ltr") or {}).get("lookahead_days")))
+    if kelly_on and uses_cal_mu and mu_h is not None and int(days) != mu_h:
+        return PreflightCheck(
+            name, "hard", False,
+            f"ranking.kelly_sizing.sigma_horizon_days={days:g} != μ horizon "
+            f"{mu_h}d (qp_mu_horizon_days / panel_ltr.lookahead_days). Kelly "
+            "f*=μ/σ² requires σ and μ on the SAME horizon; a mismatch silently "
+            "mis-scales the variance (the 2026-06-11 Kelly bug).",
+            details={"sigma_horizon_days": days, "mu_horizon_days": mu_h},
+        )
+
     return PreflightCheck(
         name, "hard", True,
-        f"ranking.kelly_sizing.sigma_horizon_days={days:g}",
-        details={"sigma_horizon_days": days},
+        f"ranking.kelly_sizing.sigma_horizon_days={days:g}"
+        + (f" (matches μ horizon {mu_h}d)" if mu_h is not None else ""),
+        details={"sigma_horizon_days": days, "mu_horizon_days": mu_h},
     )
 
 
