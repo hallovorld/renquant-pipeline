@@ -87,13 +87,25 @@ def _make_sell_tctx(ctx: InferenceContext, ticker: str) -> TickerInferenceContex
         exit_params["min_hold_days"] = soft_min_hold
         exit_params["soft_exit_min_hold_anchor_regime"] = thesis_regime
         exit_params["soft_exit_min_hold_days"] = soft_min_hold
-    apply_stop_loss_anchor_policy(
-        exit_params,
-        config=ctx.config,
-        current_regime=ctx.regime,
-        entry_regime=entry_regime,
-        entry_regime_params=entry_regime_p,
-    )
+    # BL-3 defense-in-depth: the anchor policy is opt-in and now fails safe,
+    # but this call runs inside an un-guarded list comprehension over every
+    # holding (pp_inference sell passes). Never let one holding's exit-param
+    # shaping abort sell evaluation for the whole book — keep the base
+    # exit_params (real stops still fire) and surface the failure loudly.
+    try:
+        apply_stop_loss_anchor_policy(
+            exit_params,
+            config=ctx.config,
+            current_regime=ctx.regime,
+            entry_regime=entry_regime,
+            entry_regime_params=entry_regime_p,
+        )
+    except Exception:  # noqa: BLE001 — risk path must not fail closed
+        log.exception(
+            "stop_loss_anchor_policy raised for %s; using base exit_params so "
+            "the whole-book sell pass and its stops are not taken dark",
+            ticker,
+        )
     return TickerInferenceContext(
         ticker=ticker,
         ohlcv=ctx.ohlcv,
