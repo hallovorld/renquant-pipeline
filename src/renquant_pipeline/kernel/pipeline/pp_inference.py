@@ -67,6 +67,15 @@ def _build_exit_params(regime_p: dict, config: dict) -> dict:
             "sdl_skip_if_trailing_armed",
             config.get("sdl_skip_if_trailing_armed", False),
         ),
+        # σ-horizon fix (opt-in, default OFF): resolve the σ-aware stops' daily
+        # σ from the unambiguously-daily realized_sigma_daily instead of the
+        # ambiguous (annualized-in-prod) state.sigma/√5. Re-activates the
+        # currently-dormant σ-aware SDL — see orchestrator
+        # doc/audit/2026-06-11-sigma-horizon-contract.md. Validate before
+        # enabling: risk.prefer_realized_daily_sigma.
+        "prefer_realized_daily_sigma": bool(
+            (config.get("risk") or {}).get("prefer_realized_daily_sigma", False)
+        ),
         "take_profit_pct":           regime_p.get("take_profit_pct",           0),
         "stop_decay_days":           regime_p.get("stop_decay_days",           0),
         "stop_decay_floor":          regime_p.get("stop_decay_floor",          0),
