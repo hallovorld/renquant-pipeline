@@ -557,11 +557,12 @@ class EarningsBlackoutSellTask(Task):
 
     Invariant
     ---------
-    Model-driven exits (`model_sell`, `panel_conviction`) are SUPPRESSED when
-    the holding sits inside its earnings event-blackout window. Path-action
-    exits (`stop_loss`, `trailing_stop`, `single_day_loss`, `max_hold`,
-    `kelly_trim`, `rotation`) ALWAYS fire — they are price-action signals not
-    affected by event-driven information asymmetries.
+    Model-driven exits (`model_sell`, `panel_conviction`, `model_protection`)
+    are SUPPRESSED when the holding sits inside its earnings event-blackout
+    window. Path-action exits (`stop_loss`, `trailing_stop`,
+    `single_day_loss`, `max_hold`, `kelly_trim`, `rotation`) ALWAYS fire —
+    they are price-action signals not affected by event-driven information
+    asymmetries.
 
     Window is asymmetric:
       * pre_days  (default 2): tighter window before a known print — operator

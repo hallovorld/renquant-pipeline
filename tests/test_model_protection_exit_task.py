@@ -10,7 +10,12 @@ import datetime as dt
 from types import SimpleNamespace
 
 from renquant_pipeline.kernel.exits import ExitSignal, HoldingState
-from renquant_pipeline.kernel.pipeline.task_sell import ModelProtectionExitTask
+from renquant_pipeline.kernel.exit_types import MODEL_DRIVEN, PER_BAR_CAP_SUBJECT
+from renquant_pipeline.kernel.pipeline.task_limit_sells import LimitSellsPerBarTask
+from renquant_pipeline.kernel.pipeline.task_sell import (
+    EarningsBlackoutSellTask,
+    ModelProtectionExitTask,
+)
 
 
 def _hs(expected_return, breaches=0):
@@ -98,3 +103,57 @@ def test_n_strikes_one_exits_immediately() -> None:
     ModelProtectionExitTask().run(tc)
     assert tc.exit_signal is not None
     assert tc.exit_signal.exit_type == "model_protection"
+
+
+def test_model_protection_is_model_driven_exit_type() -> None:
+    assert "model_protection" in MODEL_DRIVEN
+    assert "model_protection" in PER_BAR_CAP_SUBJECT
+
+
+def test_earnings_blackout_vetoes_model_protection_exit() -> None:
+    today = dt.date(2026, 6, 11)
+    tc = SimpleNamespace(
+        config={"regime": {"earnings_sell_buffer_pre_days": 2,
+                           "earnings_sell_buffer_post_days": 5}},
+        ticker="AAA",
+        today=today,
+        earnings_calendar={"AAA": [today.isoformat()]},
+        exit_signal=ExitSignal(
+            should_exit=True,
+            reason="model protection",
+            exit_type="model_protection",
+        ),
+    )
+
+    EarningsBlackoutSellTask().run(tc)
+
+    assert tc.exit_signal is None
+
+
+def test_limit_sells_per_bar_caps_model_protection_exit() -> None:
+    ctx = SimpleNamespace(
+        config={"risk": {"max_sells_per_bar": 1}},
+        holdings={
+            "AAA": SimpleNamespace(mu=-0.03),
+            "BBB": SimpleNamespace(mu=-0.01),
+        },
+        exits=[
+            ("AAA", ExitSignal(True, "most bearish", "model_sell")),
+            ("BBB", ExitSignal(True, "less bearish", "model_protection")),
+        ],
+        counters={},
+    )
+
+    LimitSellsPerBarTask().run(ctx)
+
+    assert [(ticker, sig.exit_type) for ticker, sig in ctx.exits] == [
+        ("AAA", "model_sell")
+    ]
+    assert ctx.exits_throttled == [{
+        "ticker": "BBB",
+        "exit_type": "model_protection",
+        "reason": "less bearish",
+        "mu": -0.01,
+        "cap": 1,
+        "n_total": 2,
+    }]

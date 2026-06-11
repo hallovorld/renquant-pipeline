@@ -15,7 +15,8 @@ Base sets (atomic groups):
   * ``PORTFOLIO_RISK``       — portfolio-level (rotation, kelly_trim,
                                joint_sell, joint_rotation)
   * ``MODEL_DRIVEN``         — exits emitted by signal models
-                               (model_sell, panel_conviction)
+                               (model_sell, panel_conviction,
+                               model_protection)
 
 Derived sets (named for caller, composed from bases):
   * ``META_LABEL_VETO_ELIGIBLE``  — only PATH_RULE_CORE (no synonyms; the
@@ -66,6 +67,7 @@ PORTFOLIO_RISK: frozenset[str] = frozenset({
 MODEL_DRIVEN: frozenset[str] = frozenset({
     "model_sell",
     "panel_conviction",
+    "model_protection",
 })
 
 

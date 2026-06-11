@@ -19,9 +19,10 @@ References:
     accumulated through prior position-building.
 
 Behavior:
-  * Counts `model_sell` AND `panel_conviction` exits in ctx.exits — both
-    are "soft" signal-driven exits (audit fix 2026-04-29: panel_conviction
-    is a MODEL signal, not a price-action stop, so it shares the cap).
+  * Counts `model_sell`, `panel_conviction`, and `model_protection` exits in
+    ctx.exits — all are "soft" signal-driven exits (audit fix 2026-04-29:
+    panel_conviction is a MODEL signal, not a price-action stop, so it shares
+    the cap).
   * If combined count exceeds `risk.max_sells_per_bar`, sort by NGBoost
     μ ascending (most-bearish first), keep the top N, drop the rest.
   * Hard risk exits (stop_loss / trailing_stop / single_day_loss /
@@ -69,8 +70,8 @@ class LimitSellsPerBarTask(Task):
         if not ctx.exits:
             return False
 
-        # Partition: risk-exits always pass; model_sells + panel_conviction
-        # go through the cap (they're "soft" signal-driven exits).
+        # Partition: risk-exits always pass; model-driven soft exits go
+        # through the cap.
         risk_kept: list = []
         model_sells: list = []   # list of (ticker, sig, mu_for_sort)
         for ticker, sig in ctx.exits:
@@ -82,7 +83,7 @@ class LimitSellsPerBarTask(Task):
                 # Unknown type — preserve (fail-open).
                 risk_kept.append((ticker, sig))
                 continue
-            # model_sell or panel_conviction — collect with μ for ranking.
+            # Model-driven soft exit — collect with μ for ranking.
             held = (ctx.holdings or {}).get(ticker)
             mu_raw = getattr(held, "mu", None) if held is not None else None
             try:
@@ -112,7 +113,7 @@ class LimitSellsPerBarTask(Task):
         for ticker, sig, mu_used in dropped:
             ctx.exits_throttled.append({
                 "ticker":   ticker,
-                "exit_type": "model_sell",
+                "exit_type": getattr(sig, "exit_type", "model_sell"),
                 "reason":   getattr(sig, "reason", ""),
                 "mu":       mu_used if math.isfinite(mu_used) else None,
                 "cap":      max_n,
