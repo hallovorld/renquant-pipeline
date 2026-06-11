@@ -1702,13 +1702,19 @@ class VetoWeakBuysTask(Task):
                 if math.isfinite(f):
                     scores.append(f)
             if len(scores) >= 2:
-                import statistics as _stats  # noqa: PLC0415
                 qclamped = min(max(q, 0.0), 1.0)
-                # statistics.quantiles n=100 → percentile cut points;
-                # index by the requested quantile (1-based cut points).
-                cuts = _stats.quantiles(scores, n=100, method="inclusive")
-                idx = min(max(int(round(qclamped * 100)) - 1, 0), len(cuts) - 1)
-                qval = cuts[idx]
+                scores_sorted = sorted(scores)
+                pos = qclamped * (len(scores_sorted) - 1)
+                lo = math.floor(pos)
+                hi = math.ceil(pos)
+                if lo == hi:
+                    qval = scores_sorted[lo]
+                else:
+                    weight = pos - lo
+                    qval = (
+                        scores_sorted[lo] * (1.0 - weight)
+                        + scores_sorted[hi] * weight
+                    )
                 floor = max(min_fl, qval)
                 floor_label = (
                     f"max(min={min_fl:.2f}, q{qclamped:.2f}={qval:.3f}) = "

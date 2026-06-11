@@ -80,7 +80,19 @@ def test_legacy_adaptive_mean_std_unchanged() -> None:
     assert {c.rank_score for c in ctx.candidates} == {0.60}
 
 
-def test_two_candidate_fallback_uses_min_floor() -> None:
+def test_one_candidate_fallback_uses_min_floor() -> None:
     ctx = _ctx([0.5], buy_floor_quantile=0.8, buy_floor_min=0.2)
     VetoWeakBuysTask().run(ctx)
     assert len(ctx.candidates) == 1   # n<2 → floor=min_fl=0.2; 0.5 passes
+
+
+def test_quantile_mode_has_true_boundary_semantics() -> None:
+    scores = [1.0, 2.0, 3.0, 4.0]
+
+    ctx_zero = _ctx(scores, buy_floor_quantile=0.0, buy_floor_min=0.0)
+    VetoWeakBuysTask().run(ctx_zero)
+    assert [c.rank_score for c in ctx_zero.candidates] == scores
+
+    ctx_one = _ctx(scores, buy_floor_quantile=1.0, buy_floor_min=0.0)
+    VetoWeakBuysTask().run(ctx_one)
+    assert [c.rank_score for c in ctx_one.candidates] == [4.0]
