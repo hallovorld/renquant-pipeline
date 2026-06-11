@@ -153,6 +153,8 @@ class SizeAndEmitTask(Task):
 
         from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
             compute_position_size,
+            conviction_score_for_object,
+            conviction_score_percentiles,
             conviction_multiplier,
             sigma_multiplier,
             universe_sigma_median,
@@ -205,6 +207,7 @@ class SizeAndEmitTask(Task):
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
         )
+        conviction_scores = conviction_score_percentiles(ctx.ranked)
 
         # Audit fix SE-1 (Round 2 deep audit, 2026-04-25): pre-fix,
         # `if price is None or price <= 0` let NaN slip through (NaN<=0
@@ -273,8 +276,9 @@ class SizeAndEmitTask(Task):
                 # panel_score path stays — the structural mismatch the
                 # original Issue noted is real but the fix needs a
                 # paired sizing_cfg retune in the same change.
+                conv_score = conviction_score_for_object(c, sizing_cfg, conviction_scores)
                 conv = conviction_multiplier(
-                    getattr(c, "panel_score", None) if c else None, sizing_cfg,
+                    conv_score, sizing_cfg,
                 )
                 sig_m = sigma_multiplier(
                     getattr(c, "sigma", None) if c else None,
