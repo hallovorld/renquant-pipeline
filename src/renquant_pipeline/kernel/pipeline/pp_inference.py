@@ -326,6 +326,14 @@ class InferencePipeline:
         from .task_data_freshness import DataFreshnessGateTask  # noqa: PLC0415
         DataFreshnessGateTask().run(ctx)
 
+        # DataFreshnessGateTask covers OHLCV only. Verify the auxiliary feature
+        # feeds (fundamentals / earnings / sentiment) too — the 2026-06-11 audit
+        # found sec_fundamentals_daily frozen at 2026-02-10 with no pipeline
+        # check, so the fundamental features were a stale constant for every
+        # live bar. Warns by default; data_verification.hard_fail blocks.
+        from .task_data_verification import DataVerificationTask  # noqa: PLC0415
+        DataVerificationTask().run(ctx)
+
         RegimeJob().run(ctx)
         DrawdownJob().run(ctx)
         BuyGatesJob().run(ctx)
