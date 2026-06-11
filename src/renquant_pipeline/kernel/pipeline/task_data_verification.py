@@ -58,13 +58,17 @@ def _source_ok(rep: dict[str, Any], spec: dict[str, Any]) -> bool:
     if not rep["present"]:
         return False
     ok = True
-    if spec.get("check_staleness") and rep["stale_days"] is not None:
-        max_stale = spec.get("max_stale_days")
-        if max_stale is not None and rep["stale_days"] > int(max_stale):
-            rep["reasons"].append(
-                f"stale {rep['stale_days']}d > {max_stale}d "
-                f"(latest {rep['max_date']})")
+    if spec.get("check_staleness"):
+        if rep["stale_days"] is None:
+            rep["reasons"].append("staleness unavailable (missing/invalid date column)")
             ok = False
+        else:
+            max_stale = spec.get("max_stale_days")
+            if max_stale is not None and rep["stale_days"] > int(max_stale):
+                rep["reasons"].append(
+                    f"stale {rep['stale_days']}d > {max_stale}d "
+                    f"(latest {rep['max_date']})")
+                ok = False
     if rep["coverage"] is not None:
         min_cov = float(spec.get("min_coverage", 0.0) or 0.0)
         if rep["coverage"] < min_cov:
@@ -121,7 +125,7 @@ def _verify_per_ticker_dir(root: Path, spec: dict[str, Any],
         rep["coverage"] = len(have) / len(wl)
     if spec.get("check_staleness"):
         max_d = None
-        for t in list(have)[:8]:  # sample for a freshness signal
+        for t in sorted(have)[:8]:  # sample for a freshness signal
             try:
                 sdf = pd.read_parquet(d / f"{t}.parquet", columns=["date"])
                 m = pd.to_datetime(sdf["date"], errors="coerce").max()
