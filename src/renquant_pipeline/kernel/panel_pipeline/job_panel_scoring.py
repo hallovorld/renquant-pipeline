@@ -197,6 +197,9 @@ def _median_fill_rows(
     return filled, medians
 
 
+_FUND_STALE_WARN_DAYS = 15  # daily-forward-filled feed should be ~current
+
+
 def _apply_fund_features(
     rows: dict[str, dict[str, float]],
     fund_panel: pd.DataFrame,
@@ -207,20 +210,51 @@ def _apply_fund_features(
     today_ts = pd.Timestamp(today)
     panel = fund_panel.copy()
     panel["date"] = pd.to_datetime(panel["date"])
-    snap = panel[panel["date"] <= today_ts] \
-        .sort_values("date").groupby("ticker").tail(1)
-    by_ticker = {
-        str(t): g.iloc[-1]
-        for t, g in snap.groupby("ticker", sort=False)
+    panel = panel[panel["date"] <= today_ts].sort_values("date")
+
+    # BLOCKER guard (2026-06-11 R2 audit): surface a stopped fundamentals feed.
+    # The daily forward-filled parquet should be ~current; if its max date is
+    # far behind `today`, every live bar serves the SAME stale snapshot (the
+    # fundamental features carry no temporal information and drift further from
+    # training each day). Training hard-fails on this misalignment; live had no
+    # guard. We warn loudly rather than fail closed (the fresh alpha158 block
+    # still carries the bulk of the signal).
+    if not panel.empty:
+        max_date = panel["date"].max()
+        stale_days = (today_ts - max_date).days
+        if stale_days > _FUND_STALE_WARN_DAYS:
+            log.warning(
+                "fundamentals feed STALE: max date %s is %d days before as-of "
+                "%s — the %d fundamental features are a frozen snapshot for "
+                "every live bar; refresh sec_fundamentals_daily.",
+                max_date.date().isoformat(), stale_days,
+                today_ts.date().isoformat(), len(fund_cols),
+            )
+
+    # HIGH fix (2026-06-11 R2 audit): use the last VALID (finite) value per
+    # (ticker, column) as-of today, NOT the last-DATED row even when its value
+    # is NaN. Derived fundamentals go NaN on days where price/shares/NI are
+    # missing while an earlier date carries a valid value; the prior
+    # groupby.tail(1) discarded those, needlessly pushing ~17-65% of names per
+    # column onto the cross-sectional median.
+    ctx_set = {str(t) for t in context_tickers}
+    raw: dict[str, dict[str, float | None]] = {
+        str(t): {c: None for c in fund_cols} for t in context_tickers
     }
-    raw: dict[str, dict[str, float | None]] = {}
-    for ticker in context_tickers:
-        src = by_ticker.get(str(ticker))
-        raw[ticker] = {
-            col: (_finite_or_none(src[col])
-                  if src is not None and col in src.index else None)
-            for col in fund_cols
-        }
+    tickers_arr = panel["ticker"].astype(str).to_numpy()
+    for col in fund_cols:
+        if col not in panel.columns:
+            continue
+        vals = pd.to_numeric(panel[col], errors="coerce").to_numpy()
+        mask = np.isfinite(vals)
+        if not mask.any():
+            continue
+        # panel is date-sorted ascending → groupby.last() = latest finite value.
+        sub = pd.DataFrame({"ticker": tickers_arr[mask], "_v": vals[mask]})
+        last_valid = sub.groupby("ticker", sort=False)["_v"].last()
+        for tkr, v in last_valid.items():
+            if str(tkr) in ctx_set:
+                raw[str(tkr)][col] = float(v)
     target_tickers = list(rows.keys())
     filled, medians = _median_fill_rows(raw, target_tickers, context_tickers, fund_cols)
     n_real = 0
