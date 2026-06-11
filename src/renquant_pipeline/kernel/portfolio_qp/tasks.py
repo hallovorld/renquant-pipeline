@@ -2484,10 +2484,49 @@ def _qp_buy_admission_block_reason(ctx, env: dict, ticker: str) -> str | None:
     return None
 
 
+# BL-4 (2026-06-10 deep audit): dedup set so the per-regime fallthrough
+# warning fires once per (key, regime) per process, not per candidate per bar.
+_QP_REGIME_FALLTHROUGH_WARNED: set[tuple[str, str | None]] = set()
+
+
 def _qp_admission_gate_value(gate: dict, key: str, regime: str | None):
+    """Resolve a QP admission knob per-regime, honouring the PRIME DIRECTIVE.
+
+    BL-4: a ``{key}_by_regime`` map whose live ``regime`` is absent used to
+    fall through SILENTLY to the flat global ``gate[key]``. Prod set
+    ``min_expected_return_by_regime={BULL_CALM: 0.01}`` with NO global, so the
+    ER floor (and its coupled horizon check) disabled itself in
+    BULL_VOLATILE / CHOPPY / BEAR — those regimes are not keys in the map, the
+    lookup returned ``gate.get(key)`` = ``None``, and the gate went dark.
+
+    Resolution order when a ``{key}_by_regime`` map is configured:
+      1. exact ``regime`` entry
+      2. explicit ``default`` / ``_default`` key in the map (operator's
+         baseline for un-listed regimes)
+      3. flat global ``gate[key]`` — but LOG it (deduped), so a missing regime
+         is observable instead of silently disabling the gate.
+    """
     by_regime = gate.get(f"{key}_by_regime")
-    if isinstance(by_regime, dict) and regime in by_regime:
-        return by_regime[regime]
+    if isinstance(by_regime, dict):
+        if regime in by_regime:
+            return by_regime[regime]
+        for default_key in ("default", "_default"):
+            if default_key in by_regime:
+                return by_regime[default_key]
+        flat = gate.get(key)
+        warn_id = (key, regime)
+        if warn_id not in _QP_REGIME_FALLTHROUGH_WARNED:
+            _QP_REGIME_FALLTHROUGH_WARNED.add(warn_id)
+            log.warning(
+                "_qp_admission_gate_value: '%s_by_regime' is configured but "
+                "regime=%s is absent and no 'default' key is set; falling back "
+                "to flat '%s'=%r. PRIME DIRECTIVE: a per-regime map with a "
+                "missing regime silently disables this gate wherever the global "
+                "is None. Set '%s_by_regime.default' or add the regime "
+                "explicitly to restore the floor.",
+                key, regime, key, flat, key,
+            )
+        return flat
     return gate.get(key)
 
 
