@@ -78,6 +78,57 @@ class GlobalPanelCalibration:
         )
         return self._scale_expected_return_to_horizon(native, horizon_days)
 
+    def _curve_zero_crossing(
+        self, xs: np.ndarray, ys: np.ndarray, level: float
+    ) -> float | None:
+        """Raw score where the piecewise-linear (xs→ys) curve crosses ``level``.
+
+        Returns the FIRST crossing scanning from the low-raw end, or ``None``
+        when the curve never reaches ``level`` (e.g. an ER head that is
+        entirely positive — structurally long-only, scoring finding F3). When
+        a segment is flat exactly at ``level`` we return that segment's left
+        edge.
+        """
+        if len(xs) < 2 or len(ys) < 2:
+            return None
+        shifted = np.asarray(ys, dtype=float) - float(level)
+        for i in range(len(shifted) - 1):
+            y0, y1 = shifted[i], shifted[i + 1]
+            if y0 == 0.0:
+                return float(xs[i])
+            if y0 * y1 < 0.0:  # strict sign change brackets a root
+                x0, x1 = float(xs[i]), float(xs[i + 1])
+                # linear interpolation of the zero on this segment
+                return x0 + (x1 - x0) * (0.0 - y0) / (y1 - y0)
+        if shifted[-1] == 0.0:
+            return float(xs[-1])
+        return None
+
+    @property
+    def neutral_raw(self) -> float | None:
+        """Raw panel score at which the calibrated expected return is 0.
+
+        BL-2 (2026-06-10): the "stored neutral raw anchor" the decision-tree
+        audit found missing. Consumers (signal-direction gate, μ-sign checks)
+        must NOT assume raw=0 is the calibrator's neutral — for the live
+        PatchTST calibrator the ER=0 crossing sits near raw≈−0.13, so a
+        slightly-negative raw maps to a positive μ. ``None`` means the ER head
+        never crosses zero (entirely positive or entirely negative surface),
+        which is itself a flag worth surfacing.
+        """
+        cached = self.metadata.get("neutral_raw_cached")
+        if cached is not None:
+            try:
+                return None if cached == "none" else float(cached)
+            except (TypeError, ValueError):
+                pass
+        return self._curve_zero_crossing(self.er_x, self.er_y, 0.0)
+
+    @property
+    def prob_neutral_raw(self) -> float | None:
+        """Raw panel score at which the calibrated P(outperform) is 0.5."""
+        return self._curve_zero_crossing(self.prob_x, self.prob_y, 0.5)
+
     def expected_return_vec(
         self,
         raws: np.ndarray,
@@ -173,13 +224,37 @@ class GlobalPanelCalibration:
             )
             er_y = np.clip(er_y, -0.20, 0.20)
 
-        return cls(
+        obj = cls(
             prob_x=np.asarray(payload["probability"]["x"], dtype=float),
             prob_y=prob_y,
             er_x=np.asarray(payload["expected_return"]["x"], dtype=float),
             er_y=er_y,
             metadata=payload.get("metadata", {}),
         )
+        # BL-2 (2026-06-10): surface the neutral-raw anchor at load. A
+        # calibrator whose ER=0 crossing is materially away from raw=0 maps a
+        # bearish raw signal to a positive μ ("laundering") — the gate must
+        # not silently assume 0 is neutral. Stamp it for downstream consumers
+        # and telemetry; warn loudly when the offset is non-trivial.
+        nr = obj.neutral_raw
+        obj.metadata["neutral_raw_cached"] = "none" if nr is None else float(nr)
+        obj.metadata.setdefault("prob_neutral_raw", obj.prob_neutral_raw)
+        if nr is None:
+            log.warning(
+                "GlobalPanelCalibration.load: ER head never crosses zero at %s "
+                "(entirely one-signed surface) — μ sign cannot be anchored to "
+                "the raw signal; consumers should rely on the raw-sign gate.",
+                path,
+            )
+        elif abs(nr) > 0.02:
+            log.warning(
+                "GlobalPanelCalibration.load: ER=0 neutral sits at raw=%+.4f "
+                "(not 0) at %s — raw scores in (%.4f, %.4f) map to a μ of the "
+                "OPPOSITE sign to their raw signal. Signal-direction gating "
+                "must use this anchor, not a hard-coded 0.",
+                nr, path, min(0.0, nr), max(0.0, nr),
+            )
+        return obj
 
 
 __all__ = ["GlobalPanelCalibration"]
