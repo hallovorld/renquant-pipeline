@@ -2089,8 +2089,27 @@ def _calibrator_expected_return_at_horizon(
     horizon_days: int | None,
     native_horizon_days: int | None,
 ) -> float:
+    # R2 audit (2026-06-11): er_y is clipped to ±er_clip_bound (0.20) at LOAD,
+    # but scaling μ from its native horizon UP to a longer horizon multiplies
+    # it past that bound with no re-clip — contradicting the stated invariant
+    # that the Kelly numerator is bounded (and risking μ-inflated sizing). Re-
+    # clip after any horizon scaling. No-op in prod where horizon == native
+    # (60 == 60); only bites when a horizon config is raised above native.
+    bound = 0.20
+    meta = getattr(cal, "metadata", {}) or {}
     try:
-        return float(cal.expected_return(raw_score, horizon_days=horizon_days))
+        b = float(meta.get("er_clip_bound", 0.20))
+        if math.isfinite(b) and b > 0:
+            bound = b
+    except (TypeError, ValueError):
+        pass
+
+    def _clip(value: float) -> float:
+        v = float(value)
+        return max(-bound, min(bound, v)) if math.isfinite(v) else v
+
+    try:
+        return _clip(cal.expected_return(raw_score, horizon_days=horizon_days))
     except TypeError:
         base = float(cal.expected_return(raw_score))
     if (
@@ -2099,8 +2118,8 @@ def _calibrator_expected_return_at_horizon(
         or native_horizon_days <= 0
         or int(horizon_days) == int(native_horizon_days)
     ):
-        return base
-    return base * (float(horizon_days) / float(native_horizon_days))
+        return _clip(base)
+    return _clip(base * (float(horizon_days) / float(native_horizon_days)))
 
 
 class LoadGlobalCalibrationTask(Task):
