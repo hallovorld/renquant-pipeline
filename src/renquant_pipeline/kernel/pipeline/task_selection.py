@@ -12,6 +12,19 @@ from .pipeline import Task
 log = logging.getLogger("kernel.pipeline.selection")
 
 
+def _require_positive_raw_signal_cfg(config: dict | None) -> bool:
+    """Whether new longs require a positive raw panel_score (default True).
+
+    The signal-direction gate (2026-06-10). Default ON: the system must not
+    open a long on a name the model scores bearish, regardless of what the
+    calibrator extrapolates for μ. Opt out explicitly with
+    ``ranking.panel_scoring.require_positive_raw_signal_for_buy: false``.
+    """
+    sel = ((config or {}).get("ranking", {}) or {}).get("panel_scoring", {}) or {}
+    v = sel.get("require_positive_raw_signal_for_buy")
+    return True if v is None else bool(v)
+
+
 class PrepareSelectionTask(Task):
     """Compute open slots, apply BEAR cap, build SelectionContext → ctx._sel_ctx."""
 
@@ -231,6 +244,30 @@ class SizeAndEmitTask(Task):
                 continue
 
             c = next((c for c in ctx.ranked if c.ticker == ticker), None)
+
+            # SIGNAL-DIRECTION GATE (2026-06-10): never open a long on a name
+            # the model scores BEARISH. A calibrator can map a negative raw
+            # panel_score to a positive expected-return by extrapolation; on
+            # 2026-06-10 that bought 5 names whose panel_score was −0.10..−0.13
+            # while the calibrated μ read +0.034..+0.042. Buying what the model
+            # is short is the failure the operator flagged. This is the correct
+            # fix for the anti-pattern of setting min_panel_score=null so a
+            # whole-universe-negative model can still trade: if every raw score
+            # is negative (model bug or genuine universe-bearish), NO new long
+            # is admitted — the book holds/sells, it does not long bearish
+            # signals. Opt-out only via explicit config (default ON).
+            if bool(_require_positive_raw_signal_cfg(ctx.config)):
+                ps = getattr(c, "panel_score", None) if c is not None else None
+                if ps is None or not _math.isfinite(float(ps)) or float(ps) <= 0.0:
+                    log.info(
+                        "SizeAndEmitTask: %s BLOCKED new long — raw panel_score "
+                        "%s ≤ 0 (model not bullish; refusing to long a bearish "
+                        "signal even if the calibrator extrapolates positive μ)",
+                        ticker, ps,
+                    )
+                    _block(ticker, "negative_raw_signal_no_long")
+                    continue
+
             if kelly_on and kelly_pure:
                 # Pure-Kelly mode — neutralise extra multipliers that
                 # overlap with Kelly's μ / σ² inputs.
