@@ -2244,6 +2244,7 @@ class ApplyGlobalCalibrationTask(Task):
                 return False
 
         n_cand = 0
+        n_laundered = 0  # BL-2: raw<0 mapped to ER>0 (or raw>0 → ER<0)
         for c in ctx.candidates:
             if c.panel_score is None or c.panel_score != c.panel_score:
                 continue
@@ -2257,6 +2258,14 @@ class ApplyGlobalCalibrationTask(Task):
             c.rank_score      = float(prob)
             c.expected_return = float(er)
             c.expected_return_horizon_days = rotation_horizon
+            # BL-2 telemetry: the calibrator can map a bearish raw signal to a
+            # positive expected return (sign laundering). Count it per bar so
+            # the operator can watch it collapse once BL-1 re-centres the raw
+            # score distribution. The signal-direction gate (BL-4) is what
+            # actually refuses to long these.
+            if (math.isfinite(er) and math.isfinite(float(c.panel_score))
+                    and float(c.panel_score) * float(er) < 0.0):
+                n_laundered += 1
             if use_cal_mu and math.isfinite(er):
                 mu = _calibrator_expected_return_at_horizon(
                     cal,
@@ -2271,6 +2280,19 @@ class ApplyGlobalCalibrationTask(Task):
                 c.mu = float(mu)
                 c.mu_horizon_days = qp_mu_horizon
             n_cand += 1
+        if n_laundered:
+            _nr = getattr(cal, "neutral_raw", None)
+            log.warning(
+                "ApplyGlobalCalibrationTask: %d/%d candidates have raw signal "
+                "and calibrated ER of OPPOSITE sign (calibrator neutral_raw="
+                "%s). Signal-direction gate refuses to long these; watch this "
+                "count fall after the BL-1 cross-section fix.",
+                n_laundered, n_cand,
+                ("%.4f" % _nr) if isinstance(_nr, (int, float)) else _nr,
+            )
+        ctx.counters["calibrator_sign_laundered"] = (
+            ctx.counters.get("calibrator_sign_laundered", 0) + n_laundered
+        )
 
         n_held = 0
         for ticker, hs in ctx.holdings.items():
