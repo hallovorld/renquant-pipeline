@@ -3118,6 +3118,9 @@ class EmitOrdersFromQPSolutionTask(Task):
             },
             exit_only_tickers=set(getattr(ctx, "_qp_exit_only_tickers", set()) or set()),
             exit_only_reasons=dict(getattr(ctx, "_qp_exit_only_reasons", {}) or {}),
+            admitted_new_tickers=set(
+                getattr(ctx, "_qp_admitted_new_tickers", set()) or set()
+            ),
             emitted_new_tickers=set(),
         )
 
