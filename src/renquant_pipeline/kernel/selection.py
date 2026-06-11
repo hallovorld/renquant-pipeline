@@ -224,7 +224,7 @@ def passes_sector_guard(
             continue
         held_sector = sector_map.get(held)
         if not isinstance(held_sector, str) or not held_sector:
-            return False
+            continue
     count = sum(1 for t in held_tickers if sector_map.get(t) == sector)
     return count < max_per_sector
 
