@@ -704,6 +704,8 @@ class EmitRotationsTask(Task):
         from renquant_pipeline.kernel.exits  import ExitSignal                              # noqa: PLC0415
         from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
             compute_position_size,
+            conviction_score_for_object,
+            conviction_score_percentiles,
             conviction_multiplier,
             sigma_multiplier,
             universe_sigma_median,
@@ -772,6 +774,7 @@ class EmitRotationsTask(Task):
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
         )
+        conviction_scores = conviction_score_percentiles(ctx.ranked)
 
         # Audit fix ROT-BLOCKED-NTFY (Bug L, 2026-04-25): pre-fix, when
         # a rotation pair was found by find_rotation_pairs (counted in
@@ -866,9 +869,11 @@ class EmitRotationsTask(Task):
                 # 2026-05-04 REVERTED — same as task_selection.py (audit
                 # Issue 17 fix needed paired sizing_cfg retune; without
                 # it, halved position sizes regressed Sharpe).
+                conv_score = conviction_score_for_object(
+                    buy_cand, sizing_cfg, conviction_scores,
+                )
                 conv = conviction_multiplier(
-                    getattr(buy_cand, "panel_score", None) if buy_cand else None,
-                    sizing_cfg,
+                    conv_score, sizing_cfg,
                 )
                 sig_m = sigma_multiplier(
                     getattr(buy_cand, "sigma", None) if buy_cand else None,

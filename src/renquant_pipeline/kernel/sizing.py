@@ -5,6 +5,15 @@ Self-contained: no common/ imports.
 from __future__ import annotations
 
 
+def _finite_float(value) -> float | None:
+    import math
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
 def sigma_multiplier(
     sigma: float | None,
     sigma_median: float | None,
@@ -57,6 +66,67 @@ def universe_sigma_median(sigmas: list[float | None]) -> float | None:
     if n % 2 == 1:
         return vals[n // 2]
     return 0.5 * (vals[n // 2 - 1] + vals[n // 2])
+
+
+def conviction_score_percentiles(
+    objects: list[object] | tuple[object, ...],
+    *,
+    attr: str = "panel_score",
+) -> dict[str, float]:
+    """Return ticker -> cross-sectional percentile for finite scores.
+
+    Percentiles are in ``(0, 1]`` with average ranks for ties. This lets
+    negative-centered rankers preserve relative conviction without retuning
+    raw score floors/ceilings.
+    """
+    scored: list[tuple[float, str]] = []
+    for obj in objects or []:
+        ticker = getattr(obj, "ticker", None)
+        score = _finite_float(getattr(obj, attr, None))
+        if ticker is not None and score is not None:
+            scored.append((score, str(ticker)))
+    if not scored:
+        return {}
+    scored.sort(key=lambda item: item[0])
+    n = len(scored)
+    out: dict[str, float] = {}
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and scored[j][0] == scored[i][0]:
+            j += 1
+        avg_one_based_rank = ((i + 1) + j) / 2.0
+        percentile = avg_one_based_rank / n
+        for _, ticker in scored[i:j]:
+            out[ticker] = percentile
+        i = j
+    return out
+
+
+def conviction_score_for_object(
+    obj: object | None,
+    sizing_cfg: dict | None,
+    percentile_scores: dict[str, float] | None = None,
+) -> float | None:
+    """Return the score input for ``conviction_multiplier``.
+
+    ``score_mode=rank_percentile`` is an opt-in fix for negative-centered
+    rankers such as PatchTST: raw ``panel_score`` values are first converted
+    to the same-day cross-sectional percentile, preserving relative strength
+    without assuming a model-specific raw score scale.
+    """
+    if obj is None:
+        return None
+    cfg = sizing_cfg or {}
+    mode = str(cfg.get("score_mode", cfg.get("input", "panel_score"))).lower()
+    if mode in {"rank_percentile", "percentile", "xs_percentile", "cross_sectional_percentile"}:
+        ticker = getattr(obj, "ticker", None)
+        if ticker is None:
+            return None
+        return (percentile_scores or {}).get(str(ticker))
+    if mode in {"rank_score", "calibrated_rank_score"}:
+        return getattr(obj, "rank_score", None)
+    return getattr(obj, "panel_score", None)
 
 
 def conviction_multiplier(panel_score: float | None, sizing_cfg: dict | None) -> float:

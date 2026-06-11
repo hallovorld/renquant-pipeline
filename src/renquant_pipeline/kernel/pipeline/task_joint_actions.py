@@ -169,7 +169,8 @@ class JointActionTask(Task):
             is_wash_sale_blocked, passes_sector_guard, passes_correlation_guard,
         )
         from renquant_pipeline.kernel.sizing   import (                                         # noqa: PLC0415
-            compute_position_size, conviction_multiplier, sigma_multiplier,
+            compute_position_size, conviction_score_for_object,
+            conviction_score_percentiles, conviction_multiplier, sigma_multiplier,
             universe_sigma_median,
         )
         from renquant_pipeline.kernel.regime   import confidence_to_size_multiplier            # noqa: PLC0415
@@ -287,6 +288,7 @@ class JointActionTask(Task):
         sigma_median  = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
         )
+        conviction_scores = conviction_score_percentiles(ctx.ranked)
 
         def _passes_tier(cand) -> bool:
             """Approximate the SelectionJob tier_idx=0 baseline.
@@ -779,9 +781,10 @@ class JointActionTask(Task):
                     sell_proceeds = h_shares * h_price * (1.0 - fee_pct - slip_pct)
             cash_for_sizing = cash_remaining + sell_proceeds
 
-            conv = conviction_multiplier(
-                getattr(a.cand_obj, "panel_score", None), sizing_cfg,
+            conv_score = conviction_score_for_object(
+                a.cand_obj, sizing_cfg, conviction_scores,
             )
+            conv = conviction_multiplier(conv_score, sizing_cfg)
             sig_m = sigma_multiplier(
                 getattr(a.cand_obj, "sigma", None), sigma_median, sigma_cfg,
             )

@@ -1334,19 +1334,24 @@ class ApplyConvictionCapTask(Task):
             return None
 
         # Local import to keep qp module decoupled from renquant_pipeline.kernel.sizing.
-        from renquant_pipeline.kernel.sizing import conviction_multiplier
+        from renquant_pipeline.kernel.sizing import (
+            conviction_score_for_object,
+            conviction_score_percentiles,
+            conviction_multiplier,
+        )
 
         tickers = _get_path(ctx, "_qp_tickers") or []
         w_upper = _get_path(ctx, "_qp_w_upper")
         src     = _get_path(ctx, "_qp_mu_source_map") or {}
         if w_upper is None or len(tickers) == 0 or len(w_upper) != len(tickers):
             return None
+        conviction_scores = conviction_score_percentiles(tuple(src.values()))
 
         caps: list[float] = []
         for i, t in enumerate(tickers):
             obj = src.get(t)
-            ps = getattr(obj, "panel_score", None) if obj is not None else None
-            mult = conviction_multiplier(ps, sizing_cfg)
+            score = conviction_score_for_object(obj, sizing_cfg, conviction_scores)
+            mult = conviction_multiplier(score, sizing_cfg)
             # Defensive: conviction_multiplier returns 1.0 on bad input
             # (None / NaN / inf / malformed cfg). Clip to [0, 1] in case
             # of future-config changes — w_upper must remain ≤ original.
