@@ -33,6 +33,7 @@ import math
 from .context import InferenceContext
 from .order_attribution import stamp_order_attribution
 from .pipeline import Task
+from .signal_direction import long_signal_ok_for_object
 
 log = logging.getLogger("kernel.pipeline.topup")
 
@@ -222,6 +223,21 @@ class TopUpHeldTask(Task):
                 log.info(
                     "TopUpHeldTask [%s]: SKIPPED — within ±%d days of earnings",
                     ticker, earnings_buf,
+                )
+                continue
+            signal_ok, signal_reason = long_signal_ok_for_object(hs, ctx.config)
+            if not signal_ok:
+                blocked[ticker] = signal_reason
+                ctx.counters[f"topup_{signal_reason}"] = (
+                    ctx.counters.get(f"topup_{signal_reason}", 0) + 1
+                )
+                log.info(
+                    "TopUpHeldTask [%s]: SKIPPED — %s "
+                    "(panel_score=%s expected_return=%s)",
+                    ticker,
+                    signal_reason,
+                    getattr(hs, "panel_score", None),
+                    getattr(hs, "expected_return", None),
                 )
                 continue
             # Conviction floor — fail-closed on missing/low rank.

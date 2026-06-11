@@ -95,9 +95,24 @@ def long_signal_ok(
     return True, ""
 
 
+def long_signal_ok_for_object(obj: Any, config: dict | None) -> tuple[bool, str]:
+    """Apply :func:`long_signal_ok` to a candidate/holding-like object."""
+    if obj is None:
+        return long_signal_ok(None, config, expected_return=None)
+    expected_return = getattr(obj, "expected_return", None)
+    if expected_return is None:
+        expected_return = getattr(obj, "mu", None)
+    return long_signal_ok(
+        getattr(obj, "panel_score", None),
+        config,
+        expected_return=expected_return,
+    )
+
+
 __all__ = [
     "REASON_NEGATIVE_RAW",
     "REASON_NONPOSITIVE_ER",
     "require_positive_raw_signal_cfg",
     "long_signal_ok",
+    "long_signal_ok_for_object",
 ]

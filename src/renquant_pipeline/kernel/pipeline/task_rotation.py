@@ -20,6 +20,7 @@ import math
 from .context  import InferenceContext
 from .order_attribution import stamp_order_attribution
 from .pipeline import Task
+from .signal_direction import long_signal_ok_for_object
 
 log = logging.getLogger("kernel.pipeline.rotation")
 
@@ -835,6 +836,30 @@ class EmitRotationsTask(Task):
                 continue
 
             buy_cand = next((c for c in ctx.ranked if c.ticker == pair.buy_ticker), None)
+            signal_ok, signal_reason = long_signal_ok_for_object(buy_cand, ctx.config)
+            if not signal_ok:
+                log.info(
+                    "EmitRotationsTask: %s blocked rotation buy-leg — %s "
+                    "(panel_score=%s expected_return=%s)",
+                    pair.buy_ticker,
+                    signal_reason,
+                    getattr(buy_cand, "panel_score", None) if buy_cand else None,
+                    getattr(buy_cand, "expected_return", None) if buy_cand else None,
+                )
+                ctx.rotations_blocked.append({
+                    "sell": pair.sell_ticker,
+                    "buy": pair.buy_ticker,
+                    "reason": signal_reason,
+                })
+                blocked = getattr(ctx, "_blocked_by_ticker", None)
+                if blocked is None:
+                    blocked = {}
+                    ctx._blocked_by_ticker = blocked  # noqa: SLF001
+                blocked.setdefault(pair.buy_ticker, signal_reason)
+                ctx.counters[f"rotation_{signal_reason}"] = (
+                    ctx.counters.get(f"rotation_{signal_reason}", 0) + 1
+                )
+                continue
             if kelly_on and kelly_pure:
                 conv, sig_m = 1.0, 1.0
             else:
