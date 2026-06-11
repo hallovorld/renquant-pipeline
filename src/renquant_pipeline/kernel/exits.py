@@ -435,39 +435,62 @@ def check_trailing_stop(
     return _NO_EXIT
 
 
-def _resolve_daily_sigma(state: "HoldingState") -> float | None:
-    """Resolve per-position daily volatility from NGBoost σ (preferred) or
-    realized-vol fallback.
+def _resolve_daily_sigma(
+    state: "HoldingState", prefer_realized_daily: bool = False
+) -> float | None:
+    """Resolve per-position daily volatility from NGBoost σ or realized-vol.
 
-    Priority:
-      1. ``state.sigma`` (NGBoost 5-day σ) → daily = σ / √5
-      2. ``state.realized_sigma_daily`` (20-day realized) → use as-is
+    Default priority (legacy):
+      1. ``state.sigma`` → daily = σ / √5   (assumes a 5-day σ)
+      2. ``state.realized_sigma_daily`` (already daily) → use as-is
       3. ``None`` when neither available
 
-    Reviving Fix #0a (σ-aware stops, was dead-code per AUDIT_2026-05-09 #1):
-    NGB is OFF in production so state.sigma is always None; the realized-vol
-    fallback (computed in PrepareHoldingTask from last 20d daily returns)
-    makes σ-aware exits actually fire. Industry-standard volatility-scaled
-    risk control (Almgren-Chriss 2000; Edwards-Magee 1948; RiskMetrics
-    1996 — daily-σ as the canonical risk unit).
+    BUG (σ-horizon contract, 2026-06-11 — see orchestrator
+    doc/audit/2026-06-11-sigma-horizon-contract.md): in prod NGB is OFF and
+    ``ApplyRealizedVolFallbackTask`` writes an **annualized** σ into
+    ``state.sigma`` (which persists across bars). Priority 1 then divides an
+    annualized σ by √5, overstating daily σ by √(252/5) ≈ 7.1× and effectively
+    disabling the σ-aware single-day-loss / cumulative stops. The docstring's
+    old "state.sigma is always None in prod" claim was false.
+
+    ``prefer_realized_daily=True`` flips the priority to use the
+    unambiguously-daily ``realized_sigma_daily`` first (correct in prod), only
+    falling back to ``state.sigma/√5`` when the daily field is absent. Default
+    False preserves legacy behaviour byte-for-byte; the corrected path is
+    opt-in because it RE-ACTIVATES a currently-dormant live stop and must be
+    validated first.
     """
     import math  # noqa: PLC0415 — local import keeps helper self-contained
-    sg = getattr(state, "sigma", None)
-    if sg is not None:
+
+    def _from_state_sigma() -> float | None:
+        sg = getattr(state, "sigma", None)
+        if sg is None:
+            return None
         try:
             sgf = float(sg)
-            if math.isfinite(sgf) and sgf > 0:
-                return sgf / math.sqrt(5.0)
         except (TypeError, ValueError):
-            pass
-    rs = getattr(state, "realized_sigma_daily", None)
-    if rs is not None:
+            return None
+        return sgf / math.sqrt(5.0) if math.isfinite(sgf) and sgf > 0 else None
+
+    def _from_realized_daily() -> float | None:
+        rs = getattr(state, "realized_sigma_daily", None)
+        if rs is None:
+            return None
         try:
             rsf = float(rs)
-            if math.isfinite(rsf) and rsf > 0:
-                return rsf
         except (TypeError, ValueError):
-            pass
+            return None
+        return rsf if math.isfinite(rsf) and rsf > 0 else None
+
+    order = (
+        (_from_realized_daily, _from_state_sigma)
+        if prefer_realized_daily
+        else (_from_state_sigma, _from_realized_daily)
+    )
+    for resolver in order:
+        val = resolver()
+        if val is not None:
+            return val
     return None
 
 
@@ -479,6 +502,7 @@ def check_stop_loss(
     today: datetime.date | None = None,
     stop_decay_days: int = 0,    # B1: after N days held, linearly tighten stop_pct (0 = off)
     stop_decay_floor: float = 0.5,  # B1: minimum multiplier (0.5 = stop tightens to 50% of original)
+    prefer_realized_daily_sigma: bool = False,  # σ-horizon fix (opt-in): use daily realized σ
 ) -> ExitSignal:
     """Cumulative stop-loss from entry price — absolute and/or σ-adaptive.
 
@@ -532,7 +556,7 @@ def check_stop_loss(
 
     sigma_thresh = 0.0
     if stop_n_sigma and stop_n_sigma > 0:
-        sg_daily = _resolve_daily_sigma(state)
+        sg_daily = _resolve_daily_sigma(state, prefer_realized_daily_sigma)
         if sg_daily is not None:
             if today is not None:
                 days_held = max(1, (today - state.entry_date).days)
@@ -578,6 +602,7 @@ def check_single_day_loss(
     sdl_skip_if_unrealized_above: float = 0.0,  # B2: skip SDL if position is up X% (default 0 = off)
     sdl_skip_if_trailing_armed: bool = False,   # H-2: defer to trailing stop once armed
     trailing_trigger_pct: float = 0.0,          # H-2: the regime's trailing-stop arm threshold
+    prefer_realized_daily_sigma: bool = False,  # σ-horizon fix (opt-in): use daily realized σ
 ) -> ExitSignal:
     """Single-day loss gate — fires on gap-downs vs previous close.
 
@@ -646,7 +671,7 @@ def check_single_day_loss(
         # 2026-05-10: route through _resolve_daily_sigma so realized-vol
         # fallback is used when NGB is OFF (NGB σ unavailable). Industry-
         # standard daily-σ resolution per Almgren-Chriss / RiskMetrics.
-        daily_vol = _resolve_daily_sigma(state)
+        daily_vol = _resolve_daily_sigma(state, prefer_realized_daily_sigma)
         if daily_vol is not None:
             sigma_thresh = float(sdl_n_sigma) * daily_vol
 
@@ -841,6 +866,7 @@ def compute_exits(
         return sig, state
 
     # 2. Cumulative stop-loss (legacy absolute % AND/OR σ-adaptive)
+    _prefer_realized_daily = bool(params.get("prefer_realized_daily_sigma", False))
     sig = check_stop_loss(
         current_price, state,
         float(params.get("stop_loss_pct", 0)),
@@ -848,6 +874,7 @@ def compute_exits(
         today,
         stop_decay_days=int(params.get("stop_decay_days", 0)),
         stop_decay_floor=float(params.get("stop_decay_floor", 0.5)),
+        prefer_realized_daily_sigma=_prefer_realized_daily,
     )
     if sig.should_exit:
         return sig, state
@@ -860,6 +887,7 @@ def compute_exits(
         sdl_skip_if_unrealized_above=float(params.get("sdl_skip_if_unrealized_above", 0)),
         sdl_skip_if_trailing_armed=bool(params.get("sdl_skip_if_trailing_armed", False)),
         trailing_trigger_pct=float(params.get("trailing_stop_trigger_pct", 0)),
+        prefer_realized_daily_sigma=_prefer_realized_daily,
     )
     if sig.should_exit:
         return sig, state
