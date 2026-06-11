@@ -1,8 +1,11 @@
 """Exit-parameter helpers shared by inference and adapter audit logs."""
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 
 def _positive_float(value: Any) -> float | None:
@@ -55,12 +58,34 @@ def apply_stop_loss_anchor_policy(
 
     current_stop = _positive_float(exit_params.get("stop_loss_pct"))
     entry_stop = _positive_float((entry_regime_params or {}).get("stop_loss_pct"))
+    # BL-3 (2026-06-10): fail SAFE, not closed. This anchor policy is an
+    # opt-in A/B hook (mode=max_entry_current). A single holding whose
+    # current- or entry-regime config lacks a positive stop_loss_pct must
+    # NOT raise — the call sites apply this inside an un-guarded list
+    # comprehension over every holding, so one bad config would abort sell
+    # evaluation for the WHOLE book and take all risk stops dark. Degrade to
+    # the stop we can compute and keep the holding's base stop intact.
     if current_stop is None:
-        raise ValueError("stop_loss_anchor_policy requires current stop_loss_pct")
-    if entry_stop is None:
-        raise ValueError(
-            f"stop_loss_anchor_policy requires stop_loss_pct for entry regime {entry_regime}"
+        # No current stop to anchor; nothing to tighten. Leave exit_params
+        # untouched so downstream stop logic uses whatever it already had.
+        log.warning(
+            "stop_loss_anchor_policy: missing current stop_loss_pct "
+            "(current_regime=%s entry_regime=%s); skipping anchor, base stop preserved",
+            current_regime,
+            entry_regime,
         )
+        return exit_params
+    if entry_stop is None:
+        # Entry-regime config has no positive stop; cannot widen toward it.
+        # Keep the current stop rather than crashing the whole sell pass.
+        log.warning(
+            "stop_loss_anchor_policy: missing stop_loss_pct for entry regime %s "
+            "(current_regime=%s); keeping current stop %.4f",
+            entry_regime,
+            current_regime,
+            current_stop,
+        )
+        return exit_params
 
     anchored_stop = max(current_stop, entry_stop)
     anchor_regime = entry_regime if entry_stop >= current_stop else current_regime
