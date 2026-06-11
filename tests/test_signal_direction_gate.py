@@ -30,7 +30,7 @@ def _ctx(ranked, selected, **overrides):
         "regime_params": {"BULL_CALM": {"max_position_pct": 0.10,
                                         "cash_reserve_pct": 0.0,
                                         "max_concurrent_positions": 8}},
-        "ranking": {"panel_scoring": {"sizing": {}, "sigma_sizing": {}},
+        "ranking": {"panel_scoring": {"enabled": True, "sizing": {}, "sigma_sizing": {}},
                     "kelly_sizing": {"enabled": False}},
         "regime": {},
     }
@@ -77,10 +77,13 @@ def test_all_negative_universe_buys_nothing():
 
 
 def test_gate_is_on_by_default_and_opt_out():
-    assert _require_positive_raw_signal_cfg({}) is True
+    assert _require_positive_raw_signal_cfg({}) is False
     assert _require_positive_raw_signal_cfg(
-        {"ranking": {"panel_scoring": {"require_positive_raw_signal_for_buy": False}}}
+        {"ranking": {"panel_scoring": {"enabled": True, "require_positive_raw_signal_for_buy": False}}}
     ) is False
+    assert _require_positive_raw_signal_cfg(
+        {"ranking": {"panel_scoring": {"enabled": True}}}
+    ) is True
 
 
 def test_opt_out_allows_negative_signal_long():
@@ -89,7 +92,7 @@ def test_opt_out_allows_negative_signal_long():
         "regime_params": {"BULL_CALM": {"max_position_pct": 0.10,
                                         "cash_reserve_pct": 0.0,
                                         "max_concurrent_positions": 8}},
-        "ranking": {"panel_scoring": {"sizing": {}, "sigma_sizing": {},
+        "ranking": {"panel_scoring": {"enabled": True, "sizing": {}, "sigma_sizing": {},
                                       "require_positive_raw_signal_for_buy": False},
                     "kelly_sizing": {"enabled": False}},
         "regime": {},
@@ -100,3 +103,18 @@ def test_opt_out_allows_negative_signal_long():
     # gate (it proceeds to sizing; whether it ultimately trades is up to cash)
     blocked = getattr(ctx, "_blocked_by_ticker", {}) or {}
     assert blocked.get("NEG") != "negative_raw_signal_no_long"
+
+
+def test_disabled_panel_scoring_does_not_apply_raw_signal_gate():
+    cand = _cand("AAA", panel_score=None, expected_return=0.04, mu=0.04)
+    cfg = {
+        "regime_params": {"BULL_CALM": {"max_position_pct": 0.10,
+                                        "cash_reserve_pct": 0.0,
+                                        "max_concurrent_positions": 8}},
+        "ranking": {"panel_scoring": {"enabled": False, "sizing": {}, "sigma_sizing": {}},
+                    "kelly_sizing": {"enabled": False}},
+        "regime": {},
+    }
+    ctx = _ctx([cand], ["AAA"], config=cfg)
+    SizeAndEmitTask().run(ctx)
+    assert "AAA" in [o["ticker"] for o in ctx.orders]
