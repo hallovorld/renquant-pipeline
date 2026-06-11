@@ -1680,7 +1680,44 @@ class VetoWeakBuysTask(Task):
         # mean+std happens to land low.
         floor: float
         floor_label: str
-        if isinstance(raw_floor, str) and raw_floor in {"adaptive_mean_std_cap", "adaptive_mean_std"}:
+        if isinstance(raw_floor, str) and raw_floor == "adaptive_quantile":
+            # 2026-06-11 false-BEAR audit P2: explicit breadth control.
+            # mean+kσ on a Platt-compressed calibrator (rank_score IQR ~0.04)
+            # is shape-unstable — skew/kurtosis decide admission, and the rule
+            # structurally caps breadth at ~16% regardless of edge (Grinold
+            # FLAM: IR = IC·√BR; throttling BR caps achievable IR). A
+            # cross-sectional QUANTILE floor admits a deliberate top fraction
+            # (default top 20%) independent of distribution compression.
+            # buy_floor_min stays as the absolute fail-safe on degenerate
+            # cross-sections.
+            q       = float(panel_cfg.get("buy_floor_quantile", 0.80))
+            min_fl  = float(panel_cfg.get("buy_floor_min",      0.20))
+            raw_scores = [getattr(c, "rank_score", None) for c in ctx.candidates]
+            scores = []
+            for s in raw_scores:
+                try:
+                    f = float(s)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(f):
+                    scores.append(f)
+            if len(scores) >= 2:
+                import statistics as _stats  # noqa: PLC0415
+                qclamped = min(max(q, 0.0), 1.0)
+                # statistics.quantiles n=100 → percentile cut points;
+                # index by the requested quantile (1-based cut points).
+                cuts = _stats.quantiles(scores, n=100, method="inclusive")
+                idx = min(max(int(round(qclamped * 100)) - 1, 0), len(cuts) - 1)
+                qval = cuts[idx]
+                floor = max(min_fl, qval)
+                floor_label = (
+                    f"max(min={min_fl:.2f}, q{qclamped:.2f}={qval:.3f}) = "
+                    f"{floor:.3f}  (n={len(scores)})"
+                )
+            else:
+                floor = min_fl
+                floor_label = f"{floor:.3f} (fallback; n<2 for stats)"
+        elif isinstance(raw_floor, str) and raw_floor in {"adaptive_mean_std_cap", "adaptive_mean_std"}:
             cap     = float(panel_cfg.get("buy_floor_adaptive_cap", 0.30))
             min_fl  = float(panel_cfg.get("buy_floor_min",          0.20))
             std_mult = float(panel_cfg.get("buy_floor_std_mult",     1.0))
