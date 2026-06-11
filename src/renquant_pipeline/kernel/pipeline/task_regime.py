@@ -223,15 +223,45 @@ class BEAROverrideTask(Task):
         else:
             spy_20d_vol = spy_20d_ret = 0.0
 
-        # ── 5-day check (2026-05-17 fix A) ──
+        # ── 5-day check (2026-05-17 fix A; 2026-06-11 false-BEAR audit P0) ──
+        # P0: the short-horizon route was OR(vol, ret) — a lone vol spike with
+        # no real drop flipped the whole book to hard_bear on routine pullback
+        # chop (2026-06-11: 5d_vol=0.26>0.25, ret=-2.57% > -4% → false BEAR in a
+        # market +7.6% above its 200-DMA). Two opt-in guards, config-gated so the
+        # 20-day GFC routes (35% vol / -8% ret) stay UNCONDITIONAL:
+        #   • bear_short_route_require_both: demand vol AND a real drop (not OR)
+        #   • bear_trend_filter: suppress the 5d route while price > long MA
+        # Refs: Faber (2007) 200-DMA timing; Moskowitz-Ooi-Pedersen (2012) TSMOM;
+        # Bollerslev (1986) vol-clustering persists; Hamilton (1989) regime duration.
+        require_both_5d = bool(cfg.get("bear_short_route_require_both", False))
         hard_bear_5d = False
         if len(spy_returns) >= vol_window_5d:
             vol_5d, ret_5d = _vol_ret(spy_returns[-vol_window_5d:])
-            hard_bear_5d = vol_5d > bear_vol_thr_5d or ret_5d < bear_ret_thr_5d
+            vol_breach = vol_5d > bear_vol_thr_5d
+            ret_breach = ret_5d < bear_ret_thr_5d
+            hard_bear_5d = (vol_breach and ret_breach) if require_both_5d \
+                else (vol_breach or ret_breach)
         else:
             vol_5d = ret_5d = 0.0
         state.vol_5d = vol_5d
         state.ret_5d = ret_5d
+
+        # Trend confirmation: a market above its long moving average is not a
+        # brief crisis — suppress the sensitive 5d route when price > MA(window).
+        # 20d routes are unaffected (a genuine crash can begin above the MA).
+        trend_cfg = cfg.get("bear_trend_filter", {}) or {}
+        if hard_bear_5d and bool(trend_cfg.get("enabled", False)):
+            ma_window = int(trend_cfg.get("ma_window", 200))
+            if len(spy_returns) >= ma_window:
+                prices = np.cumprod(1.0 + spy_returns)
+                ma = float(np.mean(prices[-ma_window:]))
+                if math.isfinite(ma) and ma > 0.0 and prices[-1] > ma:
+                    log.info(
+                        "BEAROverrideTask: 5d-route BEAR SUPPRESSED — "
+                        "SPY %.4f > %dd MA %.4f (trend up)",
+                        prices[-1], ma_window, ma,
+                    )
+                    hard_bear_5d = False
 
         state.hard_bear = hard_bear_20d or hard_bear_5d
 

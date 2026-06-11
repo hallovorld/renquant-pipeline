@@ -23,6 +23,7 @@ import pandas as pd
 job_regime = importlib.import_module("renquant_pipeline.kernel.pipeline.job_regime")
 regime = importlib.import_module("renquant_pipeline.kernel.regime")
 config = importlib.import_module("renquant_pipeline.kernel.config")
+task_regime = importlib.import_module("renquant_pipeline.kernel.pipeline.task_regime")
 
 
 def _calm_bull_ctx(n: int = 250, seed: int = 0) -> SimpleNamespace:
@@ -97,3 +98,77 @@ def test_regime_job_is_deterministic() -> None:
     job_regime.RegimeJob().run(r1)
     job_regime.RegimeJob().run(r2)
     assert r1.regime == r2.regime
+
+
+# ── 2026-06-11 false-BEAR audit (P0): BEAROverrideTask short-route guards ──────
+#
+# The 5-day route was OR(vol, ret): a lone vol spike with no real drop flipped
+# the whole book to hard_bear on routine pullback chop. These tests pin the two
+# config-gated guards (require-both + trend filter) and prove the 20-day GFC
+# routes stay unconditional.
+
+# Reproduces 2026-06-11: elevated 5d vol (~0.30 > 0.25) but only a ~-0.5%
+# cumulative move (NOT < -4%), sitting on a calm prior window so the 20d route
+# is quiet.
+_VOL_SPIKE_5D = [0.02, -0.02, 0.018, -0.018, -0.004]
+
+
+def _run_bear(rets, regime_cfg=None):
+    ctx = SimpleNamespace(
+        spy_returns=np.asarray(rets, dtype=float),
+        regime_state=regime.RegimeState(),
+        config={"regime": regime_cfg or {}, "regime_params": {}},
+    )
+    task_regime.BEAROverrideTask().run(ctx)
+    return ctx.regime_state
+
+
+def test_5d_vol_spike_alone_triggers_under_legacy_or_default() -> None:
+    """Backward-compat: with no config, the legacy OR still fires on vol alone."""
+    rets = np.concatenate([np.full(40, 0.0003), _VOL_SPIKE_5D])
+    st = _run_bear(rets, {})
+    assert st.vol_5d > 0.25 and st.ret_5d > -0.04   # vol breached, ret did not
+    assert st.hard_bear is True                      # legacy OR ⇒ fires
+
+
+def test_require_both_suppresses_vol_only_false_bear() -> None:
+    """P0: require_both demands vol AND a real drop — the 2026-06-11 case is no
+    longer a false BEAR (vol breached but the -0.5% move did not)."""
+    rets = np.concatenate([np.full(40, 0.0003), _VOL_SPIKE_5D])
+    st = _run_bear(rets, {"bear_short_route_require_both": True})
+    assert st.vol_5d > 0.25 and st.ret_5d > -0.04
+    assert st.hard_bear is False
+
+
+def test_require_both_still_fires_on_genuine_both_breach() -> None:
+    """A real sharp week (high vol AND < -4% drop) still trips the 5d route."""
+    crash5 = [-0.04, 0.01, -0.05, -0.01, -0.03]            # vol high, cumret ~-11%
+    rets = np.concatenate([np.full(40, 0.0003), crash5])
+    st = _run_bear(rets, {"bear_short_route_require_both": True})
+    assert st.vol_5d > 0.25 and st.ret_5d < -0.04
+    assert st.hard_bear is True
+
+
+def test_20d_gfc_route_stays_unconditional_under_both_guards() -> None:
+    """A sustained crash must still label BEAR even with both 5d guards on —
+    the 20-day GFC routes are never gated."""
+    rets = np.concatenate([np.full(220, 0.0003), np.full(30, -0.015)])
+    st = _run_bear(rets, {"bear_short_route_require_both": True,
+                          "bear_trend_filter": {"enabled": True, "ma_window": 200}})
+    assert st.hard_bear is True
+
+
+def test_trend_filter_suppresses_5d_route_above_ma() -> None:
+    """A vol spike in a confirmed uptrend (price > 200d MA) is suppressed."""
+    rets = np.concatenate([np.full(240, 0.0015), _VOL_SPIKE_5D])  # strong uptrend
+    st = _run_bear(rets, {"bear_trend_filter": {"enabled": True, "ma_window": 200}})
+    assert st.vol_5d > 0.25
+    assert st.hard_bear is False
+
+
+def test_trend_filter_does_not_suppress_5d_route_below_ma() -> None:
+    """The same vol spike in a downtrend (price < 200d MA) is NOT suppressed."""
+    rets = np.concatenate([np.full(240, -0.001), _VOL_SPIKE_5D])  # downtrend
+    st = _run_bear(rets, {"bear_trend_filter": {"enabled": True, "ma_window": 200}})
+    assert st.vol_5d > 0.25
+    assert st.hard_bear is True
