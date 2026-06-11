@@ -123,6 +123,14 @@ class HoldingState:
     # intraday sell-only runs) don't double-count. None means never
     # incremented yet.
     last_streak_inc_date: datetime.date | None = None
+    # Model-based protection (2026-06-11): consecutive evaluations on which the
+    # holding's re-scored calibrated μ has breached the exit threshold. The
+    # thesis-aware meta-label exit (kernel.model_protection) sells only after N
+    # consecutive breaches (CUSUM-style debounce); a recovering reading resets
+    # this to 0. Persists across bars like ``sell_streak`` (see
+    # ModelProtectionExitTask). Cross-day persistence rides the live_state
+    # holding round-trip.
+    protection_breaches: int = 0
     prev_close:      float | None = None
     rank_score:      float | None = None   # latest calibrated probability (set by ScoreModelTask)
     expected_return: float | None = None   # latest E[R-SPY] over rotation horizon

@@ -455,6 +455,103 @@ class PanelConvictionExitTask(Task):
                      tc.ticker, prob_score, mu, trigger_mode)
 
 
+class ModelProtectionExitTask(Task):
+    """Thesis-aware meta-label exit with sequential (N-of-N) debounce.
+
+    Operator spec: a holding needs a MODEL-based protection (a price-only stop
+    is unreliable). This sells a holding only after the model's re-scored
+    calibrated μ has stayed at/below an exit threshold on N CONSECUTIVE
+    evaluations — the meta-labeling idea (de Prado) with CUSUM/SPRT debouncing
+    (Page 1954; Wald 1945). Unlike PanelConvictionExitTask (a single-bar μ
+    check) this requires a sustained breach, so a single noisy bearish reading
+    does not exit; a recovering reading resets the strike count. See
+    kernel.model_protection and the design RFC
+    (orchestrator doc/research/2026-06-11-construction-and-model-based-protection.md).
+
+    Default OFF (``risk.model_protection.enabled``). Runs after the
+    priority/stop chain and PanelConvictionExitTask (only when nothing higher
+    has already exited). Respects the LT / tax / thesis-age suppressions like
+    PanelConvictionExitTask. The breach counter lives on
+    ``HoldingState.protection_breaches`` and persists across bars; the N-strikes
+    rule gives a natural ~N-bar minimum hold even without a min-hold config.
+
+    NOTE: the cross-DAY debounce needs the live_state holding round-trip to
+    carry ``protection_breaches`` (like ``sell_streaks``). Until that persists,
+    the counter resets each run, so this stays inert (cannot misfire) even if
+    enabled — see the integration follow-up.
+    """
+
+    def run(self, tc: TickerInferenceContext) -> bool | None:
+        if getattr(tc, "exit_signal", None) is not None:
+            return  # a higher-priority exit already fired
+
+        from renquant_pipeline.kernel.model_protection import (  # noqa: PLC0415
+            ACTION_EXIT, ProtectionState, evaluate, protection_config_from,
+        )
+        cfg = protection_config_from(tc.config)
+        if not cfg.enabled:
+            return
+
+        hs = tc.holding
+        if hs is None:
+            return
+
+        # Calibrated expected return for the holding (set fresh in the sell
+        # pass; falls back to NGBoost μ). A missing μ never advances/exits.
+        mu = getattr(hs, "expected_return", None)
+        if mu is None:
+            mu = getattr(hs, "mu", None)
+
+        state = ProtectionState(int(getattr(hs, "protection_breaches", 0) or 0))
+        action, new_state, reason = evaluate(mu, cfg, state)
+        # Always persist the updated streak (count even when an exit is later
+        # suppressed, so it fires once the suppression lifts).
+        hs.protection_breaches = new_state.consecutive_breaches
+
+        if action != ACTION_EXIT:
+            return
+
+        mp_cfg = (tc.config.get("risk", {}) or {}).get("model_protection", {}) or {}
+        suppress, why = soft_exit_horizon_suppression(
+            panel_cfg=mp_cfg,
+            regime=soft_exit_thesis_regime(hs, getattr(tc, "regime", None)),
+            today=getattr(tc, "today", None),
+            holding=hs,
+        )
+        if suppress:
+            log.info("ModelProtectionExitTask [%s]: EXIT held by horizon gate (%s)",
+                     tc.ticker, why)
+            return
+
+        current_price = resolve_current_price(tc, hs, getattr(tc, "ticker", None))
+        suppress, why = lt_gate_suppression(
+            config=tc.config, today=getattr(tc, "today", None),
+            holding=hs, current_price=current_price,
+        )
+        if suppress:
+            log.info("ModelProtectionExitTask [%s]: SUPPRESSED by LT tax gate (%s)",
+                     tc.ticker, why)
+            return
+        suppress, why = tax_adjusted_soft_exit_suppression(
+            panel_cfg=mp_cfg, tax_cfg=tc.config.get("tax") or {},
+            today=getattr(tc, "today", None), holding=hs,
+            current_price=current_price, mu=mu,
+        )
+        if suppress:
+            log.info("ModelProtectionExitTask [%s]: SUPPRESSED by tax gate (%s)",
+                     tc.ticker, why)
+            return
+
+        from renquant_pipeline.kernel.exits import ExitSignal  # noqa: PLC0415
+        tc.exit_signal = ExitSignal(
+            should_exit=True,
+            reason=f"model_protection {reason}",
+            exit_type="model_protection",
+            exit_params=dict(getattr(tc, "exit_params", {}) or {}),
+        )
+        log.info("ModelProtectionExitTask [%s]: EXIT %s", tc.ticker, reason)
+
+
 class EarningsBlackoutSellTask(Task):
     """Veto model-driven exits inside the earnings event-blackout window.
 

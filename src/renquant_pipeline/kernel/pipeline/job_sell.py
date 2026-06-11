@@ -4,7 +4,8 @@ from __future__ import annotations
 from .pipeline import TickerJob, Task
 from .task_sell import (
     PrepareHoldingTask, ScoreModelTask, EvaluateExitsTask,
-    SellGateBTask, PanelConvictionExitTask, EarningsBlackoutSellTask,
+    SellGateBTask, PanelConvictionExitTask, ModelProtectionExitTask,
+    EarningsBlackoutSellTask,
 )
 
 
@@ -34,6 +35,7 @@ class TickerSellJob(TickerJob):
             ScoreModelTask(),
             EvaluateExitsTask(),
             SellGateBTask(),              # NGBoost μ/σ guard on model_sell
-            PanelConvictionExitTask(),    # tiebreaker
+            PanelConvictionExitTask(),    # tiebreaker (single-bar μ)
+            ModelProtectionExitTask(),    # thesis-aware N-of-N debounce (default OFF)
             EarningsBlackoutSellTask(),   # event-blackout veto on model_*
         ]
