@@ -209,7 +209,19 @@ class ApplyShadowScoringTask(Task):
                 continue
             p = Path(artifact_path)
             if not p.is_absolute():
-                p = repo / p
+                # 2026-06-11 shadow-dead fix: resolve like the PRIMARY scorer —
+                # strategy_dir first, repo data_root as back-compat fallback.
+                # Pre-fix this resolved ONLY against data_root(), so the
+                # post-PatchTST-promotion shadow ("artifacts/prod/panel-ltr.
+                # alpha158_fund.json", which lives under <strategy_dir>/) failed
+                # to load on every run and the primary-vs-previous comparison
+                # was silently off since 2026-06-05.
+                strategy_dir = ctx.config.get("_strategy_dir")
+                candidates = []
+                if strategy_dir:
+                    candidates.append(Path(strategy_dir) / p)
+                candidates.append(repo / p)
+                p = next((c for c in candidates if c.exists()), candidates[-1])
             try:
                 handler = registry.get(kind)
             except ValueError as exc:
