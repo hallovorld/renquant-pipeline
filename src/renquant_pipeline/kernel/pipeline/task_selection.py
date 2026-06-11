@@ -13,14 +13,19 @@ log = logging.getLogger("kernel.pipeline.selection")
 
 
 def _require_positive_raw_signal_cfg(config: dict | None) -> bool:
-    """Whether new longs require a positive raw panel_score (default True).
+    """Whether new longs require a positive raw panel_score.
 
     The signal-direction gate (2026-06-10). Default ON: the system must not
     open a long on a name the model scores bearish, regardless of what the
     calibrator extrapolates for μ. Opt out explicitly with
     ``ranking.panel_scoring.require_positive_raw_signal_for_buy: false``.
+
+    The gate only applies when panel scoring itself is enabled. If the run is
+    using a non-panel ranker, there is no raw panel_score contract to enforce.
     """
     sel = ((config or {}).get("ranking", {}) or {}).get("panel_scoring", {}) or {}
+    if not bool(sel.get("enabled", False)):
+        return False
     v = sel.get("require_positive_raw_signal_for_buy")
     return True if v is None else bool(v)
 
