@@ -83,6 +83,12 @@ def test_sigma_mu_horizon_mismatch_fails_hard() -> None:
     assert r.details == {"sigma_horizon_days": 252.0, "mu_horizon_days": 60}
 
 
+def test_fractional_sigma_mu_horizon_mismatch_fails_hard() -> None:
+    r = _check_kelly_sigma_horizon_config(_cfg_horizons(60.5, 60))
+    assert r.ok is False and r.severity == "hard"
+    assert r.details == {"sigma_horizon_days": 60.5, "mu_horizon_days": 60}
+
+
 def test_mismatch_inert_without_calibrator_mu() -> None:
     """If Kelly does not consume calibrator μ, the σ/μ match is not enforced."""
     r = _check_kelly_sigma_horizon_config(

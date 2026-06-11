@@ -1515,7 +1515,7 @@ def _check_kelly_sigma_horizon_config(
     joint_cfg = ((config.get("rotation") or {}).get("joint_actions") or {})
     mu_h = (_pos_int(joint_cfg.get("qp_mu_horizon_days"))
             or _pos_int((config.get("panel_ltr") or {}).get("lookahead_days")))
-    if kelly_on and uses_cal_mu and mu_h is not None and int(days) != mu_h:
+    if kelly_on and uses_cal_mu and mu_h is not None and days != float(mu_h):
         return PreflightCheck(
             name, "hard", False,
             f"ranking.kelly_sizing.sigma_horizon_days={days:g} != μ horizon "
