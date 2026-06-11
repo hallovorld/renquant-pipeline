@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import sqlite3
 
 import pytest
 
 from renquant_pipeline import (
+    account_snapshot_from_live_state,
     build_run_bundle,
     hash_jsonable,
+    load_live_state_contract,
     live_state_path,
     resolve_live_state_read,
     runs_db_path,
     validate_feature_contract,
     validate_panel_artifact_contract,
+)
+from renquant_pipeline.kernel.persistence import (
+    ensure_schema,
+    record_live_state_snapshot,
 )
 from renquant_pipeline.context import (
     InferenceContext as PipelineInferenceContext,
@@ -52,6 +60,83 @@ def test_state_read_uses_legacy_only_as_read_fallback(tmp_path) -> None:
 
     assert path == legacy
     assert is_legacy is True
+
+
+def test_live_state_contract_prefers_broker_file_and_normalizes_account(tmp_path) -> None:
+    path = live_state_path(tmp_path, "alpaca")
+    path.write_text(
+        json.dumps({
+            "cash": 1000.0,
+            "portfolio_value": 2500.0,
+            "positions": {
+                "AAPL": {"qty": 3, "avg_entry_price": 190.0},
+                "MSFT": {"quantity": 0},
+            },
+            "position_hwm": {"TSLA": 260.0},
+        }),
+        encoding="utf-8",
+    )
+
+    contract = load_live_state_contract(tmp_path, "alpaca")
+
+    assert contract.source == "live_state_file"
+    assert contract.used_legacy is False
+    assert contract.account_snapshot["positions"] == {
+        "AAPL": {"avg_entry_price": 190.0, "quantity": 3, "ticker": "AAPL"}
+    }
+    assert "TSLA" not in contract.account_snapshot["positions"]
+    assert contract.account_snapshot["cash"] == pytest.approx(1000.0)
+
+
+def test_live_state_contract_uses_legacy_file_as_read_only_fallback(tmp_path) -> None:
+    legacy = tmp_path / "live_state.json"
+    legacy.write_text(
+        json.dumps({"account_snapshot": {"positions": {"IBM": {"quantity": 1}}}}),
+        encoding="utf-8",
+    )
+
+    contract = load_live_state_contract(tmp_path, "alpaca")
+
+    assert contract.source == "live_state_file"
+    assert contract.used_legacy is True
+    assert contract.path == str(legacy)
+    assert contract.account_snapshot == {"positions": {"IBM": {"quantity": 1}}}
+
+
+def test_live_state_contract_falls_back_to_runs_db_when_file_corrupt(tmp_path) -> None:
+    state_path = live_state_path(tmp_path, "alpaca")
+    state_path.write_text("{not-json", encoding="utf-8")
+    db_path = tmp_path / "runs.alpaca.db"
+    conn = sqlite3.connect(db_path)
+    ensure_schema(conn)
+    record_live_state_snapshot(
+        conn,
+        "run-1",
+        run_date=dt.date(2026, 6, 10),
+        strategy="renquant_104",
+        state={"account_snapshot": {"positions": {"BAC": {"quantity": 2}}}},
+    )
+    conn.commit()
+    conn.close()
+
+    contract = load_live_state_contract(tmp_path, "alpaca", runs_db=db_path)
+
+    assert contract.source == "live_state_snapshots_db"
+    assert contract.account_snapshot == {"positions": {"BAC": {"quantity": 2}}}
+    assert contract.warnings
+
+
+def test_live_state_contract_missing_sources_returns_empty_contract(tmp_path) -> None:
+    contract = load_live_state_contract(tmp_path, "alpaca", runs_db=tmp_path / "missing.db")
+
+    assert contract.source == "empty"
+    assert contract.state == {}
+    assert contract.account_snapshot == {}
+
+
+def test_account_snapshot_from_live_state_rejects_malformed_account_snapshot() -> None:
+    with pytest.raises(ValueError, match="account_snapshot must be an object"):
+        account_snapshot_from_live_state({"account_snapshot": []})
 
 
 def test_pipeline_context_defaults_are_independent() -> None:
