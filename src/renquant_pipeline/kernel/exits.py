@@ -576,6 +576,8 @@ def check_single_day_loss(
     sdl_pct: float,    # absolute %: e.g. 0.06 (6% single-day drop)
     sdl_n_sigma: float = 0.0,   # N × daily realized vol (preferred when set)
     sdl_skip_if_unrealized_above: float = 0.0,  # B2: skip SDL if position is up X% (default 0 = off)
+    sdl_skip_if_trailing_armed: bool = False,   # H-2: defer to trailing stop once armed
+    trailing_trigger_pct: float = 0.0,          # H-2: the regime's trailing-stop arm threshold
 ) -> ExitSignal:
     """Single-day loss gate — fires on gap-downs vs previous close.
 
@@ -611,6 +613,31 @@ def check_single_day_loss(
             and math.isfinite(state.entry_price) and state.entry_price > 0):
         unrealized = (current_price - state.entry_price) / state.entry_price
         if math.isfinite(unrealized) and unrealized >= float(sdl_skip_if_unrealized_above):
+            return _NO_EXIT
+
+    # H-2 (2026-06-10 deep audit) — once the TRAILING stop is armed, the
+    # single-day-loss gate must defer to it. Rationale (separation of
+    # concerns): the loss-stop exists to cap a *catastrophic gap-down on a
+    # losing/flat position*; the trailing stop exists to *manage giveback on a
+    # winner*. A position whose peak gain has already crossed the regime's
+    # trailing-arm threshold is a confirmed winner — a noise single-day drop
+    # there is exactly what the trailing stop (wide trail) is meant to ride
+    # through. Pre-fix, SDL fired first (it sits at a tighter threshold than
+    # the trail) and crystallized winners: live evidence NVTS exited via
+    # `single_day_loss` at +113%, and single_day_loss exits averaged +9% pnl —
+    # the "stop" was systematically selling gains. When armed, the trailing
+    # stop still fires normally on a real giveback (it runs at priority 1,
+    # before SDL). Opt-in (default off): config `sdl_skip_if_trailing_armed`.
+    # Long-only: peak_gain=(HWM-entry)/entry and the trailing stop both carry
+    # long semantics; a short profits on price DOWN, so this skip must not
+    # apply to shorts (they keep the unconditional SDL).
+    _is_long = float(getattr(state, "shares", 0.0) or 0.0) > 0
+    if (sdl_skip_if_trailing_armed and _is_long
+            and trailing_trigger_pct and trailing_trigger_pct > 0
+            and math.isfinite(state.entry_price) and state.entry_price > 0
+            and math.isfinite(state.high_watermark) and state.high_watermark > 0):
+        peak_gain = (state.high_watermark - state.entry_price) / state.entry_price
+        if math.isfinite(peak_gain) and peak_gain >= float(trailing_trigger_pct):
             return _NO_EXIT
 
     abs_thresh = float(sdl_pct) if sdl_pct and sdl_pct > 0 else 0.0
@@ -831,6 +858,8 @@ def compute_exits(
         float(params.get("max_single_day_loss_pct", 0)),
         float(params.get("sdl_n_sigma", 0)),
         sdl_skip_if_unrealized_above=float(params.get("sdl_skip_if_unrealized_above", 0)),
+        sdl_skip_if_trailing_armed=bool(params.get("sdl_skip_if_trailing_armed", False)),
+        trailing_trigger_pct=float(params.get("trailing_stop_trigger_pct", 0)),
     )
     if sig.should_exit:
         return sig, state

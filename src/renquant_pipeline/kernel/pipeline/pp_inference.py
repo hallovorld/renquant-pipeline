@@ -56,6 +56,14 @@ def _build_exit_params(regime_p: dict, config: dict) -> dict:
         # so it was dead. Now config-driven (industry value 2.0-2.5).
         "sdl_n_sigma":               regime_p.get("sdl_n_sigma",               0),
         "sdl_skip_if_unrealized_above": regime_p.get("sdl_skip_if_unrealized_above", 0),
+        # H-2 (2026-06-10): once the trailing stop is armed, the single-day-loss
+        # gate defers to it (the trailing stop manages winner giveback; SDL is
+        # for catastrophic gaps on losers/flats). Per-regime override, else a
+        # single global default. Default OFF (legacy: SDL fires on winners).
+        "sdl_skip_if_trailing_armed": regime_p.get(
+            "sdl_skip_if_trailing_armed",
+            config.get("sdl_skip_if_trailing_armed", False),
+        ),
         "take_profit_pct":           regime_p.get("take_profit_pct",           0),
         "stop_decay_days":           regime_p.get("stop_decay_days",           0),
         "stop_decay_floor":          regime_p.get("stop_decay_floor",          0),
