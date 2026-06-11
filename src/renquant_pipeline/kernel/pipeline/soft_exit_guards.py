@@ -8,10 +8,24 @@ call these helpers.
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 from typing import Any
 
 from renquant_pipeline.kernel.exits import nyse_trading_days_between
+
+log = logging.getLogger(__name__)
+
+# BL-4 class (R2 audit 2026-06-11): dedup the per-regime fallthrough warning so
+# it fires once per (key, regime) per process, not per holding per bar.
+_MIN_DAYS_FALLTHROUGH_WARNED: set[tuple[str, str | None]] = set()
+
+
+def _coerce_days(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
 
 
 def holding_days(today: Any, holding: Any) -> int | None:
@@ -29,16 +43,36 @@ def trading_holding_days(today: Any, holding: Any) -> int | None:
 
 
 def _configured_min_days(panel_cfg: dict[str, Any], regime: str | None) -> int:
-    by_regime = panel_cfg.get("min_holding_days_by_regime") or {}
-    if regime is not None and isinstance(by_regime, dict) and regime in by_regime:
-        try:
-            return max(0, int(by_regime[regime]))
-        except (TypeError, ValueError):
-            return 0
-    try:
-        return max(0, int(panel_cfg.get("min_holding_days", 0)))
-    except (TypeError, ValueError):
-        return 0
+    """Resolve the soft-exit thesis-age floor per-regime.
+
+    BL-4 class (R2 audit): a ``min_holding_days_by_regime`` map whose live
+    regime is absent used to fall through SILENTLY to the flat
+    ``min_holding_days`` — which prod does not set, so the floor became 0 and
+    the model-driven soft exit fired with NO minimum-hold protection in
+    BULL_VOLATILE / CHOPPY / BEAR (over-eager selling). Resolution order:
+    exact regime -> ``default``/``_default`` key -> flat global (logged when
+    that silently disables the guard). Mirrors ``_qp_admission_gate_value``.
+    """
+    by_regime = panel_cfg.get("min_holding_days_by_regime")
+    if isinstance(by_regime, dict) and by_regime:
+        if regime is not None and regime in by_regime:
+            return _coerce_days(by_regime[regime])
+        for default_key in ("default", "_default"):
+            if default_key in by_regime:
+                return _coerce_days(by_regime[default_key])
+        flat = panel_cfg.get("min_holding_days", 0)
+        warn_id = ("min_holding_days", regime)
+        if _coerce_days(flat) <= 0 and warn_id not in _MIN_DAYS_FALLTHROUGH_WARNED:
+            _MIN_DAYS_FALLTHROUGH_WARNED.add(warn_id)
+            log.warning(
+                "soft-exit min_holding_days_by_regime has no entry for "
+                "regime=%s and no 'default' key, and flat min_holding_days is "
+                "0 — the thesis-age soft-exit guard is OFF for this regime "
+                "(over-eager model selling). Add a 'default' to the map.",
+                regime,
+            )
+        return _coerce_days(flat)
+    return _coerce_days(panel_cfg.get("min_holding_days", 0))
 
 
 def configured_soft_exit_min_days(panel_cfg: dict[str, Any], regime: str | None) -> int:
