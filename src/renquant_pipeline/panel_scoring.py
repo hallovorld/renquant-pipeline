@@ -132,7 +132,6 @@ class BuildFeatureMatrixTask(Task):
 
         setattr(ctx, "panel_feature_matrix", matrix)
         if not matrix:
-            setattr(ctx, "buy_blocked", True)
             ctx_registry(ctx).submit(
                 gate="panel_feature_matrix", scope="book", verdict="block",
                 reason="no ticker produced a complete feature row",
@@ -190,7 +189,6 @@ class ApplyScoresTask(Task):
             scores[ticker] = score
 
         if not scores:
-            setattr(ctx, "buy_blocked", True)
             ctx_registry(ctx).submit(
                 gate="panel_scores", scope="book", verdict="block",
                 reason="no ticker received a panel score",
@@ -226,7 +224,6 @@ class ApplyGlobalCalibrationTask(Task):
                 continue
             calibrated[ticker] = value
         if not calibrated:
-            setattr(ctx, "buy_blocked", True)
             ctx_registry(ctx).submit(
                 gate="global_calibration", scope="book", verdict="block",
                 reason="every score invalid after calibration",
@@ -355,6 +352,21 @@ class PanelScoringJob(Job):
     def tasks(self) -> list[Task]:
         return self._tasks
 
+    def run(self, ctx: Any) -> None:
+        """Run the chain, then apply the registry aggregate ONCE.
+
+        Errata-C choke point (eng plan S2-PR4), mirroring
+        kernel/pipeline/job_gates.BuyGatesJob: tasks submit verdicts
+        instead of writing ``buy_blocked``; the max-join aggregate is
+        applied at the job boundary, before any downstream consumer
+        (ranking / QP / order emit) reads the flag. Task False-returns
+        still short-circuit the chain — independent mechanisms.
+        """
+        super().run(ctx)
+        registry = getattr(ctx, "gate_registry", None)
+        if registry is not None and registry.blocked("book"):
+            setattr(ctx, "buy_blocked", True)
+
     def should_skip(self, ctx: Any) -> bool:
         return not bool(_panel_cfg(ctx).get("enabled", True))
 
@@ -371,7 +383,6 @@ def _trace(ctx: Any, selected: list[str] | None = None) -> None:
 def _block_all(ctx: Any, reason: str) -> None:
     for ticker in _watchlist(ctx):
         _block(ctx, ticker, reason)
-    setattr(ctx, "buy_blocked", True)
     ctx_registry(ctx).submit(
         gate="panel_scoring", scope="book", verdict="block",
         reason=str(reason),

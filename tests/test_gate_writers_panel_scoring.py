@@ -41,7 +41,8 @@ class TestBlockingPathsSubmit:
     def test_block_all_helper_submits_with_reason(self):
         ctx = _ctx()
         _block_all(ctx, "missing_panel_artifact")
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked, "helper must not write the flag directly"
+        assert ctx.gate_registry.blocked("book")
         rows = ctx.gate_registry.ledger_rows(run_id="t")
         assert rows[0]["gate"] == "panel_scoring"
         assert rows[0]["reason"] == "missing_panel_artifact"
@@ -51,7 +52,7 @@ class TestBlockingPathsSubmit:
         ctx = _ctx(artifact_manifest={})
         result = LoadScorerTask().run(ctx)
         assert result is False
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
         assert "panel_scoring" in _gates(ctx)
 
     def test_empty_feature_matrix_submits(self):
@@ -60,7 +61,7 @@ class TestBlockingPathsSubmit:
                    feature_rows={})
         result = BuildFeatureMatrixTask().run(ctx)
         assert result is False
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
         assert "panel_feature_matrix" in _gates(ctx)
 
     def test_no_scores_submits(self):
@@ -68,7 +69,7 @@ class TestBlockingPathsSubmit:
                    panel_feature_matrix={}, panel_score_snapshot={})
         result = ApplyScoresTask().run(ctx)
         assert result is False
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
         assert "panel_scores" in _gates(ctx)
 
     def test_calibration_all_invalid_submits(self):
@@ -82,7 +83,7 @@ class TestBlockingPathsSubmit:
         )
         result = ApplyGlobalCalibrationTask().run(ctx)
         if result is False:  # NaN params → every score invalid
-            assert ctx.buy_blocked
+            assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
             assert "global_calibration" in _gates(ctx)
 
 
@@ -101,7 +102,7 @@ class TestNonBlockingSilent:
 
 class TestCensusPin:
 
-    def test_direct_writers_still_four(self):
+    def test_single_designated_writer(self):
         src = (Path(__file__).resolve().parent.parent /
                "src/renquant_pipeline/panel_scoring.py")
         tree = ast.parse(src.read_text())
@@ -116,6 +117,28 @@ class TestCensusPin:
                     and isinstance(node.args[2], ast.Constant)
                     and node.args[2].value is True):
                 count += 1
-        assert count == 4, (
+        # Exactly ONE setattr remains: the PanelScoringJob.run choke point —
+        # the single designated writer (errata C(iii): gates submit, the
+        # job applies the aggregate). Any second writer is a regression.
+        assert count == 1, (
             f"panel_scoring.py direct buy_blocked writers = {count}, expected "
-            f"4 during dual-write; flip to 0 at choke-point retirement")
+            f"exactly 1 (the PanelScoringJob choke point)")
+
+
+class TestChokePoint:
+
+    def test_job_applies_aggregate(self):
+        from renquant_pipeline.panel_scoring import PanelScoringJob
+
+        ctx = _ctx(artifact_manifest={})  # LoadScorer will block
+        PanelScoringJob().run(ctx)
+        assert ctx.buy_blocked
+        assert ctx.gate_registry.blocked("book")
+
+    def test_job_skip_leaves_flag(self):
+        from renquant_pipeline.panel_scoring import PanelScoringJob
+
+        ctx = _ctx(strategy_config={"ranking": {"panel_scoring": {"enabled": False}}})
+        job = PanelScoringJob()
+        assert job.should_skip(ctx)
+        assert not ctx.buy_blocked
