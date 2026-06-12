@@ -6,8 +6,6 @@ deliberate strict flip after one clean telemetry week.
 """
 from __future__ import annotations
 
-import pytest
-
 from renquant_pipeline.kernel.preflight_pipeline import (
     ConfigSchemaTask,
     PreflightContext,
