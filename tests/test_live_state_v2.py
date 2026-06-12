@@ -20,8 +20,6 @@ import datetime
 import json
 import os
 import random
-import sqlite3
-from pathlib import Path
 
 import pytest
 
