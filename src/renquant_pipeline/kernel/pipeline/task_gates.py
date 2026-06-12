@@ -1,4 +1,10 @@
-"""Pre-buy gate tasks — each returns False to short-circuit and block buys."""
+"""Pre-buy gate tasks — each returns False to short-circuit and block buys.
+
+Errata C(iii) retirement (eng plan S2-PR4): gate tasks no longer write
+``ctx.buy_blocked`` directly — they submit verdicts to the GateRegistry
+and ``BuyGatesJob.run`` applies the aggregate once, after the chain.
+This file must contain ZERO direct writers (census-pinned).
+"""
 from __future__ import annotations
 
 import logging
@@ -62,7 +68,6 @@ class FlattenCooldownGateTask(Task):
         if days_since <= 0:
             # Same bar — flatten just fired; ensure buys still blocked.
             ctx.skip_buys = True
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="flatten_cooldown", scope="book", verdict="block",
                 reason="hard flatten fired this bar",
@@ -70,7 +75,6 @@ class FlattenCooldownGateTask(Task):
             return False
         if days_since <= cd_n:
             ctx.skip_buys = True
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="flatten_cooldown", scope="book", verdict="block",
                 reason=f"post-flatten cooldown day {days_since} of {cd_n}",
@@ -94,7 +98,6 @@ class DrawdownGateTask(Task):
 
     def run(self, ctx: InferenceContext) -> bool | None:
         if ctx.skip_buys:
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="drawdown_circuit", scope="book", verdict="block",
                 reason="drawdown circuit breaker active (skip_buys)",
@@ -119,7 +122,6 @@ class TransitionWindowTask(Task):
             return None
         if ctx.regime_state is not None and ctx.regime_state.in_transition:
             ctx.counters["transition_blocks"] = ctx.counters.get("transition_blocks", 0) + 1
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="transition_window", scope="book", verdict="block",
                 reason="CUSUM regime-transition uncertainty window",
@@ -191,7 +193,6 @@ class BullVolOffensiveBlockTask(Task):
             return None
         ctx.counters["bull_vol_blocks"] = ctx.counters.get("bull_vol_blocks", 0) + 1
         if bool(regime_cfg.get("bull_vol_defensives_too", False)):
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="bull_vol_offensive", scope="book", verdict="block",
                 reason="BULL_VOLATILE anti-predictive panel — all buys blocked",
@@ -232,7 +233,6 @@ class RegimeAlphaGateTask(Task):
         ctx.counters["regime_alpha_blocks"] = (
             ctx.counters.get("regime_alpha_blocks", 0) + 1
         )
-        ctx.buy_blocked = True
         ctx_registry(ctx).submit(
             gate="regime_alpha", scope="book", verdict="block",
             reason=f"regime_params[{ctx.regime}].disable_new_buys",
@@ -326,7 +326,6 @@ class VelocityCrashTask(Task):
 
         if check_spy_velocity_crash(ctx.spy_returns, v_look, v_halt):
             ctx.counters["velocity_blocks"] = ctx.counters.get("velocity_blocks", 0) + 1
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="spy_velocity_crash", scope="book", verdict="block",
                 reason="SPY velocity crash",
@@ -362,7 +361,6 @@ class EMA50GateTask(Task):
         # disable both macro gates in BULL while offensive buys flowed.
         # Now: missing SPY = block buys this bar.
         if spy_df is None or "close" not in spy_df.columns or spy_df.empty:
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="ema50", scope="book", verdict="block",
                 reason="SPY OHLCV missing — fail-SAFE",
@@ -371,7 +369,6 @@ class EMA50GateTask(Task):
                         "buys this bar (data outage)")
             return False
         if check_spy_ema_trend(spy_df["close"]):
-            ctx.buy_blocked = True
             ctx_registry(ctx).submit(
                 gate="ema50", scope="book", verdict="block",
                 reason="SPY below 50-day EMA",
