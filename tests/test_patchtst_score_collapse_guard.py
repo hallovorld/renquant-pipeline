@@ -46,7 +46,9 @@ def test_collapsed_scores_fail_closed() -> None:
     ctx = _ctx(_CollapsedScorer())
     ApplyScoresTask().run(ctx)
     assert ctx.skip_buys is True
-    assert ctx.buy_blocked is True
+    # Post errata-C retirement: fail-closed submits a block verdict; the
+    # flag is applied by PanelScoringJob.run at the job boundary.
+    assert ctx.gate_registry is not None and ctx.gate_registry.blocked("book")
     assert ctx.candidates == []
     assert ctx._panel_scoring_fail_reason == "panel_score_collapsed"
 
