@@ -25,6 +25,7 @@ from renquant_common import (
 from .decision_trace import append_ticker_daily_state_rows
 from .model_admission import evaluate_model_admission
 from .order_attribution import stamp_order_attribution
+from .kernel.gate_registry import ctx_registry
 from .runtime_features import build_runtime_feature_frame
 
 
@@ -132,6 +133,10 @@ class BuildFeatureMatrixTask(Task):
         setattr(ctx, "panel_feature_matrix", matrix)
         if not matrix:
             setattr(ctx, "buy_blocked", True)
+            ctx_registry(ctx).submit(
+                gate="panel_feature_matrix", scope="book", verdict="block",
+                reason="no ticker produced a complete feature row",
+                inputs={"watchlist_size": len(_watchlist(ctx))})
             _trace(ctx)
             return False
         return True
@@ -186,6 +191,10 @@ class ApplyScoresTask(Task):
 
         if not scores:
             setattr(ctx, "buy_blocked", True)
+            ctx_registry(ctx).submit(
+                gate="panel_scores", scope="book", verdict="block",
+                reason="no ticker received a panel score",
+                inputs={"scorer_load_error": str(scorer_load_error or "")[:120]})
             _trace(ctx)
             return False
         setattr(ctx, "raw_panel_scores", dict(scores))
@@ -218,6 +227,10 @@ class ApplyGlobalCalibrationTask(Task):
             calibrated[ticker] = value
         if not calibrated:
             setattr(ctx, "buy_blocked", True)
+            ctx_registry(ctx).submit(
+                gate="global_calibration", scope="book", verdict="block",
+                reason="every score invalid after calibration",
+                inputs={"method": str(method)})
             _trace(ctx)
             return False
         setattr(ctx, "panel_scores", dict(calibrated))
@@ -359,6 +372,10 @@ def _block_all(ctx: Any, reason: str) -> None:
     for ticker in _watchlist(ctx):
         _block(ctx, ticker, reason)
     setattr(ctx, "buy_blocked", True)
+    ctx_registry(ctx).submit(
+        gate="panel_scoring", scope="book", verdict="block",
+        reason=str(reason),
+        inputs={"watchlist_size": len(_watchlist(ctx))})
 
 
 def _block(ctx: Any, ticker: str, reason: str) -> None:
