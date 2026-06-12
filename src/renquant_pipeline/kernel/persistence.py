@@ -403,6 +403,25 @@ CREATE TABLE IF NOT EXISTS challenger_decisions (
 CREATE INDEX IF NOT EXISTS idx_challenger_run    ON challenger_decisions(run_id);
 CREATE INDEX IF NOT EXISTS idx_challenger_window ON challenger_decisions(challenger_name, decision_date);
 
+-- GateRegistry decision ledger (eng plan S2-PR4 / errata C, 2026-06-12).
+-- One APPEND-ONLY row per gate verdict submission: turns funnel
+-- forensics ("which gate blocked buys on date D and why") into a SQL
+-- query instead of log archaeology. inputs_json carries the values the
+-- gate decided on.
+CREATE TABLE IF NOT EXISTS gate_verdicts (
+    verdict_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT    NOT NULL,
+    run_date     TEXT    NOT NULL,
+    gate         TEXT    NOT NULL,
+    scope        TEXT    NOT NULL,      -- 'book' or a ticker symbol
+    verdict      TEXT    NOT NULL,      -- allow | halve | block
+    reason       TEXT,
+    inputs_json  TEXT,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_gate_verdicts_run  ON gate_verdicts(run_id);
+CREATE INDEX IF NOT EXISTS idx_gate_verdicts_date ON gate_verdicts(run_date, gate);
+
 -- Trade-evaluation table (roadmap §2026-04-26 Phase 1, shipped 2026-05-02).
 -- Re-evaluates every trade at multiple horizons (1d, 5d, 7d, 14d, 28d).
 -- Joining trades × ticker_forward_returns at horizon h gives the realized
@@ -2286,3 +2305,43 @@ __all__ = [
     "validate_decision_trace_integrity",
     "lookup_candidate_scores_on_date",
 ]
+
+
+def record_gate_verdicts(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    registry,
+) -> int:
+    """Append the run's GateRegistry submissions to gate_verdicts.
+
+    eng plan S2-PR4 / errata C: every decision writes a ledger row.
+    ``registry`` is a kernel.gate_registry.GateRegistry (duck-typed via
+    ledger_rows so the umbrella's lazy-import path works). No-op when
+    persistence is disabled, run_id is missing, or no verdicts were
+    submitted. Append-only by construction — no upsert.
+    """
+    if conn is None or run_id is None or registry is None:
+        return 0
+    rows = registry.ledger_rows(run_id=run_id)
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO gate_verdicts
+              (run_id, run_date, gate, scope, verdict, reason, inputs_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r["run_id"],
+                run_date.isoformat(),
+                r["gate"],
+                r["scope"],
+                r["verdict"],
+                r["reason"],
+                json.dumps(r["inputs"], sort_keys=True, default=str),
+            )
+            for r in rows
+        ],
+    )
+    return len(rows)
