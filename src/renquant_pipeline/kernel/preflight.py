@@ -1834,6 +1834,7 @@ _LEGACY_CHECK_ORDER: tuple[str, ...] = (
     "P-META-LABEL",
     "P-CALIBRATOR-HEALTH",
     "P-CALIBRATOR-FLAT-REGION",
+    "P-CONFIG-SCHEMA",
 )
 
 

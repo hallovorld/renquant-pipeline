@@ -7,6 +7,7 @@ from .tasks.broker import BrokerConnectTask
 from .tasks.broker_fill_freshness import BrokerFillFreshnessTask
 from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .tasks.config_fingerprint import ConfigFingerprintTask
+from .tasks.config_schema import ConfigSchemaTask
 from .tasks.correlation import CorrelationMetadataTask
 from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.gate import RegimeLayeredICTask, WfGateMetadataTask
@@ -51,7 +52,7 @@ class _IdentityJob(PreflightJob):
 class _RiskConfigJob(PreflightJob):
     """Pure config risk checks that do not need artifacts or broker state."""
 
-    tasks = [KellySigmaHorizonTask()]
+    tasks = [KellySigmaHorizonTask(), ConfigSchemaTask()]
 
 
 class _CalibratorJob(PreflightJob):
