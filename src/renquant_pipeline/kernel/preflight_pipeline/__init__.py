@@ -28,6 +28,7 @@ from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.config_fingerprint import ConfigFingerprintTask
+from .tasks.config_schema import ConfigSchemaTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
 from .pipeline import build_minimal_preflight_pipeline, build_preflight_pipeline
 
@@ -53,6 +54,7 @@ __all__ = [
     "KellySigmaHorizonTask",
     "ArtifactRunIdAlignmentTask",
     "ConfigFingerprintTask",
+    "ConfigSchemaTask",
     "MetaLabelArtifactContractTask",
     "build_minimal_preflight_pipeline",
     "build_preflight_pipeline",
