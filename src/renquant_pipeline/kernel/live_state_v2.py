@@ -76,7 +76,7 @@ _HOLDING_DEFAULTS = {
 _TOP_LEVEL_V1 = {
     "schema_version", "regime", "regime_confidence", "high_water_mark",
     "last_sell_dates", "last_stop_exit_dates", "skip_buys",
-    "monitor_state", "regime_state", "stop_orders",
+    "monitor_state", "regime_state", "stop_orders", "recent_sell_orders",
     *_HOLDING_V1_KEYS.values(),
 }
 
@@ -118,6 +118,9 @@ class LiveStateV2(BaseModel):
     # Z9 broker-side stop bookkeeping; shape owned by the umbrella runner —
     # typed passthrough until the Z9 record gets its own model.
     stop_orders: dict[str, Any] = {}
+    # Runner-submitted SELL order_ids pending fill attribution (GC'd by
+    # _gc_recent_sell_orders); shape owned by the umbrella runner.
+    recent_sell_orders: dict[str, Any] = {}
     extra_quarantine: dict[str, Any] = {}
 
     # ── parse: the ONE v1-flat → typed migration ────────────────────────
@@ -163,6 +166,7 @@ class LiveStateV2(BaseModel):
             monitor_state=MonitorStateV2(**monitor) if monitor else None,
             regime_state=RegimeStateV2(**regime_state) if regime_state else None,
             stop_orders=dict(raw.get("stop_orders") or {}),
+            recent_sell_orders=dict(raw.get("recent_sell_orders") or {}),
             extra_quarantine=quarantine,
         )
 
@@ -183,6 +187,7 @@ class LiveStateV2(BaseModel):
             "last_stop_exit_dates": dict(self.last_stop_exit_dates),
             "skip_buys": self.skip_buys,
             "stop_orders": dict(self.stop_orders),
+            "recent_sell_orders": dict(self.recent_sell_orders),
         }
         if self.monitor_state is not None:
             out["monitor_state"] = self.monitor_state.model_dump()
