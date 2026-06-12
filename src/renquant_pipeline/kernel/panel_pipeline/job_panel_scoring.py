@@ -778,7 +778,6 @@ def _fail_closed_panel_scoring(ctx: Any, reason: str) -> None:
         if ticker:
             blocked[ticker] = reason
     ctx.candidates = []
-    ctx.buy_blocked = True
     ctx.skip_buys = True
     _submit_gate_verdict(ctx, gate="panel_scoring_fail_closed", reason=reason,
                          inputs={"candidates_blocked": len(candidates)})
@@ -2082,7 +2081,6 @@ def _fail_closed_missing_calibrator(ctx: InferenceContext, reason: str) -> None:
     scores. Exits already emitted earlier in the pipeline are left intact.
     """
     ctx._calibrator_contract_failed = True  # noqa: SLF001
-    ctx.buy_blocked = True
     ctx.skip_buys = True
     _submit_gate_verdict(ctx, gate="calibrator_fail_closed", reason=reason,
                          inputs={})
@@ -2646,7 +2644,6 @@ def _fail_closed_ngboost(ctx: InferenceContext, reason: str, *, detail: str = ""
     ctx._ngboost_fail_closed_reason = reason  # noqa: SLF001
     if detail:
         ctx._ngboost_fail_closed_detail = detail  # noqa: SLF001
-    ctx.buy_blocked = True
     ctx.skip_buys = True
     ctx.candidates = []
     _submit_gate_verdict(ctx, gate="ngboost_fail_closed", reason=reason,
@@ -3451,6 +3448,21 @@ class PanelScoringJob(Job):
         if not ctx.candidates and not ctx.holdings:
             return True
         return not ctx.config.get("ranking", {}).get("panel_scoring", {}).get("enabled", False)
+
+    def run(self, ctx: InferenceContext) -> None:
+        """Run the chain, then apply the registry aggregate ONCE.
+
+        Errata-C choke point (eng plan S2-PR4): the fail-closed helpers
+        submit verdicts instead of writing ``buy_blocked``; the max-join
+        aggregate is applied here, at the job boundary, before any later
+        job (selection / QP / order emit) reads the flag. skip_buys and
+        candidate-clearing keep their direct effects — they are
+        position/sizing mechanics, not the admission lattice.
+        """
+        super().run(ctx)
+        registry = getattr(ctx, "gate_registry", None)
+        if registry is not None and registry.blocked("book"):
+            ctx.buy_blocked = True
 
     @property
     def tasks(self) -> list[Task]:

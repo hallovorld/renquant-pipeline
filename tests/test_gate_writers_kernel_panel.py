@@ -1,8 +1,9 @@
 """GateRegistry writer migration #4 — kernel/panel_pipeline fail-closed
 helpers dual-write (eng plan S2-PR4; pipeline-repo copy of the umbrella
 mirror migrated in RenQuant#316). Same-repo import — direct, no degrade.
-Direct writes stay until these helpers get an aggregate boundary (they
-are called mid-task with same-chain readers of buy_blocked/skip_buys)."""
+Post-retirement (errata C(iii)): helpers submit-only; PanelScoringJob.run
+applies the aggregate at the job boundary. skip_buys keeps its direct
+effect (position mechanics, not the admission lattice)."""
 from __future__ import annotations
 
 from types import SimpleNamespace
@@ -30,20 +31,40 @@ class TestDualWrite:
     def test_panel_scoring_fail_closed(self):
         ctx = _ctx()
         _fail_closed_panel_scoring(ctx, "panel_scorer_load_failed")
-        assert ctx.buy_blocked and ctx.skip_buys
+        assert not ctx.buy_blocked, "helper must not write the flag directly"
+        assert ctx.skip_buys
         assert _rows(ctx)[0]["gate"] == "panel_scoring_fail_closed"
-        assert ctx.gate_registry.blocked("book") == ctx.buy_blocked
+        assert ctx.gate_registry.blocked("book")
 
     def test_calibrator_fail_closed(self):
         ctx = _ctx()
         _fail_closed_missing_calibrator(ctx, "calibrator_missing")
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
         assert _rows(ctx)[0]["gate"] == "calibrator_fail_closed"
 
     def test_ngboost_fail_closed(self):
         ctx = _ctx()
         _fail_closed_ngboost(ctx, "ngb_artifact_unreadable", detail="bad json")
-        assert ctx.buy_blocked
+        assert not ctx.buy_blocked and ctx.gate_registry.blocked("book")
         row = _rows(ctx)[0]
         assert row["gate"] == "ngboost_fail_closed"
         assert row["inputs"]["detail"] == "bad json"
+
+
+class TestChokePoint:
+
+    def test_job_applies_aggregate_after_fail_closed(self):
+        from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (
+            PanelScoringJob,
+        )
+
+        ctx = _ctx(
+            candidates=[SimpleNamespace(ticker="MU")],
+            holdings={},
+            config={"ranking": {"panel_scoring": {"enabled": True}}},
+        )
+        # No artifact configured → LoadScorerTask fail-closes mid-chain;
+        # the job boundary must still land the aggregate on the flag.
+        PanelScoringJob().run(ctx)
+        assert ctx.buy_blocked
+        assert ctx.gate_registry.blocked("book")
