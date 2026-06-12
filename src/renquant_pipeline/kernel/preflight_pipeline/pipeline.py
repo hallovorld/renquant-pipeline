@@ -15,6 +15,7 @@ from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.sector_map import SectorMapCoverageTask
+from .tasks.staleness import ModelStalenessTask
 from .tasks.state import StateFileTask
 from .tasks.watchlist import WatchlistSizeTask
 
@@ -27,6 +28,7 @@ class _ArtifactJob(PreflightJob):
         ModelArtifactTask(),
         PanelContractTask(),
         BestIterTask(),
+        ModelStalenessTask(),
     ]
 
 
