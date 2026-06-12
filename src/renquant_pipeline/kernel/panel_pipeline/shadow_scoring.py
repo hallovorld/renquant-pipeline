@@ -66,6 +66,27 @@ _DEFAULT_EXPERIMENT = "renquant_104_shadow"
 _SCORER_CACHE: dict[tuple[str, str], object] = {}
 
 
+def _resolve_shadow_artifact_path(
+    artifact_path: str | Path,
+    *,
+    strategy_dir: str | Path | None,
+    repo: Path,
+) -> Path:
+    p = Path(artifact_path)
+    if p.is_absolute():
+        return p
+
+    # 2026-06-11 shadow-dead fix: resolve like the PRIMARY scorer —
+    # strategy_dir first, repo data_root as back-compat fallback. Pre-fix this
+    # resolved only against data_root(), so the post-PatchTST-promotion shadow
+    # under <strategy_dir>/artifacts/prod failed to load on every run.
+    candidates: list[Path] = []
+    if strategy_dir:
+        candidates.append(Path(strategy_dir) / p)
+    candidates.append(repo / p)
+    return next((c for c in candidates if c.exists()), candidates[-1])
+
+
 def _ensure_mlflow_setup(tracking_uri: Optional[str] = None,
                          experiment_name: Optional[str] = None) -> str:
     """Set MLflow tracking URI + experiment. Returns experiment_id."""
@@ -207,9 +228,11 @@ class ApplyShadowScoringTask(Task):
                 log.warning("ApplyShadowScoringTask: shadow %s missing "
                              "kind/artifact_path", name)
                 continue
-            p = Path(artifact_path)
-            if not p.is_absolute():
-                p = repo / p
+            p = _resolve_shadow_artifact_path(
+                artifact_path,
+                strategy_dir=ctx.config.get("_strategy_dir"),
+                repo=repo,
+            )
             try:
                 handler = registry.get(kind)
             except ValueError as exc:
