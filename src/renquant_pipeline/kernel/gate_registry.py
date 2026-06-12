@@ -106,3 +106,19 @@ class GateRegistry:
             }
             for v in self._verdicts
         ]
+
+
+def ctx_registry(ctx) -> GateRegistry:
+    """Lazily attach a GateRegistry to an inference context.
+
+    Dual-write migration helper (S2-PR4): gates call
+    ``ctx_registry(ctx).submit(...)`` alongside their existing direct
+    ``ctx.buy_blocked = True`` write; the direct write is retired only
+    when the aggregate choke point lands. Works with SimpleNamespace
+    test fixtures (attaches dynamically when the field is absent).
+    """
+    reg = getattr(ctx, "gate_registry", None)
+    if reg is None:
+        reg = GateRegistry()
+        ctx.gate_registry = reg
+    return reg
