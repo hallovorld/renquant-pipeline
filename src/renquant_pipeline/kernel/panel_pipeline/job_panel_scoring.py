@@ -758,6 +758,16 @@ def _snapshot_buy_candidates(ctx: Any) -> list[Any]:
     return existing
 
 
+def _submit_gate_verdict(ctx: Any, *, gate: str, reason: str, inputs: dict) -> None:
+    """Dual-write a block verdict (eng plan S2-PR4). Same-repo import —
+    unlike the umbrella mirror, no lazy/degrade path is needed; the
+    registry ships atomically with this module."""
+    from renquant_pipeline.kernel.gate_registry import ctx_registry  # noqa: PLC0415
+
+    ctx_registry(ctx).submit(gate=gate, scope="book", verdict="block",
+                             reason=reason, inputs=inputs)
+
+
 def _fail_closed_panel_scoring(ctx: Any, reason: str) -> None:
     """Block buy/QP when enabled panel scoring cannot provide the alpha surface."""
     candidates = list(getattr(ctx, "candidates", None) or [])
@@ -770,6 +780,8 @@ def _fail_closed_panel_scoring(ctx: Any, reason: str) -> None:
     ctx.candidates = []
     ctx.buy_blocked = True
     ctx.skip_buys = True
+    _submit_gate_verdict(ctx, gate="panel_scoring_fail_closed", reason=reason,
+                         inputs={"candidates_blocked": len(candidates)})
     ctx._panel_scoring_contract_failed = True  # noqa: SLF001
     ctx._panel_scoring_fail_reason = reason  # noqa: SLF001
     counters = getattr(ctx, "counters", None)
@@ -2072,6 +2084,8 @@ def _fail_closed_missing_calibrator(ctx: InferenceContext, reason: str) -> None:
     ctx._calibrator_contract_failed = True  # noqa: SLF001
     ctx.buy_blocked = True
     ctx.skip_buys = True
+    _submit_gate_verdict(ctx, gate="calibrator_fail_closed", reason=reason,
+                         inputs={})
     blocked_map = getattr(ctx, "_blocked_by_ticker", None)
     if blocked_map is None:
         blocked_map = {}
@@ -2635,6 +2649,8 @@ def _fail_closed_ngboost(ctx: InferenceContext, reason: str, *, detail: str = ""
     ctx.buy_blocked = True
     ctx.skip_buys = True
     ctx.candidates = []
+    _submit_gate_verdict(ctx, gate="ngboost_fail_closed", reason=reason,
+                         inputs={"detail": str(detail)[:120]})
     if hasattr(ctx, "counters"):
         ctx.counters["ngb_fail_closed"] = (
             ctx.counters.get("ngb_fail_closed", 0) + 1
