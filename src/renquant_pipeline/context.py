@@ -85,6 +85,11 @@ class InferenceContext:
     # BuyGatesJob
     buy_blocked: bool = False
     bear_only: bool = False
+    # GateRegistry (eng plan S2-PR4, errata C): gates dual-write their
+    # verdicts here during the writer migration; lazily created by
+    # kernel.gate_registry.ctx_registry so SimpleNamespace test fixtures
+    # keep working. None until the first gate submits.
+    gate_registry: Any = None
 
     # CandidateJob
     candidates: list = field(default_factory=list)      # list of CandidateResult
