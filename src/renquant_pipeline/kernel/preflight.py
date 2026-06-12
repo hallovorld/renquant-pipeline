@@ -51,15 +51,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .artifact_resolver import locate_artifact
+
 log = logging.getLogger("kernel.preflight")
 
 
 def _resolve_artifact_path(strategy_dir: Path, rel: str | Path) -> Path:
-    """Resolve config artifact paths relative to the strategy directory."""
-    p = Path(rel)
-    if p.is_absolute():
-        return p
-    return strategy_dir / p
+    """Resolve config artifact paths via the single resolution authority.
+
+    2026-06-12 (eng plan §III.5, incident #2 / PR #114 class): delegates
+    to kernel.artifact_resolver so preflight checks the SAME path the
+    loaders will use — strategy_dir first, repo-root fallback. Pre-fix,
+    preflight only tried strategy_dir, so a ref that loaders found at the
+    repo root was reported missing here (and vice versa).
+    """
+    return locate_artifact(rel, strategy_dir=strategy_dir)
 
 
 def _patchtst_summary_path(path: Path) -> Path:
