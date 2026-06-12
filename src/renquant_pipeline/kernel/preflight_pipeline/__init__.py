@@ -21,6 +21,7 @@ from .tasks.broker_fill_freshness import BrokerFillFreshnessTask
 from .tasks.artifact import BestIterTask, ModelArtifactTask, PanelContractTask
 from .tasks.gate import RegimeLayeredICTask, WfGateMetadataTask
 from .tasks.sector_map import SectorMapCoverageTask
+from .tasks.staleness import ModelStalenessTask
 from .tasks.watchlist import WatchlistSizeTask
 from .tasks.correlation import CorrelationMetadataTask
 from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
@@ -46,6 +47,7 @@ __all__ = [
     "WfGateMetadataTask",
     "RegimeLayeredICTask",
     "SectorMapCoverageTask",
+    "ModelStalenessTask",
     "WatchlistSizeTask",
     "CorrelationMetadataTask",
     "CalibratorHealthTask",
