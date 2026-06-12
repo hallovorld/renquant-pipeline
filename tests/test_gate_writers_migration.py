@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from renquant_pipeline.kernel.config import BEAR, BULL_VOLATILE
+from renquant_pipeline.kernel.config import BULL_VOLATILE
 from renquant_pipeline.kernel.pipeline.task_gates import (
     BullVolOffensiveBlockTask,
     DrawdownGateTask,
