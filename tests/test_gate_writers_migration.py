@@ -5,12 +5,11 @@ doc/research/2026-06-12-engineering-architecture-deep-plan.md S2-PR4 +
 errata C(iii); census authority counts these 9 sites (AST census,
 renquant_orchestrator.engineering_census).
 
-Contract pinned here: every ``ctx.buy_blocked = True`` site in
-task_gates.py ALSO submits a block verdict to the registry — and never
-submits when it doesn't block. Equivalence (registry.blocked("book") ==
-ctx.buy_blocked) holds for every gate in this file by construction;
-behavior is unchanged because the direct writes are untouched (additive
-lines only — the retirement happens with the aggregate choke point).
+Contract (post-retirement, errata C(iii)): gate tasks submit verdicts
+and NEVER write ``ctx.buy_blocked`` directly; ``BuyGatesJob.run``
+applies the max-join aggregate once at the job boundary. Blocking
+behavior is therefore asserted at the JOB level; task-level tests
+assert submission. The census test pins ZERO direct writers.
 """
 from __future__ import annotations
 
@@ -43,12 +42,16 @@ def _ctx(**kw) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _assert_equivalence(ctx) -> None:
-    reg_blocked = (ctx.gate_registry is not None
-                   and ctx.gate_registry.blocked("book"))
-    assert reg_blocked == ctx.buy_blocked, (
-        f"dual-write divergence: registry={reg_blocked} "
-        f"direct={ctx.buy_blocked}")
+def _registry_blocked(ctx) -> bool:
+    return (ctx.gate_registry is not None
+            and ctx.gate_registry.blocked("book"))
+
+
+def _apply_aggregate(ctx) -> None:
+    """What BuyGatesJob.run does after the chain — applied manually in
+    task-level tests."""
+    if _registry_blocked(ctx):
+        ctx.buy_blocked = True
 
 
 class TestBlockingPathsSubmit:
@@ -56,8 +59,10 @@ class TestBlockingPathsSubmit:
     def test_drawdown_gate(self):
         ctx = _ctx(skip_buys=True)
         DrawdownGateTask().run(ctx)
+        assert not ctx.buy_blocked, "task must not write the flag directly"
+        assert _registry_blocked(ctx)
+        _apply_aggregate(ctx)
         assert ctx.buy_blocked
-        _assert_equivalence(ctx)
         rows = ctx.gate_registry.ledger_rows(run_id="t")
         assert rows[0]["gate"] == "drawdown_circuit"
 
@@ -65,8 +70,7 @@ class TestBlockingPathsSubmit:
         ctx = _ctx(monitor_state={"flatten_last_date_iso": "2026-06-12",
                                   "flatten_cooldown_bars": 3})
         FlattenCooldownGateTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
         v = ctx.gate_registry.ledger_rows(run_id="t")[0]
         assert v["gate"] == "flatten_cooldown"
         assert v["inputs"]["cooldown_bars"] == 3
@@ -75,30 +79,26 @@ class TestBlockingPathsSubmit:
         ctx = _ctx(monitor_state={"flatten_last_date_iso": "2026-06-10",
                                   "flatten_cooldown_bars": 5})
         FlattenCooldownGateTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
         assert ctx.gate_registry.ledger_rows(run_id="t")[0]["inputs"]["days_since"] == 2
 
     def test_transition_window(self):
         ctx = _ctx(regime_state=SimpleNamespace(in_transition=True))
         TransitionWindowTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
 
     def test_bull_vol_defensives_too(self):
         ctx = _ctx(regime=BULL_VOLATILE,
                    config={"regime": {"bull_vol_block_offensive": True,
                                       "bull_vol_defensives_too": True}})
         BullVolOffensiveBlockTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
 
     def test_regime_alpha(self):
         ctx = _ctx(regime="BULL_CALM",
                    config={"regime_params": {"BULL_CALM": {"disable_new_buys": True}}})
         RegimeAlphaGateTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
         assert ctx.gate_registry.ledger_rows(run_id="t")[0]["inputs"]["regime"] == "BULL_CALM"
 
     def test_velocity_crash(self):
@@ -107,14 +107,12 @@ class TestBlockingPathsSubmit:
                        "spy_velocity_halt_pct": 0.05,
                        "spy_velocity_lookback_days": 3}}})
         VelocityCrashTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
 
     def test_ema50_missing_spy_fail_safe(self):
         ctx = _ctx(ohlcv={})
         EMA50GateTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
         assert ctx.gate_registry.ledger_rows(run_id="t")[0]["inputs"]["data_outage"] is True
 
     def test_ema50_below_trend(self):
@@ -122,8 +120,7 @@ class TestBlockingPathsSubmit:
         closes = pd.Series([100.0 - i for i in range(60)])
         ctx = _ctx(ohlcv={"SPY": pd.DataFrame({"close": closes})})
         EMA50GateTask().run(ctx)
-        assert ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not ctx.buy_blocked and _registry_blocked(ctx)
         assert ctx.gate_registry.ledger_rows(run_id="t")[0]["inputs"]["data_outage"] is False
 
 
@@ -144,22 +141,19 @@ class TestNonBlockingPathsStaySilent:
         assert not ctx.buy_blocked
         assert ctx.gate_registry is None or \
             ctx.gate_registry.ledger_rows(run_id="t") == []
-        _assert_equivalence(ctx)
 
     def test_ema50_above_trend_silent(self):
         closes = pd.Series([100.0 + i for i in range(60)])
         ctx = _ctx(ohlcv={"SPY": pd.DataFrame({"close": closes})})
         EMA50GateTask().run(ctx)
         assert not ctx.buy_blocked
-        _assert_equivalence(ctx)
+        assert not _registry_blocked(ctx)
 
 
 class TestCensusRetirement:
-    """The AST census over task_gates.py must show the direct writes are
-    still present (dual-write phase) — this test flips to assert ZERO
-    when the aggregate choke point retires them (errata C(iii))."""
+    """Errata C(iii): zero direct buy_blocked writers in task_gates.py."""
 
-    def test_direct_writers_still_nine(self):
+    def test_direct_writers_zero(self):
         import ast
         from pathlib import Path
 
@@ -174,6 +168,54 @@ class TestCensusRetirement:
                     and isinstance(node.value, ast.Constant)
                     and node.value.value is True):
                 count += 1
-        assert count == 9, (
-            f"task_gates.py direct buy_blocked writers = {count}, expected 9 "
-            f"during dual-write; if you retired them, flip this test to 0")
+        assert count == 0, (
+            f"task_gates.py direct buy_blocked writers = {count}, expected 0 "
+            f"post-retirement (errata C(iii)) — new gates must submit to the "
+            f"registry, never write the flag")
+
+
+class TestChokePoint:
+    """BuyGatesJob.run applies the aggregate once at the job boundary."""
+
+    def test_job_applies_block_aggregate(self):
+        from renquant_pipeline.kernel.pipeline.job_gates import BuyGatesJob
+
+        ctx = _ctx(skip_buys=True)  # DrawdownGate will submit block
+        BuyGatesJob().run(ctx)
+        assert ctx.buy_blocked
+        assert ctx.gate_registry.blocked("book")
+
+    def test_job_leaves_flag_clear_when_no_blocks(self):
+        from renquant_pipeline.kernel.pipeline.job_gates import BuyGatesJob
+        import pandas as pd
+
+        closes = pd.Series([100.0 + i for i in range(60)])
+        ctx = _ctx(ohlcv={"SPY": pd.DataFrame({"close": closes})},
+                   spy_returns=[0.01, 0.01, 0.01])
+        BuyGatesJob().run(ctx)
+        assert not ctx.buy_blocked
+
+    def test_short_circuit_preserved(self):
+        # FlattenCooldown same-bar returns False → later gates never run;
+        # the aggregate still lands at the job boundary.
+        from renquant_pipeline.kernel.pipeline.job_gates import BuyGatesJob
+
+        ctx = _ctx(monitor_state={"flatten_last_date_iso": "2026-06-12",
+                                  "flatten_cooldown_bars": 3})
+        BuyGatesJob().run(ctx)
+        assert ctx.buy_blocked
+        gates = [r["gate"] for r in ctx.gate_registry.ledger_rows(run_id="t")]
+        assert gates == ["flatten_cooldown"], "chain must have short-circuited"
+
+    def test_preexisting_flag_never_cleared(self):
+        # Risk-monotone at the job level too: an upstream writer's True is
+        # never reset by an all-allow gate chain.
+        from renquant_pipeline.kernel.pipeline.job_gates import BuyGatesJob
+        import pandas as pd
+
+        closes = pd.Series([100.0 + i for i in range(60)])
+        ctx = _ctx(buy_blocked=True,
+                   ohlcv={"SPY": pd.DataFrame({"close": closes})},
+                   spy_returns=[0.01, 0.01, 0.01])
+        BuyGatesJob().run(ctx)
+        assert ctx.buy_blocked

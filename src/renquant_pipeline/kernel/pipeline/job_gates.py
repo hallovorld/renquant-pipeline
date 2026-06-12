@@ -44,3 +44,18 @@ class BuyGatesJob(Job):
             VelocityCrashTask(),
             EMA50GateTask(),
         ]
+
+    def run(self, ctx) -> None:
+        """Run the gate chain, then apply the registry aggregate ONCE.
+
+        The errata-C choke point (eng plan S2-PR4): gate tasks submit
+        verdicts instead of writing ``ctx.buy_blocked``; the max-join
+        aggregate is applied here, at the job boundary, before any
+        downstream job reads the flag. A task returning False still
+        short-circuits the chain exactly as before — short-circuit and
+        blocking are independent mechanisms.
+        """
+        super().run(ctx)
+        registry = getattr(ctx, "gate_registry", None)
+        if registry is not None and registry.blocked("book"):
+            ctx.buy_blocked = True
