@@ -68,6 +68,7 @@ GOLDEN_V1 = {
         "cooldown_start": None,
     },
     "stop_orders": {},
+    "recent_sell_orders": {"oid-1": {"ticker": "BA", "submitted": "2026-06-12"}},
 }
 
 
@@ -90,6 +91,7 @@ class TestV1Migration:
         assert isinstance(s.regime_state, RegimeStateV2)
         assert s.regime_state.cooldown_start is None
         assert s.extra_quarantine == {}
+        assert s.recent_sell_orders == {"oid-1": {"ticker": "BA", "submitted": "2026-06-12"}}
 
     def test_empty_state_parses_to_defaults(self):
         s = LiveStateV2.parse({})
@@ -252,6 +254,7 @@ def _random_state(rng: random.Random) -> LiveStateV2:
         monitor_state=rng.choice([None, MonitorStateV2(no_trade_streak=rng.randint(0, 9))]),
         regime_state=rng.choice([None, RegimeStateV2(regime="BEAR", confidence=0.7)]),
         stop_orders=rng.choice([{}, {"MU": {"order_id": "abc", "stop_price": 70.5}}]),
+        recent_sell_orders=rng.choice([{}, {"oid": {"ticker": "BA"}}]),
         extra_quarantine=rng.choice([{}, {"some_foreign_key": [1, 2]}]),
     )
 
