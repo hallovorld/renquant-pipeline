@@ -61,3 +61,49 @@ class TestMonitor:
         code, reports = monitor([str(good), str(tmp_path / "missing.db")])
         assert code == 3  # worst wins
         assert len(reports) == 2
+
+
+class TestPersist:
+    def test_persist_records_drift(self, tmp_path):
+        import sqlite3
+        import numpy as np
+        rng = np.random.RandomState(0)
+        runs = [(f"2026-06-{d:02d}-full", rng.normal(0.5, 0.1, 140).tolist())
+                for d in range(1, 5)]
+        runs.append(("2026-06-06-full", [0.5] * 140))  # collapse
+        db = tmp_path / "runs.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE candidate_scores (run_id TEXT, rank_score REAL)")
+        for rid, scores in runs:
+            conn.executemany("INSERT INTO candidate_scores VALUES (?, ?)",
+                             [(rid, s) for s in scores])
+        conn.commit()
+        conn.close()
+        code, reports = monitor([str(db)], persist=True)
+        assert code == 1 and reports[0]["persisted"] is True
+        # the audit row was written into the same DB
+        conn = sqlite3.connect(str(db))
+        row = conn.execute(
+            "SELECT severity, psi FROM score_drift_audits").fetchone()
+        conn.close()
+        assert row[0] == "CRITICAL" and row[1] is not None
+
+    def test_no_persist_does_not_write(self, tmp_path):
+        import sqlite3
+        import numpy as np
+        rng = np.random.RandomState(0)
+        db = tmp_path / "runs.db"
+        conn = sqlite3.connect(str(db))
+        conn.execute("CREATE TABLE candidate_scores (run_id TEXT, rank_score REAL)")
+        for d in range(1, 6):
+            conn.executemany("INSERT INTO candidate_scores VALUES (?, ?)",
+                             [(f"2026-06-{d:02d}-full", s)
+                              for s in rng.normal(0.5, 0.1, 140).tolist()])
+        conn.commit()
+        conn.close()
+        monitor([str(db)], persist=False)
+        conn = sqlite3.connect(str(db))
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        conn.close()
+        assert "score_drift_audits" not in tables  # read-only path untouched
