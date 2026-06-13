@@ -438,6 +438,24 @@ CREATE TABLE IF NOT EXISTS score_drift_audits (
 );
 CREATE INDEX IF NOT EXISTS idx_score_drift_date ON score_drift_audits(run_date);
 
+-- Broker-reconciliation action log (eng plan §III.4, 2026-06-13). One
+-- APPEND-ONLY row per non-OK reconcile() action so 'when did a position
+-- vanish externally / get quarantined / force-covered' is a query. OK
+-- actions are not logged (they are the steady state). Mirrors
+-- gate_verdicts / score_drift_audits.
+CREATE TABLE IF NOT EXISTS reconciliation_actions (
+    action_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT,
+    run_date     TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,   -- EXT_SELL | QUARANTINE | ADOPT_QTY | FORCED_COVER
+    ticker       TEXT    NOT NULL,
+    detail       TEXT,
+    state_qty    REAL,
+    broker_qty   REAL,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_date ON reconciliation_actions(run_date, kind);
+
 -- Alert incident book (eng plan §12.3 / L6 alert lifecycle, 2026-06-13).
 -- Persists the escalation state machine across restarts: WITHOUT this, a
 -- daily restart resets every incident to NEW and re-escalates — exactly
@@ -2470,3 +2488,37 @@ def load_alert_book(conn: sqlite3.Connection | None,
         )
         book.alerts[a.key] = a
     return book
+
+
+def record_reconciliation_actions(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    actions,
+) -> int:
+    """Append a broker-reconciliation run's NON-OK actions to
+    reconciliation_actions (eng plan §III.4).
+
+    ``actions`` is the list from kernel.broker_reconciliation.reconcile()
+    (duck-typed on .kind/.ticker/.detail/.state_qty/.broker_qty). OK
+    actions are skipped (steady state). No-op when persistence is
+    disabled, run_id is missing, or there are no non-OK actions.
+    Append-only by construction.
+    """
+    if conn is None or run_id is None or not actions:
+        return 0
+    rows = [
+        (run_id, run_date.isoformat(), a.kind, a.ticker, a.detail,
+         a.state_qty, a.broker_qty)
+        for a in actions if a.kind != "OK"
+    ]
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO reconciliation_actions
+              (run_id, run_date, kind, ticker, detail, state_qty, broker_qty)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    return len(rows)
