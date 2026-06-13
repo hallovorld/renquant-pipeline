@@ -82,8 +82,12 @@ def run_score_drift_audit(
     alert_state = None
     notifications = None
     if book is not None:
-        if report.ok:   # INFO — the drift cleared; close any open incident
-            book.resolve_if_absent(seen_today=set(), today=run_date)
+        if report.ok:   # INFO — the drift cleared; close only THIS audit+scope
+            # Lifecycle isolation: resolve only the score_drift incident(s)
+            # for the target scope. A book-wide resolve_if_absent here would
+            # silently RESOLVE unrelated open incidents (other audits, other
+            # scopes) whose last_seen predates this run — see PR #137 review.
+            book.resolve_audit_scope(AUDIT_NAME, scope, run_date)
             alert_state = "RESOLVED" if not _has_open(book, scope) else None
         else:           # WARN/CRITICAL — fold into the escalation lifecycle
             alert = book.observe(AUDIT_NAME, scope, _cause_hash(report), run_date)
@@ -93,5 +97,9 @@ def run_score_drift_audit(
 
 
 def _has_open(book, scope: str) -> bool:
-    return any(a.scope == scope and a.state != "RESOLVED"
+    """Whether a score_drift incident for ``scope`` is still open. Scoped to
+    AUDIT_NAME so the INFO verdict reflects THIS audit's incident, not an
+    unrelated audit that happens to share the scope."""
+    return any(a.audit == AUDIT_NAME and a.scope == scope
+               and a.state != "RESOLVED"
                for a in book.alerts.values())

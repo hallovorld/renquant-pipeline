@@ -80,6 +80,29 @@ class TestAuditLoop:
         assert res.report.ok
         assert res.alert_state == "RESOLVED"
 
+    def test_info_does_not_resolve_unrelated_incidents(self, tmp_path):
+        # REGRESSION (PR #137 review): a clean score-drift run must resolve
+        # ONLY its own (audit, scope) incident. Incidents from other audits,
+        # and other scopes of the SAME audit, must survive untouched —
+        # otherwise a stable panel score keeps silently clearing active
+        # broker/reconciliation/shadow alarms.
+        book = AlertBook(escalate_after_days=5)
+        book.observe("score_drift", "panel", "CRITICAL:psi~0.5", RUN_DATE)
+        book.observe("broker_reconciliation", "book", "EXT_SELL:NVDA", RUN_DATE)
+        book.observe("score_drift", "shadow", "WARN:psi~0.3", RUN_DATE)
+        conn = _db_with(tmp_path, _stable_runs())  # stable → INFO
+        res = run_score_drift_audit(conn, run_id="r1", scope="panel",
+                                    run_date=RUN_DATE + dt.timedelta(days=1),
+                                    book=book)
+        assert res.report.ok
+        assert res.alert_state == "RESOLVED"   # panel score_drift cleared
+        open_keys = {a.key for a in book.open_incidents()}
+        # unrelated audit + different scope of the same audit stay OPEN
+        assert ("broker_reconciliation", "book", "EXT_SELL:NVDA") in open_keys
+        assert ("score_drift", "shadow", "WARN:psi~0.3") in open_keys
+        # the targeted incident is the only one resolved
+        assert ("score_drift", "panel", "CRITICAL:psi~0.5") not in open_keys
+
     def test_insufficient_data_noop(self, tmp_path):
         conn = _db_with(tmp_path, [("2026-06-01-full", [0.5] * 40)])
         res = run_score_drift_audit(conn, run_id="r1", run_date=RUN_DATE)
