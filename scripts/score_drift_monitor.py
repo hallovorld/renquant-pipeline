@@ -30,6 +30,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
+from renquant_pipeline.kernel.persistence import record_score_drift_audit  # noqa: E402
 from renquant_pipeline.kernel.score_drift import (  # noqa: E402
     DriftReport,
     load_score_drift_from_db,
@@ -41,7 +42,32 @@ def _open_ro(path: str) -> sqlite3.Connection:
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
 
-def monitor(db_paths: list[str], *, trailing: int = 20) -> tuple[int, list[dict]]:
+def _persist_audit(path: str, report: DriftReport) -> None:
+    """Append the drift verdict to the DB's own score_drift_audits log.
+    Opened read-write ONLY when --persist is requested; the table is
+    created on connect (CREATE IF NOT EXISTS) so an existing trade DB
+    gains it without migration. The audit log is the only thing written
+    — positions/trades are untouched."""
+    import datetime as _dt  # noqa: PLC0415
+
+    conn = sqlite3.connect(path)
+    try:
+        # Ensure the audits table exists (idempotent DDL from persistence).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS score_drift_audits ("
+            "audit_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, "
+            "run_date TEXT NOT NULL, psi REAL, severity TEXT NOT NULL, "
+            "n_baseline INTEGER, n_current INTEGER, "
+            "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        record_score_drift_audit(conn, run_id=None,
+                                 run_date=_dt.date.today(), report=report)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def monitor(db_paths: list[str], *, trailing: int = 20,
+            persist: bool = False) -> tuple[int, list[dict]]:
     worst = 0
     out: list[dict] = []
     for path in db_paths:
@@ -67,6 +93,9 @@ def monitor(db_paths: list[str], *, trailing: int = 20) -> tuple[int, list[dict]
                          n_current=report.n_current, ok=report.ok)
             if not report.ok:
                 worst = max(worst, 1)
+            if persist:
+                _persist_audit(path, report)
+                entry["persisted"] = True
         out.append(entry)
     return worst, out
 
@@ -77,8 +106,11 @@ def main() -> int:
                    help="runs DB path (repeatable)")
     p.add_argument("--trailing", type=int, default=20)
     p.add_argument("--json", action="store_true", help="emit JSON")
+    p.add_argument("--persist", action="store_true",
+                   help="append each verdict to the DB's score_drift_audits log")
     args = p.parse_args()
-    code, reports = monitor(args.db, trailing=args.trailing)
+    code, reports = monitor(args.db, trailing=args.trailing,
+                            persist=args.persist)
     if args.json:
         print(json.dumps({"exit_code": code, "reports": reports}, indent=2))
     else:
