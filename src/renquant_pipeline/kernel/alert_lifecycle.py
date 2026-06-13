@@ -81,10 +81,36 @@ class AlertBook:
     def resolve_if_absent(self, seen_today: set, today: dt.date) -> list[Alert]:
         """Mark any open incident NOT observed today as RESOLVED. Returns the
         list of newly-resolved alerts (the caller may send a resolution
-        ntfy)."""
+        ntfy).
+
+        Book-wide: every caller that uses this MUST pass a ``seen_today``
+        covering ALL audits/scopes it observed this run, or it will resolve
+        incidents owned by other audits. An audit that only knows about its
+        own ``(audit, scope)`` slice should call ``resolve_audit_scope``
+        instead — it cannot construct a complete book-wide seen set."""
         resolved = []
         for k, a in self.alerts.items():
             if a.state != RESOLVED and k not in seen_today and a.last_seen < today:
+                a.state = RESOLVED
+                resolved.append(a)
+        return resolved
+
+    def resolve_audit_scope(self, audit: str, scope: str, today: dt.date,
+                            *, seen: set | frozenset = frozenset()) -> list[Alert]:
+        """Resolve open incidents for a SINGLE ``(audit, scope)`` whose cause
+        was not observed today — the lifecycle-isolated counterpart to
+        ``resolve_if_absent``. A clean audit run uses this to close only ITS
+        OWN stale incidents, leaving every other audit/scope untouched (the
+        isolation implied by the ``(audit, scope, cause_hash)`` dedup key).
+
+        ``seen`` is the set of full keys this run DID observe and must keep
+        open (empty for a fully-clean run). Returns the newly-resolved
+        alerts."""
+        resolved = []
+        for k, a in self.alerts.items():
+            if (a.audit == audit and a.scope == scope
+                    and a.state != RESOLVED and k not in seen
+                    and a.last_seen < today):
                 a.state = RESOLVED
                 resolved.append(a)
         return resolved
