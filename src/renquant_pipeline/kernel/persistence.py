@@ -438,6 +438,22 @@ CREATE TABLE IF NOT EXISTS score_drift_audits (
 );
 CREATE INDEX IF NOT EXISTS idx_score_drift_date ON score_drift_audits(run_date);
 
+-- Alert incident book (eng plan §12.3 / L6 alert lifecycle, 2026-06-13).
+-- Persists the escalation state machine across restarts: WITHOUT this, a
+-- daily restart resets every incident to NEW and re-escalates — exactly
+-- the noise the lifecycle exists to prevent. PK = the dedup key.
+CREATE TABLE IF NOT EXISTS alert_incidents (
+    audit         TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    cause_hash    TEXT NOT NULL,
+    first_seen    TEXT NOT NULL,
+    last_seen     TEXT NOT NULL,
+    state         TEXT NOT NULL,    -- WARN | CRITICAL | RESOLVED
+    acked         INTEGER NOT NULL DEFAULT 0,
+    notifications INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (audit, scope, cause_hash)
+);
+
 -- Trade-evaluation table (roadmap §2026-04-26 Phase 1, shipped 2026-05-02).
 -- Re-evaluates every trade at multiple horizons (1d, 5d, 7d, 14d, 28d).
 -- Joining trades × ticker_forward_returns at horizon h gives the realized
@@ -2394,3 +2410,63 @@ def record_score_drift_audit(
         ),
     )
     return 1
+
+
+def save_alert_book(conn: sqlite3.Connection | None, book) -> int:
+    """Persist every incident in an AlertBook (kernel.alert_lifecycle).
+
+    Upsert keyed on (audit, scope, cause_hash) — the escalation state
+    machine survives restarts so a daily run continues an incident
+    instead of re-raising it as NEW. No-op when persistence is disabled.
+    Returns the number of incidents written.
+    """
+    if conn is None or book is None:
+        return 0
+    rows = [
+        (a.audit, a.scope, a.cause_hash, a.first_seen.isoformat(),
+         a.last_seen.isoformat(), a.state, 1 if a.acked else 0,
+         int(a.notifications))
+        for a in book.alerts.values()
+    ]
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO alert_incidents
+              (audit, scope, cause_hash, first_seen, last_seen, state,
+               acked, notifications)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(audit, scope, cause_hash) DO UPDATE SET
+              last_seen=excluded.last_seen, state=excluded.state,
+              acked=excluded.acked, notifications=excluded.notifications""",
+        rows,
+    )
+    return len(rows)
+
+
+def load_alert_book(conn: sqlite3.Connection | None,
+                    *, escalate_after_days: int = 5):
+    """Rebuild an AlertBook from alert_incidents. Returns an empty book
+    when persistence is disabled or the table is empty."""
+    from renquant_pipeline.kernel.alert_lifecycle import (  # noqa: PLC0415
+        Alert, AlertBook,
+    )
+
+    book = AlertBook(escalate_after_days=escalate_after_days)
+    if conn is None:
+        return book
+    try:
+        cur = conn.execute(
+            "SELECT audit, scope, cause_hash, first_seen, last_seen, state, "
+            "acked, notifications FROM alert_incidents")
+    except sqlite3.OperationalError:
+        return book  # table not created yet
+    for (audit, scope, cause_hash, first_seen, last_seen, state,
+         acked, notifications) in cur.fetchall():
+        a = Alert(
+            audit=audit, scope=scope, cause_hash=cause_hash,
+            first_seen=datetime.date.fromisoformat(first_seen),
+            last_seen=datetime.date.fromisoformat(last_seen),
+            state=state, acked=bool(acked), notifications=int(notifications),
+        )
+        book.alerts[a.key] = a
+    return book
