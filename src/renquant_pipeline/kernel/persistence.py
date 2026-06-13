@@ -422,6 +422,22 @@ CREATE TABLE IF NOT EXISTS gate_verdicts (
 CREATE INDEX IF NOT EXISTS idx_gate_verdicts_run  ON gate_verdicts(run_id);
 CREATE INDEX IF NOT EXISTS idx_gate_verdicts_date ON gate_verdicts(run_date, gate);
 
+-- Score-distribution drift audit log (eng plan L6 sidecar item 3,
+-- 2026-06-13). Append-only PSI history so 'when did the score
+-- distribution drift, and how far' is a query, not a re-computation.
+-- Severity bands match kernel.score_drift (INFO<0.10, WARN<0.25, CRITICAL).
+CREATE TABLE IF NOT EXISTS score_drift_audits (
+    audit_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT,
+    run_date     TEXT    NOT NULL,
+    psi          REAL,
+    severity     TEXT    NOT NULL,      -- INFO | WARN | CRITICAL
+    n_baseline   INTEGER,
+    n_current    INTEGER,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_score_drift_date ON score_drift_audits(run_date);
+
 -- Trade-evaluation table (roadmap §2026-04-26 Phase 1, shipped 2026-05-02).
 -- Re-evaluates every trade at multiple horizons (1d, 5d, 7d, 14d, 28d).
 -- Joining trades × ticker_forward_returns at horizon h gives the realized
@@ -2345,3 +2361,36 @@ def record_gate_verdicts(
         ],
     )
     return len(rows)
+
+
+def record_score_drift_audit(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    report,
+) -> int:
+    """Append one score_drift_audits row from a DriftReport (L6 item 3).
+
+    ``report`` is a kernel.score_drift.DriftReport (duck-typed on .psi /
+    .severity / .n_baseline / .n_current). No-op when persistence is
+    disabled or there is no report. Append-only — drift history accrues.
+    Returns 1 on write, else 0.
+    """
+    if conn is None or report is None:
+        return 0
+    psi_val = getattr(report, "psi", None)
+    conn.execute(
+        """INSERT INTO score_drift_audits
+              (run_id, run_date, psi, severity, n_baseline, n_current)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            run_date.isoformat(),
+            None if psi_val is not None and psi_val != psi_val else psi_val,  # NaN→NULL
+            report.severity,
+            getattr(report, "n_baseline", None),
+            getattr(report, "n_current", None),
+        ),
+    )
+    return 1
