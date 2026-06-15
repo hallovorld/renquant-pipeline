@@ -2454,8 +2454,9 @@ def save_alert_book(conn: sqlite3.Connection | None, book) -> int:
                acked, notifications)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(audit, scope, cause_hash) DO UPDATE SET
-              last_seen=excluded.last_seen, state=excluded.state,
-              acked=excluded.acked, notifications=excluded.notifications""",
+              first_seen=excluded.first_seen, last_seen=excluded.last_seen,
+              state=excluded.state, acked=excluded.acked,
+              notifications=excluded.notifications""",
         rows,
     )
     return len(rows)
