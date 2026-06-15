@@ -63,6 +63,31 @@ class TestRoundTrip:
         n = conn.execute("SELECT COUNT(*) FROM alert_incidents").fetchone()[0]
         assert n == 1
 
+    def test_recurrence_after_resolve_resets_first_seen(self, tmp_path):
+        # REGRESSION: an incident that RESOLVED and later recurs with the same
+        # (audit, scope, cause_hash) is a fresh incident in memory (observe()
+        # restarts first_seen). The upsert must persist that reset first_seen —
+        # otherwise the reload reads the stale ORIGINAL first_seen and the
+        # escalation clock fires immediately on a brand-new incident.
+        conn = _conn(tmp_path)
+        b1 = AlertBook(escalate_after_days=5)
+        b1.observe("x", "s", "h", D0)                       # opens
+        b1.resolve_if_absent(seen_today=set(), today=D0 + dt.timedelta(days=10))
+        save_alert_book(conn, b1)                           # persisted RESOLVED
+
+        recur = D0 + dt.timedelta(days=100)
+        b2 = load_alert_book(conn, escalate_after_days=5)
+        b2.observe("x", "s", "h", recur)                    # RESOLVED → fresh WARN
+        save_alert_book(conn, b2)
+
+        b3 = load_alert_book(conn, escalate_after_days=5)
+        a = b3.alerts[("x", "s", "h")]
+        assert a.first_seen == recur                        # reset, not the stale D0
+        assert a.state == WARN
+        # the restarted clock must NOT escalate two days into the recurrence
+        a2 = b3.observe("x", "s", "h", recur + dt.timedelta(days=2))
+        assert a2.state == WARN                             # would be CRITICAL pre-fix
+
 
 class TestNoOps:
     def test_none_conn(self):
