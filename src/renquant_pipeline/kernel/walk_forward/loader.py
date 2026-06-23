@@ -360,11 +360,37 @@ class WalkForwardModelLoader:
         return cal
 
     def _resolve_uri(self, uri: str):
-        """Resolve local relative manifest URIs against the manifest folder."""
+        """Resolve local relative manifest URIs.
+
+        Contract: relative URIs are anchored to the manifest folder. But some
+        manifests (e.g. the GBDT ``walkforward_manifest_gbdt_prod_recipe_v2``
+        corpus) stored **strategy-dir-relative** URIs like
+        ``artifacts/walkforward_gbdt_.../<date>/panel-ltr.json``. Under the
+        manifest-parent anchor those doubled the path
+        (``.../artifacts/sim/artifacts/...``) → corpus not found → every WF cut
+        failed, which has broken ``weekly_wf_promote`` since 2026-05-24.
+
+        Resolve defensively (same philosophy as ``kernel.artifact_resolver``):
+        try the manifest-parent anchor first (the contract); if that path does
+        not exist, walk up the manifest's ancestor dirs and return the first
+        existing ``<ancestor>/uri``. Falls back to the contract path (so the
+        downstream 'not found' error names the canonical expected location) when
+        nothing matches. Backward-compatible: when the contract path exists it is
+        returned unchanged.
+        """
         if "://" in uri:
             return uri
         p = Path(uri)
-        return p if p.is_absolute() else self._manifest_path.parent / p
+        if p.is_absolute():
+            return p
+        primary = self._manifest_path.parent / p
+        if primary.exists():
+            return primary
+        for ancestor in self._manifest_path.parent.parents:
+            candidate = ancestor / p
+            if candidate.exists():
+                return candidate
+        return primary
 
     def _scorer_fingerprints_for_entry(self, entry: RetrainEntry) -> list[str]:
         """Read the selected fold's local scorer identities without loading it."""
