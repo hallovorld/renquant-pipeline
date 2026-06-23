@@ -1892,6 +1892,88 @@ def _sanity_regime_admission(
     return True, "ok", {"stats": stats}
 
 
+class ConvictionGateTask(Task):
+    """Drop buy candidates whose calibrated expected return is below a floor.
+
+    Reusable, model-agnostic, OFF by default (no-op unless
+    ``ranking.panel_scoring.conviction_gate.enabled`` is true).
+
+    Motivation (2026-06-22 operator review): a cross-sectional ranker's raw
+    ``panel_score`` is centred well below zero (e.g. XGB break-even at
+    raw ~= -0.27). The global calibrator therefore maps a raw score only
+    microscopically above ``neutral_raw`` to a *nominally* positive expected
+    return AND a high rank percentile. ``VetoWeakBuysTask`` floors on the
+    percentile (``rank_score``), so a name sitting ~0 above break-even
+    (mu ~= 0) survives and gets bought as noise. This gate floors on the
+    ECONOMIC quantity the percentile cannot see:
+
+      * ``mu_floor`` -- calibrated expected return E[R-SPY]
+        (``c.expected_return``) must clear a minimum (e.g. 0.03 = +3% over the
+        horizon). Raising it tightens conviction; it is the only knob.
+
+    Why only ``mu_floor`` (and NOT a raw>0 / ``min_raw_panel_score`` gate):
+    direction is owned by the single-source-of-truth signal-direction contract
+    (``kernel/pipeline/signal_direction.py``), which deliberately uses ``mu>0``
+    rather than ``raw>0`` precisely because ``0`` is not the neutral of an
+    all-negative ranker -- a hardcoded ``raw>0`` recreates the structural
+    sell-only failure that contract exists to avoid. ``mu_floor`` composes with
+    it cleanly: ``mu >= floor > 0`` already implies ``raw > the model's own
+    neutral_raw``, so it is the correct, scale-safe direction+magnitude test.
+    (``panel_score`` is also not a stable raw value here -- NGBoost
+    ``mu_minus_lambda_sigma`` can overwrite it upstream -- so it must not be
+    thresholded as if it were.)
+
+    Blocked tickers are tagged on ``ctx._blocked_by_ticker`` for the
+    decision-trace audit, exactly like ``VetoWeakBuysTask``.
+
+    ``consensus`` (k-of-n agreement across >=2 scorers) is reserved: enforcement
+    needs per-candidate shadow-scorer mu wiring and stays a no-op until a second
+    trustworthy scorer publishes mu. Documented so the config contract is stable.
+    """
+
+    def run(self, ctx: InferenceContext) -> bool | None:
+        if not ctx.candidates:
+            return None
+        cfg = (
+            ctx.config.get("ranking", {})
+            .get("panel_scoring", {})
+            .get("conviction_gate")
+            or {}
+        )
+        if not cfg.get("enabled"):
+            return None
+        mu_floor = cfg.get("mu_floor")
+        if mu_floor is None:
+            return None
+        mu_floor_f = float(mu_floor)
+
+        kept: list = []
+        dropped = 0
+        blocked = getattr(ctx, "_blocked_by_ticker", None) or {}
+        for cand in ctx.candidates:
+            er = getattr(cand, "expected_return", None)
+            if er is None or er != er:
+                reason = "conviction:mu_nan"
+            elif float(er) < mu_floor_f:
+                reason = "conviction:mu_below_floor"
+            else:
+                kept.append(cand)
+                continue
+            dropped += 1
+            blocked[cand.ticker] = reason
+        ctx._blocked_by_ticker = blocked                       # noqa: SLF001
+        ctx.counters["conviction_vetoed"] = (
+            ctx.counters.get("conviction_vetoed", 0) + dropped
+        )
+        if dropped:
+            ctx.candidates = kept
+            log.info(
+                "ConvictionGateTask: dropped %d candidate(s) (mu_floor=%s)",
+                dropped, mu_floor_f,
+            )
+        return None
+
+
 class RegimeModelAdmissionTask(Task):
     """Block buy candidates when the current regime lacks model evidence.
 
@@ -3490,6 +3572,12 @@ class PanelScoringJob(Job):
             # rank_score, not raw XGB margin. See VetoWeakBuysTask
             # docstring for the production incident this resolves.
             VetoWeakBuysTask(),
+            # 2026-06-22: economic-conviction floor (mu_floor) on the
+            # calibrated surface. Catches "barely above break-even" names that
+            # clear the rank_score percentile floor but have mu ~= 0. Direction
+            # stays owned by the signal_direction contract. No-op unless
+            # ranking.panel_scoring.conviction_gate.enabled.
+            ConvictionGateTask(),
             # 2026-05-15 Phase 3: σ fallback to realized 60d vol when
             # NGBoost OFF. No-op unless `kelly_sizing.use_realized_vol_
             # fallback=true`. Pairs with `use_calibrator_mu` flag in
