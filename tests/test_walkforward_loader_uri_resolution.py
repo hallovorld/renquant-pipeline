@@ -77,6 +77,45 @@ def test_relative_artifact_uri_resolved_against_manifest_parent(
     assert captured == [str(abs_path)]
 
 
+def test_strategy_dir_relative_uri_falls_back_to_ancestor(tmp_path, monkeypatch):
+    """GBDT-corpus regression (broke weekly_wf_promote since 2026-05-24).
+
+    A manifest under ``artifacts/sim/`` whose rows store strategy-dir-relative
+    URIs (``artifacts/walkforward_gbdt/...``) must resolve to the real file, not
+    the doubled ``artifacts/sim/artifacts/...`` path the manifest-parent anchor
+    produces.
+    """
+    manifest_dir = tmp_path / "artifacts" / "sim"
+    manifest_dir.mkdir(parents=True)
+    rel = "artifacts/walkforward_gbdt/2024-01-01/panel-ltr.json"
+    # Real artifact lives strategy-dir-relative (tmp_path), NOT under the manifest folder.
+    real = tmp_path / rel
+    real.parent.mkdir(parents=True, exist_ok=True)
+    real.write_text("{}")
+    # The doubled manifest-parent path must NOT exist — that is the bug.
+    assert not (manifest_dir / rel).exists()
+
+    manifest = manifest_dir / "walkforward_manifest_gbdt.json"
+    manifest.write_text(json.dumps({
+        "cadence_days": 21,
+        "training_window_years": 3.0,
+        "retrains": [_row("2024-01-01T00:00:00", "2024-01-02T03:00:00", rel)],
+    }))
+
+    captured: list[str] = []
+
+    def fake_load(path):
+        captured.append(str(path))
+        return object()
+
+    from renquant_pipeline.kernel.panel_pipeline import panel_scorer as _ps
+    monkeypatch.setattr(_ps.PanelScorer, "load", staticmethod(fake_load))
+
+    loader = WalkForwardModelLoader(manifest)
+    loader.model_as_of("2024-01-15")
+    assert captured == [str(real)]
+
+
 def test_absolute_artifact_uri_still_works(tmp_path, monkeypatch):
     abs_path = tmp_path / "panel-ltr.json"
     abs_path.write_text("{}")
