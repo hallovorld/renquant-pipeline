@@ -2007,6 +2007,75 @@ class ConvictionGateTask(Task):
         return None
 
 
+class BullCalmMomentumGuardTask(Task):
+    """Veto bottom-momentum buy candidates in the BULL_CALM regime. OFF by default.
+
+    Evidence (orchestrator #187, reproduced 2026-06-24 on the alpha158 panel):
+    in BULL_CALM the lowest momentum decile's REALIZED fwd_60d_excess has a median
+    of -0.107, rising monotonically to +0.021 in the top decile. The vol-tilted
+    ranker parks its low-conviction picks (NFLX/ZM-type beaten-down names) in that
+    bottom bucket. Momentum's cross-sectional IC in BULL_CALM is ~0, so this is NOT
+    a ranking signal — it is a one-sided TAIL veto of the systematically-bad bottom.
+
+    Universe-relative + name-agnostic (NOT reverse-engineered to exclude specific
+    tickers): veto candidates whose momentum (``-ROC60``; qlib ROC = past/current,
+    so higher ROC = lower momentum) sits below the ``percentile``-th percentile of
+    the full scored universe. BULL_CALM only — momentum is negative/unreliable in
+    BEAR / BULL_VOLATILE. ``enforce: false`` runs it WARN-only (flags, no drop) for
+    a shadow period before enabling. No-op unless
+    ``ranking.bull_calm_momentum_guard.enabled``.
+    """
+
+    def run(self, ctx: InferenceContext) -> bool | None:
+        if not ctx.candidates:
+            return None
+        cfg = ctx.config.get("ranking", {}).get("bull_calm_momentum_guard") or {}
+        if not cfg.get("enabled"):
+            return None
+        if str(getattr(ctx, "regime", "") or "UNKNOWN") != "BULL_CALM":
+            return None
+        feature = str(cfg.get("feature", "ROC60"))
+        pct = float(cfg.get("percentile", 0.10))
+        enforce = bool(cfg.get("enforce", True))
+        matrix = getattr(ctx, "_panel_matrix", None)
+        if matrix is None or feature not in getattr(matrix, "columns", []):
+            log.warning("BullCalmMomentumGuardTask: %s absent from panel matrix — skip",
+                        feature)
+            return None
+        # momentum = -ROC60; drop NaNs; need a usable cross-section for a percentile
+        mom = (-matrix[feature].astype(float)).dropna()
+        if len(mom) < 10:
+            return None
+        thresh = float(mom.quantile(pct))
+        blocked = getattr(ctx, "_blocked_by_ticker", None) or {}
+        kept: list = []
+        dropped = 0
+        flagged = 0
+        for cand in ctx.candidates:
+            mv = mom.get(cand.ticker)
+            if mv is not None and float(mv) < thresh:
+                if enforce:
+                    blocked[cand.ticker] = "bull_calm_momentum:below_pctile"
+                    dropped += 1
+                    continue
+                blocked.setdefault(cand.ticker, "bull_calm_momentum:flagged_warn")
+                flagged += 1
+            kept.append(cand)
+        ctx._blocked_by_ticker = blocked                       # noqa: SLF001
+        ctx.counters["bull_calm_momentum_vetoed"] = (
+            ctx.counters.get("bull_calm_momentum_vetoed", 0) + dropped
+        )
+        if enforce and dropped:
+            ctx.candidates = kept
+            log.info("BullCalmMomentumGuardTask: dropped %d bottom-momentum "
+                     "candidate(s) (%s pctile<%.2f, thresh=%+.4f)",
+                     dropped, feature, pct, thresh)
+        elif not enforce and flagged:
+            log.info("BullCalmMomentumGuardTask[WARN]: %d candidate(s) below momentum "
+                     "pctile %.2f — flagged, NOT dropped", flagged, pct)
+        return None
+
+
 class RegimeModelAdmissionTask(Task):
     """Block buy candidates when the current regime lacks model evidence.
 
@@ -3611,6 +3680,12 @@ class PanelScoringJob(Job):
             # stays owned by the signal_direction contract. No-op unless
             # ranking.panel_scoring.conviction_gate.enabled.
             ConvictionGateTask(),
+            # 2026-06-24 (#187): one-sided TAIL veto of bottom-momentum names in
+            # BULL_CALM (where the lowest momentum decile's realized fwd_60d median
+            # is -0.107). OFF by default; no-op unless
+            # ranking.bull_calm_momentum_guard.enabled. Complements ConvictionGate
+            # (conviction axis) on a different (momentum) axis.
+            BullCalmMomentumGuardTask(),
             # 2026-05-15 Phase 3: σ fallback to realized 60d vol when
             # NGBoost OFF. No-op unless `kelly_sizing.use_realized_vol_
             # fallback=true`. Pairs with `use_calibrator_mu` flag in
