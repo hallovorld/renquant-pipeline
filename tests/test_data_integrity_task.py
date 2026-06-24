@@ -1,6 +1,7 @@
 """Tests for the per-candidate + per-holding data-integrity gate."""
 from __future__ import annotations
 
+from datetime import date
 from types import SimpleNamespace
 
 import pandas as pd
@@ -46,12 +47,12 @@ def _cand(ticker, rank_score=0.6, mu=0.04):
                            expected_return=mu)
 
 
-def _ctx(candidates, holdings, enabled=True, **cfg):
+def _ctx(candidates, holdings, enabled=True, today=None, **cfg):
     return SimpleNamespace(
         config={"ranking": {"data_integrity": {"enabled": enabled,
                                                "min_fund_completeness": 0.6,
                                                "penalty_scale": 0.5, **cfg}}},
-        candidates=candidates, holdings=holdings)
+        candidates=candidates, holdings=holdings, today=today)
 
 
 def test_low_completeness_candidate_is_downweighted(monkeypatch):
@@ -67,6 +68,43 @@ def test_low_completeness_candidate_is_downweighted(monkeypatch):
     assert nflx.mu == pytest.approx(0.02)
     assert "data_integrity_low_completeness" in nflx.quality_penalty_reasons
     assert ctx.counters["data_integrity_candidates_penalized"] == 1
+
+
+def test_stale_but_complete_candidate_is_downweighted(monkeypatch):
+    # AAPL is 5/5 complete but the panel is 92 days old → must still be penalized
+    # (the 2026-06-23 incident: a complete-but-stale row slipping through).
+    monkeypatch.setattr(di, "_load_fund_panel", lambda ctx: _panel())  # dated 2026-06-23
+    aapl = _cand("AAPL")
+    ctx = _ctx([aapl], {}, today=date(2026, 9, 23), max_fund_age_days=45)
+    DataIntegrityTask().run(ctx)
+    assert aapl.rank_score == pytest.approx(0.3)  # down-weighted despite 5/5
+    assert "data_integrity_stale_fundamentals" in aapl.quality_penalty_reasons
+
+
+def test_fresh_complete_candidate_untouched(monkeypatch):
+    monkeypatch.setattr(di, "_load_fund_panel", lambda ctx: _panel())
+    aapl = _cand("AAPL")
+    ctx = _ctx([aapl], {}, today=date(2026, 6, 24), max_fund_age_days=45)  # 1d old
+    DataIntegrityTask().run(ctx)
+    assert aapl.rank_score == 0.6  # complete + fresh → untouched
+
+
+def test_fundamental_age_days(monkeypatch):
+    age = di.fundamental_age_days(_panel(), ["AAPL", "MISSING"], date(2026, 6, 30))
+    assert age["AAPL"] == 7
+    assert age["MISSING"] is None
+    # no today / no panel → None
+    assert di.fundamental_age_days(_panel(), ["AAPL"], None)["AAPL"] is None
+
+
+def test_report_surfaced_for_bundle(monkeypatch):
+    monkeypatch.setattr(di, "_load_fund_panel", lambda ctx: _panel())
+    ctx = _ctx([_cand("NFLX")], {"ZM": object()})
+    DataIntegrityTask().run(ctx)
+    rep = ctx._data_integrity_report
+    assert rep["candidates_penalized"][0]["ticker"] == "NFLX"
+    assert rep["candidates_penalized"][0]["reason"] == "data_integrity_low_completeness"
+    assert rep["holdings_degraded"][0]["ticker"] == "ZM"
 
 
 def test_holdings_are_flagged_only_not_acted(monkeypatch):
