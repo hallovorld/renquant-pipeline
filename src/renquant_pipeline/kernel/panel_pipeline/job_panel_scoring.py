@@ -1974,7 +1974,20 @@ class ConvictionGateTask(Task):
         demean = bool(cfg.get("demean_cross_sectional", False))
         xs_mean = 0.0
         if demean:
-            ers = [float(c.expected_return) for c in ctx.candidates
+            # 2026-06-24 FOOTGUN FIX: the cross-sectional mean must be the
+            # UNCONDITIONAL (full-universe) mean, NOT the post-veto survivors.
+            # ConvictionGateTask runs AFTER VetoWeakBuysTask, so ``ctx.candidates``
+            # here is the high-rank subset whose mean is high (~0.03); subtracting
+            # it then re-applying the absolute mu_floor (0.03) requires
+            # mu >= mean+0.03 ~= 0.06 — above the daily max mu (~0.05), so it
+            # admits ZERO and reverts to sell-only. Grinold's "unconditional mean
+            # -> zero alpha" is the FULL cross-section: use the pre-veto snapshot
+            # VetoWeakBuysTask stored (mu already populated). Validated 2026-06-24
+            # across 20 live runs: 0/20 zero-buy days; it admits the
+            # high-conviction names and drops the near-floor intercept buys.
+            # Fallback to ctx.candidates only if the snapshot is absent.
+            ref = getattr(ctx, "_full_candidate_snapshot", None) or ctx.candidates
+            ers = [float(c.expected_return) for c in ref
                    if getattr(c, "expected_return", None) is not None
                    and c.expected_return == c.expected_return]
             xs_mean = (sum(ers) / len(ers)) if ers else 0.0

@@ -112,3 +112,29 @@ def test_demean_default_off_matches_absolute_behavior() -> None:
     ctx = _ctx(cands, mu_floor=0.03)  # no demean key → absolute
     ConvictionGateTask().run(ctx)
     assert {c.ticker for c in ctx.candidates} == {"PANW", "NFLX"}
+
+
+def test_demean_uses_full_cross_section_not_post_veto_subset() -> None:
+    # FOOTGUN regression (2026-06-24): demean's reference is the FULL pre-veto
+    # universe (low unconditional mean), NOT the high-rank survivors. The gate
+    # runs after VetoWeakBuys, so ctx.candidates is the high-mean subset; using
+    # IT as the reference + the absolute 0.03 floor admits ZERO (sell-only). The
+    # full snapshot keeps the high-conviction names and drops the intercept buys.
+    survivors = [_c("MU", 0.051), _c("CRWD", 0.051), _c("CME", 0.033), _c("NFLX", 0.034)]
+    full = survivors + [_c(f"L{i}", mu) for i, mu in enumerate(
+        [-0.02, -0.01, 0.0, 0.003, 0.006, 0.010, 0.012, 0.015])]
+    ctx = _ctx(survivors, mu_floor=0.03, demean_cross_sectional=True)
+    ctx._full_candidate_snapshot = list(full)  # what VetoWeakBuysTask stores
+    ConvictionGateTask().run(ctx)
+    kept = {c.ticker for c in ctx.candidates}
+    assert kept == {"MU", "CRWD"}                      # high-conviction survive
+    assert "CME" not in kept and "NFLX" not in kept    # intercept buys dropped
+    assert kept, "demean over the full cross-section must not zero out (the footgun)"
+
+
+def test_demean_without_snapshot_falls_back_to_candidates() -> None:
+    # backward-compat: if no snapshot (e.g. veto task skipped), use ctx.candidates
+    cands = [_c("PANW", 0.062), _c("CSCO", 0.043), _c("NFLX", 0.0326), _c("ZM", 0.0312)]
+    ctx = _ctx(cands, mu_floor=0.0, demean_cross_sectional=True)  # no snapshot
+    ConvictionGateTask().run(ctx)
+    assert {c.ticker for c in ctx.candidates} == {"PANW", "CSCO"}
