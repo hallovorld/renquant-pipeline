@@ -10,6 +10,7 @@ from .tasks.config_fingerprint import ConfigFingerprintTask
 from .tasks.config_schema import ConfigSchemaTask
 from .tasks.correlation import CorrelationMetadataTask
 from .tasks.feature_coverage import FeatureCoverageTask
+from .tasks.fundamentals_freshness import FundamentalsFreshnessTask
 from .tasks.gate import RegimeLayeredICTask, WfGateMetadataTask
 from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
@@ -48,6 +49,7 @@ class _IdentityJob(PreflightJob):
         WatchlistSizeTask(),
         SectorMapCoverageTask(),
         CorrelationMetadataTask(),
+        FundamentalsFreshnessTask(),
     ]
 
 

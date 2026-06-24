@@ -1826,6 +1826,7 @@ _LEGACY_CHECK_ORDER: tuple[str, ...] = (
     "P-WATCHLIST",
     "P-SECTOR-MAP",
     "P-CORR-METADATA",
+    "P-FUND-FRESHNESS",
     "P-FEATURE-COVER",
     "P-STATE-FILE",
     "P-BROKER-CONNECT",
