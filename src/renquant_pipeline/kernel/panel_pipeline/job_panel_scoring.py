@@ -401,13 +401,26 @@ def _apply_sue_features(
 
 
 def _sentiment_runtime_gate_declared(scorer: Any) -> bool:
+    # 2026-06-23 train/serve fix: the runtime-zeroing contract is stamped at the
+    # artifact TOP LEVEL (``sentiment_runtime_gate_contract="trained_zeroing"``
+    # + ``sentiment_runtime_gate_disabled_regimes``). The panel_ltr_xgboost
+    # scorer exposes ``.artifact`` but NOT ``.metadata`` (dataclass fields:
+    # artifact/booster/feature_cols), so reading only ``scorer.metadata`` always
+    # returned {} → the gate was declared-absent → sentiment was LEFT UNCHANGED
+    # in disabled regimes (e.g. BULL_CALM) even though the model was trained
+    # with it zeroed there. Check the artifact first, metadata as a fallback for
+    # scorer types that expose it.
+    artifact = getattr(scorer, "artifact", {}) or {}
     metadata = getattr(scorer, "metadata", {}) or {}
     contract = (
-        metadata.get("sentiment_runtime_gate_contract")
+        artifact.get("sentiment_runtime_gate_contract")
+        or artifact.get("sentiment_gate_contract")
+        or metadata.get("sentiment_runtime_gate_contract")
         or metadata.get("sentiment_gate_contract")
     )
     return contract in {"trained_zeroing", "runtime_zeroing"} or bool(
-        metadata.get("sentiment_runtime_gate_trained", False)
+        artifact.get("sentiment_runtime_gate_trained", False)
+        or metadata.get("sentiment_runtime_gate_trained", False)
     )
 
 
