@@ -85,3 +85,30 @@ def test_missing_mu_is_dropped() -> None:
 def test_empty_candidates_is_safe() -> None:
     ctx = _ctx([], mu_floor=0.03)
     assert ConvictionGateTask().run(ctx) is None
+
+
+# ── demean_cross_sectional (2026-06-24 research-backed intercept removal) ────
+def test_intercept_lets_breakeven_names_clear_absolute_floor() -> None:
+    # The live bug: a +0.0245 calibration intercept lifts NFLX/ZM above a 0.03
+    # absolute floor even though they are below the cross-sectional mean.
+    cands = [_c("PANW", 0.062), _c("CSCO", 0.043), _c("NFLX", 0.0326), _c("ZM", 0.0312)]
+    ctx = _ctx(cands, mu_floor=0.03)  # demean default OFF
+    ConvictionGateTask().run(ctx)
+    assert {c.ticker for c in ctx.candidates} == {"PANW", "CSCO", "NFLX", "ZM"}
+
+
+def test_demean_gates_relative_conviction_not_the_constant() -> None:
+    # Same candidates; subtract the cross-sectional mean (~0.0423) first, floor 0
+    # → only the above-average names survive; NFLX/ZM (below the mean) drop.
+    cands = [_c("PANW", 0.062), _c("CSCO", 0.043), _c("NFLX", 0.0326), _c("ZM", 0.0312)]
+    ctx = _ctx(cands, mu_floor=0.0, demean_cross_sectional=True)
+    ConvictionGateTask().run(ctx)
+    assert {c.ticker for c in ctx.candidates} == {"PANW", "CSCO"}
+    assert ctx.counters["conviction_vetoed"] == 2
+
+
+def test_demean_default_off_matches_absolute_behavior() -> None:
+    cands = [_c("PANW", 0.062), _c("NFLX", 0.0326)]
+    ctx = _ctx(cands, mu_floor=0.03)  # no demean key → absolute
+    ConvictionGateTask().run(ctx)
+    assert {c.ticker for c in ctx.candidates} == {"PANW", "NFLX"}

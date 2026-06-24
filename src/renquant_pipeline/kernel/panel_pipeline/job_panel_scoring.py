@@ -1960,6 +1960,25 @@ class ConvictionGateTask(Task):
             return None
         mu_floor_f = float(mu_floor)
 
+        # 2026-06-24 (research-backed, default OFF): the calibrated mu carries a
+        # large unconditional-mean INTERCEPT (empirically mu ~= 0.091*raw +
+        # 0.0245), so an absolute mu_floor mostly gates the +2.45% constant
+        # rather than model conviction. Grinold/MSCI "Converting Scores into
+        # Alphas" prescribes a cross-sectionally standardized score where the
+        # consensus/unconditional mean maps to ZERO alpha. ``demean_cross_sectional``
+        # subtracts the cross-sectional mean of expected_return before the floor,
+        # so the constant carries no conviction and the floor gates *relative*
+        # conviction. Default OFF — this is a model-construction change and must
+        # be validated placebo-clean through the per-regime WF gate before being
+        # enabled in production. See doc/research analyst/mu-floor synthesis.
+        demean = bool(cfg.get("demean_cross_sectional", False))
+        xs_mean = 0.0
+        if demean:
+            ers = [float(c.expected_return) for c in ctx.candidates
+                   if getattr(c, "expected_return", None) is not None
+                   and c.expected_return == c.expected_return]
+            xs_mean = (sum(ers) / len(ers)) if ers else 0.0
+
         kept: list = []
         dropped = 0
         blocked = getattr(ctx, "_blocked_by_ticker", None) or {}
@@ -1967,7 +1986,7 @@ class ConvictionGateTask(Task):
             er = getattr(cand, "expected_return", None)
             if er is None or er != er:
                 reason = "conviction:mu_nan"
-            elif float(er) < mu_floor_f:
+            elif (float(er) - xs_mean) < mu_floor_f:
                 reason = "conviction:mu_below_floor"
             else:
                 kept.append(cand)
@@ -1981,8 +2000,9 @@ class ConvictionGateTask(Task):
         if dropped:
             ctx.candidates = kept
             log.info(
-                "ConvictionGateTask: dropped %d candidate(s) (mu_floor=%s)",
+                "ConvictionGateTask: dropped %d candidate(s) (mu_floor=%s%s)",
                 dropped, mu_floor_f,
+                f" demeaned xs_mean={xs_mean:+.4f}" if demean else "",
             )
         return None
 
