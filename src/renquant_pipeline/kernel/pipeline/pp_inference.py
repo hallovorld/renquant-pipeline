@@ -533,6 +533,13 @@ class InferencePipeline:
                 )
                 RegimeMomentumAlignmentTask().run(ctx)
                 DeepDrawdownVetoTask().run(ctx)
+                # 2026-06-23 WARN-first per-candidate + per-holding data
+                # integrity: down-weight buy candidates scored on heavily
+                # imputed fundamentals, flag degraded holdings. Default OFF;
+                # opt-in via ranking.data_integrity.enabled. See
+                # task_data_integrity.py.
+                from .task_data_integrity import DataIntegrityTask  # noqa: PLC0415
+                DataIntegrityTask().run(ctx)
 
         # Plan C: Kelly-driven top-up for existing holdings whose panel
         # score has improved beyond kelly_target_pct. No-op unless
