@@ -86,6 +86,11 @@ def build_ticker_daily_state_rows(
     scores = getattr(ctx, "scores", {}) or {}
     panel_scores = getattr(ctx, "panel_scores", None) or scores
     rank_scores = getattr(ctx, "rank_scores", None) or scores
+    # 2026-06-24: persist the calibrated expected return (mu) that
+    # ConvictionGateTask actually floors. Without it the decision history records
+    # the raw panel_score but NOT the gated quantity, so a gate change (mu_floor /
+    # demean / momentum guard) cannot be validated on real admitted-set outcomes.
+    expected_returns = _expected_returns_by_ticker(ctx)
     watchlist = list(config.get("watchlist") or [])
     held = _position_tickers(getattr(ctx, "account_snapshot", {}) or {})
     ticker_order = _stable_ticker_order(
@@ -125,6 +130,7 @@ def build_ticker_daily_state_rows(
                 "score": _finite_or_none(scores.get(ticker)),
                 "panel_score": _finite_or_none(panel_scores.get(ticker)),
                 "rank_score": _finite_or_none(rank_scores.get(ticker)),
+                "expected_return": _finite_or_none(expected_returns.get(ticker)),
                 "blocked_by": blocked.get(ticker),
                 "selected": ticker in selected,
                 "in_watchlist": ticker in watchlist,
@@ -201,6 +207,28 @@ def _get_value(ctx: Any, key: str) -> Any:
         return getattr(ctx, key)
     market = getattr(ctx, "market_snapshot", {}) or {}
     return market.get(key)
+
+
+def _expected_returns_by_ticker(ctx: Any) -> dict[str, Any]:
+    """ticker -> calibrated expected return (mu), from the candidates the
+    conviction gate floors. Prefers ``ctx.candidates`` (each ``.ticker`` /
+    ``.expected_return``); falls back to a pre-built ``ctx.expected_returns``
+    mapping. Defensive: never raises, missing -> absent key."""
+    explicit = getattr(ctx, "expected_returns", None)
+    if isinstance(explicit, dict) and explicit:
+        return explicit
+    out: dict[str, Any] = {}
+    for cand in getattr(ctx, "candidates", None) or []:
+        ticker = getattr(cand, "ticker", None)
+        if ticker is None and isinstance(cand, dict):
+            ticker = cand.get("ticker")
+        if ticker is None:
+            continue
+        er = getattr(cand, "expected_return", None)
+        if er is None and isinstance(cand, dict):
+            er = cand.get("expected_return")
+        out[str(ticker)] = er
+    return out
 
 
 def _finite_or_none(value: Any) -> float | None:
