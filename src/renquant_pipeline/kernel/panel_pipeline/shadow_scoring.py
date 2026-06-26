@@ -87,6 +87,25 @@ def _resolve_shadow_artifact_path(
     return next((c for c in candidates if c.exists()), candidates[-1])
 
 
+def _is_degenerate_cross_section(
+    sub: "pd.DataFrame", *, zero_var_threshold: float = 1e-12, frac_hard: float = 0.5
+) -> bool:
+    """True when >``frac_hard`` of columns have ~zero cross-sectional variance.
+
+    Mirrors ``model_contract``'s input HARD-FAIL condition (abs(std) <
+    ``zero_var_threshold`` over >50% of cols). Used to skip a NON-history shadow
+    scorer that was handed a target-only/degenerate ``ctx._panel_matrix`` — which
+    is what happens on history-primary runs (e.g. hf_patchtst): no valid
+    per-ticker cross-section is stamped for non-history scorers, so every name
+    gets a constant input and the scorer would collapse (model_contract HARD
+    FAIL). Needs ≥2 rows to assess variance.
+    """
+    if sub is None or len(sub) < 2 or sub.shape[1] == 0:
+        return False
+    col_stds = sub.std(axis=0, skipna=True).fillna(0.0)
+    return float((col_stds.abs() < zero_var_threshold).mean()) > frac_hard
+
+
 def _ensure_mlflow_setup(tracking_uri: Optional[str] = None,
                          experiment_name: Optional[str] = None) -> str:
     """Set MLflow tracking URI + experiment. Returns experiment_id."""
@@ -321,7 +340,24 @@ class ApplyShadowScoringTask(Task):
                         log.warning("ApplyShadowScoringTask: shadow %s missing "
                                      "cols: %s", name, missing[:5])
                         continue
-                    series = scorer.score(X[fc].fillna(0))
+                    sub = X[fc]
+                    # 2026-06-26: when the PRIMARY scorer is history-based (e.g.
+                    # hf_patchtst), ctx._panel_matrix is a target-only/degenerate
+                    # placeholder (see job_panel_scoring BUG #6) — no valid
+                    # per-ticker cross-section is stamped for non-history scorers.
+                    # A non-history (xgb) shadow then receives a constant input
+                    # across the cross-section → collapsed prediction, which trips
+                    # model_contract's HARD FAIL. That is a meaningless comparison,
+                    # not a model fault: skip cleanly rather than emit a false
+                    # alarm. (Live impact nil — shadow-only.)
+                    if _is_degenerate_cross_section(sub):
+                        log.warning(
+                            "ApplyShadowScoringTask: shadow %s skipped — degenerate "
+                            "cross-section (%d feature cols ~constant; primary is "
+                            "history-based so no panel matrix was built for "
+                            "non-history shadows)", name, len(fc))
+                        continue
+                    series = scorer.score(sub.fillna(0))
             except Exception as exc:
                 log.warning("ApplyShadowScoringTask: shadow %s score failed: %s",
                              name, exc)
