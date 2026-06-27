@@ -70,7 +70,7 @@ def _resolve_shadow_artifact_path(
     artifact_path: str | Path,
     *,
     strategy_dir: str | Path | None,
-    repo: Path,
+    repo: Path | None = None,
 ) -> Path:
     p = Path(artifact_path)
     if p.is_absolute():
@@ -80,11 +80,17 @@ def _resolve_shadow_artifact_path(
     # strategy_dir first, repo data_root as back-compat fallback. Pre-fix this
     # resolved only against data_root(), so the post-PatchTST-promotion shadow
     # under <strategy_dir>/artifacts/prod failed to load on every run.
-    candidates: list[Path] = []
     if strategy_dir:
-        candidates.append(Path(strategy_dir) / p)
-    candidates.append(repo / p)
-    return next((c for c in candidates if c.exists()), candidates[-1])
+        sd = Path(strategy_dir) / p
+        if sd.exists():
+            return sd
+    # 2026-06-27: resolve data_root() LAZILY — only when the strategy_dir
+    # candidate misses and we actually need the umbrella repo fallback. A fully
+    # stubbed/cached call path (unit tests) then never requires a data root.
+    if repo is None:
+        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+        repo = data_root()
+    return repo / p
 
 
 def _is_degenerate_cross_section(
@@ -236,8 +242,9 @@ class ApplyShadowScoringTask(Task):
                 return None
 
         from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
-        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
-        repo = data_root()
+        # data_root() is resolved lazily inside _resolve_shadow_artifact_path —
+        # only when a path actually needs the umbrella repo fallback — so a fully
+        # stubbed/cached call path (e.g. unit tests) never requires a data root.
 
         for sm in shadow_models:
             name = sm.get("name", "unnamed_shadow")
@@ -250,7 +257,6 @@ class ApplyShadowScoringTask(Task):
             p = _resolve_shadow_artifact_path(
                 artifact_path,
                 strategy_dir=ctx.config.get("_strategy_dir"),
-                repo=repo,
             )
             try:
                 handler = registry.get(kind)
