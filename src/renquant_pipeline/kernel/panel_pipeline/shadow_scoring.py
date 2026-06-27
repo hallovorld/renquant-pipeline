@@ -70,7 +70,7 @@ def _resolve_shadow_artifact_path(
     artifact_path: str | Path,
     *,
     strategy_dir: str | Path | None,
-    repo: Path,
+    repo: Path | None = None,
 ) -> Path:
     p = Path(artifact_path)
     if p.is_absolute():
@@ -80,11 +80,36 @@ def _resolve_shadow_artifact_path(
     # strategy_dir first, repo data_root as back-compat fallback. Pre-fix this
     # resolved only against data_root(), so the post-PatchTST-promotion shadow
     # under <strategy_dir>/artifacts/prod failed to load on every run.
-    candidates: list[Path] = []
     if strategy_dir:
-        candidates.append(Path(strategy_dir) / p)
-    candidates.append(repo / p)
-    return next((c for c in candidates if c.exists()), candidates[-1])
+        sd = Path(strategy_dir) / p
+        if sd.exists():
+            return sd
+    # 2026-06-27: resolve data_root() LAZILY — only when the strategy_dir
+    # candidate misses and we actually need the umbrella repo fallback. A fully
+    # stubbed/cached call path (unit tests) then never requires a data root.
+    if repo is None:
+        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
+        repo = data_root()
+    return repo / p
+
+
+def _is_degenerate_cross_section(
+    sub: "pd.DataFrame", *, zero_var_threshold: float = 1e-12, frac_hard: float = 0.5
+) -> bool:
+    """True when >``frac_hard`` of columns have ~zero cross-sectional variance.
+
+    Mirrors ``model_contract``'s input HARD-FAIL condition (abs(std) <
+    ``zero_var_threshold`` over >50% of cols). Used to skip a NON-history shadow
+    scorer that was handed a target-only/degenerate ``ctx._panel_matrix`` — which
+    is what happens on history-primary runs (e.g. hf_patchtst): no valid
+    per-ticker cross-section is stamped for non-history scorers, so every name
+    gets a constant input and the scorer would collapse (model_contract HARD
+    FAIL). Needs ≥2 rows to assess variance.
+    """
+    if sub is None or len(sub) < 2 or sub.shape[1] == 0:
+        return False
+    col_stds = sub.std(axis=0, skipna=True).fillna(0.0)
+    return float((col_stds.abs() < zero_var_threshold).mean()) > frac_hard
 
 
 def _ensure_mlflow_setup(tracking_uri: Optional[str] = None,
@@ -217,8 +242,9 @@ class ApplyShadowScoringTask(Task):
                 return None
 
         from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
-        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
-        repo = data_root()
+        # data_root() is resolved lazily inside _resolve_shadow_artifact_path —
+        # only when a path actually needs the umbrella repo fallback — so a fully
+        # stubbed/cached call path (e.g. unit tests) never requires a data root.
 
         for sm in shadow_models:
             name = sm.get("name", "unnamed_shadow")
@@ -231,7 +257,6 @@ class ApplyShadowScoringTask(Task):
             p = _resolve_shadow_artifact_path(
                 artifact_path,
                 strategy_dir=ctx.config.get("_strategy_dir"),
-                repo=repo,
             )
             try:
                 handler = registry.get(kind)
@@ -321,7 +346,24 @@ class ApplyShadowScoringTask(Task):
                         log.warning("ApplyShadowScoringTask: shadow %s missing "
                                      "cols: %s", name, missing[:5])
                         continue
-                    series = scorer.score(X[fc].fillna(0))
+                    sub = X[fc]
+                    # 2026-06-26: when the PRIMARY scorer is history-based (e.g.
+                    # hf_patchtst), ctx._panel_matrix is a target-only/degenerate
+                    # placeholder (see job_panel_scoring BUG #6) — no valid
+                    # per-ticker cross-section is stamped for non-history scorers.
+                    # A non-history (xgb) shadow then receives a constant input
+                    # across the cross-section → collapsed prediction, which trips
+                    # model_contract's HARD FAIL. That is a meaningless comparison,
+                    # not a model fault: skip cleanly rather than emit a false
+                    # alarm. (Live impact nil — shadow-only.)
+                    if _is_degenerate_cross_section(sub):
+                        log.warning(
+                            "ApplyShadowScoringTask: shadow %s skipped — degenerate "
+                            "cross-section (%d feature cols ~constant; primary is "
+                            "history-based so no panel matrix was built for "
+                            "non-history shadows)", name, len(fc))
+                        continue
+                    series = scorer.score(sub.fillna(0))
             except Exception as exc:
                 log.warning("ApplyShadowScoringTask: shadow %s score failed: %s",
                              name, exc)
