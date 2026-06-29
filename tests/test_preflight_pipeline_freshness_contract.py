@@ -47,15 +47,15 @@ def test_run_preflight_legacy_order_covers_all_checks(tmp_path):
 
 
 # ── P-FUND-FRESHNESS through the real run_preflight entrypoint ──────────────
-# Verifies the two 2026-06-29 fixes end-to-end at the abort boundary:
-#   * a genuinely-stale (quarter-behind) fundamentals panel HARD-fails a
-#     full/buy run (still blocks new buys), but is downgraded to a soft pass
-#     in sell-only mode (the run does NOT abort).
+# Verifies the 2026-06-29 fix end-to-end at the abort boundary:
+#   * a stopped DAILY feed (the live 2026-06-29 case: max as-of 2026-03-31,
+#     ~90d old) HARD-fails a full/buy run (still blocks new buys), but is
+#     downgraded to a soft pass in sell-only mode (the run does NOT abort).
 #   * a true safety-invariant failure (corrupt live_state.json) STILL aborts
-#     even in sell-only mode — Fix 2 only exempts buy-only gates.
+#     even in sell-only mode — the sell-only exemption only covers buy-only gates.
 
 def _patch_stale_panel(monkeypatch, tmp_path, last_period, today):
-    """Make the fundamentals panel a genuinely-stale (quarter-behind) one."""
+    """Make the fundamentals panel a genuinely-stale (stopped daily feed) one."""
     data_dir = tmp_path / "data"
     data_dir.mkdir(exist_ok=True)
     pd.DataFrame({
@@ -79,24 +79,30 @@ def _fund_result(results):
     return next(r for r in results if r.name == "P-FUND-FRESHNESS")
 
 
-def test_stale_fundamentals_hard_fails_full_run(monkeypatch, tmp_path):
-    # Mid-August, panel stuck at Q1 → one quarter behind the filing calendar.
-    # In a full/buy run the gate is a HARD failure (blocks new buys).
-    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 8, 16))
+def test_stopped_daily_feed_hard_fails_full_run(monkeypatch, tmp_path):
+    # The live 2026-06-29 case: feed max as-of 2026-03-31 (~90d old). The
+    # quarterly calendar alone is satisfied (Q1 is the latest-expected-filed
+    # quarter), so the daily-feed dimension is what surfaces the stopped feed.
+    # In a full/buy run the gate is a HARD failure (blocks new buys) — the gate
+    # does NOT hide the stop.
+    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 6, 29))
     results = run_preflight(config={}, broker=None, strategy_dir=tmp_path,
                             strict=False, run_mode="full")
     fund = _fund_result(results)
     assert fund.severity == "hard" and fund.ok is False
+    assert "DAILY-FEED STALE" in fund.message
     assert "blocking new buys" in fund.message
+    assert fund.details["feed_age_days"] == 90
+    assert fund.details["quarters_behind"] == 0  # quarterly check alone passes
 
 
-def test_stale_fundamentals_does_not_abort_sell_only_run(monkeypatch, tmp_path):
-    # Same genuinely-stale panel, but sell-only → P-FUND-FRESHNESS soft pass.
-    # The buy-only gate no longer contributes a hard failure, so it cannot
-    # by itself abort the sell-only run. (Other gates are config/artifact
-    # gates outside this fix's scope; here we assert the freshness gate's
-    # own severity, which is what the runner aborts on.)
-    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 8, 16))
+def test_stopped_daily_feed_does_not_abort_sell_only_run(monkeypatch, tmp_path):
+    # Same stopped feed, but sell-only → P-FUND-FRESHNESS soft pass. The
+    # buy-only gate no longer contributes a hard failure, so it cannot by itself
+    # abort the sell-only run. (Other gates are config/artifact gates outside
+    # this fix's scope; here we assert the freshness gate's own severity, which
+    # is what the runner aborts on.)
+    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 6, 29))
     results = run_preflight(config={}, broker=None, strategy_dir=tmp_path,
                             strict=False, run_mode="sell-only (intraday)")
     fund = _fund_result(results)
@@ -111,7 +117,7 @@ def test_safety_invariant_state_file_still_aborts_sell_only(monkeypatch, tmp_pat
     # A buy-only gate is exempt in sell-only, but a SAFETY-INVARIANT gate is not.
     # Corrupt live_state.json (state-file integrity) must still HARD-fail and
     # abort even in sell-only mode.
-    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 8, 16))
+    _patch_stale_panel(monkeypatch, tmp_path, "2026-03-31", date(2026, 6, 29))
     (tmp_path / "live_state.paper.json").write_text("{ this is not valid json")
     with pytest.raises(PreflightFailed) as exc:
         run_preflight(config={}, broker=None, strategy_dir=tmp_path,
