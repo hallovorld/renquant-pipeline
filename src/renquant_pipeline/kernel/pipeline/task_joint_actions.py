@@ -778,7 +778,9 @@ class JointActionTask(Task):
             # mark-to-market value net of fees/slippage on the sell.
             sell_proceeds = 0.0
             if a.kind == "rotate":
-                h_shares = int(getattr(a.held_obj, "shares", 0) or 0)
+                # Fractional-share lifecycle (#153): read held qty as a FLOAT so
+                # a sub-1-share sell-leg isn't truncated to 0 in proceeds sizing.
+                h_shares = float(getattr(a.held_obj, "shares", 0.0) or 0.0)
                 h_price  = float(ctx.prices.get(a.held_ticker, 0.0) or 0.0)
                 if h_shares > 0 and math.isfinite(h_price) and h_price > 0:
                     sell_proceeds = h_shares * h_price * (1.0 - fee_pct - slip_pct)

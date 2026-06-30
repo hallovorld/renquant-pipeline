@@ -21,7 +21,12 @@ from dataclasses import dataclass
 import pandas as pd
 
 from .fees import FeeConfig, compute_buy_fees, compute_sell_fees
-from .types import Fill, OrderIntent, OrderSide
+from .types import Fill, OrderIntent, OrderSide, resolve_fill_quantity
+
+# Positions held below this absolute share count are treated as fully closed
+# so a fractional full-liquidate (x - x = 0.0, but a partial sell may leave fp
+# dust) never strands a residual position that PruneFullExitsTask can't reap.
+_POSITION_EPS = 1e-9
 
 
 # ─── ExecutionBackend ABC ──────────────────────────────────────────────────
@@ -36,6 +41,19 @@ class ExecutionBackend(ABC):
     state (e.g. Alpaca's account number, LEAN's algorithm handle)
     accept it in ``__init__`` and keep it private.
     """
+
+    @property
+    def supports_fractional(self) -> bool:
+        """Whether this backend can MODEL fractional (sub-1-share) quantities.
+
+        Default ``False`` (whole-share only). Capability negotiation
+        (Codex review #153, blocking #1): when fractional sizing is enabled
+        but the attached backend returns ``False`` here, the pipeline fails
+        fast instead of letting a fractional order be floored to a zero-share
+        fill on a sim/validation/LEAN path. Fractional-capable backends
+        override this to reflect their constructed mode.
+        """
+        return False
 
     @abstractmethod
     def place_market_order(self, intent: OrderIntent) -> Fill:
@@ -71,7 +89,7 @@ class ExecutionBackend(ABC):
 
 @dataclass
 class _FakePosition:
-    quantity: int = 0
+    quantity: float = 0.0  # int-valued in whole-share mode; float under fractional
     avg_cost: float = 0.0  # volume-weighted average cost basis
 
 
@@ -90,6 +108,8 @@ class FakeBackend(ExecutionBackend):
         self,
         starting_cash: float = 100_000.0,
         fee_config: FeeConfig | None = None,
+        *,
+        allow_fractional: bool = False,
     ) -> None:
         if not math.isfinite(starting_cash) or starting_cash < 0:
             raise ValueError(
@@ -102,6 +122,15 @@ class FakeBackend(ExecutionBackend):
         self._intents: list[OrderIntent] = []
         self._fills: list[Fill] = []
         self._fee_cfg = fee_config or FeeConfig()
+        # Fractional-share capability (strategy-104 #35): opt-in so whole-share
+        # mode stays byte-for-byte unchanged. When True this backend MODELS
+        # fractional quantities (float positions, no int() floor) so the
+        # readonly/shadow/sim path validates the exact behaviour enabled live.
+        self._allow_fractional = bool(allow_fractional)
+
+    @property
+    def supports_fractional(self) -> bool:
+        return self._allow_fractional
 
     # ── Test helpers ────────────────────────────────────────────────────
 
@@ -136,7 +165,15 @@ class FakeBackend(ExecutionBackend):
         price = self.get_last_price(intent.ticker)  # raises KeyError on unseeded
 
         if intent.side == OrderSide.BUY:
-            shares = int(intent.shares)  # type: ignore[arg-type]  # guarded by __post_init__
+            # Capability negotiation (#153): a fractional-capable backend keeps
+            # the float; a whole-share one fails fast rather than flooring to 0.
+            shares = resolve_fill_quantity(
+                intent.shares,
+                supports_fractional=self._allow_fractional,
+                backend_name="FakeBackend",
+                ticker=intent.ticker,
+                side="BUY",
+            )
             fees_dict = compute_buy_fees(shares, price, self._fee_cfg)
             fees = fees_dict["total"]
             self._cash -= shares * price + fees
@@ -165,21 +202,30 @@ class FakeBackend(ExecutionBackend):
                     f"SELL OrderIntent for {intent.ticker!r}: no position to close"
                 )
             if intent.is_full_liquidate:
-                shares = int(pos.quantity)
+                # Liquidate the ENTIRE position — never int()-floor here or a
+                # sub-1-share fractional holding would be stranded forever (#153).
+                shares = pos.quantity if self._allow_fractional else int(pos.quantity)
             else:
-                requested = int(intent.shares)  # type: ignore[arg-type]
-                if requested > pos.quantity:
+                requested = resolve_fill_quantity(
+                    intent.shares,
+                    supports_fractional=self._allow_fractional,
+                    backend_name="FakeBackend",
+                    ticker=intent.ticker,
+                    side="SELL",
+                )
+                if requested > pos.quantity + _POSITION_EPS:
                     raise ValueError(
                         f"SELL OrderIntent for {intent.ticker!r}: "
                         f"requested {requested} > held {pos.quantity}"
                     )
-                shares = requested
+                shares = min(requested, pos.quantity)
             fees_dict = compute_sell_fees(shares, price, self._fee_cfg)
             fees = fees_dict["total"]
             revenue = shares * price - fees
             self._cash += revenue
             pos.quantity -= shares
-            if pos.quantity == 0:
+            if pos.quantity <= _POSITION_EPS:
+                pos.quantity = 0.0  # clamp fp dust so the position reaps cleanly
                 pos.avg_cost = 0.0  # release cost basis on full close
             fill = Fill(
                 ticker=intent.ticker,

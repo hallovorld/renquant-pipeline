@@ -911,7 +911,10 @@ class EmitRotationsTask(Task):
             # SimpleNamespace ctx without `holdings` set up.
             _holdings   = getattr(ctx, "holdings", None) or {}
             held_st     = _holdings.get(pair.sell_ticker) if _holdings else None
-            held_shares = int(getattr(held_st, "shares", 0) or 0) if held_st else 0
+            # Fractional-share lifecycle (#153): read the held quantity as a
+            # FLOAT so a sub-1-share fractional sell-leg is not truncated to 0
+            # when estimating same-bar rotation proceeds for buy-leg sizing.
+            held_shares = float(getattr(held_st, "shares", 0.0) or 0.0) if held_st else 0.0
             held_price  = float(ctx.prices.get(pair.sell_ticker, 0.0) or 0.0)
             sell_proceeds = 0.0
             if held_shares > 0 and math.isfinite(held_price) and held_price > 0:

@@ -30,6 +30,63 @@ class OrderSide(str, Enum):
     SELL = "SELL"
 
 
+def _is_positive_finite_real(value: object) -> bool:
+    """True iff ``value`` is a finite, strictly-positive real number.
+
+    Excludes ``bool`` (an ``int`` subclass — ``True`` must NOT count as
+    "1 share") and any non-numeric type (so a string-like ``"1.5"`` is
+    rejected with a clean ValueError by the caller rather than raising a
+    TypeError mid-``float()``). Accepts both ``int`` (whole-share) and
+    ``float`` (fractional, strategy-104 #35) inputs.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(float(value)) and value > 0
+
+
+def resolve_fill_quantity(
+    requested: object,
+    *,
+    supports_fractional: bool,
+    backend_name: str,
+    ticker: str,
+    side: str,
+) -> float | int:
+    """Negotiate the concrete quantity a backend will actually fill.
+
+    ``requested`` is the order's share count (``OrderIntent.shares`` for a
+    BUY, or the resolved partial-sell quantity). The return is ALWAYS a
+    strictly-positive number:
+
+    * a fractional-capable backend (``supports_fractional=True``) keeps the
+      float verbatim, so a sub-1-share order models its true quantity; and
+    * a whole-share-only backend returns the integral count, but ONLY when
+      ``requested`` is already (within fp tolerance) a whole number.
+
+    A whole-share backend asked to fill a genuinely fractional quantity
+    raises :class:`ValueError` — fail fast — so no path can silently floor a
+    fractional order to a ZERO-share fill (Codex review #153, blocking #1).
+    """
+    qty = float(requested)
+    if not math.isfinite(qty) or qty <= 0:
+        raise ValueError(
+            f"{backend_name} {side} {ticker}: fill quantity must be finite "
+            f"and positive, got {requested!r}"
+        )
+    if supports_fractional:
+        return qty
+    nearest = round(qty)
+    if nearest >= 1 and abs(qty - nearest) <= 1e-9:
+        return int(nearest)
+    raise ValueError(
+        f"{backend_name} cannot represent fractional {side} quantity "
+        f"{qty!r} for {ticker!r}: route fractional orders to a "
+        f"fractional-capable backend (allow_fractional=True) or disable "
+        f"execution.fractional_shares — a whole-share backend must never "
+        f"floor a fractional order to a zero-share fill"
+    )
+
+
 @dataclass(frozen=True)
 class OrderIntent:
     """A pipeline-level execution request.
@@ -77,14 +134,16 @@ class OrderIntent:
             # pipeline bug (e.g. SizeAndEmitTask emitting on rejected order).
             # Fractional-share execution (strategy-104 #35) emits a FLOAT
             # `shares` for sub-1-share targets on high-priced names; accept any
-            # finite positive real here. Whole-share callers still pass ints.
-            if (
-                self.shares is None
-                or not math.isfinite(float(self.shares))
-                or self.shares <= 0
-            ):
+            # finite positive REAL here. Whole-share callers still pass ints.
+            #
+            # Type discipline (Codex review #153): require an actual finite real
+            # number and EXCLUDE bool (``True`` is an ``int`` subclass and would
+            # otherwise sneak through as "1 share") and string-likes (``float()``
+            # on which raises, not a clean ValueError). Mirrors the Fill guard.
+            if not _is_positive_finite_real(self.shares):
                 raise ValueError(
-                    f"BUY OrderIntent.shares must be a positive number, "
+                    f"BUY OrderIntent.shares must be a positive real number "
+                    f"(int whole-share or float fractional, not bool/str), "
                     f"got {self.shares!r}"
                 )
             if self.target_pct <= 0:
@@ -98,12 +157,12 @@ class OrderIntent:
                     f"got {self.exit_type!r}"
                 )
         elif self.side == OrderSide.SELL:
-            # SELL: shares=None → full liquidate; positive int → partial.
-            # Zero / negative is a bug.
-            if self.shares is not None and self.shares <= 0:
+            # SELL: shares=None → full liquidate; positive real → partial.
+            # Zero / negative / bool / string-like is a bug.
+            if self.shares is not None and not _is_positive_finite_real(self.shares):
                 raise ValueError(
-                    f"partial SELL OrderIntent.shares must be > 0 or None, "
-                    f"got {self.shares!r}"
+                    f"partial SELL OrderIntent.shares must be a positive real "
+                    f"number or None (not bool/str), got {self.shares!r}"
                 )
         else:  # pragma: no cover — enum exhaustiveness
             raise ValueError(f"unknown OrderSide {self.side!r}")
@@ -137,15 +196,11 @@ class Fill:
     def __post_init__(self) -> None:
         # Fractional-share execution (strategy-104 #35): a fill may report a
         # FLOAT share count for fractionable live orders. Accept any finite
-        # positive real; whole-share backends still produce ints.
-        if (
-            not isinstance(self.shares, (int, float))
-            or isinstance(self.shares, bool)
-            or not math.isfinite(float(self.shares))
-            or self.shares <= 0
-        ):
+        # positive real; whole-share backends still produce ints. ``bool`` and
+        # string-likes are rejected (see :func:`_is_positive_finite_real`).
+        if not _is_positive_finite_real(self.shares):
             raise ValueError(
-                f"Fill.shares must be a positive number, got {self.shares!r}"
+                f"Fill.shares must be a positive real number, got {self.shares!r}"
             )
         if not math.isfinite(self.price) or self.price <= 0:
             raise ValueError(
@@ -164,4 +219,4 @@ class Fill:
         return self.shares * self.price
 
 
-__all__ = ["OrderSide", "OrderIntent", "Fill"]
+__all__ = ["OrderSide", "OrderIntent", "Fill", "resolve_fill_quantity"]

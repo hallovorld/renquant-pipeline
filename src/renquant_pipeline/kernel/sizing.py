@@ -185,15 +185,27 @@ def fractional_sizing_cfg(config: dict | None) -> tuple[bool, float]:
     rotation) so the flag is threaded identically. Defaults to whole-share mode
     (``False``, ``1.0``) when the block is absent or malformed — no behaviour
     change unless strategy-104 opts in via ``execution.fractional_shares.enabled``.
+
+    Fail-closed type discipline (Codex review #153, blocking #4): ``enabled``
+    must be an ACTUAL ``bool``. A non-bool (e.g. the YAML string ``"false"``,
+    which is truthy under ``bool()``) is treated as DISABLED rather than
+    silently enabling fractional execution. ``min_notional`` must be a real,
+    non-bool, finite, non-negative number or it falls back to ``$1``.
     """
     import math
     exec_cfg = (config or {}).get("execution", {}) or {}
     frac_cfg = exec_cfg.get("fractional_shares", {}) or {}
-    enabled = bool(frac_cfg.get("enabled", False))
-    try:
-        min_notional = float(frac_cfg.get("min_notional", 1.0))
-    except (TypeError, ValueError):
+    # Only a genuine bool enables — a string/int/None fails CLOSED to whole-share
+    # mode so a malformed config can never silently turn fractional execution on.
+    enabled = frac_cfg.get("enabled", False) is True
+    raw_min = frac_cfg.get("min_notional", 1.0)
+    if isinstance(raw_min, bool):  # bool is an int subclass — reject explicitly
         min_notional = 1.0
+    else:
+        try:
+            min_notional = float(raw_min)
+        except (TypeError, ValueError):
+            min_notional = 1.0
     if not math.isfinite(min_notional) or min_notional < 0:
         min_notional = 1.0
     return enabled, min_notional
