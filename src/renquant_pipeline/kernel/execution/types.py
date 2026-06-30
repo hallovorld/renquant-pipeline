@@ -57,7 +57,7 @@ class OrderIntent:
 
     ticker: str
     side: OrderSide
-    shares: Optional[int]
+    shares: Optional[float]  # int in whole-share mode; float under fractional (#35)
     target_pct: float
     today: pd.Timestamp
     reason: str
@@ -75,9 +75,16 @@ class OrderIntent:
         if self.side == OrderSide.BUY:
             # Buys MUST be explicit and positive — None or zero is a
             # pipeline bug (e.g. SizeAndEmitTask emitting on rejected order).
-            if self.shares is None or self.shares <= 0:
+            # Fractional-share execution (strategy-104 #35) emits a FLOAT
+            # `shares` for sub-1-share targets on high-priced names; accept any
+            # finite positive real here. Whole-share callers still pass ints.
+            if (
+                self.shares is None
+                or not math.isfinite(float(self.shares))
+                or self.shares <= 0
+            ):
                 raise ValueError(
-                    f"BUY OrderIntent.shares must be a positive int, "
+                    f"BUY OrderIntent.shares must be a positive number, "
                     f"got {self.shares!r}"
                 )
             if self.target_pct <= 0:
@@ -122,15 +129,23 @@ class Fill:
 
     ticker: str
     side: OrderSide
-    shares: int
+    shares: float  # int in whole-share mode; float under fractional (#35)
     price: float
     fees: float
     today: pd.Timestamp
 
     def __post_init__(self) -> None:
-        if not isinstance(self.shares, int) or self.shares <= 0:
+        # Fractional-share execution (strategy-104 #35): a fill may report a
+        # FLOAT share count for fractionable live orders. Accept any finite
+        # positive real; whole-share backends still produce ints.
+        if (
+            not isinstance(self.shares, (int, float))
+            or isinstance(self.shares, bool)
+            or not math.isfinite(float(self.shares))
+            or self.shares <= 0
+        ):
             raise ValueError(
-                f"Fill.shares must be a positive int, got {self.shares!r}"
+                f"Fill.shares must be a positive number, got {self.shares!r}"
             )
         if not math.isfinite(self.price) or self.price <= 0:
             raise ValueError(

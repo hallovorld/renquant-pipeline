@@ -170,7 +170,8 @@ class JointActionTask(Task):
         )
         from renquant_pipeline.kernel.sizing   import (                                         # noqa: PLC0415
             compute_position_size, conviction_score_for_object,
-            conviction_score_percentiles, conviction_multiplier, sigma_multiplier,
+            conviction_score_percentiles, conviction_multiplier,
+            fractional_sizing_cfg, sigma_multiplier,
             universe_sigma_median,
         )
         from renquant_pipeline.kernel.regime   import confidence_to_size_multiplier            # noqa: PLC0415
@@ -285,6 +286,8 @@ class JointActionTask(Task):
         sigma_cfg     = (ctx.config.get("ranking", {})
                           .get("panel_scoring", {})
                           .get("sigma_sizing", {}))
+        # Fractional-share execution (strategy-104 #35 cash-drag follow-up).
+        frac_on, frac_min_notional = fractional_sizing_cfg(ctx.config)
         sigma_median  = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
         )
@@ -792,8 +795,9 @@ class JointActionTask(Task):
             _, shares = compute_position_size(
                 ctx.portfolio_value, cash_for_sizing,
                 max_pct, reserve_pct, price,
+                fractional=frac_on, min_notional=frac_min_notional,
             )
-            if shares < 1:
+            if (shares <= 0) if frac_on else (shares < 1):
                 ctx.counters["joint_blocked_cash"] = (
                     ctx.counters.get("joint_blocked_cash", 0) + 1
                 )

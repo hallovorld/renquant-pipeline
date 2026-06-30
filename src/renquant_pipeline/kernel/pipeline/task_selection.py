@@ -156,6 +156,7 @@ class SizeAndEmitTask(Task):
             conviction_score_for_object,
             conviction_score_percentiles,
             conviction_multiplier,
+            fractional_sizing_cfg,
             sigma_multiplier,
             universe_sigma_median,
         )
@@ -196,6 +197,10 @@ class SizeAndEmitTask(Task):
                           .get("sigma_sizing", {}))
         kelly_cfg     = ctx.config.get("ranking", {}).get("kelly_sizing", {})
         kelly_on      = bool(kelly_cfg.get("enabled", False))
+        # Fractional-share execution (strategy-104 #35 cash-drag follow-up):
+        # when enabled, a sub-1-share Kelly target on a high-priced name
+        # (AVGO/BLK/GS) deploys as a FLOAT quantity instead of rounding to 0.
+        frac_on, frac_min_notional = fractional_sizing_cfg(ctx.config)
         # When Kelly is primary sizer, conviction_multiplier (derived from
         # panel_score) and sigma_multiplier (inverse of σ) approximately
         # re-scale the SAME quantities Kelly already encodes (μ and σ²).
@@ -317,12 +322,16 @@ class SizeAndEmitTask(Task):
                 ctx.portfolio_value, remaining_cash,
                 max_pct, reserve_pct, price,
                 override_pct=override_pct,
+                fractional=frac_on, min_notional=frac_min_notional,
             )
             if override_pct is not None and shares * price > (override_pct * ctx.portfolio_value) + 1e-6:
                 log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
                 _block(ticker, "bear_defensive_slot_cap")
                 continue
-            if shares < 1:
+            # Fractional mode returns a float < 1 for sub-share targets; the
+            # sizer already applied the dust (min_notional) floor, so here a
+            # clean skip means shares <= 0. Whole-share mode keeps `< 1`.
+            if (shares <= 0) if frac_on else (shares < 1):
                 log.info("SizeAndEmitTask: %s insufficient cash — skip "
                          "(remaining_cash=$%.0f price=$%.2f)",
                          ticker, remaining_cash, price)

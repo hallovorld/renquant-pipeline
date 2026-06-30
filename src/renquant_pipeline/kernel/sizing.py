@@ -178,6 +178,27 @@ def conviction_multiplier(panel_score: float | None, sizing_cfg: dict | None) ->
     return min_mult + frac * (1.0 - min_mult)
 
 
+def fractional_sizing_cfg(config: dict | None) -> tuple[bool, float]:
+    """Read ``execution.fractional_shares`` → ``(enabled, min_notional)``.
+
+    Single source of truth for the three buy-emitting tasks (selection / joint /
+    rotation) so the flag is threaded identically. Defaults to whole-share mode
+    (``False``, ``1.0``) when the block is absent or malformed — no behaviour
+    change unless strategy-104 opts in via ``execution.fractional_shares.enabled``.
+    """
+    import math
+    exec_cfg = (config or {}).get("execution", {}) or {}
+    frac_cfg = exec_cfg.get("fractional_shares", {}) or {}
+    enabled = bool(frac_cfg.get("enabled", False))
+    try:
+        min_notional = float(frac_cfg.get("min_notional", 1.0))
+    except (TypeError, ValueError):
+        min_notional = 1.0
+    if not math.isfinite(min_notional) or min_notional < 0:
+        min_notional = 1.0
+    return enabled, min_notional
+
+
 def compute_position_size(
     portfolio_value: float,
     available_cash: float,
@@ -185,25 +206,45 @@ def compute_position_size(
     cash_reserve_pct: float,   # from regime params (already confidence-scaled by caller)
     price: float,
     override_pct: float | None = None,
-) -> tuple[float, int]:
+    *,
+    fractional: bool = False,
+    min_notional: float = 1.0,
+) -> tuple[float, float]:
     """Return (target_pct, shares) for a buy order.
 
     override_pct: bypass reserve calc (BEAR defensive branch).
 
-    Returns (0.0, 0) if there is insufficient cash for at least 1 share within
-    the effective cap. Fallback sizing is still bounded by the same cap, so a
-    high-priced stock cannot turn a small Kelly target into an oversized order.
+    Whole-share mode (``fractional=False``, the default) is UNCHANGED: ``shares``
+    is an ``int`` and the function returns ``(0.0, 0)`` when there is not enough
+    cash for at least 1 whole share within the effective cap. This is the
+    measured cash-drag bottleneck for high-priced names (AVGO/BLK/GS): a small
+    Kelly target (e.g. ~$400 / ~4%) buys < 1 whole share, so the order is skipped
+    entirely and the slot's cash cannot deploy.
+
+    Fractional mode (``fractional=True``, follow-up to strategy-104 #35) returns
+    ``shares`` as a FLOAT rounded to 6 dp — ``round(min(target_$, cap_$,
+    investable)/price, 6)`` — with NO < 1-share skip, so a sub-1-share target
+    deploys at its true notional. It still returns ``(0.0, 0.0)`` (skip) when the
+    resulting notional is below ``min_notional`` (dust avoidance; default ~$1).
+    Fractional sizing is bounded by the SAME cap as whole-share mode, so a small
+    Kelly target stays small — this only removes the rounding-to-zero skip, it
+    does NOT change which names are selected or the per-name target fraction.
+
+    Returns:
+        (actual_pct, shares). ``shares`` is ``int`` when ``fractional=False`` and
+        ``float`` when ``fractional=True``; both are 0 / 0.0 on a clean skip.
     """
     # Audit fix S-1 (Round 5, 2026-04-25): pre-fix, NaN price/portfolio
     # passed `<= 0` (NaN comparisons False) but then `int(NaN)` later in
     # the function raised ValueError, crashing the whole sizing path.
     # Post-fix: explicit isfinite + non-positive guard at the top.
     import math
+    zero = 0.0 if fractional else 0
     if (not math.isfinite(price) or not math.isfinite(portfolio_value)
             or price <= 0 or portfolio_value <= 0):
-        return 0.0, 0
+        return 0.0, zero
     if not math.isfinite(available_cash):
-        return 0.0, 0
+        return 0.0, zero
     # Audit fix CPS-1 (Round 2 deep audit, 2026-04-25): pre-fix, NaN
     # max_position_pct or cash_reserve_pct (e.g. caller computed
     # `max_pct * confidence` and confidence was NaN — pre-G-1 leak,
@@ -214,9 +255,9 @@ def compute_position_size(
     # → return (0, 0) clean fallback (skip this ticker; caller logs).
     if (not math.isfinite(max_position_pct)
             or not math.isfinite(cash_reserve_pct)):
-        return 0.0, 0
+        return 0.0, zero
     if override_pct is not None and not math.isfinite(override_pct):
-        return 0.0, 0
+        return 0.0, zero
 
     if override_pct is not None:
         investable = available_cash
@@ -227,14 +268,42 @@ def compute_position_size(
         max_pct      = max_position_pct
 
     if max_pct <= 0:
-        return 0.0, 0
+        return 0.0, zero
 
     target_pct = min(max_pct, investable / portfolio_value)
     if target_pct <= 0:
-        return 0.0, 0
+        return 0.0, zero
 
-    # Compute shares
     target_dollars = target_pct * portfolio_value
+
+    # ── Fractional-share path (strategy-104 #35 cash-drag follow-up) ──────────
+    # Deploy the capped target as a fractional quantity. NO whole-share floor and
+    # NO 25%/1-share oversize fallback — those only existed to repair the
+    # integer rounding that fractional shares make unnecessary. The notional is
+    # still bounded by `target_dollars` (= the same per-name cap whole-share mode
+    # used), so this cannot oversize a high-priced name. Dust below `min_notional`
+    # is skipped to avoid sub-$1 odd-lot orders that brokers may reject.
+    if fractional:
+        if not math.isfinite(min_notional) or min_notional < 0:
+            min_notional = 0.0
+        # Bound by the cap AND by cash actually on hand (investable already nets
+        # the reserve / equals available_cash on the override branch).
+        spend = min(target_dollars, investable)
+        if not math.isfinite(spend) or spend <= 0:
+            return 0.0, 0.0
+        # Truncate (floor) to 6 dp rather than round-to-nearest so the realized
+        # notional NEVER rounds UP past the cap / available cash (a round() here
+        # let pct exceed the cap at the ~1e-8 level). Alpaca accepts up to 9 dp
+        # of fractional qty; 6 dp is a safe, auditable precision.
+        shares_f = math.floor((spend / price) * 1_000_000) / 1_000_000
+        notional = shares_f * price
+        if shares_f <= 0 or notional < min_notional:
+            return 0.0, 0.0
+        actual_pct = notional / portfolio_value
+        return actual_pct, shares_f
+
+    # ── Whole-share path (default, UNCHANGED) ────────────────────────────────
+    # Compute shares
     shares = int(target_dollars / price)
 
     if shares < 1:

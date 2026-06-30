@@ -707,6 +707,7 @@ class EmitRotationsTask(Task):
             conviction_score_for_object,
             conviction_score_percentiles,
             conviction_multiplier,
+            fractional_sizing_cfg,
             sigma_multiplier,
             universe_sigma_median,
         )
@@ -770,6 +771,8 @@ class EmitRotationsTask(Task):
         kelly_on     = bool(kelly_cfg.get("enabled", False))
         kelly_pure   = bool(kelly_cfg.get("disable_extra_multipliers", False))
         per_session_cap = kelly_cfg.get("per_session_buy_cap")
+        # Fractional-share execution (strategy-104 #35 cash-drag follow-up).
+        frac_on, frac_min_notional = fractional_sizing_cfg(ctx.config)
 
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
@@ -922,8 +925,9 @@ class EmitRotationsTask(Task):
             _, shares = compute_position_size(
                 ctx.portfolio_value, cash_for_sizing,
                 max_pct, reserve_pct, price,
+                fractional=frac_on, min_notional=frac_min_notional,
             )
-            if shares < 1:
+            if (shares <= 0) if frac_on else (shares < 1):
                 log.info("EmitRotationsTask: %s insufficient cash — skip ENTIRE pair "
                          "(no atomic-rotation orphan exit)  cash_for_sizing=%.0f",
                          pair.buy_ticker, cash_for_sizing)

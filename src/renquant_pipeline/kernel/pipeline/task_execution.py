@@ -283,9 +283,17 @@ class ExecuteBuysTask(Task):
                     order,
                 )
                 continue
+            # Fractional-share execution (strategy-104 #35): preserve a FLOAT
+            # share count for fractionable live orders instead of truncating to
+            # int here. Whole-share orders carry an integral float (e.g. 17.0);
+            # in-process sim/LEAN backends still floor to whole shares for
+            # backtest fidelity. The live broker (renquant-execution) honours
+            # the fractional qty directly.
+            raw_shares = float(order["shares"])
+            order_shares = raw_shares if raw_shares != int(raw_shares) else int(raw_shares)
             intent = OrderIntent(
                 ticker=order["ticker"], side=OrderSide.BUY,
-                shares=int(order["shares"]),
+                shares=order_shares,
                 target_pct=float(order["target_pct"]),
                 today=today,
                 reason=str(order.get("detail") or "buy"),
