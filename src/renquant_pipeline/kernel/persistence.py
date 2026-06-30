@@ -497,6 +497,67 @@ CREATE TABLE IF NOT EXISTS trade_evaluations (
 CREATE INDEX IF NOT EXISTS idx_trade_eval_ticker  ON trade_evaluations(ticker);
 CREATE INDEX IF NOT EXISTS idx_trade_eval_horizon ON trade_evaluations(horizon_days);
 CREATE INDEX IF NOT EXISTS idx_trade_eval_run     ON trade_evaluations(run_id);
+
+-- Conviction-gate decision outcomes VIEW (gate-validation prep, 2026-06-29).
+--
+-- Per Codex review on PR #152: the three source tables ALREADY hold every
+-- fact this needs — candidate_scores carries the per-name decision factors
+-- (raw_score / mu / expected_return / rank_score / selected / blocked_by) on
+-- EVERY run via record_candidate_scores(), pipeline_runs supplies
+-- (run_date, run_type, regime), and ticker_forward_returns backfills
+-- (as_of_date, ticker) -> fwd_1d/5d/20d/60d nightly. The only gap was an
+-- ad-hoc JOIN per analysis query, which is exactly what a VIEW fixes — with
+-- no second mutable copy that can diverge, no producer wiring (the view reads
+-- live candidate_scores rows that already exist), and no unvalidated label
+-- baked into persistence.
+--
+-- The view exposes, per (run_id, ticker, role):
+--   * the decision factors (raw_score, mu, expected_return, rank_score,
+--     selected, blocked_by) and context (run_date, run_type, regime);
+--   * the realized own forward return (fwd_Nd), NULL until ticker_forward_returns
+--     backfills that horizon — so each horizon (1d/5d/20d/60d) becomes
+--     available independently, no waiting on fwd_60d; and
+--   * the BENCHMARK-RELATIVE realized return (fwd_Nd MINUS SPY's fwd_Nd for the
+--     same as_of_date), since the conviction gate is documented as calibrated
+--     E[R - SPY]. The outcome is provided benchmark-relative; cost is applied
+--     in the query layer, not stored. NO binary winner label is persisted —
+--     all experiment/label logic lives in the validation query (per Codex).
+--
+-- run_type is carried through so analysis can EXCLUDE sim (sim is
+-- look-ahead-contaminated; IC grows with horizon) and filter to live.
+CREATE VIEW IF NOT EXISTS decision_outcomes AS
+SELECT
+    cs.run_id                       AS run_id,
+    pr.run_date                     AS run_date,
+    pr.run_type                     AS run_type,
+    pr.regime                       AS regime,
+    cs.ticker                       AS ticker,
+    cs.role                         AS role,
+    cs.raw_score                    AS raw_score,
+    cs.mu                           AS mu,
+    cs.expected_return              AS expected_return,
+    cs.rank_score                   AS rank_score,
+    cs.selected                     AS selected,
+    cs.blocked_by                   AS blocked_by,
+    tfr.fwd_1d                      AS fwd_1d,
+    tfr.fwd_5d                      AS fwd_5d,
+    tfr.fwd_20d                     AS fwd_20d,
+    tfr.fwd_60d                     AS fwd_60d,
+    -- Benchmark-relative realized return = own fwd_Nd - SPY fwd_Nd (same
+    -- as_of_date). NULL when either leg is unrealized.
+    (tfr.fwd_1d  - spy.fwd_1d)      AS rel_fwd_1d,
+    (tfr.fwd_5d  - spy.fwd_5d)      AS rel_fwd_5d,
+    (tfr.fwd_20d - spy.fwd_20d)     AS rel_fwd_20d,
+    (tfr.fwd_60d - spy.fwd_60d)     AS rel_fwd_60d
+FROM candidate_scores cs
+JOIN pipeline_runs pr
+  ON pr.run_id = cs.run_id
+LEFT JOIN ticker_forward_returns tfr
+  ON tfr.ticker     = cs.ticker
+ AND tfr.as_of_date = pr.run_date
+LEFT JOIN ticker_forward_returns spy
+  ON spy.ticker     = 'SPY'
+ AND spy.as_of_date = pr.run_date;
 """
 
 
