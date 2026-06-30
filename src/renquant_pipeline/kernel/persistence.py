@@ -498,41 +498,66 @@ CREATE INDEX IF NOT EXISTS idx_trade_eval_ticker  ON trade_evaluations(ticker);
 CREATE INDEX IF NOT EXISTS idx_trade_eval_horizon ON trade_evaluations(horizon_days);
 CREATE INDEX IF NOT EXISTS idx_trade_eval_run     ON trade_evaluations(run_id);
 
--- Conviction-gate decision ledger (gate-validation prep, 2026-06-29).
--- APPEND-ONLY, one row per (run, ticker) decision that PRE-JOINS the
--- decision (raw_score / mu / expected_return / selected / blocked_by) to
--- its realized forward return. candidate_scores already captures the
--- decision factors and ticker_forward_returns the realized fwd_* — but
--- the join is ad-hoc per query. This first-class ledger starts
--- accumulating clean LIVE data NOW so that ~Aug-2026 (when fwd_60d
--- realizes for the live runs that began 2026-04-22) we can validate
--- whether the conviction gate's mu threshold separates realized winners
--- from losers. fwd_* + is_winner_60d are NULL at write time and
--- backfilled out-of-band by scripts/backfill_decision_ledger_returns.py.
--- UNIQUE(run_id, ticker) makes the writer idempotent (INSERT OR IGNORE)
--- so a re-run of the same bar never double-counts.
-CREATE TABLE IF NOT EXISTS decision_ledger (
-    ledger_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    run_id           TEXT NOT NULL,
-    run_date         DATE,
-    ticker           TEXT NOT NULL,
-    role             TEXT,
-    raw_score        REAL,
-    mu               REAL,
-    expected_return  REAL,
-    rank_score       REAL,
-    selected         INTEGER,
-    blocked_by       TEXT,
-    regime           TEXT,
-    fwd_1d           REAL,        -- backfilled from ticker_forward_returns
-    fwd_5d           REAL,
-    fwd_20d          REAL,
-    fwd_60d          REAL,
-    is_winner_60d    INTEGER,     -- 1 if fwd_60d > 0 else 0; NULL until backfilled
-    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE (run_id, ticker)
-);
-CREATE INDEX IF NOT EXISTS idx_decision_ledger_date ON decision_ledger(run_date, ticker);
+-- Conviction-gate decision outcomes VIEW (gate-validation prep, 2026-06-29).
+--
+-- Per Codex review on PR #152: the three source tables ALREADY hold every
+-- fact this needs — candidate_scores carries the per-name decision factors
+-- (raw_score / mu / expected_return / rank_score / selected / blocked_by) on
+-- EVERY run via record_candidate_scores(), pipeline_runs supplies
+-- (run_date, run_type, regime), and ticker_forward_returns backfills
+-- (as_of_date, ticker) -> fwd_1d/5d/20d/60d nightly. The only gap was an
+-- ad-hoc JOIN per analysis query, which is exactly what a VIEW fixes — with
+-- no second mutable copy that can diverge, no producer wiring (the view reads
+-- live candidate_scores rows that already exist), and no unvalidated label
+-- baked into persistence.
+--
+-- The view exposes, per (run_id, ticker, role):
+--   * the decision factors (raw_score, mu, expected_return, rank_score,
+--     selected, blocked_by) and context (run_date, run_type, regime);
+--   * the realized own forward return (fwd_Nd), NULL until ticker_forward_returns
+--     backfills that horizon — so each horizon (1d/5d/20d/60d) becomes
+--     available independently, no waiting on fwd_60d; and
+--   * the BENCHMARK-RELATIVE realized return (fwd_Nd MINUS SPY's fwd_Nd for the
+--     same as_of_date), since the conviction gate is documented as calibrated
+--     E[R - SPY]. The outcome is provided benchmark-relative; cost is applied
+--     in the query layer, not stored. NO binary winner label is persisted —
+--     all experiment/label logic lives in the validation query (per Codex).
+--
+-- run_type is carried through so analysis can EXCLUDE sim (sim is
+-- look-ahead-contaminated; IC grows with horizon) and filter to live.
+CREATE VIEW IF NOT EXISTS decision_outcomes AS
+SELECT
+    cs.run_id                       AS run_id,
+    pr.run_date                     AS run_date,
+    pr.run_type                     AS run_type,
+    pr.regime                       AS regime,
+    cs.ticker                       AS ticker,
+    cs.role                         AS role,
+    cs.raw_score                    AS raw_score,
+    cs.mu                           AS mu,
+    cs.expected_return              AS expected_return,
+    cs.rank_score                   AS rank_score,
+    cs.selected                     AS selected,
+    cs.blocked_by                   AS blocked_by,
+    tfr.fwd_1d                      AS fwd_1d,
+    tfr.fwd_5d                      AS fwd_5d,
+    tfr.fwd_20d                     AS fwd_20d,
+    tfr.fwd_60d                     AS fwd_60d,
+    -- Benchmark-relative realized return = own fwd_Nd - SPY fwd_Nd (same
+    -- as_of_date). NULL when either leg is unrealized.
+    (tfr.fwd_1d  - spy.fwd_1d)      AS rel_fwd_1d,
+    (tfr.fwd_5d  - spy.fwd_5d)      AS rel_fwd_5d,
+    (tfr.fwd_20d - spy.fwd_20d)     AS rel_fwd_20d,
+    (tfr.fwd_60d - spy.fwd_60d)     AS rel_fwd_60d
+FROM candidate_scores cs
+JOIN pipeline_runs pr
+  ON pr.run_id = cs.run_id
+LEFT JOIN ticker_forward_returns tfr
+  ON tfr.ticker     = cs.ticker
+ AND tfr.as_of_date = pr.run_date
+LEFT JOIN ticker_forward_returns spy
+  ON spy.ticker     = 'SPY'
+ AND spy.as_of_date = pr.run_date;
 """
 
 
@@ -1002,7 +1027,6 @@ def get_connection(
 # survive the reset.
 _SIM_RESET_TABLES = [
     "candidate_scores",
-    "decision_ledger",
     "score_distribution",
     "score_percentiles_daily",
     "ticker_daily_state",
@@ -1282,98 +1306,6 @@ def record_candidate_scores(
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
-
-
-def record_decision_ledger(
-    conn: sqlite3.Connection | None,
-    run_id: str | None,
-    run_date: "datetime.date | str | None",
-    candidates: Iterable[Any],
-    holdings: dict[str, Any] | None,
-    selected_tickers: set[str],
-    blocked_map: dict[str, str] | None = None,
-    *,
-    regime: str | None = None,
-    include_holdings: bool = True,
-) -> int:
-    """Append one APPEND-ONLY decision_ledger row per candidate (+ holding).
-
-    Mirrors :func:`record_candidate_scores`' attribute access + None-safety:
-    each row captures the decision factors that drive the conviction gate
-    (raw_score / mu / expected_return / rank_score / selected / blocked_by /
-    regime). The realized forward-return columns (fwd_1d/5d/20d/60d) and
-    is_winner_60d are written NULL and backfilled out-of-band once the
-    forward window elapses (scripts/backfill_decision_ledger_returns.py).
-
-    Idempotent: ``INSERT OR IGNORE`` against the UNIQUE(run_id, ticker)
-    constraint, so re-running the same bar never double-counts. The FIRST
-    write for a (run_id, ticker) pair wins — re-runs are silently ignored.
-
-    `candidates`:  iterable of CandidateResult-like objects (must have
-                   .ticker; .raw_score / .mu / .expected_return / .rank_score
-                   read defensively via getattr).
-    `holdings`:    optional dict of ticker → HoldingState (role='holding').
-                   Only written when ``include_holdings`` is True.
-    `selected_tickers`: set of tickers that ended up in orders this run.
-    `blocked_map`: optional dict of ticker → reason for unselected names.
-    `regime`:      bar regime (e.g. 'BULL_CALM'), stamped on every row.
-
-    No-op (returns 0) when persistence is disabled (conn None) or run_id is
-    missing. Returns the number of rows attempted (INSERT OR IGNORE may
-    silently skip duplicates, so this is an upper bound, not the inserted
-    count).
-    """
-    if conn is None or run_id is None:
-        return 0
-    blocked_map = blocked_map or {}
-    if run_date is None:
-        run_date_str = None
-    elif isinstance(run_date, str):
-        run_date_str = run_date
-    else:
-        run_date_str = run_date.isoformat()
-
-    rows: list[tuple] = []
-    for c in candidates:
-        ticker = getattr(c, "ticker", None)
-        if ticker is None:
-            continue
-        selected = ticker in selected_tickers
-        role = str(getattr(c, "trace_role", None) or "candidate")
-        rows.append((
-            run_id, run_date_str, ticker, role,
-            _none_or_float(getattr(c, "raw_score", None)),
-            _none_or_float(getattr(c, "mu", None)),
-            _none_or_float(getattr(c, "expected_return", None)),
-            _none_or_float(getattr(c, "rank_score", None)),
-            1 if selected else 0,
-            None if selected else blocked_map.get(ticker, "candidate_not_selected"),
-            regime,
-        ))
-    if include_holdings and holdings:
-        for ticker, hs in holdings.items():
-            if ticker is None:
-                continue
-            rows.append((
-                run_id, run_date_str, ticker, "holding",
-                None,
-                _none_or_float(getattr(hs, "mu", None)),
-                _none_or_float(getattr(hs, "expected_return", None)),
-                _none_or_float(getattr(hs, "rank_score", None)),
-                1 if ticker in selected_tickers else 0,
-                None,
-                regime,
-            ))
-    if not rows:
-        return 0
-    conn.executemany(
-        """INSERT OR IGNORE INTO decision_ledger
-              (run_id, run_date, ticker, role, raw_score, mu,
-               expected_return, rank_score, selected, blocked_by, regime)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        rows,
-    )
-    return len(rows)
 
 
 def record_trades(
@@ -2473,7 +2405,6 @@ __all__ = [
     "clear_sim_tables",
     "record_pipeline_run",
     "record_candidate_scores",
-    "record_decision_ledger",
     "record_trades",
     "record_training_run",
     "record_forward_returns",
