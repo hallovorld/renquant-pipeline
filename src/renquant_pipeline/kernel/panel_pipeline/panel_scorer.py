@@ -21,7 +21,6 @@ Two gate helpers are provided for selection use:
 from __future__ import annotations
 
 import json
-import hashlib
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -29,140 +28,29 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 
-
-def artifact_sha256(path: str | Path) -> str:
-    """Full-file artifact hash for tamper/audit checks.
-
-    Do not use this as the scorer/calibrator pairing identity: acceptance
-    tools append mutable metadata such as ``wf_gate_metadata`` after training,
-    which changes the file bytes without changing the model.
-    """
-    return "sha256:" + hashlib.sha256(Path(path).read_bytes()).hexdigest()
-
-
-_MUTABLE_ARTIFACT_KEYS = {
-    "metadata",
-    "wf_gate_metadata",
-    "artifact_path",
-    "artifact_sha256",
-    "artifact_fingerprint",
-    "model_content_fingerprint",
-    "config_fingerprint",
-    "config_fingerprint_fields",
-    "trained_date",
-    "training_notes",
-    "label",
-    "label_col",
-    "lookahead_days",
-    "panel_shape",
-    "n_train_rows",
-    "training_train_ic",
-    "val_mean_ic",
-    "val_median_ic",
-    "test_mean_ic",
-    "test_median_ic",
-    "oos_mean_ic",
-    # P-PANEL-CONTRACT acceptance fields (2026-05-30 Bug D fix).
-    # These are pure post-training metadata: CV bookkeeping, OOS evidence,
-    # promotion gates, sentiment-contract markers, audit IDs. Stamping any
-    # of these changes the JSON bytes but does NOT change the model's
-    # predictions — must be excluded from model_content_fingerprint so the
-    # calibrator binding survives metadata edits (previously caused 3
-    # calibrator rebinds in one day).
-    "cv_method",
-    "cv_embargo_days",
-    "cv_folds",
-    "cv_n_splits",
-    "oos_std_ic",
-    "oos_per_fold_ic",
-    "eval_ic",
-    "train_run_id",
-    "sentiment_runtime_gate_contract",
-    "sentiment_runtime_gate_trained",
-    "promotion_status",
-    "promotion_gating_reason",
-    "version",  # artifact-format version, not a model parameter
-    "side_label",
-}
-
-_PREDICTIVE_CONTENT_HINTS = {
-    "booster_raw_json",
-    "feature_cols",
-    "feature_columns",
-    "feature_means",
-    "feature_stds",
-    "feature_norm_kind",
-    "feature_norm_kinds",
-    "feature_raw_clip_low",
-    "feature_raw_clip_high",
-    "coef",
-    "intercept",
-    "clip_sigma",
-    "state_dict",
-    "config_dict",
-    "model_bytes",
-    "model_bytes_b64",
-}
-
-
-def model_content_sha256(payload: dict[str, Any]) -> str:
-    """Stable scorer identity over immutable model content.
-
-    Panel artifacts are JSON files that later acquire operational metadata
-    (WF gate results, file hashes, paths). Calibrators are fitted to the model
-    score distribution, not to that mutable metadata. Hash only the content
-    that changes the scorer's predictions.
-    """
-    content = {
-        k: v for k, v in payload.items()
-        if k not in _MUTABLE_ARTIFACT_KEYS
-    }
-    if not any(k in content for k in _PREDICTIVE_CONTENT_HINTS):
-        raise ValueError("payload has no recognizable scorer prediction content")
-    blob = json.dumps(content, sort_keys=True, separators=(",", ":"), default=str)
-    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()
-
-
-def model_content_sha256_from_path(path: str | Path) -> str:
-    """Return model-content hash for JSON artifacts, full hash otherwise."""
-    p = Path(path)
-    try:
-        payload = json.loads(p.read_text())
-    except Exception:
-        return artifact_sha256(p)
-    if not isinstance(payload, dict):
-        return artifact_sha256(p)
-    try:
-        return model_content_sha256(payload)
-    except ValueError:
-        return artifact_sha256(p)
-
-
-def stamp_artifact_metadata(
-    metadata: dict | None,
-    path: str | Path,
-    payload: dict[str, Any] | None = None,
-) -> dict:
-    """Return metadata with path + fingerprint fields for runtime contracts."""
-    meta = dict(metadata or {})
-    nested = meta.get("metadata")
-    if isinstance(nested, dict):
-        for key, value in nested.items():
-            meta.setdefault(key, value)
-    sha = artifact_sha256(path)
-    try:
-        content_sha = (
-            model_content_sha256(payload)
-            if isinstance(payload, dict)
-            else model_content_sha256_from_path(path)
-        )
-    except ValueError:
-        content_sha = sha
-    meta.setdefault("artifact_path", str(Path(path)))
-    meta.setdefault("artifact_sha256", sha)
-    meta.setdefault("artifact_fingerprint", sha)
-    meta.setdefault("model_content_fingerprint", content_sha)
-    return meta
+# Model-content fingerprint (`model_content_sha256` + friends) is the
+# calibrator/scorer binding identity: it MUST be computed identically here
+# (runtime scorer-load side) and in renquant-model's calibrator fit scripts,
+# or a freshly-fit calibrator can never match the active scorer, by
+# construction. 2026-07-01: this used to be hand-copied per repo (with
+# DIFFERENT included/excluded field sets — that's the recurring
+# 05-27/06-22/07-01 production incident) — now it lives in ONE place, and
+# both repos import the same function. Do not re-fork a local copy; add new
+# excluded/included fields in `renquant_common.model_fingerprint` so both
+# sides pick them up automatically.
+#
+# Re-exported under their original (including underscore-prefixed) names
+# here for back-compat: other modules in this repo import
+# `model_content_sha256` / `stamp_artifact_metadata` / `artifact_sha256`
+# from this module rather than from renquant_common directly.
+from renquant_common.model_fingerprint import (  # noqa: F401
+    MUTABLE_ARTIFACT_KEYS as _MUTABLE_ARTIFACT_KEYS,
+    PREDICTIVE_CONTENT_HINTS as _PREDICTIVE_CONTENT_HINTS,
+    artifact_sha256,
+    model_content_sha256,
+    model_content_sha256_from_path,
+    stamp_artifact_metadata,
+)
 
 
 class PanelScorer:
