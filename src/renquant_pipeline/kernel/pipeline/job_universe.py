@@ -7,7 +7,8 @@ land in exactly one place.
 
 Chain:
     LoadArtifactsTask        walk watchlist, call kernel.models.load_artifact
-    FilterStalenessTask      drop artifacts older than model_staleness_days
+    FilterStalenessTask      drop artifacts stale by binding DATA CUTOFF (not
+                               trained_date); fail-closed on missing/future cutoff
     FilterUniverseFloorTask  dispatch by ranking.universe_floor.type:
                                - "none"   no filter (default)
                                - "sharpe" metadata.live_holdout_sharpe or .sharpe
@@ -76,45 +77,123 @@ class LoadArtifactsTask(UniverseTask):
         return True
 
 
+# ── Binding data-cutoff field precedence ──────────────────────────────────────
+#
+# Freshness keys on the binding DATA CUTOFF, never ``trained_date`` (run time): a
+# retrain run *today* over a stale data cutoff would stamp a fresh
+# ``trained_date`` while being just as blind, so a fresh ``trained_date`` over
+# stale data must not pass the gate (model-freshness-governance design §2, #210).
+# This tuple mirrors the orchestrator ``model_freshness_monitor.DATA_CUTOFF_FIELDS``
+# precedence (#213) so the admission gate and the monitor agree on which axis is
+# binding. The per-ticker tournament ``*-policy-metadata.json`` carries
+# ``live_train_end``; the panel-style cutoffs are listed first so the same
+# precedence holds if one is ever stamped on a per-ticker artifact.
+# ``trained_date`` is DELIBERATELY absent — it is not a data-freshness axis and
+# must never serve as a fallback here.
+DATA_CUTOFF_FIELDS: tuple[str, ...] = (
+    "effective_selection_cutoff_date",
+    "effective_train_cutoff_date",
+    "data_cutoff_date",
+    "live_train_end",
+    "cutoff_date",
+)
+
+
+def _binding_cutoff_date(
+    meta: dict, fields: "tuple[str, ...]",
+) -> "tuple[date | None, str | None]":
+    """First parseable binding data cutoff in ``fields`` order.
+
+    Returns ``(cutoff_date, field_name)`` for the first present, parseable cutoff
+    field; ``(None, field_name)`` when a field is present but unparseable (so the
+    caller can log which axis was malformed); ``(None, None)`` when no cutoff
+    field is present at all. ``trained_date`` is never consulted — run time is not
+    a data-freshness axis (design §2, #210).
+    """
+    for name in fields:
+        value = meta.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date(), name
+        except ValueError:
+            return None, name
+    return None, None
+
+
 class FilterStalenessTask(UniverseTask):
+    """Drop tickers whose binding DATA CUTOFF exceeds ``model_staleness_days``.
+
+    Keys age on the binding DATA CUTOFF (``live_train_end`` / the panel-style
+    cutoffs in ``DATA_CUTOFF_FIELDS``), never ``trained_date``: a training run
+    *today* over a stale data cutoff is NOT fresh, so its fresh ``trained_date``
+    must not wrongly admit a ticker (freshness-governance design §2, #210). Field
+    precedence mirrors the orchestrator freshness monitor (#213) and is
+    overridable via ``config.model_staleness_cutoff_fields``.
+
+    **Fail-closed for offensive (non-held) buys** (Codex review, #213): a
+    missing / unparseable binding cutoff DROPS the ticker as
+    ``data_cutoff_missing`` — it is NOT admitted via a ``trained_date`` fallback,
+    because freshness cannot be proven. A cutoff LATER than today is look-ahead
+    and DROPS as ``data_cutoff_future``. An in-range-but-old cutoff keeps the
+    existing ``stale_<age>d_limit_<days>`` reason.
+
+    **Held tickers stay exempt** (unchanged sell-path behaviour): a currently-held
+    name is admitted even with a missing / stale / future cutoff so its
+    ``model_sell_streak`` exit path stays armed — do not strand a held position's
+    exit signal (mirrors ``FilterUniverseFloorTask``). Each held admit is logged.
+    """
+
     def run(self, uctx: UniverseContext) -> "bool | None":
         staleness_days = int(uctx.config.get("model_staleness_days", 0))
         if staleness_days <= 0:
             return True
+        cutoff_fields = tuple(
+            uctx.config.get("model_staleness_cutoff_fields") or DATA_CUTOFF_FIELDS
+        )
         today = date.today()
         stale: list[tuple[str, str]] = []
         held = _held_tickers_for_context(uctx)
         for ticker, art in uctx.loaded_models.items():
             meta = art.get("_metadata", {})
-            trained = meta.get("trained_date")
-            if not trained:
+            cutoff, field_name = _binding_cutoff_date(meta, cutoff_fields)
+            if cutoff is None:
+                # Fail closed: no provable data freshness. trained_date is NOT a
+                # fallback (design §2, #210) — a fresh run over stale data lies.
                 if ticker in held:
+                    detail = (
+                        f"unparseable {field_name}" if field_name
+                        else "no data-cutoff field"
+                    )
                     log.warning(
-                        "%s HELD — admitting despite missing trained_date "
-                        "(so sell path stays armed)",
-                        ticker,
+                        "%s HELD — admitting despite missing binding data cutoff "
+                        "(%s; so sell path stays armed)",
+                        ticker, detail,
                     )
                     continue
-                stale.append((ticker, "trained_date_missing"))
+                stale.append((ticker, "data_cutoff_missing"))
                 continue
-            try:
-                age = (today - datetime.strptime(trained, "%Y-%m-%d").date()).days
-            except ValueError:
+            age = (today - cutoff).days
+            if age < 0:
+                # Cutoff later than today → look-ahead; cannot be trusted.
                 if ticker in held:
                     log.warning(
-                        "%s HELD — admitting despite invalid trained_date=%r "
-                        "(so sell path stays armed)",
-                        ticker, trained,
+                        "%s HELD — admitting despite future data cutoff "
+                        "%s=%s (%dd ahead, so sell path stays armed)",
+                        ticker, field_name, cutoff.isoformat(), -age,
                     )
                     continue
-                stale.append((ticker, "trained_date_invalid"))
+                stale.append((ticker, "data_cutoff_future"))
                 continue
             if age > staleness_days:
                 if ticker in held:
                     log.warning(
-                        "%s HELD — admitting despite stale trained_date=%s "
-                        "(age=%dd > limit=%dd, so sell path stays armed)",
-                        ticker, trained, age, staleness_days,
+                        "%s HELD — admitting despite stale data cutoff "
+                        "%s=%s (age=%dd > limit=%dd, so sell path stays armed)",
+                        ticker, field_name, cutoff.isoformat(), age, staleness_days,
                     )
                     continue
                 stale.append((ticker, f"stale_{age}d_limit_{staleness_days}"))
