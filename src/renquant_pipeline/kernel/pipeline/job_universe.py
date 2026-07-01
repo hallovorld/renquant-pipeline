@@ -7,7 +7,8 @@ land in exactly one place.
 
 Chain:
     LoadArtifactsTask        walk watchlist, call kernel.models.load_artifact
-    FilterStalenessTask      drop artifacts older than model_staleness_days
+    FilterStalenessTask      drop artifacts stale by binding DATA CUTOFF (not
+                               trained_date); fail-closed on missing/future cutoff
     FilterUniverseFloorTask  dispatch by ranking.universe_floor.type:
                                - "none"   no filter (default)
                                - "sharpe" metadata.live_holdout_sharpe or .sharpe
@@ -40,8 +41,20 @@ class UniverseContext:
     # live_state-derived position_hwm keys so stale state cannot grant held
     # exemptions to flat tickers.
     held_tickers:   set[str] | None          = None
+    # Effective as-of / session date for freshness math. Threaded from the
+    # pipeline's session date so replay / as-of runs are deterministic and never
+    # wall-clock-dependent (Codex review, #213). A datetime is normalized to its
+    # date (session-boundary safe). None → date.today() for the live path.
+    as_of_date:     "date | datetime | None" = None
     loaded_models:  dict[str, dict]          = field(default_factory=dict)
     rejections:     list[tuple[str, str]]    = field(default_factory=list)
+    # Held names whose model provenance is UNTRUSTED (missing / unparseable /
+    # future data cutoff). These are NOT trusted scorers: a downstream consumer
+    # must apply a model-INDEPENDENT (position / risk) exit policy for them —
+    # never a model-driven signal from a look-ahead artifact (Codex review point
+    # 3, #213). They are removed from loaded_models but are NOT hard-rejected, so
+    # the position stays exitable without trusting a bad model.
+    fallback_exit:  list[tuple[str, str]]    = field(default_factory=list)
 
 
 class UniverseTask(ABC):
@@ -76,51 +89,256 @@ class LoadArtifactsTask(UniverseTask):
         return True
 
 
+# ── Binding data-cutoff axes ──────────────────────────────────────────────────
+#
+# Freshness keys on the binding DATA CUTOFF, never ``trained_date`` (run time): a
+# retrain run *today* over a stale data cutoff would stamp a fresh
+# ``trained_date`` while being just as blind (model-freshness-governance design
+# §2, #210).
+#
+# CRITICAL (Codex review, #213/#423): data freshness is NOT a single axis. The
+# as-of used to SELECT a model (``effective_selection_cutoff_date``) and the
+# cutoff of the data the model TRAINED on (``effective_train_cutoff_date`` / the
+# panel / per-ticker aliases) are SEPARATE required facts. A fresh selection
+# cutoff must NOT hide a stale training cutoff (or vice-versa). So the gate does
+# NOT collapse them into a single precedence list and pick "the first present
+# field" as the one binding axis — that is exactly the #213/#423 bug. It
+# evaluates EVERY present axis and, for an offensive buy, fails closed on the
+# first axis that is missing / unparseable / future / stale, naming the exact
+# field in the rejection.
+#
+# Within an axis the listed fields are ALIASES (the same fact under different
+# artifact schemas), read in precedence order; only the first present alias is
+# consulted. The alias precedence mirrors the orchestrator
+# ``model_freshness_monitor.DATA_CUTOFF_FIELDS`` (#213) so the gate and the
+# monitor read the same field for the same fact.
+#
+# ``trained_date`` is DELIBERATELY absent from every axis — run time is not a
+# data-freshness axis and must never rescue a stale / missing cutoff.
+
+# Training-data axis aliases, most-authoritative first (mirrors the monitor).
+TRAINING_DATA_FIELDS: tuple[str, ...] = (
+    "effective_train_cutoff_date",
+    "data_cutoff_date",
+    "live_train_end",
+    "cutoff_date",
+)
+# Model-selection axis (the PatchTST shadow sidecar stamps this).
+SELECTION_FIELDS: tuple[str, ...] = (
+    "effective_selection_cutoff_date",
+)
+
+# Flat, monitor-aligned precedence — kept ONLY so the gate ⇄ monitor field
+# agreement stays testable. The gate does NOT consume this as a single-winner
+# list (that is the #213/#423 bug); it is the union of the axis fields and is
+# asserted equal to the monitor's DATA_CUTOFF_FIELDS in the test suite.
+DATA_CUTOFF_FIELDS: tuple[str, ...] = (
+    "effective_selection_cutoff_date",
+    "effective_train_cutoff_date",
+    "data_cutoff_date",
+    "live_train_end",
+    "cutoff_date",
+)
+
+
+@dataclass(frozen=True)
+class CutoffAxis:
+    """One independent data-freshness fact and its schema-alias field names."""
+    name:     str
+    fields:   tuple[str, ...]
+    required: bool
+
+
+# Required axes by artifact kind/schema. ``training_data`` is mandatory (every
+# real artifact carries a training cutoff); ``selection`` is evaluated whenever
+# present. Both are checked — neither can mask the other.
+BASE_CUTOFF_AXES: tuple[CutoffAxis, ...] = (
+    CutoffAxis("training_data", TRAINING_DATA_FIELDS, required=True),
+    CutoffAxis("selection",     SELECTION_FIELDS,     required=False),
+)
+
+
+def _resolve_axes(config: dict) -> "tuple[CutoffAxis, ...]":
+    """Built-in axes, with operator-supplied fields APPENDED as extra
+    training-data aliases (lowest precedence).
+
+    ``config.model_staleness_cutoff_fields`` can only ADD alias names for the
+    training cutoff — it can NEVER erase or reorder the mandatory built-in axes
+    (Codex review: "do not let an operator-provided precedence list silently
+    erase mandatory provenance", #213). A built-in field, when present, always
+    binds ahead of an operator alias.
+    """
+    extra = tuple(config.get("model_staleness_cutoff_fields") or ())
+    if not extra:
+        return BASE_CUTOFF_AXES
+    return tuple(
+        CutoffAxis(ax.name, ax.fields + extra, ax.required)
+        if ax.name == "training_data" else ax
+        for ax in BASE_CUTOFF_AXES
+    )
+
+
+def _session_today(uctx: "UniverseContext") -> date:
+    """Effective session/as-of date for freshness math.
+
+    Threaded from the pipeline's session date so replay / as-of runs are
+    deterministic and never wall-clock-dependent (Codex review point 2, #213). A
+    ``datetime`` is normalized to its ``.date()`` (session-boundary safe); ``None``
+    falls back to ``date.today()`` for the live path.
+    """
+    as_of = uctx.as_of_date
+    if as_of is None:
+        return date.today()
+    if isinstance(as_of, datetime):
+        return as_of.date()
+    return as_of
+
+
+def _axis_cutoff(
+    meta: dict, aliases: "tuple[str, ...]",
+) -> "tuple[date | None, str | None, bool]":
+    """Read one axis. Returns ``(cutoff, field_name, present)``.
+
+    * ``(date, field, True)``  — first present alias parsed OK.
+    * ``(None, field, True)``  — an alias is present but UNPARSEABLE.
+    * ``(None, None, False)``  — the axis is entirely absent.
+    """
+    for name in aliases:
+        value = meta.get(name)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            continue
+        try:
+            return datetime.strptime(text[:10], "%Y-%m-%d").date(), name, True
+        except ValueError:
+            return None, name, True
+    return None, None, False
+
+
+def _classify_cutoffs(
+    meta: dict, axes: "tuple[CutoffAxis, ...]", today: date, staleness_days: int,
+) -> "tuple[str, str | None, int | None]":
+    """Evaluate ALL axes → ``(verdict, field_name, age)``.
+
+    ``verdict`` ∈ {``fresh``, ``stale``, ``future``, ``unparseable``,
+    ``missing``}. UNTRUSTED verdicts (``future`` / ``unparseable`` / ``missing``)
+    take priority over ``stale`` so a look-ahead / unprovable axis is never masked
+    by reporting a *different* axis as merely stale. ``missing`` fires only for a
+    REQUIRED axis that is entirely absent. A fresh axis never rescues a non-fresh
+    one — every present axis must pass.
+    """
+    stale_hit: "tuple[str, int] | None" = None
+    for axis in axes:
+        cutoff, field_name, present = _axis_cutoff(meta, axis.fields)
+        if not present:
+            if axis.required:
+                return "missing", None, None
+            continue
+        if cutoff is None:
+            return "unparseable", field_name, None
+        age = (today - cutoff).days
+        if age < 0:
+            return "future", field_name, age
+        if age > staleness_days and stale_hit is None:
+            stale_hit = (field_name, age)
+    if stale_hit is not None:
+        return "stale", stale_hit[0], stale_hit[1]
+    return "fresh", None, None
+
+
+def _staleness_reason(
+    verdict: str, field_name: "str | None", age: "int | None", staleness_days: int,
+) -> str:
+    """Rejection / fallback reason naming the exact offending field (Codex #213)."""
+    if verdict == "missing":
+        return "data_cutoff_missing"
+    if verdict == "unparseable":
+        return f"data_cutoff_unparseable:{field_name}"
+    if verdict == "future":
+        return f"data_cutoff_future:{field_name}"
+    return f"stale_{age}d_limit_{staleness_days}:{field_name}"
+
+
+_UNTRUSTED_VERDICTS = frozenset({"missing", "unparseable", "future"})
+
+
 class FilterStalenessTask(UniverseTask):
+    """Drop tickers whose binding DATA CUTOFF exceeds ``model_staleness_days``.
+
+    Ages on the binding DATA CUTOFF, never ``trained_date``: a training run
+    *today* over a stale data cutoff is NOT fresh, so its fresh ``trained_date``
+    must not wrongly admit a ticker (freshness-governance design §2, #210).
+
+    **Every required axis is evaluated** (Codex review, #213/#423). Selection
+    freshness (``effective_selection_cutoff_date``) and training-data freshness
+    (``TRAINING_DATA_FIELDS``) are SEPARATE facts; the gate checks BOTH and a
+    fresh axis never masks a stale one. Within an axis, aliases are read in the
+    monitor's field precedence. ``config.model_staleness_cutoff_fields`` may only
+    APPEND training-data aliases — it cannot erase the mandatory axes.
+
+    **Fail-closed for offensive (non-held) buys:** a missing / unparseable / future
+    / stale value on ANY required axis DROPS the ticker, with the exact field in
+    the rejection (``data_cutoff_missing`` / ``data_cutoff_unparseable:<field>`` /
+    ``data_cutoff_future:<field>`` / ``stale_<age>d_limit_<days>:<field>``).
+    ``trained_date`` is never a fallback — freshness cannot be proven from run time.
+
+    **Held tickers — exemption preserved, refined for untrusted provenance**
+    (Codex review point 3):
+
+      * An aging-but-VALID cutoff (known past date, merely ``stale``) still admits
+        the model so the ``model_sell_streak`` exit path stays armed — do not
+        strand a held position's exit signal (mirrors ``FilterUniverseFloorTask``).
+      * An UNTRUSTED cutoff (missing / unparseable / FUTURE — cannot prove the
+        artifact is not look-ahead) does NOT admit the scorer wholesale. The name
+        is removed from ``loaded_models`` and recorded in ``uctx.fallback_exit``
+        so a downstream consumer applies a model-INDEPENDENT (position / risk)
+        exit policy. The position stays exitable WITHOUT trusting a bad model, and
+        is never hard-rejected.
+    """
+
     def run(self, uctx: UniverseContext) -> "bool | None":
         staleness_days = int(uctx.config.get("model_staleness_days", 0))
         if staleness_days <= 0:
             return True
-        today = date.today()
-        stale: list[tuple[str, str]] = []
+        axes = _resolve_axes(uctx.config)
+        today = _session_today(uctx)
         held = _held_tickers_for_context(uctx)
+        drop:    list[tuple[str, str]] = []   # offensive → rejections
+        untrust: list[tuple[str, str]] = []   # held + untrusted → fallback_exit
         for ticker, art in uctx.loaded_models.items():
             meta = art.get("_metadata", {})
-            trained = meta.get("trained_date")
-            if not trained:
-                if ticker in held:
-                    log.warning(
-                        "%s HELD — admitting despite missing trained_date "
-                        "(so sell path stays armed)",
-                        ticker,
-                    )
-                    continue
-                stale.append((ticker, "trained_date_missing"))
+            verdict, field_name, age = _classify_cutoffs(
+                meta, axes, today, staleness_days,
+            )
+            if verdict == "fresh":
                 continue
-            try:
-                age = (today - datetime.strptime(trained, "%Y-%m-%d").date()).days
-            except ValueError:
-                if ticker in held:
+            reason = _staleness_reason(verdict, field_name, age, staleness_days)
+            if ticker in held:
+                if verdict not in _UNTRUSTED_VERDICTS:   # aging-but-valid → keep
                     log.warning(
-                        "%s HELD — admitting despite invalid trained_date=%r "
-                        "(so sell path stays armed)",
-                        ticker, trained,
+                        "%s HELD — admitting despite stale data cutoff (%s; so "
+                        "sell path stays armed)", ticker, reason,
                     )
                     continue
-                stale.append((ticker, "trained_date_invalid"))
+                # Untrusted provenance (missing / unparseable / future): do NOT
+                # admit a look-ahead / unprovable scorer. Route to a
+                # model-INDEPENDENT fallback exit (Codex review point 3, #213).
+                log.warning(
+                    "%s HELD but model provenance UNTRUSTED (%s) — NOT admitting "
+                    "the scorer; routing to model-independent fallback exit",
+                    ticker, reason,
+                )
+                untrust.append((ticker, reason))
                 continue
-            if age > staleness_days:
-                if ticker in held:
-                    log.warning(
-                        "%s HELD — admitting despite stale trained_date=%s "
-                        "(age=%dd > limit=%dd, so sell path stays armed)",
-                        ticker, trained, age, staleness_days,
-                    )
-                    continue
-                stale.append((ticker, f"stale_{age}d_limit_{staleness_days}"))
-        for ticker, reason in stale:
+            drop.append((ticker, reason))
+        for ticker, reason in drop:
             uctx.loaded_models.pop(ticker, None)
             uctx.rejections.append((ticker, reason))
+        for ticker, reason in untrust:
+            uctx.loaded_models.pop(ticker, None)
+            uctx.fallback_exit.append((ticker, reason))
         return True
 
 
