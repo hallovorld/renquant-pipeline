@@ -13,7 +13,7 @@ dependencies = [
   # — 2026-07-01 fix for the recurring calibrator/scorer fingerprint-mismatch
   # fail-closed, 05-27/06-22/07-01). Structural dependency, not just a
   # version-range bump: below 0.8.1 this module does not exist.
-  "renquant-common>=0.8.1,<0.9",
+  "renquant-common>=0.8.1,<1.0",
   "renquant-base-data>=0.1.0",
   "renquant-artifacts>=0.1.0",
   "cvxpy>=1.4",
