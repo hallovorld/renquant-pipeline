@@ -203,6 +203,27 @@ class SizeAndEmitTask(Task):
         # multipliers. Default False preserves v4 behaviour.
         kelly_pure    = bool(kelly_cfg.get("disable_extra_multipliers", False))
 
+        # S6 A-3 (2026-07-02, capability program §1.2 / RS-2 lane-A memo):
+        # one-share floor for high-price INITIATIONS. The multiplicative
+        # sizing stack (Kelly × conviction × σ-mult) can compound a target
+        # notional below ONE share of a high-price name (2026-07-01 OXY
+        # forensics: BLK target $324 < 1 share ~$1.1k → size_insufficient_cash
+        # → selection drifts toward LOW-price names). When enabled, a
+        # floor-clearing candidate that zeroes out ONLY because of whole-share
+        # rounding may round UP to exactly one share iff (a) one share ≤
+        # regime max_position_pct × PV, and (b) one share ≤ investable
+        # headroom after cash reservations. SIZING only — every admission
+        # gate (greedy loop, signal-direction, bear caps) has already run by
+        # the time this fires. Default OFF; inert until strategy-104 defines
+        # `sizing.one_share_floor_enabled: true`. QP already has the analog
+        # for HELD names (portfolio_qp qp_min_share_floor_pct, 2026-05-17);
+        # this extends the concept to the initiation path.
+        _sizing_root = ctx.config.get("sizing")
+        one_share_floor_on = (
+            bool(_sizing_root.get("one_share_floor_enabled", False))
+            if isinstance(_sizing_root, dict) else False
+        )
+
         # Universe σ median over all ranked candidates (σ written by ApplyNGBoostTask).
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
@@ -322,6 +343,44 @@ class SizeAndEmitTask(Task):
                 log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
                 _block(ticker, "bear_defensive_slot_cap")
                 continue
+            one_share_floor_applied = False
+            if shares < 1 and one_share_floor_on and override_pct is None:
+                # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
+                # ONE share iff (a) one share fits under the regime's own
+                # max_position_pct × PV (the UNSCALED regime cap — the floor
+                # is a minimum-investability exception bounded by the hard
+                # regime cap, per §1.2 "1 share ≤ min(max_position_pct × PV,
+                # available headroom)"), and (b) one share fits inside the
+                # investable headroom after the cash reservation — the same
+                # reservation compute_position_size applies. The candidate
+                # has already passed every admission gate above; this changes
+                # sizing only. BEAR defensive slots (override_pct) keep the
+                # legacy drop behaviour.
+                regime_cap_dollars = (
+                    float(regime_p.get("max_position_pct", 0.15))
+                    * float(ctx.portfolio_value or 0.0)
+                )
+                investable = max(
+                    remaining_cash - reserve_pct * float(ctx.portfolio_value or 0.0),
+                    0.0,
+                )
+                if price <= regime_cap_dollars + 1e-6 and price <= investable + 1e-6:
+                    shares = 1
+                    one_share_floor_applied = True
+                    ctx.counters["one_share_floor_roundups"] = (
+                        ctx.counters.get("one_share_floor_roundups", 0) + 1
+                    )
+                    log.info(
+                        "SizeAndEmitTask: %s ONE_SHARE_FLOOR — target $%.0f "
+                        "< 1 share $%.2f; rounding UP to 1 share "
+                        "(1 share = %.1f%% PV ≤ regime cap %.1f%%, "
+                        "investable=$%.0f)",
+                        ticker, max_pct * ctx.portfolio_value, price,
+                        100.0 * price / ctx.portfolio_value
+                        if ctx.portfolio_value > 0 else 0.0,
+                        100.0 * float(regime_p.get("max_position_pct", 0.15)),
+                        investable,
+                    )
             if shares < 1:
                 log.info("SizeAndEmitTask: %s insufficient cash — skip "
                          "(remaining_cash=$%.0f price=$%.2f)",
@@ -368,6 +427,12 @@ class SizeAndEmitTask(Task):
                 # vs rotation vs QP). TopUpHeldTask sets "TOP_UP" on its
                 # orders; this is the fresh-entry path.
                 "order_type": "NEW_BUY",
+                # A-3 dedicated ledger reason field: stamped ONLY when the
+                # one-share floor actually rounded this order up, so every
+                # round-up is auditable in the ledger and flag-off orders
+                # stay byte-identical.
+                **({"size_floor_reason": "one_share_floor_round_up"}
+                   if one_share_floor_applied else {}),
             }, ctx=ctx, source_job="SelectionJob",
                 source_task="SizeAndEmitTask",
                 acceptance_reason="selected_by_greedy_loop",
@@ -379,6 +444,8 @@ class SizeAndEmitTask(Task):
                     "conviction": conv,
                     "sigma_mult": sig_m,
                     "kelly_enabled": kelly_on,
+                    **({"one_share_floor_applied": True}
+                       if one_share_floor_applied else {}),
                 }))
             remaining_cash -= invest
             log.info(
