@@ -540,6 +540,19 @@ class InferencePipeline:
                 # task_data_integrity.py.
                 from .task_data_integrity import DataIntegrityTask  # noqa: PLC0415
                 DataIntegrityTask().run(ctx)
+                # 2026-07-02 M5/R1 admission shadow: OBSERVE-ONLY parallel
+                # logger comparing the live per-ticker-tournament admission
+                # (ctx.models, from LoadUniverseJob → FilterStalenessTask)
+                # against the panel-based admission set (R1 rule: admissible
+                # iff features are fresh and the panel scores the name).
+                # Appends one JSONL delta per session to
+                # logs/admission_shadow.jsonl for the ≥20-session R1
+                # tournament-retirement decision. ZERO behavior change —
+                # the live admission still rules; the task is fail-isolated
+                # (an exception inside it is swallowed + counted, never
+                # fails the run). Kill switch: admission_shadow.enabled.
+                from .task_admission_shadow import AdmissionShadowLoggerTask  # noqa: PLC0415
+                AdmissionShadowLoggerTask().run(ctx)
 
         # Plan C: Kelly-driven top-up for existing holdings whose panel
         # score has improved beyond kelly_target_pct. No-op unless
