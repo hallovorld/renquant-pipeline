@@ -1,0 +1,305 @@
+{
+  "calibrator": {
+    "file_sha256": "cab0904424b06154e70d23b5a4f7c6974517165a1b87c590fa07f180f1747b06",
+    "native_horizon_days": 60,
+    "neutral_raw": -0.29021485236669337,
+    "path": "/Users/renhao/git/github/RenQuant/backtesting/renquant_104/artifacts/prod/panel-rank-calibration.json",
+    "trained_date": null
+  },
+  "db": "/Users/renhao/git/github/RenQuant/data/runs.alpaca.db",
+  "generated_at": "2026-07-02T23:12:18+00:00",
+  "mu_floor": 0.03,
+  "notes": "READ-ONLY replay. BEFORE = ER(raw) as prod computes today (rotation horizon 60d == native 60d, no scaling). AFTER = ER(raw - median(cross-section) + neutral_raw), i.e. the recenter_raw_per_bar=true path. sign_laundered_after counts against the RECENTERED sign (the M4 acceptance metric). The fidelity_check compares BEFORE vs the mu the pipeline actually stored that day; a non-zero diff means the day ran a different weekly calibrator vintage than the replayed artifact.",
+  "purpose": "M4/BL-1 shadow replay: per-bar raw recentering (recenter_raw_per_bar) before/after on stored prod panel scores",
+  "runs": [
+    {
+      "admission_gained": [],
+      "admission_lost": [
+        "ABBV",
+        "AEP",
+        "AVGO",
+        "BAC",
+        "BLK",
+        "CVS",
+        "D",
+        "EME",
+        "EOG",
+        "ETN",
+        "GM",
+        "GRMN",
+        "GS",
+        "JPM",
+        "MCHP",
+        "MRK",
+        "MS",
+        "OXY",
+        "WFC",
+        "WMT",
+        "ZM"
+      ],
+      "admitted_at_mu_floor_after": 1,
+      "admitted_at_mu_floor_before": 22,
+      "cross_section_center_median": -0.03618967905640602,
+      "date": "2026-07-02",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.0,
+        "n_rows_with_stored_mu": 83
+      },
+      "mu_distribution_after": {
+        "max": 0.03039102037556922,
+        "mean": -0.002360808722554625,
+        "median": -1.4750405503879061e-18,
+        "min": -0.02272037380023896,
+        "p10": -0.020718153574205367,
+        "p90": 0.012936072714277557,
+        "std": 0.012975277395762744
+      },
+      "mu_distribution_before": {
+        "max": 0.051138981997518256,
+        "mean": 0.01891149562989182,
+        "median": 0.02158676334587726,
+        "min": -0.008282503327025388,
+        "p10": 0.000878497851132388,
+        "p90": 0.0342835796411396,
+        "std": 0.013293313533435637
+      },
+      "n_candidates": 83,
+      "recenter_shift": -0.25402517331028734,
+      "run_id": "2026-07-02-live-85496d1c",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 45
+    },
+    {
+      "admission_gained": [],
+      "admission_lost": [
+        "AAPL",
+        "AEP",
+        "AVGO",
+        "BAC",
+        "BLK",
+        "CVS",
+        "EME",
+        "EOG",
+        "GRMN",
+        "GS",
+        "JPM",
+        "MCHP",
+        "OXY",
+        "PM",
+        "WFC",
+        "ZM"
+      ],
+      "admitted_at_mu_floor_after": 1,
+      "admitted_at_mu_floor_before": 17,
+      "cross_section_center_median": -0.05285589396953583,
+      "date": "2026-07-01",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.0,
+        "n_rows_with_stored_mu": 83
+      },
+      "mu_distribution_after": {
+        "max": 0.03310369773265188,
+        "mean": -0.0017650043384838231,
+        "median": -1.4750405503879061e-18,
+        "min": -0.02272037380023896,
+        "p10": -0.019088803752274626,
+        "p90": 0.013384166632949623,
+        "std": 0.012905232061451232
+      },
+      "mu_distribution_before": {
+        "max": 0.05240894830913207,
+        "mean": 0.018183397720868154,
+        "median": 0.02018048026488111,
+        "min": -0.00796903189122964,
+        "p10": 0.0011022501268601558,
+        "p90": 0.033339497254601475,
+        "std": 0.013088005593796378
+      },
+      "n_candidates": 83,
+      "recenter_shift": -0.23735895839715754,
+      "run_id": "2026-07-01-live-01c54b39",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 44
+    },
+    {
+      "admission_gained": [],
+      "admission_lost": [
+        "AAPL",
+        "AEP",
+        "ASML",
+        "AVGO",
+        "BAC",
+        "BLK",
+        "CVS",
+        "EME",
+        "EOG",
+        "GRMN",
+        "GS",
+        "JPM",
+        "MCHP",
+        "OXY",
+        "PM",
+        "WFC",
+        "ZM"
+      ],
+      "admitted_at_mu_floor_after": 1,
+      "admitted_at_mu_floor_before": 18,
+      "cross_section_center_median": -0.046418365091085434,
+      "date": "2026-06-30",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.0019753605060277707,
+        "n_rows_with_stored_mu": 83
+      },
+      "mu_distribution_after": {
+        "max": 0.03137469109603941,
+        "mean": -0.0021226628362718933,
+        "median": -1.4750405503879061e-18,
+        "min": -0.02272037380023896,
+        "p10": -0.02008495166580988,
+        "p90": 0.012989337695793964,
+        "std": 0.012868578810649445
+      },
+      "mu_distribution_before": {
+        "max": 0.051265294862031144,
+        "mean": 0.01823629880728942,
+        "median": 0.02072388126325044,
+        "min": -0.007474121103145675,
+        "p10": 0.0006456519793841321,
+        "p90": 0.03348775698801567,
+        "std": 0.013287853189994828
+      },
+      "n_candidates": 83,
+      "recenter_shift": -0.24379648727560793,
+      "run_id": "2026-06-30-live-b616357c",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 43
+    },
+    {
+      "admission_gained": [],
+      "admission_lost": [
+        "AAPL",
+        "AVGO",
+        "BAC",
+        "BLK",
+        "CME",
+        "CVS",
+        "CVX",
+        "D",
+        "DUK",
+        "EOG",
+        "FTNT",
+        "JPM",
+        "KMI",
+        "NEE",
+        "PLTR",
+        "SOFI",
+        "WELL",
+        "WFC"
+      ],
+      "admitted_at_mu_floor_after": 0,
+      "admitted_at_mu_floor_before": 18,
+      "cross_section_center_median": -0.04734288156032562,
+      "date": "2026-06-26",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.0018462995146944355,
+        "n_rows_with_stored_mu": 79
+      },
+      "mu_distribution_after": {
+        "max": 0.02869513816240533,
+        "mean": -0.0007364154845110017,
+        "median": -1.4750405503879061e-18,
+        "min": -0.02272037380023896,
+        "p10": -0.018652051976889454,
+        "p90": 0.014453769800756869,
+        "std": 0.012322827261520246
+      },
+      "mu_distribution_before": {
+        "max": 0.04862112201959298,
+        "mean": 0.019790136668936965,
+        "median": 0.02064586653029774,
+        "min": -0.005994365931702929,
+        "p10": 0.0020131119808544057,
+        "p90": 0.034839586966336746,
+        "std": 0.012293535631879644
+      },
+      "n_candidates": 79,
+      "recenter_shift": -0.24287197080636774,
+      "run_id": "2026-06-26-live-3d74ce5c",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 46
+    },
+    {
+      "admission_gained": [
+        "TXN"
+      ],
+      "admission_lost": [],
+      "admitted_at_mu_floor_after": 6,
+      "admitted_at_mu_floor_before": 5,
+      "cross_section_center_median": -0.2973184436559677,
+      "date": "2026-06-25",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.003329071281141665,
+        "n_rows_with_stored_mu": 76
+      },
+      "mu_distribution_after": {
+        "max": 0.03189125462741454,
+        "mean": 0.004762503364904377,
+        "median": -1.4772254600114998e-18,
+        "min": -0.016858436904529834,
+        "p10": -0.009969194054740019,
+        "p90": 0.027825813188007698,
+        "std": 0.014537169318863905
+      },
+      "mu_distribution_before": {
+        "max": 0.031300477150566365,
+        "mean": 0.004159990400617976,
+        "median": -0.0006060157250260317,
+        "min": -0.017459948384370986,
+        "p10": -0.010573600808641174,
+        "p90": 0.027231251894469635,
+        "std": 0.014540760900857786
+      },
+      "n_candidates": 76,
+      "recenter_shift": 0.007103591289274347,
+      "run_id": "2026-06-25-live-6c3aa3fa",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 26
+    },
+    {
+      "admission_gained": [],
+      "admission_lost": [],
+      "admitted_at_mu_floor_after": 3,
+      "admitted_at_mu_floor_before": 3,
+      "cross_section_center_median": -0.28170284628868103,
+      "date": "2026-06-24",
+      "fidelity_check": {
+        "max_abs_diff_replayed_vs_stored_mu": 0.00347530632336944,
+        "n_rows_with_stored_mu": 73
+      },
+      "mu_distribution_after": {
+        "max": 0.034248302548043334,
+        "mean": 0.003992344906897312,
+        "median": -1.4750405503879061e-18,
+        "min": -0.020071978546080626,
+        "p10": -0.012758866183730495,
+        "p90": 0.026979278615624745,
+        "std": 0.015490004141256347
+      },
+      "mu_distribution_before": {
+        "max": 0.03495267778178805,
+        "mean": 0.004713807663315913,
+        "median": 0.0007261637815786942,
+        "min": -0.01935285955638854,
+        "p10": -0.01203544691426604,
+        "p90": 0.027691799833683316,
+        "std": 0.015485741804446946
+      },
+      "n_candidates": 73,
+      "recenter_shift": -0.008512006078012335,
+      "run_id": "2026-06-24-live-710e3805",
+      "sign_laundered_after": 0,
+      "sign_laundered_before": 23
+    }
+  ],
+  "tool": "scripts/shadow_replay_bl1_recenter.py"
+}
