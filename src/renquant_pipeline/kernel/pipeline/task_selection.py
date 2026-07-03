@@ -344,7 +344,7 @@ class SizeAndEmitTask(Task):
                 _block(ticker, "bear_defensive_slot_cap")
                 continue
             one_share_floor_applied = False
-            if shares < 1 and one_share_floor_on and override_pct is None:
+            if shares < 1 and one_share_floor_on and override_pct is None and max_pct > 0:
                 # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
                 # ONE share iff (a) one share fits under the regime's own
                 # max_position_pct × PV (the UNSCALED regime cap — the floor
@@ -356,6 +356,25 @@ class SizeAndEmitTask(Task):
                 # has already passed every admission gate above; this changes
                 # sizing only. BEAR defensive slots (override_pct) keep the
                 # legacy drop behaviour.
+                #
+                # `max_pct > 0` guard (round-2 fix, codex review): the Kelly
+                # branch above already `continue`s on max_pct<=0 before this
+                # point, but the legacy (non-Kelly) branch has no equivalent
+                # early exit -- conviction_multiplier/sigma_multiplier can
+                # legitimately return exactly 0.0 (e.g. min_mult=0.0 config,
+                # at-or-below-floor candidate), meaning max_pct==0 is a
+                # genuine "the model says invest nothing" decision, NOT a
+                # rounds-to-zero-due-to-price artifact. Without this guard,
+                # a zero-conviction candidate whose price happens to fit the
+                # regime cap + investable cash was WRONGLY rounded up to one
+                # share and bought -- confirmed reproducible pre-fix (BLK
+                # @ $1,100, conviction=0.0 exactly, floor rescued it anyway).
+                # This check does not change flag-OFF behaviour (untouched
+                # by this whole block) or the Kelly path (already excluded
+                # upstream) -- it only narrows the legacy-path floor's own
+                # eligibility, so the block-reason string for a genuine
+                # zero-target legacy candidate stays "size_insufficient_cash"
+                # (the existing fallback below), exactly as before this fix.
                 regime_cap_dollars = (
                     float(regime_p.get("max_position_pct", 0.15))
                     * float(ctx.portfolio_value or 0.0)
