@@ -540,6 +540,19 @@ class InferencePipeline:
                 # task_data_integrity.py.
                 from .task_data_integrity import DataIntegrityTask  # noqa: PLC0415
                 DataIntegrityTask().run(ctx)
+                # 2026-07-02 M5/R1 admission shadow: OBSERVE-ONLY parallel
+                # logger comparing the live per-ticker-tournament admission
+                # (ctx.models, from LoadUniverseJob → FilterStalenessTask)
+                # against the panel-based admission set (R1 rule: admissible
+                # iff features are fresh and the panel scores the name).
+                # Appends one JSONL delta per session to
+                # logs/admission_shadow.jsonl for the ≥20-session R1
+                # tournament-retirement decision. ZERO behavior change —
+                # the live admission still rules; the task is fail-isolated
+                # (an exception inside it is swallowed + counted, never
+                # fails the run). Kill switch: admission_shadow.enabled.
+                from .task_admission_shadow import AdmissionShadowLoggerTask  # noqa: PLC0415
+                AdmissionShadowLoggerTask().run(ctx)
 
         # Plan C: Kelly-driven top-up for existing holdings whose panel
         # score has improved beyond kelly_target_pct. No-op unless
@@ -561,6 +574,15 @@ class InferencePipeline:
         # QP turn weak alpha candidates into trades. Disabled by default.
         from .task_benchmark_sleeve import BenchmarkSleeveTask  # noqa: PLC0415
         BenchmarkSleeveTask().run(ctx)
+
+        # S7 lane-B parking sleeve (renquant-orchestrator RS-1 + capability
+        # program §1.3): β-budgeted SPY/SGOV sweep of idle cash above the
+        # reserve. Default OFF (`sleeve.enabled`); shadow mode only — logs the
+        # intended sweep/fund orders to a JSONL and places NOTHING. Runs after
+        # every selection/top-up/trim decision so it can never compete with or
+        # block single-name admission.
+        from .task_parking_sleeve import ParkingSleeveShadowTask  # noqa: PLC0415
+        ParkingSleeveShadowTask().run(ctx)
 
         # Monitor: persistent no-trade periods are treated as a hard signal,
         # not a silent state. See task_monitor.MonitorIdleStreakTask.

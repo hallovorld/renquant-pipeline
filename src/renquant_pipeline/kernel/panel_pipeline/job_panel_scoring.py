@@ -2374,6 +2374,108 @@ def _calibrator_expected_return_at_horizon(
     return _clip(base * (float(horizon_days) / float(native_horizon_days)))
 
 
+# BL-1 / M4 (2026-07-02): minimum finite cross-section size for the per-bar
+# recentering median. Below this a "center" is statistically meaningless (1-2
+# names would be mapped exactly onto the calibrator's neutral → forced μ≈0),
+# so recentering is skipped for the bar and the raw path runs unchanged.
+_RECENTER_MIN_FINITE = 3
+
+
+def _per_bar_recenter_shift(
+    ctx: InferenceContext, cal: Any, enabled: bool
+) -> tuple[float, float] | None:
+    """Per-bar raw-recentering shift for the calibrator INPUT (BL-1 / M4).
+
+    Returns ``(shift, center)`` where ``calibrator_input = raw + shift`` and
+    ``shift = neutral_raw − center``, or ``None`` when recentering is inactive
+    (flag off, calibrator has no ER=0 anchor, or the cross-section is too
+    thin to estimate a center).
+
+    Why: the calibrator is fit POOLED over history, so its ER=0 neutral
+    (``neutral_raw``; live prod ≈ −0.2902) encodes the TRAINING
+    cross-sections' center. Live cross-sections drift away from that center,
+    so every raw score between the live center and the stale anchor maps to a
+    μ of the OPPOSITE sign to its cross-sectional stance — the BL-2 "sign
+    laundering" (44/90 candidates on 2026-07-01, 45/90 on 2026-07-02).
+    Translating each bar's raw cross-section so its center lands exactly ON
+    the anchor makes the calibrator's neutral coincide with the actual
+    per-bar center BY CONSTRUCTION: names above the bar's center → μ>0,
+    below → μ<0, and (by the heads' monotonicity) the residual
+    ``calibrator_sign_laundered`` count collapses to ties/flat spans only.
+
+    MEDIAN, not mean: a cross-sectional ranker's raw tails are heavy — one
+    blown-out score would drag a mean-center and flip the μ sign of every
+    near-center name, exactly the instability this fix removes. The median
+    is invariant to tail magnitudes and matches the rank-centric meaning of
+    "center of the cross-section". (NaN/None scores are excluded.)
+
+    Scope: the center is computed over ``ctx.candidates`` — at this point in
+    the chain that is the FULL scored panel (ApplyGlobalCalibrationTask runs
+    before the veto/conviction filters). Holdings are transformed with the
+    SAME shift so held-vs-candidate μ comparisons (rotation, protection
+    exits) stay on one scale. ``c.panel_score`` itself is NEVER mutated —
+    only the value fed to the interpolation heads — so raw-score consumers
+    (persistence ``raw_panel``, decision trace, the BL-4 raw-sign gate) are
+    untouched and all downstream thresholds keep their meaning.
+
+    ENABLE PROTOCOL (frozen, not yet executed): flipping this flag alone
+    collapses ``conviction_gate.mu_floor`` admission to ~0-1 names on
+    drifted cross-sections (see shadow replay). ``mu_floor`` must be
+    re-derived as a relative-conviction quantity (same pattern as
+    ``demean_cross_sectional``) on live runs AFTER the ones that motivated
+    this fix, against OOS acceptance metrics frozen BEFORE that holdout —
+    see "Frozen enable protocol" in
+    ``doc/2026-07-02-bl1-recenter-raw-per-bar.md``. Do not enable this flag
+    without that evidence.
+    """
+    if not enabled:
+        return None
+    anchor_raw = getattr(cal, "neutral_raw", None)
+    try:
+        anchor = float(anchor_raw) if anchor_raw is not None else None
+    except (TypeError, ValueError):
+        anchor = None
+    if anchor is None or not math.isfinite(anchor):
+        log.warning(
+            "ApplyGlobalCalibrationTask: recenter_raw_per_bar=true but the "
+            "calibrator has no finite ER=0 neutral_raw anchor (%r) — nothing "
+            "to align the cross-section center onto; recentering SKIPPED "
+            "this bar (raw path unchanged).",
+            anchor_raw,
+        )
+        return None
+    raws: list[float] = []
+    for c in getattr(ctx, "candidates", []) or []:
+        ps = getattr(c, "panel_score", None)
+        if ps is None:
+            continue
+        try:
+            v = float(ps)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(v):
+            raws.append(v)
+    if len(raws) < _RECENTER_MIN_FINITE:
+        log.warning(
+            "ApplyGlobalCalibrationTask: recenter_raw_per_bar=true but only "
+            "%d finite raw score(s) in the cross-section (< %d) — center is "
+            "not estimable; recentering SKIPPED this bar (raw path "
+            "unchanged).",
+            len(raws), _RECENTER_MIN_FINITE,
+        )
+        return None
+    center = float(np.median(raws))
+    shift = anchor - center
+    log.info(
+        "ApplyGlobalCalibrationTask: BL-1 recenter_raw_per_bar ON — per-bar "
+        "cross-section center=%+.4f (median of %d finite raw scores) mapped "
+        "onto calibrator neutral_raw=%+.4f (calibrator-input shift %+.4f; "
+        "c.panel_score itself is NOT mutated).",
+        center, len(raws), anchor, shift,
+    )
+    return shift, center
+
+
 class LoadGlobalCalibrationTask(Task):
     """Load the global panel calibrator artifact(s) if enabled.
 
@@ -2626,15 +2728,33 @@ class ApplyGlobalCalibrationTask(Task):
                 )
                 return False
 
+        # BL-1 / M4 (2026-07-02, default OFF): per-bar raw recentering.
+        # ``ranking.panel_scoring.global_calibration.recenter_raw_per_bar``
+        # translates this bar's raw cross-section so its MEDIAN lands on the
+        # calibrator's ER=0 neutral anchor BEFORE the interpolation heads are
+        # evaluated (see _per_bar_recenter_shift for the full rationale).
+        # Flag absent/false ⇒ byte-identical legacy behavior. The BL-4
+        # signal-direction gate stays in force as the interim guard; the BL-2
+        # ``calibrator_sign_laundered`` counter below is the acceptance
+        # metric (expected → single digits when this is enabled).
+        recenter = _per_bar_recenter_shift(
+            ctx,
+            cal,
+            bool(panel_cfg.get("global_calibration", {})
+                 .get("recenter_raw_per_bar", False)),
+        )
+
         n_cand = 0
         n_laundered = 0  # BL-2: raw<0 mapped to ER>0 (or raw>0 → ER<0)
         for c in ctx.candidates:
             if c.panel_score is None or c.panel_score != c.panel_score:
                 continue
-            prob = cal.calibrate_probability(c.panel_score)
+            cal_x = (float(c.panel_score) + recenter[0]
+                     if recenter is not None else c.panel_score)
+            prob = cal.calibrate_probability(cal_x)
             er = _calibrator_expected_return_at_horizon(
                 cal,
-                c.panel_score,
+                cal_x,
                 rotation_horizon,
                 native_horizon,
             )
@@ -2645,14 +2765,20 @@ class ApplyGlobalCalibrationTask(Task):
             # positive expected return (sign laundering). Count it per bar so
             # the operator can watch it collapse once BL-1 re-centres the raw
             # score distribution. The signal-direction gate (BL-4) is what
-            # actually refuses to long these.
-            if (math.isfinite(er) and math.isfinite(float(c.panel_score))
-                    and float(c.panel_score) * float(er) < 0.0):
+            # actually refuses to long these. With BL-1 recentering ON the
+            # direction test uses the RECENTERED raw (raw − center): that is
+            # the signal whose sign the calibrator now honors by
+            # construction, so the counter measures RESIDUAL laundering
+            # (exact ties / flat ER spans) — the M4 acceptance metric.
+            sig = (float(c.panel_score) - recenter[1]
+                   if recenter is not None else float(c.panel_score))
+            if (math.isfinite(er) and math.isfinite(sig)
+                    and sig * float(er) < 0.0):
                 n_laundered += 1
             if use_cal_mu and math.isfinite(er):
                 mu = _calibrator_expected_return_at_horizon(
                     cal,
-                    c.panel_score,
+                    cal_x,
                     qp_mu_horizon,
                     native_horizon,
                 )
@@ -2682,10 +2808,13 @@ class ApplyGlobalCalibrationTask(Task):
             ps = getattr(hs, "panel_score", None)
             if ps is None or ps != ps:
                 continue
-            hs.rank_score      = cal.calibrate_probability(ps)
+            # BL-1: holdings share the SAME per-bar shift as candidates so
+            # held-vs-candidate μ comparisons stay on one scale.
+            cal_x = float(ps) + recenter[0] if recenter is not None else ps
+            hs.rank_score      = cal.calibrate_probability(cal_x)
             hs.expected_return = _calibrator_expected_return_at_horizon(
                 cal,
-                ps,
+                cal_x,
                 rotation_horizon,
                 native_horizon,
             )
@@ -2693,7 +2822,7 @@ class ApplyGlobalCalibrationTask(Task):
             if use_cal_mu and math.isfinite(hs.expected_return):
                 hs.mu = float(_calibrator_expected_return_at_horizon(
                     cal,
-                    ps,
+                    cal_x,
                     qp_mu_horizon,
                     native_horizon,
                 ))
