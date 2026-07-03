@@ -22,7 +22,11 @@ import pytest
 
 from renquant_pipeline.context import InferenceContext
 from renquant_pipeline.kernel.pipeline.task_parking_sleeve import (
+    ECONOMIC_BOOK_STATE_FIELDS,
+    OPERATIONAL_BOOK_STATE_FIELDS,
     ParkingSleeveShadowTask,
+    build_economic_scorecard,
+    build_operational_scorecard,
     compute_parking_sleeve_plan,
     load_last_shadow_state,
 )
@@ -400,3 +404,130 @@ class TestShadowTask:
         assert math.isclose(
             bs["net_invested"], buys, rel_tol=0, abs_tol=1e-6,
         )
+
+
+# ── idempotency / concurrency guard ───────────────────────────────────────
+
+
+class TestIdempotency:
+
+    def test_rerun_same_date_is_skipped_not_double_applied(self, tmp_path):
+        ctx1 = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx1)
+        rows_after_first = _read_log(tmp_path)
+        state_after_first = load_last_shadow_state(
+            tmp_path / "logs" / "parking_sleeve_shadow.jsonl"
+        )
+
+        # Same ctx, same date (a retry after a transient failure, or a
+        # second concurrent run) — must not append a second set of rows or
+        # roll the shadow book forward a second time.
+        ctx2 = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx2)
+
+        rows_after_second = _read_log(tmp_path)
+        assert rows_after_second == rows_after_first, \
+            "duplicate run for an already-logged date must not append anything"
+        assert ctx2.counters["parking_sleeve_duplicate_date_skipped"] == 1
+        state_after_second = load_last_shadow_state(
+            tmp_path / "logs" / "parking_sleeve_shadow.jsonl"
+        )
+        assert state_after_second == state_after_first, \
+            "shadow book must not be double-applied for a re-run of the same date"
+
+    def test_scorecard_reports_zero_duplicate_dates_when_guard_holds(self, tmp_path):
+        ctx1 = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx1)
+        ctx2 = _ctx(tmp_path, sleeve=_enabled())  # same date — should be a no-op skip
+        ParkingSleeveShadowTask().run(ctx2)
+        ctx3 = _ctx(tmp_path, sleeve=_enabled(), today=dt.date(2026, 7, 3))
+        ParkingSleeveShadowTask().run(ctx3)
+
+        rows = _read_log(tmp_path)
+        scorecard = build_operational_scorecard(rows)
+        assert scorecard["duplicate_summary_dates"] == 0
+        assert scorecard["schema_complete"] is True
+
+
+# ── SGOV valuation semantics (cost, no carry) ─────────────────────────────
+
+
+class TestSgovValuationSemantics:
+
+    def test_sgov_price_appreciation_alone_does_not_move_sleeve_value(self, tmp_path):
+        # Session 1: sweep into SPY + SGOV.
+        ctx1 = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx1)
+        state1 = load_last_shadow_state(
+            tmp_path / "logs" / "parking_sleeve_shadow.jsonl"
+        )
+        assert state1["sgov_value"] > 0
+
+        # Session 2: SGOV price "appreciates" (simulating real T-bill NAV
+        # accretion) but the book is already at target ⇒ no new buy/sell.
+        # SGOV is tracked at cost (module contract) so its persisted value
+        # must be byte-identical to session 1 despite the price move —
+        # unlike SPY, which IS marked to market.
+        ctx2 = _ctx(
+            tmp_path, sleeve=_enabled(), today=dt.date(2026, 7, 3),
+            prices={"SPY": 100.0, "SGOV": 100.50},
+        )
+        ParkingSleeveShadowTask().run(ctx2)
+        state2 = load_last_shadow_state(
+            tmp_path / "logs" / "parking_sleeve_shadow.jsonl"
+        )
+        assert state2["sgov_value"] == pytest.approx(state1["sgov_value"]), \
+            "SGOV is cost-basis only — a price move alone must not change its value"
+
+        summary = _summaries(_read_log(tmp_path))[-1]
+        assert summary["book_state"]["sgov_valuation_mode"] == "cost_no_carry"
+
+    def test_sgov_valuation_mode_stamped_on_every_row(self, tmp_path):
+        ctx = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx)
+        rows = _read_log(tmp_path)
+        assert rows
+        assert all(r["book_state"]["sgov_valuation_mode"] == "cost_no_carry" for r in rows)
+
+
+# ── operational vs economic scorecard separation ──────────────────────────
+
+
+class TestScorecardSeparation:
+
+    def test_scorecards_do_not_share_fields(self):
+        assert OPERATIONAL_BOOK_STATE_FIELDS.isdisjoint(ECONOMIC_BOOK_STATE_FIELDS)
+
+    def test_operational_scorecard_never_reports_economic_merit(self, tmp_path):
+        ctx1 = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx1)
+        ctx2 = _ctx(
+            tmp_path, sleeve=_enabled(), today=dt.date(2026, 7, 3),
+            portfolio_value=9_700.0, hwm=10_000.0,
+            prices={"SPY": 110.0, "SGOV": 100.0},
+        )
+        ParkingSleeveShadowTask().run(ctx2)
+
+        rows = _read_log(tmp_path)
+        operational = build_operational_scorecard(rows)
+        economic = build_economic_scorecard(rows)
+
+        # No economic-merit field name leaks into the operational scorecard.
+        assert not (set(operational) & ECONOMIC_BOOK_STATE_FIELDS)
+        assert "sleeve_contribution_abs" not in operational
+        assert "drawdown_pct" not in operational
+        # The operational scorecard is pure hygiene — never an authorization
+        # signal by itself.
+        assert "authorization_grade" not in operational
+
+    def test_economic_scorecard_is_explicitly_not_authorization_grade(self, tmp_path):
+        ctx = _ctx(tmp_path, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx)
+        rows = _read_log(tmp_path)
+        economic = build_economic_scorecard(rows)
+        assert economic["authorization_grade"] is False
+        assert economic["n_sessions"] == 1
+        assert "final_sleeve_contribution_pct" in economic
+
+    def test_economic_scorecard_empty_log_is_not_authorization_grade(self):
+        assert build_economic_scorecard([]) == {"authorization_grade": False, "n_sessions": 0}

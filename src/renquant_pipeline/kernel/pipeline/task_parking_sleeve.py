@@ -70,6 +70,11 @@ import math
 from pathlib import Path
 from typing import Any
 
+try:
+    import fcntl  # POSIX-only; Windows falls back to no cross-process lock
+except ImportError:  # pragma: no cover - non-POSIX platform
+    fcntl = None  # type: ignore[assignment]
+
 from .context import InferenceContext
 from .pipeline import Task
 from .task_benchmark_sleeve import _finite_float, _pending_buy_invest
@@ -77,6 +82,35 @@ from .task_benchmark_sleeve import _finite_float, _pending_buy_invest
 log = logging.getLogger("kernel.pipeline.parking_sleeve")
 
 DEFAULT_LOG_PATH = "logs/parking_sleeve_shadow.jsonl"
+
+# SGOV is tracked at COST, not marked to market: the shadow book only moves
+# the SGOV leg's value via BUY/SELL notional (see module docstring — T-bill
+# carry/accretion is not modeled). Stamped into every book_state so a
+# consumer of the raw JSONL cannot misread ``sleeve_contribution_pct`` as
+# capturing SGOV's real economics; the SPY leg IS marked to market by
+# contrast (``shadow_spy_qty * spy_price``), so the two legs are NOT
+# treated symmetrically and this makes that asymmetry explicit rather than
+# implicit in the arithmetic.
+SGOV_VALUATION_MODE = "cost_no_carry"
+
+# ── Operational vs economic field split (see build_operational_scorecard /
+# build_economic_scorecard below) — a clean operational log (idempotent,
+# schema-complete, no errors) is NOT evidence the sleeve strategy itself is
+# a good idea; the two questions must never be blended into one scorecard.
+OPERATIONAL_BOOK_STATE_FIELDS = frozenset({
+    "mode", "live_orders_placed", "blocked", "sgov_valuation_mode",
+})
+ECONOMIC_BOOK_STATE_FIELDS = frozenset({
+    "pv", "shadow_pv", "cash", "shadow_cash", "positions_value",
+    "pending_buy_notional", "regime", "regime_cash_reserve_pct",
+    "reserve_operational", "reserve_regime", "deployable", "funding_shortfall",
+    "w_pos", "w_sleeve", "sleeve_spy_frac", "target_spy_value",
+    "target_sgov_value", "spy_price", "sgov_price", "shadow_spy_qty",
+    "shadow_sgov_value", "net_invested", "sleeve_value",
+    "sleeve_contribution_abs", "sleeve_contribution_pct", "drawdown_pct",
+    "dd_budget_pct", "dd_budget_consumption_pct",
+    "max_dd_budget_consumption_pct",
+})
 
 _EMPTY_SHADOW_STATE: dict[str, float] = {
     "spy_qty": 0.0,
@@ -279,6 +313,102 @@ def load_last_shadow_state(path: str | Path) -> dict[str, float]:
     return out
 
 
+def _has_logged_date(path: str | Path, date_str: str | None) -> bool:
+    """True iff a ``summary`` row for ``date_str`` already exists in the log.
+
+    Idempotency guard: without this, re-running the task for a date it has
+    already processed (a retry after a transient failure, or two runs
+    racing on the same host) would append a second set of action/summary
+    rows and roll the shadow book forward a second time for the same
+    calendar date, silently double-applying that day's intended sweep.
+    """
+    if date_str is None:
+        return False
+    p = Path(path)
+    if not p.exists():
+        return False
+    try:
+        with p.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(row, dict)
+                    and row.get("record_type") == "summary"
+                    and row.get("date") == date_str
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def build_operational_scorecard(rows: list[dict]) -> dict[str, Any]:
+    """Instrumentation hygiene only — does the shadow logger itself work?
+
+    Never evidence that the parking-sleeve STRATEGY is a good idea; see
+    ``build_economic_scorecard`` for that separate question. A clean
+    operational scorecard must never be presented or interpreted as
+    authorization evidence for live capital deployment.
+    """
+    summaries = [r for r in rows if isinstance(r, dict) and r.get("record_type") == "summary"]
+    required = {"date", "action", "symbol", "qty", "notional", "reason", "book_state"}
+    schema_complete = all(required <= set(r) for r in rows if isinstance(r, dict))
+    dates = [r.get("date") for r in summaries]
+    duplicate_dates = len(dates) - len(set(dates))
+    blocked_counts: dict[str, int] = {}
+    sgov_modes: set[str] = set()
+    for r in summaries:
+        bs = r.get("book_state") or {}
+        for reason in bs.get("blocked") or []:
+            blocked_counts[reason] = blocked_counts.get(reason, 0) + 1
+        mode = bs.get("sgov_valuation_mode")
+        if mode:
+            sgov_modes.add(mode)
+    return {
+        "n_summary_rows": len(summaries),
+        "schema_complete": schema_complete,
+        "duplicate_summary_dates": duplicate_dates,
+        "blocked_reason_counts": blocked_counts,
+        "sgov_valuation_modes_seen": sorted(sgov_modes),
+        "sgov_valuation_mode_consistent": len(sgov_modes) <= 1,
+    }
+
+
+def build_economic_scorecard(rows: list[dict]) -> dict[str, Any]:
+    """Shadow-simulated economic merit — separate from operational hygiene.
+
+    ``authorization_grade`` is always ``False``: this is shadow-only
+    (no live capital at risk), subject to the same look-ahead / regime-
+    coverage caveats as any other shadow-only measurement, and is at most
+    the beginning of an eventual economic case — never sufficient alone to
+    authorize live deployment.
+    """
+    summaries = [r for r in rows if isinstance(r, dict) and r.get("record_type") == "summary"]
+    if not summaries:
+        return {"authorization_grade": False, "n_sessions": 0}
+    last_bs = summaries[-1].get("book_state") or {}
+    contributions = [
+        _finite_float((r.get("book_state") or {}).get("sleeve_contribution_pct"), 0.0)
+        for r in summaries
+    ]
+    return {
+        "authorization_grade": False,
+        "n_sessions": len(summaries),
+        "final_sleeve_contribution_abs": last_bs.get("sleeve_contribution_abs"),
+        "final_sleeve_contribution_pct": last_bs.get("sleeve_contribution_pct"),
+        "final_max_dd_budget_consumption_pct": last_bs.get("max_dd_budget_consumption_pct"),
+        "mean_sleeve_contribution_pct": (
+            sum(contributions) / len(contributions) if contributions else 0.0
+        ),
+    }
+
+
 class ParkingSleeveShadowTask(Task):
     """Compute + log the intended parking-sleeve orders. Places NOTHING."""
 
@@ -300,6 +430,9 @@ class ParkingSleeveShadowTask(Task):
     def _run(self, ctx: InferenceContext, sleeve_cfg: dict) -> None:
         orders_before = len(getattr(ctx, "orders", []) or [])
         exits_before = len(getattr(ctx, "exits", []) or [])
+
+        date_str = getattr(ctx, "today", None)
+        date_str = date_str.isoformat() if date_str is not None else None
 
         mode = str(sleeve_cfg.get("mode", "shadow")).strip().lower()
         if mode == "live":
@@ -337,6 +470,49 @@ class ParkingSleeveShadowTask(Task):
         sgov_price = _finite_float(prices.get(sgov_symbol), 0.0)
 
         path = self._resolve_path(ctx, sleeve_cfg)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a+") as lock_fh:
+            if fcntl is not None:
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            try:
+                # Idempotency guard, checked INSIDE the lock so a retry or a
+                # concurrent run racing on the same host cannot both pass the
+                # check before either has appended — see _has_logged_date.
+                if _has_logged_date(path, date_str):
+                    log.warning(
+                        "ParkingSleeveShadowTask: date %s already logged in %s — "
+                        "skipping duplicate run (idempotency guard)",
+                        date_str, path,
+                    )
+                    ctx.counters["parking_sleeve_duplicate_date_skipped"] = (
+                        ctx.counters.get("parking_sleeve_duplicate_date_skipped", 0) + 1
+                    )
+                    return
+                self._compute_and_log(
+                    ctx, sleeve_cfg, path=path, date_str=date_str, mode=mode,
+                    pv_real=pv_real, cash_real=cash_real,
+                    spy_symbol=spy_symbol, sgov_symbol=sgov_symbol,
+                    spy_price=spy_price, sgov_price=sgov_price,
+                    orders_before=orders_before, exits_before=exits_before,
+                )
+            finally:
+                if fcntl is not None:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+
+    def _compute_and_log(
+        self, ctx: InferenceContext, sleeve_cfg: dict, *, path: Path,
+        date_str: str | None, mode: str, pv_real: float, cash_real: float,
+        spy_symbol: str, sgov_symbol: str, spy_price: float, sgov_price: float,
+        orders_before: int, exits_before: int,
+    ) -> None:
+        """Compute the sweep plan and append it to the shadow log.
+
+        Must only be called while ``path``'s ``.lock`` sibling is held
+        exclusively (see ``_run``) — this is the idempotency/concurrency
+        critical section: read-last-state, compute, and append are not
+        individually safe against a concurrent second caller.
+        """
         state = load_last_shadow_state(path)
         if spy_price <= 0 and state["spy_qty"] > 0:
             # Mark a held shadow SPY leg at its last known price rather than
@@ -441,11 +617,10 @@ class ParkingSleeveShadowTask(Task):
             "max_dd_budget_consumption_pct": round(
                 new_state["max_dd_budget_consumption_pct"], 6,
             ),
+            "sgov_valuation_mode": SGOV_VALUATION_MODE,
             "blocked": list(plan.get("blocked") or []),
         }
 
-        date_str = getattr(ctx, "today", None)
-        date_str = date_str.isoformat() if date_str is not None else None
         records: list[dict[str, Any]] = []
         for action in plan["actions"]:
             records.append({
