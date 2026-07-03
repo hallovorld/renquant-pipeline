@@ -2417,6 +2417,16 @@ def _per_bar_recenter_shift(
     only the value fed to the interpolation heads — so raw-score consumers
     (persistence ``raw_panel``, decision trace, the BL-4 raw-sign gate) are
     untouched and all downstream thresholds keep their meaning.
+
+    ENABLE PROTOCOL (frozen, not yet executed): flipping this flag alone
+    collapses ``conviction_gate.mu_floor`` admission to ~0-1 names on
+    drifted cross-sections (see shadow replay). ``mu_floor`` must be
+    re-derived as a relative-conviction quantity (same pattern as
+    ``demean_cross_sectional``) on live runs AFTER the ones that motivated
+    this fix, against OOS acceptance metrics frozen BEFORE that holdout —
+    see "Frozen enable protocol" in
+    ``doc/2026-07-02-bl1-recenter-raw-per-bar.md``. Do not enable this flag
+    without that evidence.
     """
     if not enabled:
         return None

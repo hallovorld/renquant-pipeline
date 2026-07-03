@@ -89,3 +89,60 @@ near-sell-only — the same failure algebra as the 2026-06-29 demean revert.
 Enable path: shadow verdict → a strategy-104 config PR that flips the flag
 AND re-derives the floor as a relative-conviction quantity (operator
 decision), never a silent default-ON here.
+
+## Frozen enable protocol (codex review, 2026-07-02)
+
+This is a coupled recenter+threshold redesign, not an isolated hygiene flag —
+frozen here, before any enable PR, so a future decision is measured against a
+pre-committed bar rather than calibrated post-hoc against whatever the
+holdout happens to show.
+
+**Which threshold(s) re-derive.** `ranking.panel_scoring.conviction_gate
+.mu_floor` is the only absolute economic threshold this repo applies to
+`expected_return`/μ (verified: no other `expected_return`-keyed absolute
+gate exists in `job_panel_scoring.py`). It is the one and only knob the
+enable PR is allowed to touch. Re-derivation must follow the SAME pattern
+already validated for the parallel drift problem in this file — the
+`demean_cross_sectional` flag on `ConvictionGateTask` (2026-06-24, 20/20
+live runs zero-buy-free) — i.e. the floor becomes a RELATIVE-conviction
+quantity (demeaned or equivalent), never a new absolute number. A new
+absolute constant just relocates today's failure to a different point on a
+distribution that keeps drifting.
+
+**Sample.** Re-derivation is computed on live runs STRICTLY AFTER the six
+already inspected above (07-02, 07-01, 06-30, 06-26, 06-25, 06-24) — those
+six diagnosed the problem and are disqualified as fitting data for its
+fix, on the same logic as the WF-gate threshold-freeze fix elsewhere this
+session (renquant-backtesting#61): a threshold tuned on the data used to
+motivate it is not validated, it's calibrated to the answer. Minimum
+sample: the next 10 FULL live runs (`min_candidates=60`, same definition
+`shadow_replay_bl1_recenter.py` already uses) counted from the enable PR's
+open date.
+
+**Out-of-sample acceptance metrics** (all must hold on that holdout, via
+`scripts/shadow_replay_bl1_recenter.py --mu-floor <re-derived>` or its
+successor):
+1. `calibrator_sign_laundered` (recentered sign vs μ sign) stays in single
+   digits — necessary, not sufficient (already this PR's M4 metric).
+2. Admitted-candidate count per run falls in a defensible band, not the
+   0-1 collapse this PR's own replay measured (`22→1, 17→1, 18→1, 18→0`) —
+   e.g. a floor that admits fewer than ~5 names on >2 of the 10 holdout
+   runs is a fail, full stop, regardless of (1).
+3. The admitted set's SUBSEQUENT realized forward-excess-return
+   distribution (mean/median over the holdout) is not statistically worse
+   than the legacy (pre-recenter, pre-refloor) admitted set's realized
+   forward-excess-return over the SAME 10 runs — this is the metric that
+   actually matters; (1) and (2) are necessary preconditions, not
+   sufficient evidence of a net-positive change.
+
+**Success is not "laundering went to zero."** A floor that admits ~0 names
+also drives laundering to ~0 trivially (nothing is admitted to launder).
+Success requires ALL THREE metrics above to hold together — laundering
+near-zero AND a sane admitted count AND non-inferior realized returns.
+Failing (2) or (3) while (1) passes means: revert to legacy (flag OFF),
+do not ship.
+
+**Still true from the original doc:** enabling `recenter_raw_per_bar`
+without ALSO re-deriving `mu_floor` per this protocol remains near-sell-only
+and out of scope for any PR that doesn't carry this evidence. This PR keeps
+the flag default-OFF; it does not attempt re-derivation itself.
