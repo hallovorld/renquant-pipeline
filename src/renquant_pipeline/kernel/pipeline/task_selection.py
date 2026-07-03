@@ -203,6 +203,27 @@ class SizeAndEmitTask(Task):
         # multipliers. Default False preserves v4 behaviour.
         kelly_pure    = bool(kelly_cfg.get("disable_extra_multipliers", False))
 
+        # S6 A-3 (2026-07-02, capability program §1.2 / RS-2 lane-A memo):
+        # one-share floor for high-price INITIATIONS. The multiplicative
+        # sizing stack (Kelly × conviction × σ-mult) can compound a target
+        # notional below ONE share of a high-price name (2026-07-01 OXY
+        # forensics: BLK target $324 < 1 share ~$1.1k → size_insufficient_cash
+        # → selection drifts toward LOW-price names). When enabled, a
+        # floor-clearing candidate that zeroes out ONLY because of whole-share
+        # rounding may round UP to exactly one share iff (a) one share ≤
+        # regime max_position_pct × PV, and (b) one share ≤ investable
+        # headroom after cash reservations. SIZING only — every admission
+        # gate (greedy loop, signal-direction, bear caps) has already run by
+        # the time this fires. Default OFF; inert until strategy-104 defines
+        # `sizing.one_share_floor_enabled: true`. QP already has the analog
+        # for HELD names (portfolio_qp qp_min_share_floor_pct, 2026-05-17);
+        # this extends the concept to the initiation path.
+        _sizing_root = ctx.config.get("sizing")
+        one_share_floor_on = (
+            bool(_sizing_root.get("one_share_floor_enabled", False))
+            if isinstance(_sizing_root, dict) else False
+        )
+
         # Universe σ median over all ranked candidates (σ written by ApplyNGBoostTask).
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
@@ -229,6 +250,99 @@ class SizeAndEmitTask(Task):
         # ≤ ctx.cash - reserve_pct * portfolio_value.
         remaining_cash = float(getattr(ctx, "cash", 0.0) or 0.0)
         starting_cash  = remaining_cash
+
+        # S6 A-3 round 3 (2026-07-03, codex portfolio-level review): the
+        # rescue used to fire INLINE in the same pass as normal sizing,
+        # so a low-conviction rescue candidate competed for `remaining_cash`
+        # on EQUAL FOOTING with every candidate ranked below it — a rescue
+        # earlier in ctx._selected could consume MORE cash than its own
+        # (tiny) target implied and crowd out a later, higher-conviction
+        # candidate's funding entirely, or degrade the score-vs-realized-
+        # investment rank correlation (measured: Spearman rho went from
+        # +0.11 to -0.63 on a constructed 5-name panel where a rescued
+        # $0.001-conviction name displaced a $0.5-conviction name for cash).
+        # Fix: DEFER every rescue-eligible candidate into `deferred_rescues`
+        # instead of sizing it inline. Normal candidates size fully first,
+        # in unchanged rank order, so a rescue can now NEVER take cash a
+        # higher-priority candidate needed. Only after every normal
+        # candidate has had its full, uncontested shot at `remaining_cash`
+        # does the rescue pass spend whatever is genuinely left over — in
+        # the SAME relative rank order, so among rescue candidates
+        # themselves, higher rank still wins ties for leftover cash.
+        deferred_rescues: list[tuple[str, float, Any, float, float, float]] = []
+
+        def _emit_order(ticker: str, shares: int, price: float, c: Any,
+                         conv: float, sig_m: float, max_pct: float, *,
+                         one_share_floor_applied: bool) -> None:
+            nonlocal remaining_cash
+            invest = shares * price
+            # Defensive: per-position sizer already rounded down to whole
+            # shares within remaining_cash, but assert the invariant —
+            # sum of emitted invests must not exceed starting_cash.
+            if invest > remaining_cash + 1e-6:  # fp-tolerance
+                log.warning(
+                    "SizeAndEmitTask: %s invest=$%.0f > remaining_cash=$%.0f "
+                    "— skipping to preserve cash invariant",
+                    ticker, invest, remaining_cash,
+                )
+                _block(ticker, "size_cash_invariant")
+                return
+            target_pct = invest / ctx.portfolio_value if ctx.portfolio_value > 0 else 0.0
+            ctx.orders.append(stamp_order_attribution({
+                "ticker":     ticker,
+                "shares":     shares,
+                "price":      price,
+                "invest":     invest,
+                "target_pct": target_pct,
+                "regime":     ctx.regime,
+                "confidence": ctx.confidence,
+                "conviction": conv,
+                "sigma_mult": sig_m,
+                "rank_score": c.rank_score  if c else 0.0,
+                "rs_score":   c.rs_score    if c else 0.0,
+                "panel_score": getattr(c, "panel_score", None) if c else None,
+                "sigma":      getattr(c, "sigma", None)        if c else None,
+                "mu":         getattr(c, "mu", None)           if c else None,
+                # Thesis-degradation baseline (Approach A) — carry the
+                # Kelly target THE MODEL COMPUTED for this candidate so
+                # adapters can stamp it as entry_kelly_target_pct. Distinct
+                # from `target_pct` (the actually-sized fraction).
+                "kelly_target_pct": getattr(c, "kelly_target_pct", None) if c else None,
+                "detail":     c.detail      if c else "",
+                # Order provenance — distinguished in trade log so audits
+                # can tell why a buy fired (NEW_BUY vs TopUp Kelly maintenance
+                # vs rotation vs QP). TopUpHeldTask sets "TOP_UP" on its
+                # orders; this is the fresh-entry path.
+                "order_type": "NEW_BUY",
+                # A-3 dedicated ledger reason field: stamped ONLY when the
+                # one-share floor actually rounded this order up, so every
+                # round-up is auditable in the ledger and flag-off orders
+                # stay byte-identical.
+                **({"size_floor_reason": "one_share_floor_round_up"}
+                   if one_share_floor_applied else {}),
+            }, ctx=ctx, source_job="SelectionJob",
+                source_task="SizeAndEmitTask",
+                acceptance_reason="selected_by_greedy_loop",
+                source_obj=c,
+                decision_inputs={
+                    "max_pct": max_pct,
+                    "reserve_pct": reserve_pct,
+                    "remaining_cash_before": remaining_cash,
+                    "conviction": conv,
+                    "sigma_mult": sig_m,
+                    "kelly_enabled": kelly_on,
+                    **({"one_share_floor_applied": True}
+                       if one_share_floor_applied else {}),
+                }))
+            remaining_cash -= invest
+            log.info(
+                "SizeAndEmitTask: %s NEW_BUY %d shares @ %.2f "
+                "($%.0f, %.1f%% target, conv=%.2f σ_mult=%.2f) "
+                "remaining_cash=$%.0f",
+                ticker, shares, price, invest, target_pct * 100,
+                conv, sig_m, remaining_cash,
+            )
+
         for ticker in ctx._selected:  # noqa: SLF001
             price = ctx.prices.get(ticker)
             if price is None or not _math.isfinite(price) or price <= 0:
@@ -322,6 +436,47 @@ class SizeAndEmitTask(Task):
                 log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
                 _block(ticker, "bear_defensive_slot_cap")
                 continue
+            if shares < 1 and one_share_floor_on and override_pct is None and max_pct > 0:
+                # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
+                # ONE share iff (a) one share fits under the regime's own
+                # max_position_pct × PV (the UNSCALED regime cap — the floor
+                # is a minimum-investability exception bounded by the hard
+                # regime cap, per §1.2 "1 share ≤ min(max_position_pct × PV,
+                # available headroom)"), and (b) one share fits inside the
+                # investable headroom after cash reservations — checked in
+                # the DEFERRED rescue pass below, against whatever cash is
+                # left over after every normal candidate has sized (round 3
+                # fix, see note above `deferred_rescues`), not against
+                # `remaining_cash` at this candidate's turn in rank order.
+                # The candidate has already passed every admission gate
+                # above; this changes sizing only. BEAR defensive slots
+                # (override_pct) keep the legacy drop behaviour.
+                #
+                # `max_pct > 0` guard (round-2 fix, codex review): the Kelly
+                # branch above already `continue`s on max_pct<=0 before this
+                # point, but the legacy (non-Kelly) branch has no equivalent
+                # early exit -- conviction_multiplier/sigma_multiplier can
+                # legitimately return exactly 0.0 (e.g. min_mult=0.0 config,
+                # at-or-below-floor candidate), meaning max_pct==0 is a
+                # genuine "the model says invest nothing" decision, NOT a
+                # rounds-to-zero-due-to-price artifact. Without this guard,
+                # a zero-conviction candidate whose price happens to fit the
+                # regime cap + investable cash was WRONGLY rounded up to one
+                # share and bought -- confirmed reproducible pre-fix (BLK
+                # @ $1,100, conviction=0.0 exactly, floor rescued it anyway).
+                # This check does not change flag-OFF behaviour (untouched
+                # by this whole block) or the Kelly path (already excluded
+                # upstream) -- it only narrows the legacy-path floor's own
+                # eligibility, so the block-reason string for a genuine
+                # zero-target legacy candidate stays "size_insufficient_cash"
+                # (the existing fallback below), exactly as before this fix.
+                regime_cap_dollars = (
+                    float(regime_p.get("max_position_pct", 0.15))
+                    * float(ctx.portfolio_value or 0.0)
+                )
+                if price <= regime_cap_dollars + 1e-6:
+                    deferred_rescues.append((ticker, price, c, conv, sig_m, max_pct))
+                    continue
             if shares < 1:
                 log.info("SizeAndEmitTask: %s insufficient cash — skip "
                          "(remaining_cash=$%.0f price=$%.2f)",
@@ -329,65 +484,45 @@ class SizeAndEmitTask(Task):
                 _block(ticker, "size_insufficient_cash")
                 continue
 
-            invest     = shares * price
-            # Defensive: per-position sizer already rounded down to whole
-            # shares within remaining_cash, but assert the invariant —
-            # sum of emitted invests must not exceed starting_cash.
-            if invest > remaining_cash + 1e-6:  # fp-tolerance
-                log.warning(
-                    "SizeAndEmitTask: %s invest=$%.0f > remaining_cash=$%.0f "
-                    "— skipping to preserve cash invariant",
-                    ticker, invest, remaining_cash,
-                )
-                _block(ticker, "size_cash_invariant")
-                continue
-            target_pct = invest / ctx.portfolio_value if ctx.portfolio_value > 0 else 0.0
-            ctx.orders.append(stamp_order_attribution({
-                "ticker":     ticker,
-                "shares":     shares,
-                "price":      price,
-                "invest":     invest,
-                "target_pct": target_pct,
-                "regime":     ctx.regime,
-                "confidence": ctx.confidence,
-                "conviction": conv,
-                "sigma_mult": sig_m,
-                "rank_score": c.rank_score  if c else 0.0,
-                "rs_score":   c.rs_score    if c else 0.0,
-                "panel_score": getattr(c, "panel_score", None) if c else None,
-                "sigma":      getattr(c, "sigma", None)        if c else None,
-                "mu":         getattr(c, "mu", None)           if c else None,
-                # Thesis-degradation baseline (Approach A) — carry the
-                # Kelly target THE MODEL COMPUTED for this candidate so
-                # adapters can stamp it as entry_kelly_target_pct. Distinct
-                # from `target_pct` (the actually-sized fraction).
-                "kelly_target_pct": getattr(c, "kelly_target_pct", None) if c else None,
-                "detail":     c.detail      if c else "",
-                # Order provenance — distinguished in trade log so audits
-                # can tell why a buy fired (NEW_BUY vs TopUp Kelly maintenance
-                # vs rotation vs QP). TopUpHeldTask sets "TOP_UP" on its
-                # orders; this is the fresh-entry path.
-                "order_type": "NEW_BUY",
-            }, ctx=ctx, source_job="SelectionJob",
-                source_task="SizeAndEmitTask",
-                acceptance_reason="selected_by_greedy_loop",
-                source_obj=c,
-                decision_inputs={
-                    "max_pct": max_pct,
-                    "reserve_pct": reserve_pct,
-                    "remaining_cash_before": remaining_cash,
-                    "conviction": conv,
-                    "sigma_mult": sig_m,
-                    "kelly_enabled": kelly_on,
-                }))
-            remaining_cash -= invest
-            log.info(
-                "SizeAndEmitTask: %s NEW_BUY %d shares @ %.2f "
-                "($%.0f, %.1f%% target, conv=%.2f σ_mult=%.2f) "
-                "remaining_cash=$%.0f",
-                ticker, shares, price, invest, target_pct * 100,
-                conv, sig_m, remaining_cash,
+            _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
+                        one_share_floor_applied=False)
+
+        # Deferred rescue pass (round 3, codex portfolio-level review): every
+        # normal candidate above has already had its full, uncontested shot
+        # at `remaining_cash` in unchanged rank order. Only now, using
+        # whatever is genuinely left over, do rescue-eligible candidates get
+        # a chance — in the SAME relative order they were deferred in, so
+        # higher-ranked rescue candidates still win ties for leftover cash
+        # over lower-ranked ones. A rescue can therefore never displace a
+        # normal candidate's funding or invert the score-vs-realized-
+        # investment ordering the way an inline rescue could.
+        for ticker, price, c, conv, sig_m, max_pct in deferred_rescues:
+            investable = max(
+                remaining_cash - reserve_pct * float(ctx.portfolio_value or 0.0),
+                0.0,
             )
+            if price > investable + 1e-6:
+                log.info("SizeAndEmitTask: %s insufficient leftover cash for "
+                         "rescue — skip (remaining_cash=$%.0f price=$%.2f)",
+                         ticker, remaining_cash, price)
+                _block(ticker, "size_insufficient_cash")
+                continue
+            ctx.counters["one_share_floor_roundups"] = (
+                ctx.counters.get("one_share_floor_roundups", 0) + 1
+            )
+            log.info(
+                "SizeAndEmitTask: %s ONE_SHARE_FLOOR — target $%.0f "
+                "< 1 share $%.2f; rounding UP to 1 share using leftover "
+                "cash (1 share = %.1f%% PV ≤ regime cap %.1f%%, "
+                "leftover investable=$%.0f)",
+                ticker, max_pct * ctx.portfolio_value, price,
+                100.0 * price / ctx.portfolio_value
+                if ctx.portfolio_value > 0 else 0.0,
+                100.0 * float(regime_p.get("max_position_pct", 0.15)),
+                investable,
+            )
+            _emit_order(ticker, 1, price, c, conv, sig_m, max_pct,
+                        one_share_floor_applied=True)
 
         spent = starting_cash - remaining_cash
         log.info(
