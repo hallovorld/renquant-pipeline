@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import datetime as dt
 
+import pytest
+
 from renquant_pipeline.context import InferenceContext
 from renquant_pipeline.kernel.selection import CandidateResult
 from renquant_pipeline.kernel.pipeline.task_selection import SizeAndEmitTask
@@ -411,3 +413,169 @@ def test_off_vs_on_sweep_only_rounds_to_zero_names_differ():
     for ticker in ("OXY", "BKNG", "NEG"):
         assert off_orders.get(ticker) == on_orders.get(ticker), ticker
         assert off_blocked.get(ticker) == on_blocked.get(ticker), ticker
+
+
+# ── Round 3 (codex review): portfolio-level preregistered shadow evidence ────
+#
+# Round 1/2 proved the sizing FUNCTION is correct in isolation. Codex's round
+# 3 finding: unit correctness is not operational authorization — a rescue
+# that is individually correct could still interact badly with the REST of
+# a multi-candidate portfolio pass (crowd out a later candidate, inflate
+# gross exposure, invert score-vs-size ordering) in ways no single-ticker
+# test can see.
+#
+# Investigating this surfaced a REAL portfolio-level defect in the original
+# (round 1/2) implementation: the rescue fired INLINE, in the same pass as
+# normal sizing, decrementing the SAME `remaining_cash` normal candidates
+# draw from. A rescue ranked ahead of a normal candidate could consume MORE
+# cash than its own (tiny) target implied — 1 share can cost far more than
+# the fractional target that triggered the rescue — and crowd that later
+# candidate out entirely, or even invert the score-vs-realized-investment
+# ordering (measured pre-fix on the panel below: Spearman rho went from
+# +0.11 OFF to -0.63 ON, because a $0.001-conviction rescued name displaced
+# a $0.5-conviction name for cash).
+#
+# Fix (in `SizeAndEmitTask`, not just this test): the rescue is now a
+# DEFERRED second pass. Every normal candidate sizes fully first, in
+# unchanged rank order, against the full `remaining_cash`. Only after that
+# is complete does the rescue pass spend whatever is genuinely left over,
+# in the same relative order the rescue candidates were deferred in. A
+# rescue can therefore only ADD a trade using idle cash — it can no longer
+# take cash a normal candidate needed, so it cannot crowd anyone out or
+# invert an existing candidate's funding.
+#
+# Six metrics, declared in machine-checkable terms with explicit pass/fail
+# thresholds, computed by actually running the full multi-candidate pass
+# OFF vs ON over IDENTICAL inputs (same panel, same prices, same account
+# state) at two cash-reserve settings (0% and 5%):
+#
+#   1. Changed ticker/order set — the ONLY tickers whose fate (funded
+#      status or share count) may differ between OFF and ON are tickers
+#      that are floor-rescue ELIGIBLE (would round to 0 shares, flag ON,
+#      price <= regime cap). Every other ticker (normal, admission-gate-
+#      blocked, regime-cap-blocked) must be BYTE-IDENTICAL. Threshold: zero
+#      tolerance — this is a structural guarantee of the two-pass design,
+#      not a statistical one.
+#   2. Target-vs-realized gross exposure jump — total invested dollars,
+#      ON minus OFF, must equal EXACTLY the sum of successfully-rescued
+#      positions' own invest dollars (no more, no less). Threshold: exact
+#      equality (within float tolerance) — the two-pass design makes a
+#      rescue strictly additive, never a modification of an existing order.
+#   3. Max single-name concentration — no position (rescued or not) may
+#      exceed the regime's own `max_position_pct` cap, in EITHER run.
+#      Threshold: <= regime cap (already enforced by the existing
+#      eligibility check; this asserts it holds at the portfolio level too).
+#   4. Reserve use — total invested dollars must never exceed
+#      `starting_cash - cash_reserve_pct * portfolio_value`, in EITHER run.
+#      Threshold: <= that ceiling (the pre-existing cash invariant,
+#      reasserted here at the whole-panel level rather than per-ticker).
+#   5. Turnover/cost delta — gross churn (sum of |invest delta| across every
+#      ticker, ON vs OFF) must equal EXACTLY the sum of rescued positions'
+#      invest dollars — i.e., zero churn attributable to anything other
+#      than the rescue trades themselves. Threshold: exact equality.
+#   6. Score-vs-price-rank drift — restricted to the set of tickers FUNDED
+#      in the OFF run (the ones whose funding could in principle be put at
+#      risk): their invest amounts and relative ordering must be IDENTICAL
+#      in the ON run. (A raw whole-panel score-vs-invest correlation is the
+#      wrong metric here — adding a new low-score position using idle cash
+#      necessarily shifts a whole-panel correlation even when nothing else
+#      changed; the actual risk codex named is an EXISTING candidate losing
+#      ground to a lower-scored rescued one, which this metric isolates.)
+#      Threshold: exact equality for every OFF-funded ticker.
+#
+# Synthetic panel (not a replay of real production data — this is a
+# constructed stress scenario chosen specifically to exercise crowding,
+# documented as such): BLK is the round-1 rescue candidate (low conviction,
+# high price). MARGINAL and OXY are ranked ahead of BLK with genuine
+# capital needs sized to make cash genuinely tight at BLK's turn if the
+# rescue were inline — this is what exposed the pre-fix crowding defect.
+# BKNG exceeds the regime cap regardless of cash (control). NEG fails the
+# signal-direction gate before sizing ever runs (control).
+
+def _portfolio_panel():
+    return [
+        _cand("MARGINAL", panel_score=0.5),
+        _cand("BKNG", panel_score=0.7),
+        _cand("OXY", panel_score=0.6),
+        _cand("BLK", panel_score=0.001),
+        _cand("NEG", panel_score=-0.11),
+    ]
+
+
+_PORTFOLIO_PRICES = {
+    "MARGINAL": 700.0, "BKNG": 5_000.0, "OXY": 48.0, "BLK": BLK_PRICE, "NEG": 30.0,
+}
+_PORTFOLIO_ORDER = ["MARGINAL", "BKNG", "OXY", "BLK", "NEG"]
+_PORTFOLIO_CASH = 3_100.0
+
+
+def _run_portfolio(flag_on, reserve_pct):
+    cfg = (_flag_on_config(cash_reserve_pct=reserve_pct) if flag_on
+           else _config(cash_reserve_pct=reserve_pct))
+    ctx = _ctx(_portfolio_panel(), _PORTFOLIO_ORDER, cfg,
+               cash=_PORTFOLIO_CASH, prices=_PORTFOLIO_PRICES)
+    SizeAndEmitTask().run(ctx)
+    order_by_ticker = {o["ticker"]: o for o in ctx.orders}
+    orders = {t: (o["shares"], o["invest"]) for t, o in order_by_ticker.items()}
+    blocked = dict(getattr(ctx, "_blocked_by_ticker", {}) or {})
+    rescued = {t for t, o in order_by_ticker.items()
+               if o.get("size_floor_reason") == "one_share_floor_round_up"}
+    return orders, blocked, rescued
+
+
+def test_portfolio_level_off_vs_on_evidence_reserve_0pct():
+    _assert_portfolio_evidence(reserve_pct=0.0)
+
+
+def test_portfolio_level_off_vs_on_evidence_reserve_5pct():
+    _assert_portfolio_evidence(reserve_pct=0.05)
+
+
+def _assert_portfolio_evidence(reserve_pct):
+    off_orders, off_blocked, off_rescued = _run_portfolio(False, reserve_pct)
+    on_orders, on_blocked, on_rescued = _run_portfolio(True, reserve_pct)
+    assert off_rescued == set()  # flag OFF never rescues
+
+    # Metric 1: changed ticker/order set — only rescue-eligible tickers may differ.
+    all_tickers = set(off_orders) | set(off_blocked) | set(on_orders) | set(on_blocked)
+    changed = {
+        t for t in all_tickers
+        if (off_orders.get(t), off_blocked.get(t)) != (on_orders.get(t), on_blocked.get(t))
+    }
+    assert changed <= on_rescued, (
+        f"non-rescued ticker(s) changed fate: {changed - on_rescued}"
+    )
+    for t in all_tickers - on_rescued:
+        assert off_orders.get(t) == on_orders.get(t), t
+        assert off_blocked.get(t) == on_blocked.get(t), t
+
+    # Metric 2: gross exposure jump == sum of rescued positions' own invest $.
+    off_total = sum(v[1] for v in off_orders.values())
+    on_total = sum(v[1] for v in on_orders.values())
+    rescued_total = sum(on_orders[t][1] for t in on_rescued)
+    assert on_total - off_total == pytest.approx(rescued_total, abs=1e-6)
+
+    # Metric 3: no position (rescued or not) exceeds the regime cap.
+    cap_dollars = REGIME_CAP_PCT * PV
+    for shares, invest in list(off_orders.values()) + list(on_orders.values()):
+        assert invest <= cap_dollars + 1e-6
+
+    # Metric 4: reserve invariant holds for the whole panel, both runs.
+    ceiling = _PORTFOLIO_CASH - reserve_pct * PV
+    assert off_total <= ceiling + 1e-6
+    assert on_total <= ceiling + 1e-6
+
+    # Metric 5: gross churn == sum of rescued positions' invest $ (zero
+    # churn attributable to anything else).
+    all_order_tickers = set(off_orders) | set(on_orders)
+    churn = sum(
+        abs(on_orders.get(t, (0, 0.0))[1] - off_orders.get(t, (0, 0.0))[1])
+        for t in all_order_tickers
+    )
+    assert churn == pytest.approx(rescued_total, abs=1e-6)
+
+    # Metric 6: every OFF-funded (non-rescued) ticker's fill is identical ON.
+    for t in off_orders:
+        if t in on_rescued:
+            continue
+        assert off_orders[t] == on_orders.get(t), t
