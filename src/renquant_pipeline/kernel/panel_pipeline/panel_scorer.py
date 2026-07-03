@@ -39,60 +39,18 @@ import xgboost as xgb
 # excluded/included fields in `renquant_common.model_fingerprint` so both
 # sides pick them up automatically.
 #
-# 2026-07-02 M6 unification (renquant-common#19/#20): the shared module's
-# public API settled on `PREDICTIVE_KEYS`/`OPERATIONAL_KEYS` (this repo's
-# old `_PREDICTIVE_CONTENT_HINTS`/`MUTABLE_ARTIFACT_KEYS` are their direct
-# named ancestors per the module's own docstring) and a minimal `stamp()`
-# returning just the two fingerprint fields. `stamp_artifact_metadata()` and
-# `model_content_sha256_from_path()` below are LOCAL composition helpers
-# (this repo's own metadata-merging convenience, never re-exported by
-# renquant_common) that delegate the actual hash computation to the shared
-# `model_content_sha256`/`stamp`/`artifact_sha256` — never reimplement the
-# classification/hashing logic itself here.
+# Re-exported under their original (including underscore-prefixed) names
+# here for back-compat: other modules in this repo import
+# `model_content_sha256` / `stamp_artifact_metadata` / `artifact_sha256`
+# from this module rather than from renquant_common directly.
 from renquant_common.model_fingerprint import (  # noqa: F401
-    OPERATIONAL_KEYS as _MUTABLE_ARTIFACT_KEYS,
-    PREDICTIVE_KEYS as _PREDICTIVE_CONTENT_HINTS,
+    MUTABLE_ARTIFACT_KEYS as _MUTABLE_ARTIFACT_KEYS,
+    PREDICTIVE_CONTENT_HINTS as _PREDICTIVE_CONTENT_HINTS,
     artifact_sha256,
     model_content_sha256,
-    stamp,
+    model_content_sha256_from_path,
+    stamp_artifact_metadata,
 )
-
-
-def stamp_artifact_metadata(
-    public_payload: dict[str, Any],
-    path: str | Path,
-    *,
-    payload: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Compose this repo's runtime metadata dict around the shared stamp.
-
-    ``public_payload`` is merged with the shared module's
-    ``model_content_fingerprint``/``fingerprint_schema_version`` stamp plus
-    the artifact file's whole-file ``artifact_sha256`` — never a local
-    reimplementation of the fingerprint itself. ``payload`` defaults to
-    ``public_payload`` (the ``HFPatchTSTPanelScorer`` call site passes only
-    one payload dict); pass it explicitly when the fingerprint must be
-    computed over a fuller payload than what's stored as metadata (the
-    ``PanelScorer`` call site excludes ``booster_raw_json`` from
-    ``public_payload`` for storage size but still needs it hashed).
-    """
-    return {
-        **public_payload,
-        **stamp(payload if payload is not None else public_payload),
-        "artifact_sha256": artifact_sha256(path),
-    }
-
-
-def model_content_sha256_from_path(path: str | Path) -> str:
-    """Return model-content hash for JSON artifacts, full hash otherwise."""
-    p = Path(path)
-    try:
-        payload = json.loads(p.read_text())
-    except Exception:
-        return artifact_sha256(p)
-    if not isinstance(payload, dict):
-        return artifact_sha256(p)
-    return model_content_sha256(payload)
 
 
 class PanelScorer:
