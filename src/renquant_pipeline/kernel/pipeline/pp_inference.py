@@ -562,6 +562,15 @@ class InferencePipeline:
         from .task_benchmark_sleeve import BenchmarkSleeveTask  # noqa: PLC0415
         BenchmarkSleeveTask().run(ctx)
 
+        # S7 lane-B parking sleeve (renquant-orchestrator RS-1 + capability
+        # program §1.3): β-budgeted SPY/SGOV sweep of idle cash above the
+        # reserve. Default OFF (`sleeve.enabled`); shadow mode only — logs the
+        # intended sweep/fund orders to a JSONL and places NOTHING. Runs after
+        # every selection/top-up/trim decision so it can never compete with or
+        # block single-name admission.
+        from .task_parking_sleeve import ParkingSleeveShadowTask  # noqa: PLC0415
+        ParkingSleeveShadowTask().run(ctx)
+
         # Monitor: persistent no-trade periods are treated as a hard signal,
         # not a silent state. See task_monitor.MonitorIdleStreakTask.
         from .task_monitor import MonitorIdleStreakTask  # noqa: PLC0415
