@@ -29,8 +29,13 @@ import pytest
 
 from renquant_pipeline.context import InferenceContext
 from renquant_pipeline.kernel.pipeline.task_admission_shadow import (
+    MEASURED_BASES,
+    PROXY_BASES,
     SCHEMA_VERSION,
+    TAXONOMY_VERSION,
     AdmissionShadowLoggerTask,
+    TaxonomyVersionMismatchError,
+    build_acceptance_packet,
 )
 
 TODAY = datetime.date(2026, 7, 2)
@@ -110,6 +115,9 @@ def test_june_freeze_scenario_panel_scored_but_tournament_stale(tmp_path):
     assert entry["side"] == "added"
     assert entry["tournament"] == "stale_61d_limit_28:train_end"
     assert entry["panel_basis"] == "panel_scored"
+    assert entry["measured"] is True
+    # A real measured panel-admit belongs in the R1 headline metric.
+    assert "FROZEN_TOURN" in record["added_measured"]
 
 
 def test_added_via_input_freshness_proxy_when_never_reached_panel(tmp_path):
@@ -123,8 +131,12 @@ def test_added_via_input_freshness_proxy_when_never_reached_panel(tmp_path):
     entry = record["reasons"]["NO_ARTIFACT"]
     assert entry["tournament"] == "no_artifact"
     assert entry["panel_basis"] == "input_fresh_proxy"
+    assert entry["measured"] is False
     assert entry["panel"].startswith("panel_input_fresh_lag_")
     assert record["n_panel_proxy"] >= 1
+    # Proxy evidence must NOT contaminate the measured-only headline metric.
+    assert "NO_ARTIFACT" not in record["added_measured"]
+    assert "NO_ARTIFACT" in record["added_proxy"]
 
 
 def test_stale_featured_name_dropped_with_lag_reason(tmp_path):
@@ -139,7 +151,9 @@ def test_stale_featured_name_dropped_with_lag_reason(tmp_path):
     assert entry["side"] == "dropped"
     assert entry["tournament"] == "admitted"
     assert entry["panel_basis"] == "panel_block"
+    assert entry["measured"] is True
     assert entry["panel"] == "panel_score_missing"
+    assert "STALE_FEATURED" in record["dropped_measured"]
 
 
 def test_stale_inputs_without_panel_verdict_dropped_by_lag(tmp_path):
@@ -152,9 +166,13 @@ def test_stale_inputs_without_panel_verdict_dropped_by_lag(tmp_path):
 
     entry = record["reasons"]["STALE_FEATURED"]
     assert entry["panel_basis"] == "input_freshness"
+    assert entry["measured"] is False
     assert entry["panel"].startswith("panel_input_stale_lag_")
     lag = int(entry["panel"].removeprefix("panel_input_stale_lag_").rstrip("d"))
     assert lag >= 40   # last bar pinned 40 calendar days behind the session
+    # Proxy-basis drop must NOT count toward the measured headline metric.
+    assert "STALE_FEATURED" not in record["dropped_measured"]
+    assert "STALE_FEATURED" in record["dropped_proxy"]
 
 
 def test_non_panel_buy_gate_is_not_admission_noise(tmp_path):
@@ -184,6 +202,18 @@ def test_counts_are_consistent(tmp_path):
     assert record["n_intersection"] == 2
     assert sorted(record["added"]) == ["FROZEN_TOURN", "NO_ARTIFACT"]
     assert record["dropped"] == ["STALE_FEATURED"]
+    # Measured/proxy split: FROZEN_TOURN is a real panel-admit (measured),
+    # NO_ARTIFACT is proxy-inferred (never reached the panel); STALE_FEATURED
+    # drops on a measured panel-block reason (panel_score_missing).
+    assert record["added_measured"] == ["FROZEN_TOURN"]
+    assert record["added_proxy"] == ["NO_ARTIFACT"]
+    assert record["dropped_measured"] == ["STALE_FEATURED"]
+    assert record["dropped_proxy"] == []
+    assert record["n_added_measured"] == 1
+    assert record["n_added_proxy"] == 1
+    assert record["n_dropped_measured"] == 1
+    assert record["n_dropped_proxy"] == 0
+    assert record["taxonomy_version"] == TAXONOMY_VERSION
 
 
 def test_missing_ohlcv_frame_fails_closed_for_proxy(tmp_path):
@@ -226,6 +256,11 @@ def test_panel_fail_closed_day_is_empty_panel_set(tmp_path):
         assert record["reasons"][name]["panel"] == (
             "panel_fail_closed:panel_scorer_config_mismatch"
         )
+        # panel_fail_closed is a real observed operational state (the panel
+        # genuinely did fail closed) -- counts as measured, not proxy.
+        assert record["reasons"][name]["measured"] is True
+    assert sorted(record["dropped_measured"]) == sorted(ctx.models)
+    assert record["dropped_proxy"] == []
 
 
 # ── Fail isolation ────────────────────────────────────────────────────────────
@@ -257,10 +292,15 @@ def test_internal_exception_is_isolated(tmp_path, monkeypatch):
 # ── Append-only JSONL schema ──────────────────────────────────────────────────
 
 REQUIRED_KEYS = {
-    "schema", "date", "broker", "run_mode", "regime", "panel_state",
-    "panel_fail_reason", "n_watchlist", "n_tournament", "n_panel",
-    "n_panel_scored", "n_panel_proxy", "n_intersection",
-    "added", "dropped", "reasons",
+    "schema", "taxonomy_version", "date", "broker", "run_mode", "regime",
+    "panel_state", "panel_fail_reason", "n_watchlist", "n_tournament",
+    "n_panel", "n_panel_scored", "n_panel_proxy", "n_intersection",
+    "added", "dropped",
+    "added_measured", "dropped_measured",
+    "n_added_measured", "n_dropped_measured",
+    "added_proxy", "dropped_proxy",
+    "n_added_proxy", "n_dropped_proxy",
+    "reasons",
 }
 
 
@@ -403,3 +443,107 @@ def test_sell_only_pipeline_has_no_shadow_hook():
 
     src = inspect.getsource(pp_inference.SellOnlyPipeline.run)
     assert "AdmissionShadowLoggerTask" not in src
+
+
+# ── Measured vs proxy taxonomy (R1 review directive, 2026-07-02) ────────────
+
+def test_measured_and_proxy_bases_partition_all_bases():
+    """Every basis the classifier can emit is in exactly one bucket."""
+    assert MEASURED_BASES == {"panel_scored", "panel_block", "panel_fail_closed"}
+    assert PROXY_BASES == {"input_fresh_proxy", "input_freshness"}
+    assert MEASURED_BASES.isdisjoint(PROXY_BASES)
+
+
+def test_every_reason_entry_basis_is_classified(tmp_path):
+    """No basis value escapes MEASURED_BASES ∪ PROXY_BASES — a silent third
+    category would break both the headline metric and the histograms."""
+    ctx = _ctx(tmp_path)
+    AdmissionShadowLoggerTask().run(ctx)
+    (record,) = _read_records(tmp_path)
+    for entry in record["reasons"].values():
+        basis = entry["panel_basis"]
+        assert basis in MEASURED_BASES or basis in PROXY_BASES
+        assert entry["measured"] == (basis in MEASURED_BASES)
+
+
+# ── R1 acceptance packet: frozen 20-session analysis ─────────────────────────
+
+def test_acceptance_packet_headline_is_measured_only(tmp_path):
+    """The pooled headline delta must come only from *_measured counts —
+    proxy volume must never inflate it."""
+    ctx = _ctx(tmp_path)
+    AdmissionShadowLoggerTask().run(ctx)
+    (record,) = _read_records(tmp_path)
+
+    packet = build_acceptance_packet([record])
+
+    assert packet["headline"]["total_dropped_measured"] == \
+        record["n_dropped_measured"]
+    assert packet["headline"]["total_added_measured"] == \
+        record["n_added_measured"]
+    assert packet["proxy"]["total_dropped_proxy"] == record["n_dropped_proxy"]
+    assert packet["proxy"]["total_added_proxy"] == record["n_added_proxy"]
+
+
+def test_acceptance_packet_denominators_are_pooled_sums(tmp_path):
+    """Denominators sum across sessions rather than averaging per-session
+    percentages, so the packet stays comparable across a shrinking/growing
+    universe within the shadow window."""
+    ctx1 = _ctx(tmp_path)
+    AdmissionShadowLoggerTask().run(ctx1)
+    ctx2 = _ctx(tmp_path)
+    ctx2.today = TODAY + datetime.timedelta(days=1)
+    AdmissionShadowLoggerTask().run(ctx2)
+    records = _read_records(tmp_path)
+
+    packet = build_acceptance_packet(records)
+
+    assert packet["n_sessions"] == 2
+    assert packet["denominators"]["total_tournament"] == sum(
+        r["n_tournament"] for r in records
+    )
+    assert packet["denominators"]["total_panel_measured_admissible"] == sum(
+        r["n_panel_scored"] for r in records
+    )
+    assert packet["headline"]["dropped_measured_rate"] == pytest.approx(
+        sum(r["n_dropped_measured"] for r in records)
+        / packet["denominators"]["total_tournament"]
+    )
+
+
+def test_acceptance_packet_reason_histograms_split_measured_and_proxy(
+    tmp_path,
+):
+    ctx = _ctx(tmp_path)
+    AdmissionShadowLoggerTask().run(ctx)
+    (record,) = _read_records(tmp_path)
+
+    packet = build_acceptance_packet([record])
+
+    assert "panel_scored" in packet["reason_histogram_measured"]
+    assert "panel_block" in packet["reason_histogram_measured"]
+    assert "input_fresh_proxy" in packet["reason_histogram_proxy"]
+    # No basis should appear in both histograms.
+    assert set(packet["reason_histogram_measured"]).isdisjoint(
+        packet["reason_histogram_proxy"]
+    )
+
+
+def test_acceptance_packet_rejects_mismatched_taxonomy_version(tmp_path):
+    """A record from a different taxonomy version must not be silently
+    pooled — the basis categories/denominators could mean something
+    different under an old version."""
+    ctx = _ctx(tmp_path)
+    AdmissionShadowLoggerTask().run(ctx)
+    (record,) = _read_records(tmp_path)
+    stale_record = dict(record, taxonomy_version="admission_shadow_taxonomy.v0")
+
+    with pytest.raises(TaxonomyVersionMismatchError):
+        build_acceptance_packet([record, stale_record])
+
+
+def test_acceptance_packet_empty_window():
+    packet = build_acceptance_packet([])
+    assert packet["n_sessions"] == 0
+    assert packet["taxonomy_version"] == TAXONOMY_VERSION
+    assert packet["headline"] == {}

@@ -44,6 +44,30 @@ gates, weak-score vetoes, …) with fresh inputs classify as panel-admissible
 via (3): those are decision-funnel outcomes, not admission facts, and must not
 flood the delta with noise.
 
+MEASURED vs PROXY (R1 review directive, 2026-07-02): basis (1)/(2) above
+(``panel_scored``, ``panel_block``) plus the book-wide ``panel_fail_closed``
+state are MEASURED — the panel machinery actually ran and produced (or
+fail-closed on producing) a verdict for that name. Basis (3)
+(``input_fresh_proxy``, and its dropped counterpart ``input_freshness``) is
+PROXY — the name never reached the panel at all (tournament rejected it
+upstream); "the panel would/wouldn't have scored it" is INFERRED from OHLCV
+lag, not observed. A name that never reached the live panel because
+tournament blocked it first is not the same evidence as a measured
+panel-admit, even when the freshness proxy says it looks eligible.
+
+The R1 retirement decision's HEADLINE metric is measured-only
+(``added_measured`` / ``dropped_measured`` — see ``MEASURED_BASES`` below).
+Proxy rows (``added_proxy`` / ``dropped_proxy``) are reported separately and
+must NEVER be blended into the headline delta: tournament blocks far more
+names than the panel ever scores, so proxy inference volume can dwarf
+measured evidence and manufacture a retirement case from inference mass
+rather than observed panel behavior. ``added`` / ``dropped`` remain as the
+full (measured ∪ proxy) union for visibility only — they are not the
+decision metric. Each record stamps ``taxonomy_version`` (see
+``TAXONOMY_VERSION``); the R1 acceptance packet (``build_acceptance_packet``
+below) refuses to pool records whose taxonomy version differs, so the basis
+categories and their denominators cannot silently drift mid-window.
+
 CONTRACT (hard):
 
 * OBSERVE-ONLY / ZERO behavior change — the live admission still rules. This
@@ -75,6 +99,26 @@ log = logging.getLogger("kernel.pipeline.admission_shadow")
 SCHEMA_VERSION = "admission_shadow.v1"
 DEFAULT_LOG_RELPATH = Path("logs") / "admission_shadow.jsonl"
 DEFAULT_MAX_OHLCV_LAG_DAYS = 3
+
+# Reason-taxonomy version stamped into every record (R1 review directive,
+# 2026-07-02): bump this ONLY when MEASURED_BASES / PROXY_BASES or their
+# meaning changes. build_acceptance_packet() refuses to pool records whose
+# taxonomy_version differs from the packet's own, so the R1 20-session
+# window can never silently blend two different basis definitions.
+TAXONOMY_VERSION = "admission_shadow_taxonomy.v1"
+
+# MEASURED: the panel machinery actually ran (or book-wide fail-closed) and
+# produced a real verdict for the name. PROXY: the name never reached the
+# panel — "admissible" is inferred from OHLCV freshness, not observed. The
+# R1 headline decision metric is measured-only; proxy is reported but never
+# blended into it (see module docstring "MEASURED vs PROXY").
+MEASURED_BASES: frozenset[str] = frozenset({
+    "panel_scored", "panel_block", "panel_fail_closed",
+})
+PROXY_BASES: frozenset[str] = frozenset({
+    "input_fresh_proxy", "input_freshness",
+})
+ALL_BASES: frozenset[str] = MEASURED_BASES | PROXY_BASES
 
 # Blocked-map reasons that are PANEL-machinery verdicts (feature row /
 # matrix / scorer / calibration failures) — measured "the panel cannot score
@@ -338,6 +382,18 @@ class AdmissionShadowLoggerTask:
 
         added = sorted(panel_admissible - tournament)
         dropped = sorted(tournament - panel_admissible)
+        added_measured = sorted(
+            t for t in added if basis_by_name[t][0] in MEASURED_BASES
+        )
+        added_proxy = sorted(
+            t for t in added if basis_by_name[t][0] in PROXY_BASES
+        )
+        dropped_measured = sorted(
+            t for t in dropped if basis_by_name[t][0] in MEASURED_BASES
+        )
+        dropped_proxy = sorted(
+            t for t in dropped if basis_by_name[t][0] in PROXY_BASES
+        )
 
         reasons: dict[str, dict[str, Any]] = {}
         for ticker in added:
@@ -348,6 +404,7 @@ class AdmissionShadowLoggerTask:
                     ticker, "not_admitted_reason_unavailable",
                 ),
                 "panel_basis": basis,
+                "measured": basis in MEASURED_BASES,
                 "panel": reason,
                 "held": ticker in held,
             }
@@ -357,6 +414,7 @@ class AdmissionShadowLoggerTask:
                 "side": "dropped",
                 "tournament": "admitted",
                 "panel_basis": basis,
+                "measured": basis in MEASURED_BASES,
                 "panel": reason,
                 "held": ticker in held,
             }
@@ -368,6 +426,7 @@ class AdmissionShadowLoggerTask:
         run_ts = getattr(ctx, "run_timestamp", None)
         return {
             "schema": SCHEMA_VERSION,
+            "taxonomy_version": TAXONOMY_VERSION,
             "date": today.isoformat(),
             "run_timestamp": run_ts.isoformat() if isinstance(
                 run_ts, datetime) else None,
@@ -383,8 +442,20 @@ class AdmissionShadowLoggerTask:
             "n_panel_scored": len(set(panel_scores) & panel_admissible),
             "n_panel_proxy": n_proxy,
             "n_intersection": len(tournament & panel_admissible),
+            # Full (measured ∪ proxy) union — visibility only, NOT the R1
+            # decision metric. Use *_measured below for the headline delta.
             "added": added,
             "dropped": dropped,
+            # HEADLINE (R1 decision metric): measured evidence only.
+            "added_measured": added_measured,
+            "dropped_measured": dropped_measured,
+            "n_added_measured": len(added_measured),
+            "n_dropped_measured": len(dropped_measured),
+            # Reported separately, never pooled into the headline delta.
+            "added_proxy": added_proxy,
+            "dropped_proxy": dropped_proxy,
+            "n_added_proxy": len(added_proxy),
+            "n_dropped_proxy": len(dropped_proxy),
             "reasons": reasons,
         }
 
@@ -394,3 +465,103 @@ class AdmissionShadowLoggerTask:
         line = json.dumps(record, sort_keys=True, default=str)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
+
+
+class TaxonomyVersionMismatchError(ValueError):
+    """Raised when records in an R1 acceptance packet disagree on
+    ``taxonomy_version`` — pooling them would silently blend two different
+    basis definitions / denominators across the shadow window."""
+
+
+def build_acceptance_packet(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Frozen R1 acceptance packet over an accumulated shadow-log window.
+
+    Pools sessions with FIXED denominators (pooled sums, not per-session
+    percentage averages) so the packet is comparable across a window of
+    sessions with different universe sizes. The headline decision metric is
+    measured-only (``dropped_measured_rate`` / ``added_measured_rate``,
+    pooled over ``n_tournament`` / ``n_panel_measured_admissible``); proxy
+    rates are reported for visibility but are NEVER the retirement decision
+    input (see module docstring "MEASURED vs PROXY").
+
+    Refuses (raises ``TaxonomyVersionMismatchError``) to pool records whose
+    ``taxonomy_version`` differs from the first record's — re-collect the
+    window under one taxonomy version rather than silently mixing basis
+    definitions mid-window.
+    """
+    if not records:
+        return {
+            "taxonomy_version": TAXONOMY_VERSION,
+            "n_sessions": 0,
+            "headline": {},
+            "proxy": {},
+            "reason_histogram_measured": {},
+            "reason_histogram_proxy": {},
+        }
+
+    taxonomy_version = records[0].get("taxonomy_version")
+    mismatched = [
+        r["date"] for r in records
+        if r.get("taxonomy_version") != taxonomy_version
+    ]
+    if mismatched:
+        raise TaxonomyVersionMismatchError(
+            f"records {mismatched} do not share taxonomy_version "
+            f"{taxonomy_version!r} — re-collect the window under one "
+            f"taxonomy version instead of pooling mixed basis definitions",
+        )
+
+    n_sessions = len(records)
+    total_tournament = sum(int(r["n_tournament"]) for r in records)
+    total_panel_measured_admissible = sum(
+        int(r["n_panel_scored"]) for r in records
+    )
+    total_dropped_measured = sum(
+        int(r["n_dropped_measured"]) for r in records
+    )
+    total_added_measured = sum(int(r["n_added_measured"]) for r in records)
+    total_dropped_proxy = sum(int(r["n_dropped_proxy"]) for r in records)
+    total_added_proxy = sum(int(r["n_added_proxy"]) for r in records)
+
+    def _rate(numerator: int, denominator: int) -> float | None:
+        return (numerator / denominator) if denominator else None
+
+    reason_hist_measured: dict[str, int] = {}
+    reason_hist_proxy: dict[str, int] = {}
+    for record in records:
+        for entry in record.get("reasons", {}).values():
+            basis = entry.get("panel_basis")
+            bucket = (
+                reason_hist_measured if entry.get("measured")
+                else reason_hist_proxy
+            )
+            bucket[basis] = bucket.get(basis, 0) + 1
+
+    return {
+        "taxonomy_version": taxonomy_version,
+        "n_sessions": n_sessions,
+        "denominators": {
+            "total_tournament": total_tournament,
+            "total_panel_measured_admissible": total_panel_measured_admissible,
+        },
+        "headline": {
+            "total_dropped_measured": total_dropped_measured,
+            "total_added_measured": total_added_measured,
+            "dropped_measured_rate": _rate(
+                total_dropped_measured, total_tournament,
+            ),
+            "added_measured_rate": _rate(
+                total_added_measured, total_panel_measured_admissible,
+            ),
+        },
+        "proxy": {
+            "total_dropped_proxy": total_dropped_proxy,
+            "total_added_proxy": total_added_proxy,
+            "note": (
+                "inferred from OHLCV freshness for names the panel never "
+                "scored -- informational only, NOT the R1 decision input"
+            ),
+        },
+        "reason_histogram_measured": reason_hist_measured,
+        "reason_histogram_proxy": reason_hist_proxy,
+    }
