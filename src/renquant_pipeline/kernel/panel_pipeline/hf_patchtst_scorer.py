@@ -75,6 +75,63 @@ def _coalesce(*values):
     return None
 
 
+# ── 2026-06-15 silent mis-score fix (ported from the umbrella mirror) ────────
+# Umbrella commits 6cb2d79 ("reconstruct cross-stock / FiLM layers on load")
+# + 1a91680 ("fail closed on missing PatchTST component weights"). The live
+# authority copy (this file) had neither: load() built the model with
+# use_distributional_head only and swallowed the load_state_dict(strict=False)
+# result, so a cross-stock / FiLM checkpoint scored through the channel-
+# independent baseline with its cross_stock.* / film.* tensors silently
+# dropped — wrong scores, and never an error.
+
+def _checkpoint_component_flags(ckpt: dict) -> dict[str, bool]:
+    return {
+        "uses_distributional_head": bool(
+            ckpt.get("uses_distributional_head", False)
+        ),
+        "uses_film_regime": bool(ckpt.get("uses_film_regime", False)),
+        "uses_cross_stock_attn": bool(ckpt.get("uses_cross_stock_attn", False)),
+    }
+
+
+def _required_state_prefixes(ckpt: dict) -> tuple[str, ...]:
+    flags = _checkpoint_component_flags(ckpt)
+    prefixes = ["backbone.", "rank_head."]
+    if flags["uses_distributional_head"]:
+        prefixes.append("dist_head.")
+    if flags["uses_film_regime"]:
+        prefixes.append("film.")
+    if flags["uses_cross_stock_attn"]:
+        prefixes.append("cross_stock.")
+    return tuple(prefixes)
+
+
+def _summarize_key_roots(keys: list[str]) -> list[str]:
+    return sorted({k.split(".")[0] for k in keys})
+
+
+def _fail_loud_on_arch_mismatch(load_result, ckpt: dict) -> None:
+    unexpected = sorted(load_result.unexpected_keys)
+    if unexpected:
+        raise ValueError(
+            "hf_patchtst checkpoint has tensors the scorer did not "
+            "reconstruct: "
+            f"{_summarize_key_roots(unexpected)}"
+            " — unsupported architecture flag in the checkpoint?"
+        )
+    required_prefixes = _required_state_prefixes(ckpt)
+    missing = sorted(
+        key for key in load_result.missing_keys
+        if key.startswith(required_prefixes)
+    )
+    if missing:
+        raise ValueError(
+            "hf_patchtst checkpoint declared architecture components whose "
+            "tensors are missing: "
+            f"{_summarize_key_roots(missing)}"
+        )
+
+
 class HFPatchTSTPanelScorer:
     """Mirror of PatchTSTPanelScorer interface using HF transformers backbone.
 
@@ -181,8 +238,22 @@ class HFPatchTSTPanelScorer:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         sidecar = _load_contract_sidecar(path)
         cfg = PatchTSTConfig(**ckpt["config_dict"])
-        uses_dist = ckpt.get("uses_distributional_head", False)
-        model = hf_mod.HFPatchTSTRanker(cfg, use_distributional_head=uses_dist)
+        flags = _checkpoint_component_flags(ckpt)
+        uses_dist = flags["uses_distributional_head"]
+        # Reconstruct the OPTIONAL architecture flags the checkpoint was trained
+        # with. Omitting these silently scored a cross-stock / FiLM model through
+        # the channel-independent baseline path: load_state_dict(strict=False)
+        # dropped the unmatched cross_stock.* / film.* tensors as "unexpected",
+        # so the forward pass ran without those layers and produced wrong scores
+        # (and such a model could never be promoted live).
+        uses_cross_stock = flags["uses_cross_stock_attn"]
+        uses_film = flags["uses_film_regime"]
+        model = hf_mod.HFPatchTSTRanker(
+            cfg,
+            use_distributional_head=uses_dist,
+            use_film_regime=uses_film,
+            use_cross_stock_attn=uses_cross_stock,
+        )
         state = ckpt["state_dict"]
         # Legacy: SWA-wrapped state had "module." prefix (pre-2026-05-19 refactor)
         if any(k.startswith("module.") for k in state):
@@ -193,12 +264,14 @@ class HFPatchTSTPanelScorer:
                 k.startswith("rank_head.") for k in state):
             state = {("rank_head." + k.removeprefix("head.")) if k.startswith("head.") else k: v
                      for k, v in state.items()}
-        model.load_state_dict(state, strict=False)
+        load_result = model.load_state_dict(state, strict=False)
+        _fail_loud_on_arch_mismatch(load_result, ckpt)
         model.eval()
         log.info("HFPatchTSTPanelScorer loaded: n_feat=%d seq_len=%d "
-                 "val_ic=%.4f dist_head=%s",
+                 "val_ic=%.4f dist_head=%s film=%s cross_stock=%s",
                  len(ckpt["feature_cols"]), ckpt["seq_len"],
-                 float(ckpt.get("best_val_ic", float("nan"))), uses_dist)
+                 float(ckpt.get("best_val_ic", float("nan"))), uses_dist,
+                 uses_film, uses_cross_stock)
         ckpt_contract = ckpt.get("training_contract", {}) or {}
         sidecar_contract = sidecar.get("training_contract", {}) or {}
         contract = dict(sidecar_contract)
