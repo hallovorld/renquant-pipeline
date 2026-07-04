@@ -108,15 +108,36 @@ def _require_backend(ctx):
 
 
 class PrepareExecutionTask(Task):
-    """Clear transient per-bar accumulators.
+    """Clear transient per-bar accumulators + negotiate fractional capability.
 
     Pins: a stale ``ctx.fills`` from the prior bar must not survive into
     this one. Without this, an adapter that forgets to reset ctx between
     bars would double-count fills.
+
+    Capability negotiation (Codex review #153, blocking #1): when
+    ``execution.fractional_shares.enabled`` is on but the attached backend
+    cannot MODEL fractional quantities (``supports_fractional`` is False —
+    e.g. a whole-share sim/LEAN backend), fail fast at the top of the bar
+    instead of letting a sub-1-share order be floored to a zero-share fill
+    deep inside the backend. This keeps the readonly/shadow/sim path honest:
+    it must validate the SAME fractional behaviour that is enabled live.
     """
 
     def run(self, ctx) -> "bool | None":
-        _require_backend(ctx)
+        backend = _require_backend(ctx)
+        from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
+            fractional_sizing_cfg,
+        )
+        frac_on, _ = fractional_sizing_cfg(getattr(ctx, "config", None))
+        if frac_on and not getattr(backend, "supports_fractional", False):
+            raise ValueError(
+                "execution.fractional_shares.enabled is True but the attached "
+                f"{type(backend).__name__} cannot model fractional quantities "
+                "(supports_fractional=False). Refusing to run: a fractional "
+                "order would be floored to a zero-share fill on this backend. "
+                "Construct the backend with allow_fractional=True (sim/readonly) "
+                "or disable execution.fractional_shares for whole-share backends."
+            )
         ctx.fills = []
         return True
 
@@ -164,7 +185,15 @@ class ExecuteExitsTask(Task):
                 )
                 continue
             full = is_full_liquidate_signal(sig, held_qty)
-            shares = None if full else int(float(sig.quantity))
+            if full:
+                shares = None
+            else:
+                # Fractional-share lifecycle (#153): preserve a FLOAT partial
+                # sell quantity when the backend models fractional positions;
+                # int()-flooring a fractional trim would strand residual shares.
+                # Whole-share backends keep the legacy int() truncation.
+                q = float(sig.quantity)
+                shares = q if getattr(backend, "supports_fractional", False) else int(q)
             intent = OrderIntent(
                 ticker=ticker, side=OrderSide.SELL,
                 shares=shares, target_pct=0.0,
@@ -283,9 +312,18 @@ class ExecuteBuysTask(Task):
                     order,
                 )
                 continue
+            # Fractional-share execution (strategy-104 #35): preserve a FLOAT
+            # share count for fractionable orders instead of truncating to int
+            # here. Whole-share orders carry an integral float (e.g. 17.0) and
+            # are emitted as a plain int. The backend then NEGOTIATES the
+            # quantity (#153): a fractional-capable sim/readonly backend models
+            # the float; a whole-share-only backend (e.g. LEAN) fails fast
+            # rather than flooring to a zero-share fill.
+            raw_shares = float(order["shares"])
+            order_shares = raw_shares if raw_shares != int(raw_shares) else int(raw_shares)
             intent = OrderIntent(
                 ticker=order["ticker"], side=OrderSide.BUY,
-                shares=int(order["shares"]),
+                shares=order_shares,
                 target_pct=float(order["target_pct"]),
                 today=today,
                 reason=str(order.get("detail") or "buy"),

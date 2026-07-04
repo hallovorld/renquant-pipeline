@@ -156,7 +156,11 @@ class SizeAndEmitTask(Task):
             conviction_score_for_object,
             conviction_score_percentiles,
             conviction_multiplier,
+            fractional_dust_floor_usd,
+            fractional_eligible,
+            fractional_sizing_cfg,
             sigma_multiplier,
+            sizing_target_notional,
             universe_sigma_median,
         )
 
@@ -224,6 +228,39 @@ class SizeAndEmitTask(Task):
             if isinstance(_sizing_root, dict) else False
         )
 
+        # S-FRAC v2 stage 2 (2026-07-03, design §6 stage 2 / §7.2): fractional
+        # sizing under `execution.fractional_shares.enabled` (default OFF,
+        # fail-closed reader salvaged from #153). Precedence when enabled:
+        # fractional (exact) → one_share_floor (round-up) → whole-share drop.
+        # Fractional changes HOW MUCH of an admitted name is bought, never
+        # WHETHER — every admission gate above/below is untouched (admission
+        # invariance pinned by test). A-3 stays the live fallback for
+        # non-fractionable symbols and for the flag-off state.
+        frac_on, _frac_min_notional = fractional_sizing_cfg(ctx.config)
+        frac_dust_floor = fractional_dust_floor_usd(ctx.config) if frac_on else 0.0
+        if frac_on and one_share_floor_on:
+            # Mutual exclusion (§7.2): both flags on ⇒ fractional supersedes
+            # the A-3 round-up for fractionable names (its roundups counter
+            # goes to 0 for those names — a monitorable supersession signal);
+            # A-3 remains reachable ONLY as the non-fractionable fallback.
+            # Counted so the config tangle is ledger-visible, not log-only.
+            ctx.counters["config_warning_fractional_supersedes_one_share_floor"] = (
+                ctx.counters.get(
+                    "config_warning_fractional_supersedes_one_share_floor", 0) + 1
+            )
+            log.warning(
+                "SizeAndEmitTask: execution.fractional_shares.enabled AND "
+                "sizing.one_share_floor_enabled are BOTH on — fractional "
+                "supersedes the one-share floor for fractionable names "
+                "(S-FRAC v2 §7.2); A-3 remains the non-fractionable fallback"
+            )
+        # Ledger stamping (design §7.4/§7.5): sizing_mode / target_notional /
+        # realized_notional_planned are stamped whenever a non-legacy sizing
+        # mode is configured, so the three comparison arms are mechanically
+        # distinguishable. With BOTH flags off, order dicts stay byte-identical
+        # (same contract as A-3's size_floor_reason).
+        stamp_sizing_ledger = frac_on or one_share_floor_on
+
         # Universe σ median over all ranked candidates (σ written by ApplyNGBoostTask).
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
@@ -271,9 +308,11 @@ class SizeAndEmitTask(Task):
         # themselves, higher rank still wins ties for leftover cash.
         deferred_rescues: list[tuple[str, float, Any, float, float, float]] = []
 
-        def _emit_order(ticker: str, shares: int, price: float, c: Any,
+        def _emit_order(ticker: str, shares: float, price: float, c: Any,
                          conv: float, sig_m: float, max_pct: float, *,
-                         one_share_floor_applied: bool) -> None:
+                         one_share_floor_applied: bool,
+                         sizing_mode: str | None = None,
+                         target_notional: float | None = None) -> None:
             nonlocal remaining_cash
             invest = shares * price
             # Defensive: per-position sizer already rounded down to whole
@@ -320,6 +359,22 @@ class SizeAndEmitTask(Task):
                 # stay byte-identical.
                 **({"size_floor_reason": "one_share_floor_round_up"}
                    if one_share_floor_applied else {}),
+                # S-FRAC v2 §7.4 KPI schema — the sizing-fidelity metric's
+                # inputs, stamped per order intent:
+                #   sizing_fidelity_gap_i =
+                #     |realized_notional_i − target_notional_i| / target_notional_i
+                # `target_notional` = the stack's risk-budget notional (post
+                # Kelly/conviction/σ/PV, pre share-quantization; single impl:
+                # sizing.sizing_target_notional). `realized_notional_planned`
+                # = shares × price at INTENT time (the plan-side numerator
+                # source; the fill-side realized_notional is stamped by the
+                # stage-0 umbrella commit path from filled_qty × filled_avg).
+                # Stamped only when a non-legacy sizing mode is configured so
+                # both-flags-off orders stay byte-identical.
+                **({"sizing_mode": sizing_mode,
+                    "target_notional": target_notional,
+                    "realized_notional_planned": invest}
+                   if sizing_mode is not None else {}),
             }, ctx=ctx, source_job="SelectionJob",
                 source_task="SizeAndEmitTask",
                 acceptance_reason="selected_by_greedy_loop",
@@ -336,7 +391,7 @@ class SizeAndEmitTask(Task):
                 }))
             remaining_cash -= invest
             log.info(
-                "SizeAndEmitTask: %s NEW_BUY %d shares @ %.2f "
+                "SizeAndEmitTask: %s NEW_BUY %.6g shares @ %.2f "
                 "($%.0f, %.1f%% target, conv=%.2f σ_mult=%.2f) "
                 "remaining_cash=$%.0f",
                 ticker, shares, price, invest, target_pct * 100,
@@ -427,14 +482,57 @@ class SizeAndEmitTask(Task):
                               ticker, max_pct, cap)
                     max_pct = cap
 
+            # S-FRAC v2 §7.2 flag precedence: fractional (exact) runs BEFORE
+            # the one-share floor; while the flag is on, the A-3 round-up
+            # branch below is UNREACHABLE for fractionable names (every
+            # fractional-path outcome `continue`s). A-3 stays the fallback
+            # for symbols that cannot be fractionally sized.
+            use_frac = frac_on and fractional_eligible(
+                ticker, ctx.config,
+                getattr(ctx, "fractionable_by_ticker", None),
+            )
             _, shares = compute_position_size(
                 ctx.portfolio_value, remaining_cash,
                 max_pct, reserve_pct, price,
                 override_pct=override_pct,
+                fractional=use_frac,
+                # Dust is classified BELOW with its own dedicated reason
+                # (`fractional_dust_skip`) — pass 0.0 so a zero return here
+                # unambiguously means "no cash / no cap headroom".
+                min_notional=0.0,
             )
             if override_pct is not None and shares * price > (override_pct * ctx.portfolio_value) + 1e-6:
                 log.info("SizeAndEmitTask: %s exceeds BEAR defensive slot cap — skip", ticker)
                 _block(ticker, "bear_defensive_slot_cap")
+                continue
+            if use_frac:
+                if shares <= 0:
+                    log.info("SizeAndEmitTask: %s insufficient cash — skip "
+                             "(remaining_cash=$%.0f price=$%.2f, fractional)",
+                             ticker, remaining_cash, price)
+                    _block(ticker, "size_insufficient_cash")
+                    continue
+                invest_planned = shares * price
+                if invest_planned < frac_dust_floor:
+                    # Anti-churn dust guard (§7.3 / open question §9.5,
+                    # default $25 ≥ the $1 stage-1 broker floor): a sized
+                    # fractional entry below the floor is SKIPPED with a
+                    # dedicated reason — never admitted as a ~$0 order.
+                    log.info(
+                        "SizeAndEmitTask: %s FRACTIONAL_DUST_SKIP — sized "
+                        "notional $%.2f < dust floor $%.2f (qty=%.6f @ %.2f)",
+                        ticker, invest_planned, frac_dust_floor, shares, price,
+                    )
+                    _block(ticker, "fractional_dust_skip")
+                    continue
+                target_notional, _ = sizing_target_notional(
+                    ctx.portfolio_value, remaining_cash,
+                    max_pct, reserve_pct, override_pct,
+                )
+                _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
+                            one_share_floor_applied=False,
+                            sizing_mode="fractional",
+                            target_notional=target_notional)
                 continue
             if shares < 1 and one_share_floor_on and override_pct is None and max_pct > 0:
                 # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
@@ -484,8 +582,18 @@ class SizeAndEmitTask(Task):
                 _block(ticker, "size_insufficient_cash")
                 continue
 
-            _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
-                        one_share_floor_applied=False)
+            if stamp_sizing_ledger:
+                target_notional, _ = sizing_target_notional(
+                    ctx.portfolio_value, remaining_cash,
+                    max_pct, reserve_pct, override_pct,
+                )
+                _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
+                            one_share_floor_applied=False,
+                            sizing_mode="whole_share",
+                            target_notional=target_notional)
+            else:
+                _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
+                            one_share_floor_applied=False)
 
         # Deferred rescue pass (round 3, codex portfolio-level review): every
         # normal candidate above has already had its full, uncontested shot
@@ -521,8 +629,14 @@ class SizeAndEmitTask(Task):
                 100.0 * float(regime_p.get("max_position_pct", 0.15)),
                 investable,
             )
+            target_notional, _ = sizing_target_notional(
+                ctx.portfolio_value, remaining_cash,
+                max_pct, reserve_pct, None,
+            )
             _emit_order(ticker, 1, price, c, conv, sig_m, max_pct,
-                        one_share_floor_applied=True)
+                        one_share_floor_applied=True,
+                        sizing_mode="one_share_floor",
+                        target_notional=target_notional)
 
         spent = starting_cash - remaining_cash
         log.info(

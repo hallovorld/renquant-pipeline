@@ -3829,11 +3829,28 @@ def _emit_qp_sell(ctx, ticker, shares, dw, sol, i) -> bool:
     ever generated. Sim and live ran long-only regardless.
     """
     from renquant_pipeline.kernel.exits import ExitSignal
+    from renquant_pipeline.kernel.sizing import fractional_sizing_cfg
     target_w = float(sol.target_w[i])
     hs = (ctx.holdings or {}).get(ticker)
     source_obj = (getattr(ctx, "_qp_mu_source_map", None) or {}).get(ticker, hs)
-    held = int(getattr(hs, "shares", 0) or 0) if hs is not None else 0
-    requested = int(shares)  # always positive; sign comes from target_w
+    # Fractional-share lifecycle (S-FRAC v2 stage 2, from #153): when the
+    # fractional flag is ON, read held + requested as FLOATs so a fractional
+    # long is never int()-floored to 0 here (which would silently skip the QP
+    # close/sell and strand the residual position). QP buy sizing stays
+    # whole-share; this only protects the SELL/close side of a fractional
+    # holding that some other path (selection/joint/rotation) opened.
+    # Deliberately GATED on the flag (tightened vs #153, which floated these
+    # reads unconditionally): with the stage-0 umbrella commit path now
+    # float-preserving, an unconditional float(shares) could emit fractional
+    # QP sell quantities in flag-off whole-share mode — flag-off must stay
+    # byte-identical.
+    _frac_on, _ = fractional_sizing_cfg(getattr(ctx, "config", None) or {})
+    if _frac_on:
+        held = float(getattr(hs, "shares", 0.0) or 0.0) if hs is not None else 0.0
+        requested = float(shares)  # always positive; sign comes from target_w
+    else:
+        held = int(getattr(hs, "shares", 0) or 0) if hs is not None else 0
+        requested = int(shares)  # always positive; sign comes from target_w
 
     # Case A: target ≥ 0 → just close-down/no-op of existing long
     if target_w >= -1e-9:
@@ -3853,7 +3870,7 @@ def _emit_qp_sell(ctx, ticker, shares, dw, sol, i) -> bool:
         sig.decision_inputs = _qp_sell_decision_inputs(
             ctx, ticker, qty, held, dw, target_w, sol, i, source_obj,
         )
-        log.info("QP_SELL %-6s  Δw=%+.4f  shares=%d  reason=%s",
+        log.info("QP_SELL %-6s  Δw=%+.4f  shares=%.6g  reason=%s",
                  ticker, dw, qty, exit_type)
         return True
 
@@ -3876,7 +3893,7 @@ def _emit_qp_sell(ctx, ticker, shares, dw, sol, i) -> bool:
         sig.decision_inputs = _qp_sell_decision_inputs(
             ctx, ticker, long_close, held, dw, target_w, sol, i, source_obj,
         )
-        log.info("QP_SELL %-6s  Δw=%+.4f  shares=%d  reason=qp_close",
+        log.info("QP_SELL %-6s  Δw=%+.4f  shares=%.6g  reason=qp_close",
                  ticker, dw, long_close)
         emitted = True
     if short_open > 0:
@@ -3894,7 +3911,7 @@ def _emit_qp_sell(ctx, ticker, shares, dw, sol, i) -> bool:
         sig.decision_inputs = _qp_sell_decision_inputs(
             ctx, ticker, short_open, held, dw, target_w, sol, i, source_obj,
         )
-        log.info("QP_SHORT_OPEN %-6s  Δw=%+.4f  shares=%d  target_w=%+.4f",
+        log.info("QP_SHORT_OPEN %-6s  Δw=%+.4f  shares=%.6g  target_w=%+.4f",
                  ticker, dw, short_open, target_w)
         emitted = True
     return emitted

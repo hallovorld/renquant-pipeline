@@ -25,7 +25,7 @@ import math
 from typing import Any
 
 from .backend import ExecutionBackend
-from .types import Fill, OrderIntent, OrderSide
+from .types import Fill, OrderIntent, OrderSide, resolve_fill_quantity
 
 
 def _ticket_status_text(ticket: Any) -> str:
@@ -126,7 +126,17 @@ class LeanBackend(ExecutionBackend):
         price = self.get_last_price(intent.ticker)
 
         if intent.side == OrderSide.BUY:
-            shares = int(intent.shares)  # type: ignore[arg-type]
+            # LEAN is whole-share only here (supports_fractional=False): a
+            # fractional intent fails fast rather than flooring to a zero-share
+            # order (#153). The broker/LEAN fractional contract is tracked
+            # separately in renquant-execution #19.
+            shares = resolve_fill_quantity(
+                intent.shares,
+                supports_fractional=self.supports_fractional,
+                backend_name="LeanBackend",
+                ticker=intent.ticker,
+                side="BUY",
+            )
             ticket = algo.MarketOrder(sym, shares)
             filled_qty, fill_price = _confirmed_fill(
                 ticket,
@@ -151,7 +161,13 @@ class LeanBackend(ExecutionBackend):
             shares = int(current)
             ticket = algo.Liquidate(sym)
         else:
-            requested = int(intent.shares)  # type: ignore[arg-type]
+            requested = resolve_fill_quantity(
+                intent.shares,
+                supports_fractional=self.supports_fractional,
+                backend_name="LeanBackend",
+                ticker=intent.ticker,
+                side="SELL",
+            )
             if requested > current:
                 raise ValueError(
                     f"LeanBackend SELL {intent.ticker}: requested {requested} "
