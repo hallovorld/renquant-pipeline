@@ -33,18 +33,18 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from .backend import ExecutionBackend
+from .backend import _POSITION_EPS, ExecutionBackend
 from .fees import FeeConfig, compute_buy_fees, compute_sell_fees
 from .slippage import SlippageConfig, slip_fill_price
 from .t2_settlement import T2CashQueue
-from .types import Fill, OrderIntent, OrderSide
+from .types import Fill, OrderIntent, OrderSide, resolve_fill_quantity
 
 log = logging.getLogger("kernel.execution.backend_sim")
 
 
 @dataclass
 class _SimPosition:
-    quantity: int = 0
+    quantity: float = 0.0   # int-valued whole-share; float under fractional (#35)
     avg_cost: float = 0.0   # volume-weighted average cost basis
 
 
@@ -59,6 +59,7 @@ class SimBackend(ExecutionBackend):
         slip_config: SlippageConfig | None = None,
         exec_enabled: bool = False,
         t2_days: int = 0,
+        allow_fractional: bool = False,
     ) -> None:
         if not math.isfinite(starting_cash) or starting_cash < 0:
             raise ValueError(
@@ -72,11 +73,19 @@ class SimBackend(ExecutionBackend):
         self._fee_cfg = fee_config or FeeConfig()
         self._slip_cfg = slip_config or SlippageConfig()
         self._exec_enabled = bool(exec_enabled)
+        # Fractional-share capability (#153): opt-in, default OFF so whole-share
+        # backtests stay byte-identical. When True the sim MODELS fractional
+        # quantities so the readonly/shadow/sim path validates live behaviour.
+        self._allow_fractional = bool(allow_fractional)
         # T+N only when execution model on AND t2_days > 0.
         effective_t2 = t2_days if exec_enabled and t2_days > 0 else 0
         self._t2_queue: T2CashQueue | None = (
             T2CashQueue(settlement_days=effective_t2) if effective_t2 > 0 else None
         )
+
+    @property
+    def supports_fractional(self) -> bool:
+        return self._allow_fractional
 
     # ── Bar-level lifecycle ─────────────────────────────────────────────
 
@@ -131,7 +140,15 @@ class SimBackend(ExecutionBackend):
     # ── Internal: BUY / SELL helpers (≤50 lines each per §1c) ───────────
 
     def _execute_buy(self, intent: OrderIntent, market_price: float) -> Fill:
-        shares = int(intent.shares)  # type: ignore[arg-type]
+        # Capability negotiation (#153): keep the float when fractional-capable,
+        # else fail fast — never int()-floor a fractional order to a zero fill.
+        shares = resolve_fill_quantity(
+            intent.shares,
+            supports_fractional=self._allow_fractional,
+            backend_name="SimBackend",
+            ticker=intent.ticker,
+            side="BUY",
+        )
         fill_price = self._fill_price_for_buy(market_price, shares)
         # §5.13.5 parity with sim._apply_buy:1066-1077 — fees gated by
         # the same exec_enabled flag the legacy adapter uses, so a
@@ -177,15 +194,23 @@ class SimBackend(ExecutionBackend):
                 f"SimBackend SELL {intent.ticker}: no position to close"
             )
         if intent.is_full_liquidate:
-            shares = int(pos.quantity)
+            # Liquidate the ENTIRE position — never int()-floor a fractional
+            # holding to 0 and strand the residual (#153).
+            shares = pos.quantity if self._allow_fractional else int(pos.quantity)
         else:
-            requested = int(intent.shares)  # type: ignore[arg-type]
-            if requested > pos.quantity:
+            requested = resolve_fill_quantity(
+                intent.shares,
+                supports_fractional=self._allow_fractional,
+                backend_name="SimBackend",
+                ticker=intent.ticker,
+                side="SELL",
+            )
+            if requested > pos.quantity + _POSITION_EPS:
                 raise ValueError(
                     f"SimBackend SELL {intent.ticker}: requested {requested} "
                     f"> held {pos.quantity}"
                 )
-            shares = requested
+            shares = min(requested, pos.quantity)
         fill_price = self._fill_price_for_sell(market_price, shares)
         # Mirror sim._apply_sell:894-897 — fees only when exec_enabled.
         fees = (
@@ -204,7 +229,8 @@ class SimBackend(ExecutionBackend):
         else:
             self._cash += net_proceeds
         pos.quantity -= shares
-        if pos.quantity == 0:
+        if pos.quantity <= _POSITION_EPS:
+            pos.quantity = 0.0  # clamp fp dust so the position reaps cleanly (#153)
             pos.avg_cost = 0.0
         fill = Fill(
             ticker=intent.ticker, side=OrderSide.SELL,

@@ -707,7 +707,11 @@ class EmitRotationsTask(Task):
             conviction_score_for_object,
             conviction_score_percentiles,
             conviction_multiplier,
+            fractional_dust_floor_usd,
+            fractional_eligible,
+            fractional_sizing_cfg,
             sigma_multiplier,
+            sizing_target_notional,
             universe_sigma_median,
         )
 
@@ -770,6 +774,11 @@ class EmitRotationsTask(Task):
         kelly_on     = bool(kelly_cfg.get("enabled", False))
         kelly_pure   = bool(kelly_cfg.get("disable_extra_multipliers", False))
         per_session_cap = kelly_cfg.get("per_session_buy_cap")
+        # S-FRAC v2 stage 2: fractional sizing threaded identically to
+        # SizeAndEmitTask (fail-closed reader salvaged from #153) so a
+        # rotation buy-leg cannot diverge from the selection path's mode.
+        frac_on, _frac_min_notional = fractional_sizing_cfg(ctx.config)
+        frac_dust_floor = fractional_dust_floor_usd(ctx.config) if frac_on else 0.0
 
         sigma_median = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
@@ -908,7 +917,10 @@ class EmitRotationsTask(Task):
             # SimpleNamespace ctx without `holdings` set up.
             _holdings   = getattr(ctx, "holdings", None) or {}
             held_st     = _holdings.get(pair.sell_ticker) if _holdings else None
-            held_shares = int(getattr(held_st, "shares", 0) or 0) if held_st else 0
+            # Fractional-share lifecycle (#153): read the held quantity as a
+            # FLOAT so a sub-1-share fractional sell-leg is not truncated to 0
+            # when estimating same-bar rotation proceeds for buy-leg sizing.
+            held_shares = float(getattr(held_st, "shares", 0.0) or 0.0) if held_st else 0.0
             held_price  = float(ctx.prices.get(pair.sell_ticker, 0.0) or 0.0)
             sell_proceeds = 0.0
             if held_shares > 0 and math.isfinite(held_price) and held_price > 0:
@@ -919,11 +931,28 @@ class EmitRotationsTask(Task):
                 sell_proceeds = held_shares * held_price * (1.0 - _leg_cost)
             cash_for_sizing = cash_remaining + sell_proceeds
 
+            # S-FRAC v2 §7.2: fractional-first, same precedence as
+            # SizeAndEmitTask (no A-3 floor on the rotation path).
+            use_frac = frac_on and fractional_eligible(
+                pair.buy_ticker, ctx.config,
+                getattr(ctx, "fractionable_by_ticker", None),
+            )
             _, shares = compute_position_size(
                 ctx.portfolio_value, cash_for_sizing,
                 max_pct, reserve_pct, price,
+                fractional=use_frac, min_notional=0.0,
             )
-            if shares < 1:
+            if use_frac and shares > 0 and shares * price < frac_dust_floor:
+                # Anti-churn dust guard (§7.3): never a ~$0-invest admit.
+                log.info("EmitRotationsTask: %s FRACTIONAL_DUST_SKIP — sized "
+                         "notional $%.2f < dust floor $%.2f — skip ENTIRE pair",
+                         pair.buy_ticker, shares * price, frac_dust_floor)
+                ctx.rotations_blocked.append({
+                    "sell": pair.sell_ticker, "buy": pair.buy_ticker,
+                    "reason": "fractional_dust_skip",
+                })
+                continue
+            if (shares <= 0) if use_frac else (shares < 1):
                 log.info("EmitRotationsTask: %s insufficient cash — skip ENTIRE pair "
                          "(no atomic-rotation orphan exit)  cash_for_sizing=%.0f",
                          pair.buy_ticker, cash_for_sizing)
@@ -967,6 +996,15 @@ class EmitRotationsTask(Task):
                                f"net_adv={pair.net_advantage:+.4f} "
                                f"horizon={pair.horizon_days}d"),
                 "order_type": "ROTATION",
+                # S-FRAC v2 §7.4 KPI fields (see SizeAndEmitTask._emit_order
+                # for the schema note). Stamped only when fractional is
+                # configured so flag-off orders stay byte-identical.
+                **({"sizing_mode": "fractional" if use_frac else "whole_share",
+                    "target_notional": sizing_target_notional(
+                        ctx.portfolio_value, cash_for_sizing,
+                        max_pct, reserve_pct, None)[0],
+                    "realized_notional_planned": invest}
+                   if frac_on else {}),
             }, ctx=ctx, source_job="RotationJob",
                 source_task="EmitRotationsTask",
                 acceptance_reason="rotation_net_advantage_passed",
@@ -986,7 +1024,7 @@ class EmitRotationsTask(Task):
             cash_remaining = cash_remaining + sell_proceeds - invest
             ctx.counters["rotations"] = ctx.counters.get("rotations", 0) + 1
             log.info(
-                "ROTATION_EXEC  swap=%s→%s  shares=%d  net_adv=%+.4f  "
+                "ROTATION_EXEC  swap=%s→%s  shares=%.6g  net_adv=%+.4f  "
                 "raw_adv=%+.4f  tax=%.4f  cost=%.4f  threshold=%+.4f  "
                 "horizon=%dd  sell_proc=%.0f  cash_after=%.0f",
                 pair.sell_ticker, pair.buy_ticker, shares,

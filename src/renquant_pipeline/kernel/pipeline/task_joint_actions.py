@@ -170,7 +170,9 @@ class JointActionTask(Task):
         )
         from renquant_pipeline.kernel.sizing   import (                                         # noqa: PLC0415
             compute_position_size, conviction_score_for_object,
-            conviction_score_percentiles, conviction_multiplier, sigma_multiplier,
+            conviction_score_percentiles, conviction_multiplier,
+            fractional_dust_floor_usd, fractional_eligible,
+            fractional_sizing_cfg, sigma_multiplier, sizing_target_notional,
             universe_sigma_median,
         )
         from renquant_pipeline.kernel.regime   import confidence_to_size_multiplier            # noqa: PLC0415
@@ -285,6 +287,11 @@ class JointActionTask(Task):
         sigma_cfg     = (ctx.config.get("ranking", {})
                           .get("panel_scoring", {})
                           .get("sigma_sizing", {}))
+        # S-FRAC v2 stage 2: fractional sizing threaded identically to
+        # SizeAndEmitTask (fail-closed reader salvaged from #153) so the
+        # joint buy-leg cannot diverge from the selection path's sizing mode.
+        frac_on, _frac_min_notional = fractional_sizing_cfg(ctx.config)
+        frac_dust_floor = fractional_dust_floor_usd(ctx.config) if frac_on else 0.0
         sigma_median  = universe_sigma_median(
             [getattr(c, "sigma", None) for c in ctx.ranked]
         )
@@ -775,7 +782,9 @@ class JointActionTask(Task):
             # mark-to-market value net of fees/slippage on the sell.
             sell_proceeds = 0.0
             if a.kind == "rotate":
-                h_shares = int(getattr(a.held_obj, "shares", 0) or 0)
+                # Fractional-share lifecycle (#153): read held qty as a FLOAT so
+                # a sub-1-share sell-leg isn't truncated to 0 in proceeds sizing.
+                h_shares = float(getattr(a.held_obj, "shares", 0.0) or 0.0)
                 h_price  = float(ctx.prices.get(a.held_ticker, 0.0) or 0.0)
                 if h_shares > 0 and math.isfinite(h_price) and h_price > 0:
                     sell_proceeds = h_shares * h_price * (1.0 - fee_pct - slip_pct)
@@ -789,11 +798,27 @@ class JointActionTask(Task):
                 getattr(a.cand_obj, "sigma", None), sigma_median, sigma_cfg,
             )
             max_pct = base_max_pct * conv * sig_m
+            # S-FRAC v2 §7.2: fractional-first, same precedence as
+            # SizeAndEmitTask (no A-3 floor on this path — the one-share
+            # floor is an initiation-path concept; joint keeps its legacy
+            # whole-share drop as the non-fractional outcome).
+            use_frac = frac_on and fractional_eligible(
+                a.cand_ticker, ctx.config,
+                getattr(ctx, "fractionable_by_ticker", None),
+            )
             _, shares = compute_position_size(
                 ctx.portfolio_value, cash_for_sizing,
                 max_pct, reserve_pct, price,
+                fractional=use_frac, min_notional=0.0,
             )
-            if shares < 1:
+            if use_frac and shares > 0 and shares * price < frac_dust_floor:
+                # Anti-churn dust guard (§7.3): dedicated counter, never a
+                # ~$0-invest admit.
+                ctx.counters["joint_fractional_dust_skip"] = (
+                    ctx.counters.get("joint_fractional_dust_skip", 0) + 1
+                )
+                continue
+            if (shares <= 0) if use_frac else (shares < 1):
                 ctx.counters["joint_blocked_cash"] = (
                     ctx.counters.get("joint_blocked_cash", 0) + 1
                 )
@@ -827,6 +852,15 @@ class JointActionTask(Task):
                     "kelly_target_pct": getattr(a.cand_obj, "kelly_target_pct", None),
                     "detail":     getattr(a.cand_obj, "detail", "") + " (joint_buy)",
                     "order_type": "JOINT_BUY",
+                    # S-FRAC v2 §7.4 KPI fields (see SizeAndEmitTask._emit_order
+                    # for the schema note). Stamped only when fractional is
+                    # configured so flag-off orders stay byte-identical.
+                    **({"sizing_mode": "fractional" if use_frac else "whole_share",
+                        "target_notional": sizing_target_notional(
+                            ctx.portfolio_value, cash_for_sizing,
+                            max_pct, reserve_pct, None)[0],
+                        "realized_notional_planned": invest}
+                       if frac_on else {}),
                 }, ctx=ctx, source_job="JointActionJob",
                     source_task="JointActionTask",
                     acceptance_reason="joint_action_buy_net_alpha_ranked",

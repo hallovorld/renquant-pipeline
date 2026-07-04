@@ -100,6 +100,19 @@ class TrimHeldTask(Task):
         # values propagate through trim sizing → bad partial-sell orders.
         # Mirror the explicit isfinite guards used in TopUp + Size.
         import math as _math
+        # Fractional-share lifecycle (#153): when enabled, trim to the EXACT
+        # Kelly target as a float instead of int()-flooring the partial-sell
+        # quantity (which, on a fractional holding, would either skip the trim
+        # or strand a residual). Whole-share mode keeps the legacy int() path.
+        # Trims are INCREMENTAL orders, so the anti-churn dust floor applies
+        # (S-FRAC v2 §7.3: `min_fractional_trade_notional`, default $25 —
+        # prevents the 12-min loop degenerating into taxable micro-churn).
+        from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
+            fractional_dust_floor_usd,
+            fractional_sizing_cfg,
+        )
+        frac_on, _frac_broker_floor = fractional_sizing_cfg(ctx.config)
+        frac_min_notional = fractional_dust_floor_usd(ctx.config) if frac_on else 0.0
         for ticker, hs in ctx.holdings.items():
             if ticker in already_exiting or ticker in rotation_sells \
                or ticker in already_buying:
@@ -138,15 +151,26 @@ class TrimHeldTask(Task):
             target_value  = float(kelly_target) * portfolio
             current_value = current_shares * price
             delta_value   = current_value - target_value
-            trim_shares   = int(delta_value / price)
-            if trim_shares < 1:
-                continue
-            # Never trim more than we hold (safety).
-            trim_shares = min(trim_shares, int(current_shares))
-            # If this would empty the position, it's a full exit — not a trim.
-            # Skip and let sell paths handle it.
-            if trim_shares >= int(current_shares):
-                continue
+            if frac_on:
+                # Floor to 6dp (parity with compute_position_size) so the trim
+                # never rounds UP past the over-weight delta.
+                trim_shares = _math.floor((delta_value / price) * 1_000_000) / 1_000_000
+                if trim_shares <= 0 or trim_shares * price < frac_min_notional:
+                    continue  # dust trim — not worth an odd-lot order
+                trim_shares = min(trim_shares, current_shares)
+                # If this would empty the position, it's a full exit — not a trim.
+                if trim_shares >= current_shares - 1e-9:
+                    continue
+            else:
+                trim_shares = int(delta_value / price)
+                if trim_shares < 1:
+                    continue
+                # Never trim more than we hold (safety).
+                trim_shares = min(trim_shares, int(current_shares))
+                # If this would empty the position, it's a full exit — not a trim.
+                # Skip and let sell paths handle it.
+                if trim_shares >= int(current_shares):
+                    continue
 
             # Import lazily to mirror the rest of the pipeline.
             from renquant_pipeline.kernel.exits import ExitSignal  # noqa: PLC0415
@@ -160,7 +184,7 @@ class TrimHeldTask(Task):
             ctx.exits.append((ticker, sig))
             trimmed += 1
             log.info(
-                "TrimHeldTask: %s -%d shares (current=%.1f%% target=%.1f%% delta=%.1f%%)",
+                "TrimHeldTask: %s -%.6g shares (current=%.1f%% target=%.1f%% delta=%.1f%%)",
                 ticker, trim_shares, current_pct * 100,
                 float(kelly_target) * 100, delta * 100,
             )

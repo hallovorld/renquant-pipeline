@@ -18,7 +18,7 @@ from .backend import ExecutionBackend, FakeBackend
 from .fees import FeeConfig, compute_buy_fees, compute_sell_fees
 from .slippage import SlippageConfig, slip_fill_price
 from .t2_settlement import PendingCashEntry, T2CashQueue
-from .types import Fill, OrderIntent, OrderSide
+from .types import Fill, OrderIntent, OrderSide, resolve_fill_quantity
 
 __all__ = [
     # Backend ABC + reference impl (slice 1 of ExecutionPipeline refactor)
@@ -27,6 +27,7 @@ __all__ = [
     "Fill",
     "OrderIntent",
     "OrderSide",
+    "resolve_fill_quantity",
     # Fees / slippage / settlement primitives
     "FeeConfig",
     "compute_buy_fees",
