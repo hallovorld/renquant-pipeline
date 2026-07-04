@@ -3607,7 +3607,24 @@ def _realized_vol_annualized(df, window: int):
 
 
 def _kelly_sigma_horizon_days(kelly_cfg: dict) -> float:
-    raw = kelly_cfg.get("sigma_horizon_days", 252.0)
+    # Campaign A3 (2026-07-03 design-compliance audit §5.1, P0): the silent
+    # 252.0 default is GONE. Only reached when kelly_sizing is enabled
+    # (ApplyKellySizingTask returns before calling this otherwise), i.e.
+    # when the value WILL size live positions — so a missing key must fail
+    # loud, not quietly re-arm the 2026-06-11 variance bug.
+    if "sigma_horizon_days" not in kelly_cfg:
+        raise RuntimeError(
+            "ranking.kelly_sizing.sigma_horizon_days is REQUIRED when "
+            "kelly_sizing is enabled — refusing the silent annualized "
+            "default (252d). That default IS the 2026-06-11 Kelly bug: "
+            "sigma on a 252d horizon against the 60d calibrator mu inflates "
+            "the variance ~4.2x and crushes high-vol names. Preflight "
+            "P-KELLY-SIGMA-HORIZON fails closed on this key BEFORE scoring; "
+            "reaching this raise means the config lost the key after "
+            "preflight or preflight was bypassed. Set the key explicitly "
+            "(prod: 60)."
+        )
+    raw = kelly_cfg.get("sigma_horizon_days")
     try:
         days = float(raw)
     except (TypeError, ValueError):
@@ -3653,8 +3670,9 @@ class ApplyKellySizingTask(Task):
         fractional        = float(kelly_cfg.get("fractional",        0.25))
         min_edge          = float(kelly_cfg.get("min_edge",          0.0))
         max_concentration = float(kelly_cfg.get("max_concentration", 0.35))
-        # Realized-vol fallback writes annualized σ. Default 252 keeps that
-        # legacy unit; opt-in 60 aligns σ with the 60d calibrator μ horizon.
+        # Realized-vol fallback writes annualized σ. The horizon key is
+        # REQUIRED (no silent 252 default — campaign A3): 252 keeps the
+        # annualized unit; 60 aligns σ with the 60d calibrator μ horizon.
         sigma_horizon_days = _kelly_sigma_horizon_days(kelly_cfg)
 
         # Audit fix CONF-MULT (2026-04-25): floored confidence multiplier.

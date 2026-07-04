@@ -21,6 +21,11 @@ def _valid_config() -> dict:
         "min_hold_days": 5,
         "max_hold_days": 500,
         "max_concurrent_positions": 8,
+        # A3: the always-armed divergent-default keys (P-SIZING-GATE-KEYS
+        # shares _RiskConfigJob with P-CONFIG-SCHEMA — keep it green here so
+        # this suite keeps pinning the schema check's OWN strict semantics).
+        "model_staleness_days": 60,
+        "tax": {"lot_method": "hifo"},
         "regime": {
             "bear_vol_threshold": 0.028,
             "bear_return_threshold": -0.018,

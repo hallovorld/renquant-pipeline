@@ -1465,14 +1465,46 @@ def _check_kelly_sigma_horizon_config(
     strategy_dir: Path | None = None,
     run_mode: str | None = None,
 ) -> PreflightCheck:
-    """P-KELLY-SIGMA-HORIZON: optional σ horizon override is usable."""
+    """P-KELLY-SIGMA-HORIZON: σ horizon must be explicit whenever Kelly is on.
+
+    2026-07-03 design-compliance audit §5.1 (campaign A3, P0): the runtime
+    previously defaulted a missing ``sigma_horizon_days`` to 252 and THIS
+    check passed with "using default 252" — i.e. losing the config key
+    silently re-armed the documented 2026-06-11 Kelly bug (σ annualized at
+    252d against the 60d calibrator μ → ~4.2x variance inflation, high-vol
+    names crushed) while preflight stayed green. The absent-key path now
+    fails CLOSED when kelly_sizing is enabled; present-key validation is
+    unchanged.
+    """
     name = "P-KELLY-SIGMA-HORIZON"
     kelly_cfg = ((config.get("ranking") or {}).get("kelly_sizing") or {})
     if "sigma_horizon_days" not in kelly_cfg:
+        if not bool(kelly_cfg.get("enabled", False)):
+            # Absent-is-legitimate branch: kelly_sizing is OFF, so the value
+            # is never consumed (ApplyKellySizingTask no-ops before reading
+            # it). The key becomes REQUIRED the moment kelly is enabled —
+            # both here and via the runtime raise in
+            # job_panel_scoring._kelly_sigma_horizon_days.
+            return PreflightCheck(
+                name, "hard", True,
+                "ranking.kelly_sizing.sigma_horizon_days unset but unused: "
+                "kelly_sizing is disabled. The key is REQUIRED once "
+                "kelly_sizing.enabled flips on.",
+                details={"kelly_enabled": False, "sigma_horizon_days": None},
+            )
         return PreflightCheck(
-            name, "hard", True,
-            "ranking.kelly_sizing.sigma_horizon_days unset; using default 252",
-            details={"default_sigma_horizon_days": 252.0},
+            name, "hard", False,
+            "ranking.kelly_sizing.sigma_horizon_days is MISSING while "
+            "kelly_sizing is enabled. Refusing to fall back to the silent "
+            "annualized default (252d): with the 60d calibrator μ that "
+            "default IS the 2026-06-11 Kelly bug (~4.2x variance inflation, "
+            "high-vol names crushed). Set the key explicitly (prod: 60).",
+            details={
+                "kelly_enabled": True,
+                "sigma_horizon_days": None,
+                "removed_silent_default": 252.0,
+                "incident": "2026-06-11 Kelly sigma-horizon variance bug",
+            },
         )
 
     raw = kelly_cfg.get("sigma_horizon_days")
@@ -1539,6 +1571,129 @@ def _check_kelly_sigma_horizon_config(
     )
 
 
+def _check_sizing_gate_keys(
+    config: dict,
+    strategy_dir: Path | None = None,
+    run_mode: str | None = None,
+) -> PreflightCheck:
+    """P-SIZING-GATE-KEYS: the divergent-default key cluster must be explicit.
+
+    2026-07-03 design-compliance audit §5 (campaign A3): the pipeline
+    hardcodes numeric fallbacks that CONTRADICT the strategy-104 value for
+    the same key, so losing a key (side-config / replay config / sim config /
+    refactor) silently flips live semantics while every check stays green —
+    the raw>0 / #140 class. This gate makes the MISSING-key path fail closed
+    for every key in the cluster. It validates PRESENCE only — present-key
+    behavior (including present-but-odd values) is deliberately untouched.
+
+    Keys, the silent flip each absence would cause, and when the key is
+    armed (consumed by the runtime):
+
+      ranking.kelly_sizing.fractional            0.3→0.25   armed: kelly on
+      ranking.kelly_sizing.max_concentration     0.12→0.35  armed: kelly on
+                                                 (~3x looser concentration cap)
+      ranking.kelly_sizing.topup_conviction_floor 0.55→0.20 armed: kelly on
+                                                 (topup admission bar collapses)
+      model_staleness_days                       60→0 = staleness admission
+                                                 gate silently OFF; ALWAYS armed
+                                                 (audit 5.7: violates "do not
+                                                 silently continue on stale
+                                                 artifact fingerprints")
+      rotation.min_expected_advantage_pct        0.06→0.03  armed: rotation on
+                                                 (rotation bar halves)
+      rotation.joint_actions.qp_sigma_horizon_mode  match_mu→none
+                                                 armed: joint_actions on
+      rotation.joint_actions.qp_sigma_unit       annualized→horizon
+                                                 armed: joint_actions on
+      rotation.joint_actions.qp_horizon_contract strict→warn — the σ/μ horizon
+                                                 enforcement stack fails OPEN;
+                                                 armed: joint_actions on; the
+                                                 documented legacy alias
+                                                 qp_mu_contract also satisfies
+      rotation.joint_actions.qp_tax_lot_method   hifo→fifo — sell lot selection
+                                                 (tax economics) flips; ALWAYS
+                                                 armed (trade_events builds
+                                                 sell events on every path);
+                                                 the documented fallback
+                                                 tax.lot_method also satisfies
+
+    Disarmed-and-absent keys pass with the exemption recorded in details —
+    the feature that would consume them is off, so no default is reachable.
+    """
+    name = "P-SIZING-GATE-KEYS"
+    kelly_cfg = ((config.get("ranking") or {}).get("kelly_sizing") or {})
+    rotation_cfg = (config.get("rotation") or {})
+    joint_cfg = (rotation_cfg.get("joint_actions") or {})
+    tax_cfg = (config.get("tax") or {})
+
+    kelly_on = bool(kelly_cfg.get("enabled", False))
+    rotation_on = bool(rotation_cfg.get("enabled", False))
+    joint_on = bool(joint_cfg.get("enabled", False))
+
+    # (key path, armed, present, silent flip on key loss)
+    slots: list[tuple[str, bool, bool, str]] = [
+        ("ranking.kelly_sizing.fractional",
+         kelly_on, "fractional" in kelly_cfg,
+         "Kelly fraction silently falls back to 0.25 (prod 0.3)"),
+        ("ranking.kelly_sizing.max_concentration",
+         kelly_on, "max_concentration" in kelly_cfg,
+         "concentration cap silently loosens to 0.35 (prod 0.12, ~3x)"),
+        ("ranking.kelly_sizing.topup_conviction_floor",
+         kelly_on, "topup_conviction_floor" in kelly_cfg,
+         "topup admission bar silently collapses to 0.20 (prod 0.55)"),
+        ("model_staleness_days",
+         True, "model_staleness_days" in config,
+         "staleness admission gate silently turns OFF (absent ⇒ 0 ⇒ no gate)"),
+        ("rotation.min_expected_advantage_pct",
+         rotation_on, "min_expected_advantage_pct" in rotation_cfg,
+         "rotation advantage bar silently halves to 0.03 (prod 0.06)"),
+        ("rotation.joint_actions.qp_sigma_horizon_mode",
+         joint_on, "qp_sigma_horizon_mode" in joint_cfg,
+         "QP σ-horizon alignment silently disables ('none'; prod match_mu)"),
+        ("rotation.joint_actions.qp_sigma_unit",
+         joint_on, "qp_sigma_unit" in joint_cfg,
+         "QP σ unit silently flips to 'horizon' (prod annualized)"),
+        ("rotation.joint_actions.qp_horizon_contract",
+         joint_on,
+         ("qp_horizon_contract" in joint_cfg) or ("qp_mu_contract" in joint_cfg),
+         "σ/μ horizon contract silently degrades strict→warn (fails open)"),
+        ("rotation.joint_actions.qp_tax_lot_method",
+         True,
+         ("qp_tax_lot_method" in joint_cfg) or ("lot_method" in tax_cfg),
+         "sell lot selection silently flips hifo→fifo (tax economics)"),
+    ]
+
+    missing = [(key, flip) for key, armed, present, flip in slots
+               if armed and not present]
+    exempt = [key for key, armed, present, flip in slots
+              if not armed and not present]
+    details = {
+        "armed": {"kelly_sizing": kelly_on, "rotation": rotation_on,
+                  "joint_actions": joint_on},
+        "missing_armed_keys": [key for key, _ in missing],
+        "absent_but_disarmed_keys": exempt,
+    }
+    if missing:
+        return PreflightCheck(
+            name, "hard", False,
+            "divergent-default config key(s) MISSING while their consumer is "
+            "enabled — refusing the silent hardcoded fallback (2026-07-03 "
+            "design-compliance audit §5 / the 2026-06-11 Kelly-default "
+            "incident class): "
+            + "; ".join(f"{key} ({flip})" for key, flip in missing),
+            details=details,
+        )
+    n_armed = sum(1 for _, armed, _, _ in slots if armed)
+    return PreflightCheck(
+        name, "hard", True,
+        f"all armed divergent-default keys explicit "
+        f"({n_armed}/{len(slots)} armed"
+        + (f"; disarmed+absent: {', '.join(exempt)}" if exempt else "")
+        + ")",
+        details=details,
+    )
+
+
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 ALL_CHECKS = (
@@ -1549,6 +1704,7 @@ ALL_CHECKS = (
     _check_best_iter,
     _check_config_fingerprint,
     _check_kelly_sigma_horizon_config,
+    _check_sizing_gate_keys,
     _check_watchlist_size,
     _check_sector_map_coverage,
     _check_correlation_artifact_metadata,
@@ -1837,6 +1993,7 @@ _LEGACY_CHECK_ORDER: tuple[str, ...] = (
     "P-CALIBRATOR-FLAT-REGION",
     "P-CONFIG-SCHEMA",
     "P-MODEL-STALENESS",
+    "P-SIZING-GATE-KEYS",
 )
 
 
