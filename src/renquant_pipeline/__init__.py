@@ -63,13 +63,23 @@ from .state_paths import (
     runs_db_legacy_path,
     runs_db_path,
 )
+from .software_stops import (
+    DEFAULT_MAX_STALENESS_MINUTES,
+    SoftwareStopRegistry,
+    SoftwareStopRegistryCorrupt,
+    compute_staleness,
+    registry_path_for,
+)
 
 __all__ = [
     "ContractResult",
+    "DEFAULT_MAX_STALENESS_MINUTES",
     "InferenceContext",
     "LiveStateContract",
     "LiveContextSnapshot",
     "ModelAdmissionResult",
+    "SoftwareStopRegistry",
+    "SoftwareStopRegistryCorrupt",
     "ATTRIBUTION_VERSION",
     "ApplyGlobalCalibrationTask",
     "ApplyScoresTask",
@@ -89,6 +99,7 @@ __all__ = [
     "build_run_bundle",
     "build_runtime_feature_frame",
     "build_ticker_daily_state_rows",
+    "compute_staleness",
     "evaluate_model_admission",
     "hash_jsonable",
     "live_state_legacy_path",
@@ -96,6 +107,7 @@ __all__ = [
     "load_live_state_contract",
     "live_context_snapshot_from_live_context",
     "model_type_from_artifact",
+    "registry_path_for",
     "resolve_live_state_read",
     "runtime_inference_payload",
     "runtime_inference_payload_from_live_context",
