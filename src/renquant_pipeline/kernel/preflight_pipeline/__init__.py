@@ -27,6 +27,7 @@ from .tasks.correlation import CorrelationMetadataTask
 from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.kelly_config import KellySigmaHorizonTask
+from .tasks.sizing_gate_keys import SizingGateKeysTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.config_fingerprint import ConfigFingerprintTask
 from .tasks.config_schema import ConfigSchemaTask
@@ -54,6 +55,7 @@ __all__ = [
     "CalibratorFlatRegionTask",
     "FeatureCoverageTask",
     "KellySigmaHorizonTask",
+    "SizingGateKeysTask",
     "ArtifactRunIdAlignmentTask",
     "ConfigFingerprintTask",
     "ConfigSchemaTask",
