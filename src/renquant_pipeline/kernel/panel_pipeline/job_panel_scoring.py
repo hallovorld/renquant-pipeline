@@ -43,6 +43,20 @@ from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
+# M6 stage-2 step-1: the fingerprint matching helpers live in
+# fingerprint_dispatch (ONE dispatch implementation for both fail-closed
+# binding checks — this site and walk_forward/loader.py). Re-bound under
+# their historical private names for in-repo back-compat; the legacy-route
+# semantics are byte-for-byte the pre-dispatch behavior.
+from .fingerprint_dispatch import (
+    accept_legacy_stamps as _accept_legacy_stamps,
+    any_fingerprints_match as _any_fingerprints_match,
+    build_claim as _build_fingerprint_claim,
+    fingerprints_match as _fingerprints_match,
+    log_verify_telemetry as _log_fingerprint_telemetry,
+    match_claims as _match_fingerprint_claims,
+    normalize_fingerprint as _normalize_fingerprint,
+)
 
 
 from renquant_pipeline.kernel.panel_pipeline._data_root import data_root as _data_root_cached
@@ -2195,34 +2209,6 @@ def _fingerprint_values(metadata: dict | None) -> list[str]:
     return out
 
 
-def _normalize_fingerprint(value: str | None) -> str:
-    return str(value or "").strip().lower().removeprefix("sha256:")
-
-
-def _fingerprints_match(expected: str | None, actual: str | None) -> bool:
-    """Accept exact matches and historical short-sha prefixes."""
-    exp = _normalize_fingerprint(expected)
-    act = _normalize_fingerprint(actual)
-    if not exp or not act:
-        return False
-    if exp == act:
-        return True
-    min_prefix = 12
-    return (
-        len(exp) >= min_prefix
-        and len(act) >= min_prefix
-        and (exp.startswith(act) or act.startswith(exp))
-    )
-
-
-def _any_fingerprints_match(expected: list[str], actual: list[str]) -> bool:
-    return any(
-        _fingerprints_match(exp, act)
-        for exp in expected
-        for act in actual
-    )
-
-
 def _active_scorer_metadata(ctx: InferenceContext) -> dict:
     scorer = getattr(ctx, "_panel_scorer", None)
     return dict(getattr(scorer, "metadata", {}) or {})
@@ -2240,6 +2226,17 @@ def _assert_calibrator_matches_scorer(
     Invariant: calibrated rank_score / expected_return may only be produced by
     the scorer distribution the calibrator was fitted on. Otherwise Kelly/QP
     sees a shifted μ surface and a sim can report plausible but invalid APY.
+
+    M6 stage-2 step-1 (schema-version dispatch): the identity pair is
+    compared within ONE schema only — a v1-stamped scorer against a
+    v1-declared calibrator by exact digest, a versionless (legacy) stamp
+    against a versionless declaration via the pre-existing shim equality
+    path, and never across schemas. One explicit flag
+    (``ranking.panel_scoring.fingerprint.accept_legacy_stamps``, default
+    ``true`` during the migration window) controls whether the legacy
+    route exists at all; with it ``false`` a versionless identity fails
+    closed with the "re-stamp under v1" remedy. See
+    ``fingerprint_dispatch`` for the dispatch contract.
     """
     if not strict:
         return
@@ -2252,8 +2249,21 @@ def _assert_calibrator_matches_scorer(
         )
         return
 
-    active_fps = _fingerprint_values(scorer_meta)
-    cal_fps = _fingerprint_values(getattr(calibrator, "metadata", {}) or {})
+    cal_meta = dict(getattr(calibrator, "metadata", {}) or {})
+    scorer_claim = _build_fingerprint_claim(
+        schema_version=scorer_meta.get("fingerprint_schema_version"),
+        v1_value=scorer_meta.get("model_content_fingerprint"),
+        legacy_values=_fingerprint_values(scorer_meta),
+        source="active_scorer",
+    )
+    cal_claim = _build_fingerprint_claim(
+        schema_version=cal_meta.get("scorer_fingerprint_schema_version"),
+        v1_value=cal_meta.get("scorer_model_content_fingerprint"),
+        legacy_values=_fingerprint_values(cal_meta),
+        source="calibrator",
+    )
+    active_fps = list(scorer_claim.values)
+    cal_fps = list(cal_claim.values)
     if not active_fps or not cal_fps:
         raise ValueError(
             "LoadGlobalCalibrationTask contract fail: missing scorer/calibrator "
@@ -2261,12 +2271,21 @@ def _assert_calibrator_matches_scorer(
             f"calibrator={cal_fps!r}. Refit the calibrator with "
             "scorer_model_content_fingerprint stamped."
         )
-    if not _any_fingerprints_match(cal_fps, active_fps):
+    accept_legacy = _accept_legacy_stamps(getattr(ctx, "config", None))
+    verdict = _match_fingerprint_claims(
+        scorer_claim, cal_claim, accept_legacy=accept_legacy,
+    )
+    _log_fingerprint_telemetry(
+        "LoadGlobalCalibrationTask", artifact_path, scorer_claim, cal_claim,
+        verdict, accept_legacy=accept_legacy,
+    )
+    if not verdict.matched:
         raise ValueError(
             "LoadGlobalCalibrationTask contract fail: calibrator/scorer "
             f"fingerprint mismatch for {artifact_path}. calibrator={cal_fps} "
             f"active_scorer={active_fps}. Refusing to map panel_score to "
-            "rank_score/mu with a foreign calibration surface."
+            "rank_score/mu with a foreign calibration surface. "
+            f"[fingerprint-dispatch route={verdict.route}: {verdict.reason}]"
         )
 
 
