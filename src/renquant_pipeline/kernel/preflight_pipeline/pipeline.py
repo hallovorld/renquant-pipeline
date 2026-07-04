@@ -16,6 +16,7 @@ from .tasks.kelly_config import KellySigmaHorizonTask
 from .tasks.meta_label import MetaLabelArtifactContractTask
 from .tasks.run_id import ArtifactRunIdAlignmentTask
 from .tasks.sector_map import SectorMapCoverageTask
+from .tasks.sizing_gate_keys import SizingGateKeysTask
 from .tasks.staleness import ModelStalenessTask
 from .tasks.state import StateFileTask
 from .tasks.watchlist import WatchlistSizeTask
@@ -56,7 +57,7 @@ class _IdentityJob(PreflightJob):
 class _RiskConfigJob(PreflightJob):
     """Pure config risk checks that do not need artifacts or broker state."""
 
-    tasks = [KellySigmaHorizonTask(), ConfigSchemaTask()]
+    tasks = [KellySigmaHorizonTask(), SizingGateKeysTask(), ConfigSchemaTask()]
 
 
 class _CalibratorJob(PreflightJob):

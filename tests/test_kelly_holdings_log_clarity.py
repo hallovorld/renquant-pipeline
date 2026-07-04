@@ -54,6 +54,9 @@ def _build_ctx(cands, holds):
                     "fractional": 0.5,
                     "max_concentration": 0.35,
                     "min_edge": 0.0,
+                    # A3: the key is REQUIRED when kelly is enabled (the old
+                    # silent default was 252 — pinned explicitly here).
+                    "sigma_horizon_days": 252,
                 },
             },
         },

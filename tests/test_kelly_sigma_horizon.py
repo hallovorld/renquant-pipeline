@@ -55,18 +55,41 @@ def _run(ctx):
     return ctx.candidates[0].kelly_target_pct, ctx.holdings["MSFT"].kelly_target_pct
 
 
-def test_default_sigma_horizon_preserves_annualized_sigma_behavior() -> None:
-    implicit_ctx = _ctx()
+def test_explicit_252_preserves_annualized_sigma_behavior() -> None:
+    """Present-key regression pin: sigma_horizon_days=252 is byte-identical
+    to the pre-A3 legacy default path."""
     explicit_ctx = _ctx(sigma_horizon_days=252)
 
-    implicit_cand, implicit_hold = _run(implicit_ctx)
     explicit_cand, explicit_hold = _run(explicit_ctx)
 
     expected = 0.5 * (0.005 / (0.35**2))
-    assert implicit_cand == pytest.approx(expected)
-    assert implicit_hold == pytest.approx(expected)
-    assert explicit_cand == pytest.approx(implicit_cand)
-    assert explicit_hold == pytest.approx(implicit_hold)
+    assert explicit_cand == pytest.approx(expected)
+    assert explicit_hold == pytest.approx(expected)
+
+
+def test_missing_sigma_horizon_key_fails_loud_when_kelly_enabled() -> None:
+    """Campaign A3 (audit §5.1 P0): the silent 252 default is gone. A missing
+    key with kelly enabled must RAISE at scoring time (defense in depth
+    behind preflight P-KELLY-SIGMA-HORIZON), never quietly re-arm the
+    2026-06-11 variance bug."""
+    implicit_ctx = _ctx()  # kelly enabled, sigma_horizon_days ABSENT
+
+    with pytest.raises(RuntimeError, match="sigma_horizon_days") as exc:
+        _run(implicit_ctx)
+    assert "P-KELLY-SIGMA-HORIZON" in str(exc.value)
+    assert "2026-06-11" in str(exc.value)
+
+
+def test_missing_sigma_horizon_key_inert_when_kelly_disabled() -> None:
+    """Kelly disabled ⇒ the task no-ops before the horizon read; a missing
+    key must NOT raise (absent-is-legitimate when the consumer is off)."""
+    ctx = _ctx()
+    ctx.config["ranking"]["kelly_sizing"]["enabled"] = False
+
+    cand_target, hold_target = _run(ctx)
+
+    assert cand_target is None
+    assert hold_target is None
 
 
 def test_sigma_horizon_60_matches_mu_period_before_kelly_formula() -> None:

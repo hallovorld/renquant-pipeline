@@ -13,12 +13,32 @@ def _cfg(value=...):
     return {"ranking": {"kelly_sizing": kelly}}
 
 
-def test_kelly_sigma_horizon_preflight_allows_default() -> None:
+def test_kelly_sigma_horizon_preflight_missing_key_fails_closed() -> None:
+    """Campaign A3 (audit §5.1 P0): pre-fix this PASSED with "using default
+    252" — losing the key silently re-armed the 2026-06-11 ~4.2x variance
+    bug with green checks. Absent + kelly enabled must now hard-fail."""
     result = _check_kelly_sigma_horizon_config(_cfg())
 
     assert result.name == "P-KELLY-SIGMA-HORIZON"
+    assert result.ok is False
+    assert result.severity == "hard"
+    assert "MISSING" in result.message
+    assert "2026-06-11" in result.message
+    assert result.details["removed_silent_default"] == 252.0
+
+
+def test_kelly_sigma_horizon_preflight_missing_key_documented_when_disabled() -> None:
+    """Absent-is-legitimate branch: kelly_sizing disabled ⇒ the value is
+    never consumed, so absence passes — with the exemption documented."""
+    cfg = _cfg()
+    cfg["ranking"]["kelly_sizing"]["enabled"] = False
+
+    result = _check_kelly_sigma_horizon_config(cfg)
+
     assert result.ok is True
-    assert result.details["default_sigma_horizon_days"] == 252.0
+    assert "unused" in result.message
+    assert "REQUIRED" in result.message
+    assert result.details["kelly_enabled"] is False
 
 
 def test_kelly_sigma_horizon_preflight_accepts_positive_numeric() -> None:
