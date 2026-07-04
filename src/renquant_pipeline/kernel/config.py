@@ -1,6 +1,9 @@
 """Strategy config loader — self-contained, no external dependencies."""
+from __future__ import annotations
+
 import json
 from pathlib import Path
+from typing import Optional
 
 STRATEGY_DIR = Path(__file__).resolve().parent.parent
 
@@ -11,7 +14,7 @@ BEAR          = "BEAR"
 REGIMES       = [BULL_CALM, BULL_VOLATILE, CHOPPY, BEAR]
 
 
-def load_config(path: Path | None = None) -> dict:
+def load_config(path: Optional[Path] = None) -> dict:
     p = path or (STRATEGY_DIR / "strategy_config.json")
     with open(p) as f:
         return json.load(f)
@@ -36,7 +39,7 @@ def artifact_path(filename: str) -> Path:
 
 # ── Aliases for callers migrating from common/ ────────────────────────────────
 
-def load_strategy_config(path: Path | None = None) -> dict:
+def load_strategy_config(path: Optional[Path] = None) -> dict:
     """Alias for load_config — compatible with common.config.load_strategy_config."""
     return load_config(path)
 
