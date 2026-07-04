@@ -52,3 +52,32 @@ Then pass to the orchestrator's `write_verdicts()` / `write_outcomes()`.
   wiring lands)
 - Forward-outcome join ≥95% for aged decisions (outcome observer fills
   fwd_*_ret columns)
+
+## Round 2 (review)
+
+Codex found a real logic inconsistency: `_rotation_verdict()` (the scope-level
+gate) counted a rotation as viable whenever `net_advantage > 0`, while
+`format_rotation_decisions()`'s per-rotation `executed` field used the actual
+economic bar, `net_advantage >= threshold`. A run could report the rotation
+gate as `allow` with a positive `n_viable` count even though every individual
+rotation was below threshold and none would execute — two conflicting stories
+for the same run.
+
+Fixed by making `_rotation_verdict()` use the identical `net_advantage >=
+threshold` predicate as `format_rotation_decisions()`. No downstream consumer
+of the gate verdict distinguishes "positive but sub-threshold" from
+"executable" (this PR is unmerged, so there are no external consumers yet
+either), so a single shared predicate is the correct fix rather than carrying
+two parallel signals.
+
+Added `test_rotation_verdict_matches_per_rotation_executed_flag` (rotations
+with `net_advantage > 0` but all below `threshold` — asserts the gate reports
+`halve`/`n_viable == 0`, consistent with `format_rotation_decisions()`
+reporting no rotation as executed) and
+`test_rotation_verdict_allows_when_above_threshold` (control case). Confirmed
+the new regression test fails against the pre-fix code (`allow` instead of
+`halve`) and passes after. 20/20 decision_ledger tests pass; full repo suite
+1310/1314 passes (4 pre-existing failures — a stale sibling `renquant-base-data`
+checkout on this machine plus one already-failing HF live-sequence test —
+confirmed reproducing identically on a clean `origin/main` checkout, unrelated
+to this change).

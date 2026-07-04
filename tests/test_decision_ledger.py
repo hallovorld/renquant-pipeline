@@ -136,6 +136,33 @@ class TestFormatGateVerdicts:
         verdicts = format_gate_verdicts(ctx, config, "run-001", "2026-07-01")
         assert all(v["scope"] == "strategy-105" for v in verdicts)
 
+    def test_rotation_verdict_matches_per_rotation_executed_flag(self):
+        # net_advantage > 0 but below threshold on every rotation: the
+        # gate-level verdict must agree with format_rotation_decisions()'s
+        # per-rotation "executed" bar, not just check the sign.
+        subthreshold = [
+            FakeRotation(net_advantage=0.003, threshold=0.005),
+            FakeRotation(net_advantage=0.001, threshold=0.01),
+        ]
+        ctx = FakeCtx(candidates=[FakeCandidate("AAPL")], rotations=subthreshold)
+        verdicts = format_gate_verdicts(ctx, BASIC_CONFIG, "run-001", "2026-07-01")
+        rotation_v = next(v for v in verdicts if v["gate"] == "rotation")
+        assert rotation_v["verdict"] == "halve"
+        assert rotation_v["inputs"]["n_viable"] == 0
+
+        decisions = format_rotation_decisions(
+            ctx, BASIC_CONFIG, "run-001", "2026-07-01"
+        )
+        assert not any(d["executed"] for d in decisions)
+
+    def test_rotation_verdict_allows_when_above_threshold(self):
+        above = [FakeRotation(net_advantage=0.02, threshold=0.005)]
+        ctx = FakeCtx(candidates=[FakeCandidate("AAPL")], rotations=above)
+        verdicts = format_gate_verdicts(ctx, BASIC_CONFIG, "run-001", "2026-07-01")
+        rotation_v = next(v for v in verdicts if v["gate"] == "rotation")
+        assert rotation_v["verdict"] == "allow"
+        assert rotation_v["inputs"]["n_viable"] == 1
+
 
 class TestFormatTickerDecisions:
     def test_buy_decision(self):

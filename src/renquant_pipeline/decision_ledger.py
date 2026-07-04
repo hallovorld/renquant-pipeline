@@ -158,7 +158,14 @@ def _wash_sale_verdict(ctx: Any, scope: str) -> dict[str, Any]:
 
 def _rotation_verdict(ctx: Any, scope: str) -> dict[str, Any]:
     rotations = getattr(ctx, "rotations", None) or []
-    executed = [r for r in rotations if getattr(r, "net_advantage", 0) > 0]
+    # Same bar as format_rotation_decisions()'s "executed" field — net_advantage
+    # merely being positive does not mean a rotation clears its own threshold
+    # (tax drag / friction margin), and the gate-level verdict must not report
+    # allow/viable for rotations that would not actually execute.
+    executed = [
+        r for r in rotations
+        if (getattr(r, "net_advantage", 0) or 0) >= (getattr(r, "threshold", 0) or 0)
+    ]
     return {
         "scope": scope, "gate": "rotation",
         "verdict": "allow" if executed else "halve",
