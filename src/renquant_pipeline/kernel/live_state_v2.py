@@ -32,7 +32,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -43,10 +43,10 @@ SCHEMA_VERSION = 2
 
 class EntrySignalV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    rank_score: float | None = None
-    panel_score: float | None = None
-    kelly_target_pct: float | None = None
-    regime: str | None = None      # entry-regime max_hold anchor (incident #5)
+    rank_score: Optional[float] = None
+    panel_score: Optional[float] = None
+    kelly_target_pct: Optional[float] = None
+    regime: Optional[str] = None      # entry-regime max_hold anchor (incident #5)
 
 
 class HoldingV2(BaseModel):
@@ -54,8 +54,8 @@ class HoldingV2(BaseModel):
     entry_date: str
     sell_streak: int = 0
     protection_breaches: int = 0   # the PR-#294 field — the 1-line example
-    position_hwm: float | None = None
-    entry_signal: EntrySignalV2 | None = None
+    position_hwm: Optional[float] = None
+    entry_signal: Optional[EntrySignalV2] = None
 
 
 # Holding field → v1 per-ticker collection. Adding a HoldingV2 field
@@ -85,11 +85,11 @@ class MonitorStateV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
     no_trade_streak: int = 0
     no_candidate_streak: int = 0
-    last_activity_date: str | None = None
-    first_trade_date: str | None = None
-    no_trade_streak_source: str | None = None
-    last_fill_date: str | None = None
-    last_check_date: str | None = None
+    last_activity_date: Optional[str] = None
+    first_trade_date: Optional[str] = None
+    no_trade_streak_source: Optional[str] = None
+    last_fill_date: Optional[str] = None
+    last_check_date: Optional[str] = None
 
 
 class RegimeStateV2(BaseModel):
@@ -100,7 +100,7 @@ class RegimeStateV2(BaseModel):
     countdown: int = 0
     cusum_pos: float = 0.0
     cusum_neg: float = 0.0
-    cooldown_start: str | None = None
+    cooldown_start: Optional[str] = None
 
 
 class LiveStateV2(BaseModel):
@@ -108,13 +108,13 @@ class LiveStateV2(BaseModel):
     schema_version: int = SCHEMA_VERSION
     regime: str = "UNKNOWN"
     regime_confidence: float = 0.0
-    high_water_mark: float | None = None
+    high_water_mark: Optional[float] = None
     holdings: dict[str, HoldingV2] = {}
     last_sell_dates: dict[str, str] = {}
     last_stop_exit_dates: dict[str, str] = {}
     skip_buys: bool = False
-    monitor_state: MonitorStateV2 | None = None
-    regime_state: RegimeStateV2 | None = None
+    monitor_state: Optional[MonitorStateV2] = None
+    regime_state: Optional[RegimeStateV2] = None
     # Z9 broker-side stop bookkeeping; shape owned by the umbrella runner —
     # typed passthrough until the Z9 record gets its own model.
     stop_orders: dict[str, Any] = {}
