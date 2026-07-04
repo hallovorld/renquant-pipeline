@@ -43,13 +43,23 @@ import xgboost as xgb
 # here for back-compat: other modules in this repo import
 # `model_content_sha256` / `stamp_artifact_metadata` / `artifact_sha256`
 # from this module rather than from renquant_common directly.
+#
+# M6 stage-2 step-1: the schema-v1 API (`stamp` / `verify` /
+# `FINGERPRINT_SCHEMA_VERSION`) is re-exported here too — this module is
+# the pipeline's single import surface for the fingerprint contract. The
+# deprecated 0.8.1 shim names remain until step 5 removes them from
+# renquant-common (the legacy-stamped population verifies through them
+# during the migration window).
 from renquant_common.model_fingerprint import (  # noqa: F401
+    FINGERPRINT_SCHEMA_VERSION,
     MUTABLE_ARTIFACT_KEYS as _MUTABLE_ARTIFACT_KEYS,
     PREDICTIVE_CONTENT_HINTS as _PREDICTIVE_CONTENT_HINTS,
     artifact_sha256,
     model_content_sha256,
     model_content_sha256_from_path,
+    stamp,
     stamp_artifact_metadata,
+    verify,
 )
 
 
@@ -141,6 +151,18 @@ class PanelScorer:
             {k: v for k, v in payload.items() if k != "booster_raw_json"},
             path,
             payload=payload,
+        )
+        # M6 stage-2 step-1: stamp BOTH identities (legacy via the shim
+        # above, v1 via stamp() when computable) into the in-memory
+        # metadata + log the divergence-telemetry line. For a v1-stamped
+        # artifact this also verify()s the stamp against the payload —
+        # fail-closed (ValueError subclasses) — while a legacy stamp stays
+        # telemetry-only, enforced at the binding checks as before.
+        from renquant_pipeline.kernel.panel_pipeline.fingerprint_dispatch import (  # noqa: PLC0415
+            resolve_scorer_stamp_metadata,
+        )
+        meta = resolve_scorer_stamp_metadata(
+            meta, payload, path, context="PanelScorer.load",
         )
         return cls(
             booster=booster,

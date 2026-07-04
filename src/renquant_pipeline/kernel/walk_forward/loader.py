@@ -129,48 +129,38 @@ def _parse_entry(r: dict) -> RetrainEntry:
     )
 
 
-def _normalize_fingerprint(value: str | None) -> str:
-    return str(value or "").strip().lower().removeprefix("sha256:")
-
-
-def _fingerprints_match(expected: str | None, actual: str | None) -> bool:
-    """Accept exact matches and historical short-sha prefixes."""
-    exp = _normalize_fingerprint(expected)
-    act = _normalize_fingerprint(actual)
-    if not exp or not act:
-        return False
-    if exp == act:
-        return True
-    min_prefix = 12
-    return (
-        len(exp) >= min_prefix
-        and len(act) >= min_prefix
-        and (exp.startswith(act) or act.startswith(exp))
-    )
+# M6 stage-2 step-1: fingerprint matching + schema dispatch live in ONE
+# module shared with the daily-path binding check
+# (``panel_pipeline/fingerprint_dispatch.py``, design §3 step 1). This
+# loader's old recompute (the bare ``model_content_sha256`` name, whose
+# semantics silently followed the venv's renquant-common version — the
+# pipeline#160 problem) moved onto the explicit stamped-schema dispatch
+# inside ``scorer_claim_from_payload``. The historical private helper
+# names stay importable from this module.
+from renquant_pipeline.kernel.panel_pipeline.fingerprint_dispatch import (
+    SCHEMA_LEGACY as _SCHEMA_LEGACY,
+    IdentityClaim,
+    accept_legacy_stamps as _config_accept_legacy_stamps,
+    any_fingerprints_match as _any_fingerprints_match,
+    build_claim as _build_fingerprint_claim,
+    fingerprints_match as _fingerprints_match,
+    log_verify_telemetry as _log_fingerprint_telemetry,
+    match_claims as _match_fingerprint_claims,
+    normalize_fingerprint as _normalize_fingerprint,
+    scorer_claim_from_payload as _scorer_claim_from_payload,
+)
 
 
 def _scorer_fingerprints_from_payload(payload: dict) -> list[str]:
-    """Return stable scorer identities stamped in a local artifact JSON."""
-    from renquant_pipeline.kernel.panel_pipeline.panel_scorer import model_content_sha256  # noqa: PLC0415
+    """Back-compat payload-only identity view (pre-dispatch surface).
 
-    out: list[str] = []
-    try:
-        out.append(model_content_sha256(payload))
-    except Exception:
-        pass
-    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    for source in (payload, metadata):
-        for key in (
-            "model_content_fingerprint",
-            "artifact_fingerprint",
-            "artifact_sha256",
-            "model_fingerprint",
-            "fingerprint",
-        ):
-            value = source.get(key)
-            if value:
-                out.append(str(value))
-    return list(dict.fromkeys(out))
+    Kept because cross-repo verification tests (e.g. renquant-orchestrator's
+    step-0 prestamp suite) poke this name. Payload-only ⇒ no legacy shim
+    recompute and no file hash; a v1-stamped payload is verify()'d
+    (fail-closed) exactly like the claim path. Prefer
+    ``scorer_claim_from_payload`` in new code.
+    """
+    return list(_scorer_claim_from_payload(payload, None).values)
 
 
 def _calibrator_scorer_fingerprints(calibrator: object) -> list[str]:
@@ -188,11 +178,21 @@ def _calibrator_scorer_fingerprints(calibrator: object) -> list[str]:
     return out
 
 
-def _any_fingerprints_match(expected: list[str], actual: list[str]) -> bool:
-    return any(
-        _fingerprints_match(exp, act)
-        for exp in expected
-        for act in actual
+def _calibrator_claim(calibrator: object) -> IdentityClaim:
+    """The calibrator's declared scorer identity as a single-schema claim.
+
+    A ``scorer_fingerprint_schema_version: 1`` declaration (written by the
+    stage-2 step-2 re-stamp run) selects the v1 route with exactly one
+    acceptable digest; a versionless declaration IS the legacy declaration
+    (all 0.8.1-era fold calibrators predate the version field by
+    construction).
+    """
+    metadata = getattr(calibrator, "metadata", {}) or {}
+    return _build_fingerprint_claim(
+        schema_version=metadata.get("scorer_fingerprint_schema_version"),
+        v1_value=metadata.get("scorer_model_content_fingerprint"),
+        legacy_values=_calibrator_scorer_fingerprints(calibrator),
+        source="calibrator",
     )
 
 
@@ -203,11 +203,30 @@ class WalkForwardModelLoader:
     invariant is enforced once here, not duplicated downstream.
     """
 
-    def __init__(self, manifest_path: "str | Path") -> None:
+    def __init__(
+        self,
+        manifest_path: "str | Path",
+        *,
+        accept_legacy_stamps: "bool | None" = None,
+    ) -> None:
+        """``accept_legacy_stamps`` is the M6 stage-2 migration-window flag
+        (``ranking.panel_scoring.fingerprint.accept_legacy_stamps``, policy
+        owned by strategy config — consumers with a config dict should pass
+        the resolved value). ``None``/omitted resolves to the window
+        default (``True``): versionless (legacy) stamps keep verifying via
+        the pre-existing shim equality path. ``False`` = post-flip
+        strictness: only v1-stamped identity pairs verify; a versionless
+        stamp fails closed with the "re-stamp under v1" remedy.
+        """
         self._manifest_path = _resolve_manifest_path(manifest_path)
         self._entries: list[RetrainEntry] = []
         self._cache: dict[str, "PanelScorer"] = {}
         self._calibrator_cache: dict[str, object] = {}
+        self._accept_legacy_stamps = (
+            _config_accept_legacy_stamps(None)
+            if accept_legacy_stamps is None
+            else bool(accept_legacy_stamps)
+        )
         if self._manifest_path.exists():
             self._entries = self._parse_manifest(self._manifest_path)
 
@@ -392,18 +411,40 @@ class WalkForwardModelLoader:
                 return candidate
         return primary
 
-    def _scorer_fingerprints_for_entry(self, entry: RetrainEntry) -> list[str]:
-        """Read the selected fold's local scorer identities without loading it."""
+    def _scorer_claim_for_entry(self, entry: RetrainEntry) -> IdentityClaim:
+        """Read the selected fold's local scorer identity without loading it.
+
+        Dispatch on the fold artifact's OWN stamp (design §3 step 1): a
+        v1-stamped fold verifies via ``verify()`` (fail-closed — a
+        ``MismatchError``/``VersionGapError``/``UnclassifiedKeyError`` is a
+        ``ValueError`` and aborts the fold load, unlike the old fail-soft
+        recompute at the pre-dispatch :158); a versionless fold keeps the
+        pre-existing legacy acceptance set (stamped identity keys + the
+        explicit legacy shim recompute + the whole-file hash).
+        """
         resolved = self._resolve_uri(entry.artifact_uri)
         if not isinstance(resolved, Path) or not resolved.exists():
-            return []
-        out: list[str] = []
+            return IdentityClaim(
+                schema=_SCHEMA_LEGACY, values=(), source=f"scorer:{resolved}",
+            )
+        file_hash = (
+            "sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest()
+        )
         if resolved.suffix == ".json":
             payload = json.loads(resolved.read_text())
             if isinstance(payload, dict):
-                out.extend(_scorer_fingerprints_from_payload(payload))
-        out.append("sha256:" + hashlib.sha256(resolved.read_bytes()).hexdigest())
-        return list(dict.fromkeys(out))
+                return _scorer_claim_from_payload(
+                    payload, resolved, file_hash=file_hash,
+                )
+        # Non-JSON artifact families (e.g. .pt checkpoints) stay on the
+        # whole-file-hash identity (design §2a site 10 family split).
+        return IdentityClaim(
+            schema=_SCHEMA_LEGACY, values=(file_hash,), source=f"scorer:{resolved}",
+        )
+
+    def _scorer_fingerprints_for_entry(self, entry: RetrainEntry) -> list[str]:
+        """Back-compat view of :meth:`_scorer_claim_for_entry` values."""
+        return list(self._scorer_claim_for_entry(entry).values)
 
     def _assert_calibrator_matches_entry(
         self,
@@ -411,9 +452,19 @@ class WalkForwardModelLoader:
         calibrator: object,
         calibrator_path: "str | Path",
     ) -> None:
-        """Enforce the WF per-fold scorer/calibrator fingerprint contract."""
-        scorer_fps = self._scorer_fingerprints_for_entry(entry)
-        cal_fps = _calibrator_scorer_fingerprints(calibrator)
+        """Enforce the WF per-fold scorer/calibrator fingerprint contract.
+
+        M6 stage-2 step-1: the identity pair is compared within ONE schema
+        only (v1/v1 exact via the shared dispatch; versionless/versionless
+        via the pre-existing legacy equality path; cross-schema never a
+        match). With ``accept_legacy_stamps=False`` only the v1 route
+        exists and a versionless stamp fails closed with the "re-stamp
+        under v1" remedy.
+        """
+        scorer_claim = self._scorer_claim_for_entry(entry)
+        cal_claim = _calibrator_claim(calibrator)
+        scorer_fps = list(scorer_claim.values)
+        cal_fps = list(cal_claim.values)
         if not scorer_fps or not cal_fps:
             raise ValueError(
                 "WalkForwardModelLoader: missing scorer/calibrator fingerprint "
@@ -421,12 +472,21 @@ class WalkForwardModelLoader:
                 f"calibrator={calibrator_path}. scorer={scorer_fps!r} "
                 f"calibrator={cal_fps!r}."
             )
-        if not _any_fingerprints_match(cal_fps, scorer_fps):
+        verdict = _match_fingerprint_claims(
+            scorer_claim, cal_claim,
+            accept_legacy=self._accept_legacy_stamps,
+        )
+        _log_fingerprint_telemetry(
+            "WalkForwardModelLoader", entry.artifact_uri, scorer_claim,
+            cal_claim, verdict, accept_legacy=self._accept_legacy_stamps,
+        )
+        if not verdict.matched:
             raise ValueError(
                 "WalkForwardModelLoader: calibrator/scorer fingerprint mismatch "
                 f"for cutoff={entry.cutoff_date.date()} scorer={entry.artifact_uri} "
                 f"calibrator={calibrator_path}. calibrator={cal_fps} "
-                f"scorer={scorer_fps}."
+                f"scorer={scorer_fps}. "
+                f"[fingerprint-dispatch route={verdict.route}: {verdict.reason}]"
             )
 
     @property
