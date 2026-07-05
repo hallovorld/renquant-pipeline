@@ -1,10 +1,12 @@
-# S5: Decision-ledger formatter (pipeline-side)
+# S5: Decision-ledger formatter + pipeline wiring
 
 **Date:** 2026-07-04
 **PR:** feat/s5-decision-ledger-formatter
 **Roadmap:** S5 (decision-ledger wiring) — pipeline half
 
 ## What
+
+### Commit 1: Formatters
 
 Added `src/renquant_pipeline/decision_ledger.py` — a formatter that extracts
 decision records from the pipeline runtime context (`ctx`) for the
@@ -24,34 +26,31 @@ Three entry points:
 3. **`format_rotation_decisions(ctx, config, run_id, run_date)`** — rotation-pair
    decisions with net_advantage, threshold, and executed flag.
 
-## Wiring (umbrella-side, separate PR)
+### Commit 2: Pipeline wiring task
 
-The umbrella's `RunnerAdapter.commit()` (runner.py ~L2075) needs a ~3-line
-addition adjacent to the existing `record_candidate_scores()` call:
+Added `kernel/pipeline/task_decision_ledger.py` — `DecisionLedgerWriteTask`
+that calls the formatters and writes to the orchestrator's decision ledger DB.
 
-```python
-from renquant_pipeline.decision_ledger import format_gate_verdicts, format_ticker_decisions
-verdicts = format_gate_verdicts(ctx, self._config, run_id, run_date)
-ticker_decisions = format_ticker_decisions(ctx, self._config, run_id, run_date)
-```
-
-Then pass to the orchestrator's `write_verdicts()` / `write_outcomes()`.
+- Wired into `InferencePipeline.run()` at end-of-pipeline (after all decisions
+  finalized, before the final summary log)
+- **Fail-open**: if orchestrator modules are not importable, logs WARNING and
+  continues — S5 is measurement substrate, not a trading gate
+- **Default OFF**: opt-in via `decision_ledger.enabled` config flag
+- Counters: `s5_verdicts_written`, `s5_decisions_formatted`, `s5_write_skipped`,
+  `s5_write_error` for observability
 
 ## Tests
 
-18 tests covering:
-- All 6 gate verdicts (regime block, conviction block, vol/wash-sale detection)
-- Per-ticker decisions: buy, sell, hold, blocked, no_trade
-- Mixed scenario with all decision types
-- Edge cases: NaN mu, empty ctx, exit-that-is-also-a-buy dedup
-- Rotation decisions with threshold comparison
+- 18 formatter tests (commit 1)
+- 7 wiring task tests (commit 2): disabled-by-default, enabled flow, fail-open
+  on import error, fail-open on write exception, run_id fallback, verdict shape
 
 ## AC
 
-- Every live run writes gate verdicts + per-ticker decisions (once umbrella
-  wiring lands)
+- Every live run writes gate verdicts + per-ticker decisions (when
+  `decision_ledger.enabled=true` in strategy config)
 - Forward-outcome join ≥95% for aged decisions (outcome observer fills
-  fwd_*_ret columns)
+  fwd_*_ret columns — separate orchestrator job)
 
 ## Round 2 (review)
 

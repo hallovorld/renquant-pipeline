@@ -598,6 +598,14 @@ class InferencePipeline:
         if not _ml_job.should_skip(ctx):
             _ml_job.run(ctx)
 
+        # S5: persist gate verdicts + per-ticker decisions to the decision
+        # ledger DB. Fail-open — never blocks the daily run.
+        from .task_decision_ledger import DecisionLedgerWriteTask  # noqa: PLC0415
+        try:
+            DecisionLedgerWriteTask().run(ctx)
+        except Exception:
+            log.exception("S5 DecisionLedgerWriteTask raised (fail-open)")
+
         # Audit fix ROT-COUNTER (Bug L, 2026-04-25): pre-fix this logged
         # `len(ctx.rotations)` which is "pairs CONSIDERED by find_rotation_pairs",
         # not "pairs EMITTED to broker". Iter3 produced rotations=1 in the log
