@@ -4,6 +4,25 @@ Fail-open: if orchestrator modules are not importable (version skew, dependency
 missing), logs a WARNING and continues the daily run. S5 is a measurement
 substrate, not a trading gate — a missing write degrades analytics but does not
 affect trade safety.
+
+Scope: VERDICT-ONLY persistence. ``format_ticker_decisions()`` is called and its
+output is counted (``s5_decisions_formatted``) for observability, but per-ticker
+decisions are deliberately NOT written to ``decision_outcomes`` from this task.
+
+Writing them here would reintroduce the exact partial-write poisoning bug fixed
+in the S5 outcome observer (renquant-orchestrator PR #351): ``decision_outcomes``
+rows are meant to be written ATOMICALLY, once per decision, only after all three
+forward-return horizons (5d/20d/60d) are available — the observer enforces this.
+But ``outcome_observer.pending_decisions()`` treats the mere EXISTENCE of a
+``decision_outcomes`` row at ``(as_of, scope, gate)`` grain (no ticker in the
+join condition) as "already observed." A verdict-only row inserted here, at
+pipeline-run time, would permanently suppress that decision from ever being
+picked up by the observer for real forward-return backfill.
+
+A genuine per-ticker decision-ledger substrate needs a separate registry the
+observer can read FROM (distinct from decision_outcomes, which the observer
+must remain the sole writer of) — that is follow-up design work, not a missing
+API call.
 """
 from __future__ import annotations
 
@@ -17,14 +36,15 @@ log = logging.getLogger("kernel.pipeline.decision_ledger")
 
 
 class DecisionLedgerWriteTask(Task):
-    """Write gate verdicts + per-ticker decisions to the decision ledger.
+    """Write gate verdicts to the decision ledger. Verdict-only — see module
+    docstring for why per-ticker decisions are formatted but not persisted here.
 
     Reads:
       ctx (full InferenceContext after all gates have run)
       ctx.config["decision_ledger"]["enabled"]  — default False (opt-in)
 
     Writes:
-      ~/renquant-data/decision_ledger.db via orchestrator modules
+      ~/renquant-data/decision_ledger.db via orchestrator modules (verdicts only)
     """
 
     def run(self, ctx: InferenceContext) -> bool | None:
@@ -87,8 +107,9 @@ class DecisionLedgerWriteTask(Task):
             ctx.counters["s5_verdicts_written"] = len(verdicts)
             ctx.counters["s5_decisions_formatted"] = len(decisions)
             log.info(
-                "S5 decision ledger: wrote %d verdicts, %d decisions for %s",
-                len(verdicts), len(decisions), date_iso,
+                "S5 decision ledger: wrote %d verdicts for %s "
+                "(%d per-ticker decisions formatted, not persisted — see module docstring)",
+                len(verdicts), date_iso, len(decisions),
             )
         except Exception:
             log.exception(

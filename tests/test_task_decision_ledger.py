@@ -104,6 +104,48 @@ class TestDecisionLedgerWriteTask:
             assert ctx.counters["s5_verdicts_written"] == 1
             assert ctx.counters["s5_decisions_formatted"] == 1
 
+    def test_decisions_formatted_but_never_persisted(self):
+        """Regression guard: per-ticker decisions must NOT be written to
+        decision_outcomes from this task. Writing a verdict-only row here
+        (before the 60d aging window) would poison outcome_observer's
+        pending_decisions() existence check (renquant-orchestrator#351),
+        permanently suppressing that (as_of, scope, gate) from ever being
+        picked up for real forward-return backfill. See module docstring."""
+        ctx = _FakeCtx(config={"decision_ledger": {"enabled": True}})
+        task = _make_task()
+
+        mock_decisions = [
+            {"as_of": "2026-07-01", "scope": "s104", "ticker": "AAPL",
+             "gate": "buy", "verdict": "allow"},
+        ]
+
+        ledger_attribution_mod = ModuleType("renquant_orchestrator.ledger_attribution")
+        ledger_attribution_mod.write_outcomes = MagicMock()
+        ledger_attribution_mod.connect_attribution = MagicMock()
+
+        with patch(
+            "renquant_pipeline.decision_ledger.format_gate_verdicts",
+            return_value=[{"scope": "s", "gate": "g", "verdict": "allow",
+                           "reason": "r", "inputs": {}}],
+        ), patch(
+            "renquant_pipeline.decision_ledger.format_ticker_decisions",
+            return_value=mock_decisions,
+        ), patch(
+            "renquant_orchestrator.decision_ledger.connect",
+        ) as mock_connect, patch(
+            "renquant_orchestrator.decision_ledger.write_verdicts",
+        ), patch.dict(
+            "sys.modules",
+            {"renquant_orchestrator.ledger_attribution": ledger_attribution_mod},
+        ):
+            mock_connect.return_value = MagicMock()
+            result = task.run(ctx)
+
+            assert result is True
+            assert ctx.counters["s5_decisions_formatted"] == 1
+            ledger_attribution_mod.write_outcomes.assert_not_called()
+            ledger_attribution_mod.connect_attribution.assert_not_called()
+
     def test_failopen_on_orchestrator_import_error(self):
         ctx = _FakeCtx(config={"decision_ledger": {"enabled": True}})
         task = _make_task()
