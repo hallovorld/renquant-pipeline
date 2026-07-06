@@ -68,7 +68,7 @@ from renquant_artifacts import hash_jsonable
 from renquant_common import Task
 
 from .inference import InferenceContext, RuntimeInferencePipeline
-from .panel_scoring import PanelScoringJob
+from .panel_scoring import FrozenScoreScoringJob, PanelScoringJob
 from .selection import SelectionJob
 
 INTRADAY_DECISIONING_SCHEMA_VERSION = "intraday-decisioning-v1"
@@ -541,6 +541,64 @@ def run_intraday_decision_tick(
     )
 
 
+def frozen_score_diagnostic_stages() -> list[Task]:
+    """Stage list that uses pre-computed frozen scores instead of rebuilding
+    features from scratch each tick — see :func:`run_frozen_score_diagnostic_tick`
+    for the scope this is confined to."""
+    return [
+        FrozenScoreScoringJob(),
+        SelectionJob(),
+        FrozenScoreScoringJob(emit_orders=True),
+    ]
+
+
+def run_frozen_score_diagnostic_tick(
+    *,
+    strategy_config: Mapping[str, Any],
+    data_manifest: Mapping[str, Any],
+    artifact_manifest: Mapping[str, Any],
+    signal: FrozenDailySignal,
+    session_start: SessionStartSnapshot,
+    live_state: LiveStateSnapshot,
+    in_flight_parent_intents: Collection[str] = (),
+    exit_orders: Sequence[Mapping[str, Any]] = (),
+    envelope_limits: IntradayEnvelopeLimits | None = None,
+    session_counters: SessionEnvelopeCounters | None = None,
+    headroom_evaluator: HeadroomEvaluator | None = None,
+) -> IntradayTickResult:
+    """Slice-2 contract entry point for the frozen-score diagnostic probe.
+
+    DIAGNOSTIC / DEBUG PROBE ONLY — not a validated intent-generation
+    design (see :class:`~renquant_pipeline.panel_scoring.FrozenScoreScoringJob`
+    for the exact semantic-validity caveats: an empty feature matrix and a
+    hardcoded ``default_quantity=1`` unblock the per-tick feature gate, but
+    there is no proof this preserves the pipeline's real semantics, no
+    sizing control, and no exit/sell path). Exists so a caller that only
+    has a frozen daily signal (no live feature build) can still exercise
+    the gate stack end-to-end for debugging, WITHOUT reaching into
+    ``panel_scoring``/``selection`` internals to compose its own stage
+    graph — that composition belongs here, behind this contract, not in a
+    consuming repo (RFC #208 §8 row 2/3 boundary).
+
+    Otherwise identical to :func:`run_intraday_decision_tick` — same input
+    classes, same envelope/idempotency semantics, same output shape.
+    """
+    return run_intraday_decision_tick(
+        strategy_config=strategy_config,
+        data_manifest=data_manifest,
+        artifact_manifest=artifact_manifest,
+        signal=signal,
+        session_start=session_start,
+        live_state=live_state,
+        in_flight_parent_intents=in_flight_parent_intents,
+        exit_orders=exit_orders,
+        envelope_limits=envelope_limits,
+        session_counters=session_counters,
+        headroom_evaluator=headroom_evaluator,
+        stages=frozen_score_diagnostic_stages(),
+    )
+
+
 def _emit_intents(
     *,
     ctx: InferenceContext,
@@ -835,6 +893,8 @@ __all__ = [
     "compute_parent_intent_id",
     "default_decision_stages",
     "evaluate_entry_envelope",
+    "frozen_score_diagnostic_stages",
     "intraday_decisioning_enabled",
+    "run_frozen_score_diagnostic_tick",
     "run_intraday_decision_tick",
 ]
