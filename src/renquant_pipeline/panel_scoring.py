@@ -371,6 +371,79 @@ class PanelScoringJob(Job):
         return not bool(_panel_cfg(ctx).get("enabled", True))
 
 
+class _StubFrozenFeatureMatrixTask(Task):
+    """Injects an empty feature matrix keyed by the frozen class-A scores.
+
+    Stands in for ``LoadScorerTask`` + ``BuildFeatureMatrixTask`` so
+    :class:`FrozenScoreScoringJob` never has to build real runtime features —
+    it exists purely to unblock the per-tick feature-availability gate for
+    the diagnostic probe described there. See that class's docstring for the
+    semantic-validity caveats this stub carries.
+    """
+
+    def run(self, ctx: Any) -> bool | None:
+        market = getattr(ctx, "market_snapshot", {}) or {}
+        scores = market.get("panel_scores") or {}
+        matrix = {str(t): {} for t in scores}
+        setattr(ctx, "panel_feature_cols", [])
+        setattr(ctx, "panel_feature_matrix", matrix)
+        setattr(ctx, "panel_artifact_id", "frozen-daily-signal")
+        cfg = getattr(ctx, "strategy_config", {}) or {}
+        exe = cfg.setdefault("execution", {})
+        if exe.get("default_quantity") is None:
+            exe["default_quantity"] = 1
+        return True
+
+
+class FrozenScoreScoringJob(PanelScoringJob):
+    """PanelScoringJob replacement that skips feature build and uses
+    pre-computed frozen scores from the class-A signal.
+
+    Inherits ``run()``/``should_skip()`` from :class:`PanelScoringJob`
+    unchanged — the ``buy_blocked`` choke point (errata-C(iii)) has exactly
+    one designated writer in this module, pinned by
+    ``tests/test_gate_writers_panel_scoring.py::TestCensusPin`` — only
+    ``__init__`` is overridden, to swap ``LoadScorerTask`` +
+    ``BuildFeatureMatrixTask`` for the frozen-score stub below.
+
+    DIAGNOSTIC / DEBUG PROBE ONLY — not a validated intent-generation
+    design. ``_StubFrozenFeatureMatrixTask`` injects an EMPTY feature
+    matrix and sets ``default_quantity=1`` as a FALLBACK purely to unblock
+    the pipeline from its usual per-tick feature-availability gate. There
+    is no real sizing control: order sizing (``_order_quantities`` in this
+    module) still prefers ``market_snapshot["order_quantity_by_ticker"]``
+    (class B / session-start) when a caller supplies it — the fallback
+    quantity of 1 fires only when that map is absent, which is true of the
+    one real caller today (renquant-orchestrator's session scheduler builds
+    no real-time quantity map at all) but is not an intrinsic property of
+    this job; a future caller that DOES populate real quantities would get
+    real sizing through, unreviewed. There is no proof that bypassing the
+    feature contract this way preserves the pipeline's semantics, and no
+    exit/sell path at all. Intended only to be driven through
+    :func:`renquant_pipeline.intraday_decisioning
+    .run_frozen_score_diagnostic_tick`, which confines it to a shadow-only
+    caller (no submit path exists there) — but it must not be treated as,
+    or built on top of, a defensible paper/live execution design until
+    those gaps are closed.
+    """
+
+    def __init__(self, *, emit_orders: bool = False) -> None:  # noqa: super-not-called
+        tasks: list[Task] = [
+            _StubFrozenFeatureMatrixTask(),
+            ApplyScoresTask(),
+            ApplyGlobalCalibrationTask(),
+            RegimeModelAdmissionTask(),
+            VetoWeakBuysTask(),
+        ]
+        if emit_orders:
+            tasks.append(EmitAttributedOrderIntentsTask())
+        self._tasks = tasks
+
+    @property
+    def tasks(self) -> list[Task]:
+        return self._tasks
+
+
 def _trace(ctx: Any, selected: list[str] | None = None) -> None:
     append_ticker_daily_state_rows(
         getattr(ctx, "strategy_config", {}) or {},

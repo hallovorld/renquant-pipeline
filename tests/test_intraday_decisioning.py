@@ -36,9 +36,12 @@ from renquant_pipeline.intraday_decisioning import (
     SessionStartSnapshot,
     compute_parent_intent_id,
     evaluate_entry_envelope,
+    frozen_score_diagnostic_stages,
     intraday_decisioning_enabled,
+    run_frozen_score_diagnostic_tick,
     run_intraday_decision_tick,
 )
+from renquant_pipeline.panel_scoring import FrozenScoreScoringJob
 
 SRC_ROOT = Path(__file__).parent.parent / "src" / "renquant_pipeline"
 
@@ -549,3 +552,86 @@ def test_class_b_session_start_snapshot_is_frozen() -> None:
         tampered.verify()
     with pytest.raises(IntradayLeakError):
         _run_tick(session_start=tampered)
+
+
+# ── frozen-score diagnostic probe (slice-2 contract) ─────────────────────────
+#
+# Moved wholesale from renquant-orchestrator's intraday_session_scheduler
+# (orchestrator PR #400, Codex round 2): the frozen-score composition
+# reaches into panel_scoring/selection internals, which is exactly the
+# signal/decision-internals boundary this repo owns and the orchestrator
+# must not cross (RFC #208 §8 row 2/3). This entry point is the seam a
+# caller now uses instead of composing that stage graph itself.
+
+
+def _run_frozen_diagnostic(**overrides: Any):
+    kwargs: dict[str, Any] = dict(
+        strategy_config=_strategy_config(),
+        data_manifest=_data_manifest(),
+        artifact_manifest=_artifact_manifest(),
+        signal=_signal(),
+        session_start=_session_start(),
+        live_state=_live_state(),
+    )
+    kwargs.update(overrides)
+    return run_frozen_score_diagnostic_tick(**kwargs)
+
+
+def test_frozen_score_diagnostic_stages_uses_frozen_score_scoring_job() -> None:
+    """The stage list is built from FrozenScoreScoringJob, never the real
+    LoadScorerTask/BuildFeatureMatrixTask-driven PanelScoringJob."""
+    stages = frozen_score_diagnostic_stages()
+    assert [type(s).__name__ for s in stages] == [
+        "FrozenScoreScoringJob",
+        "SelectionJob",
+        "FrozenScoreScoringJob",
+    ]
+    assert isinstance(stages[0], FrozenScoreScoringJob)
+    assert isinstance(stages[2], FrozenScoreScoringJob)
+
+
+def test_frozen_score_diagnostic_tick_emits_from_frozen_signal_not_features() -> None:
+    """The frozen scores (class A) drive admission end to end, with no real
+    feature build: IBM's score (0.2) is below the 0.5 buy floor and must
+    still be blocked, exactly as the real gate stack would block it — the
+    stub only replaces feature availability, not the scoring/admission
+    gates downstream of it."""
+    result = _run_frozen_diagnostic()
+    assert result.enabled is True
+    assert result.blocked_by == {"IBM": "panel_score_below_buy_floor"}
+    admitted = sorted(intent.symbol for intent in result.intents)
+    assert admitted == ["AAPL", "MSFT"]
+
+
+def test_frozen_score_diagnostic_tick_has_no_real_sizing_control() -> None:
+    """The only real caller of this probe (renquant-orchestrator's session
+    scheduler) never populates ``order_quantity_by_ticker`` in its
+    session-start gate inputs — it has no real-time sizing pipeline to draw
+    from. Modeling that exact shape (no per-ticker quantities in class B),
+    every admitted intent sizes at the stub's hardcoded ``default_quantity``
+    of 1, proving the documented "no real sizing control" caveat is
+    actually true of the code, not just asserted in a docstring. (When a
+    caller DOES supply real order_quantity_by_ticker — e.g. the batch-mode
+    fixture used elsewhere in this file — that map still wins; the stub's
+    fallback only fires when it is absent, exactly like the real,
+    non-frozen path.)"""
+    session_start_no_quantities = SessionStartSnapshot.capture(
+        {"feature_frame": {t: {"alpha_1": 1.0} for t in WATCHLIST}},
+        captured_at=f"{TRADING_DAY}T13:35:00Z",
+    )
+    result = _run_frozen_diagnostic(session_start=session_start_no_quantities)
+    by_symbol = {intent.symbol: intent.quantity for intent in result.intents}
+    assert by_symbol == {"AAPL": 1.0, "MSFT": 1.0}
+
+
+def test_frozen_score_diagnostic_tick_still_enforces_leak_guard() -> None:
+    """The diagnostic probe reuses run_intraday_decision_tick's §6 guards —
+    it is not a parallel, unguarded code path."""
+    with pytest.raises(IntradayLeakError):
+        _run_frozen_diagnostic(signal=_signal(as_of=TRADING_DAY))
+
+
+def test_frozen_score_diagnostic_tick_is_deterministic() -> None:
+    first = _run_frozen_diagnostic()
+    second = _run_frozen_diagnostic()
+    assert first == second
