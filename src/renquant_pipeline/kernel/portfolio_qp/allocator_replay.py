@@ -21,6 +21,9 @@ to both the QP and Hybrid candidate evaluations.
 """
 from __future__ import annotations
 
+import dataclasses
+import datetime
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
@@ -28,6 +31,7 @@ import numpy as np
 
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import AllocatorResult
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
+from renquant_pipeline.kernel.rotation import tax_drag
 
 
 # An allocator callable: takes (snapshot, mu, sigma) and returns AllocatorResult.
@@ -51,6 +55,156 @@ class AllocatorReplayBar:
     fwd_return: np.ndarray                  # shape (n,) — realised per-asset return
     regime: Optional[str] = None            # for per-regime stratification
     cost_per_trade_bps: float = 5.0         # 5 bp round-trip transaction cost
+    # Session close prices per asset (shape (n,), NaN when unknown).
+    # Optional; only required by the D6 whole-share quantization
+    # convention (``ReplayConventions.integer_shares``).
+    prices: Optional[np.ndarray] = None
+
+
+# ════════════════════════════════════════════════════════════════════
+#  D6 protocol replay conventions (all OPT-IN — defaults preserve the
+#  pre-D6 stateless behavior byte-for-byte)
+# ════════════════════════════════════════════════════════════════════
+
+#: D6 §1.1 frozen tax convention — realized-gain tax rates.
+D6_TAX_SHORT_RATE = 0.50
+D6_TAX_LONG_RATE = 0.32
+D6_LONG_TERM_THRESHOLD_DAYS = 365
+#: D6 §4 frozen non-degradation gates.
+D6_PER_NAME_CAP = 0.12
+D6_SECTOR_CAP = 0.35
+
+
+@dataclass(frozen=True)
+class ReplayConventions:
+    """Opt-in D6 protocol conventions for the replay harness.
+
+    Every field defaults to OFF / the pre-D6 value; a ``None`` (or
+    all-defaults) conventions object reproduces the stateless harness
+    behavior exactly, so existing committed evidence stays
+    reproducible (pinned by ``tests/test_replay_d6_conventions.py``).
+
+    * ``stateful`` — carry portfolio state (positions, tax lots with
+      entry date + entry price, cash) across sessions within an arm.
+      Deployed fraction becomes a real state variable distinct from
+      turnover; allocators receive the carried ``w_current`` so
+      hysteresis / no-trade bands are evaluable.
+    * ``tax`` — charge realized-gain tax on every exit leg (D6 §1.1
+      frozen convention: short 50% / long 32%, lot holding period
+      decides), mirroring :func:`renquant_pipeline.kernel.rotation.tax_drag`
+      (losses give zero drag). Requires ``stateful``.
+    * ``integer_shares`` — whole-share quantization: per bar, the
+      executed share count is ``floor(w · PV / p)``. Executed-state
+      invariant: rounding is always DOWN, and the post-round executed
+      weights (not the continuous targets) are what carries into
+      state. Requires ``stateful`` and per-bar ``prices``.
+    * ``enforce_caps`` — apply the D6 §4 per-name / sector caps INSIDE
+      the arm as a down-only projection before returns are computed,
+      recording per-session breach counters instead of silently
+      allowing breaches. Sector caps need ``sector_map``.
+    """
+
+    stateful: bool = False
+    tax: bool = False
+    integer_shares: bool = False
+    enforce_caps: bool = False
+    tax_short_rate: float = D6_TAX_SHORT_RATE
+    tax_long_rate: float = D6_TAX_LONG_RATE
+    long_term_threshold_days: int = D6_LONG_TERM_THRESHOLD_DAYS
+    per_name_cap: float = D6_PER_NAME_CAP
+    sector_cap: float = D6_SECTOR_CAP
+    sector_map: Optional[dict] = None      # ticker → sector name
+    initial_capital: float = 10_000.0      # dollars; scale for share floors
+
+    def __post_init__(self) -> None:
+        if self.tax and not self.stateful:
+            raise ValueError(
+                "ReplayConventions: tax=True requires stateful=True — the D6 "
+                "tax convention charges realized-gain tax on exit legs, which "
+                "only exist when lots are carried across sessions."
+            )
+        if self.integer_shares and not self.stateful:
+            raise ValueError(
+                "ReplayConventions: integer_shares=True requires stateful=True "
+                "— the executed-state invariant carries post-round weights "
+                "into the next session's state."
+            )
+        if self.initial_capital <= 0:
+            raise ValueError(
+                f"ReplayConventions: initial_capital must be > 0, got "
+                f"{self.initial_capital}"
+            )
+
+    @property
+    def any_enabled(self) -> bool:
+        return bool(self.stateful or self.enforce_caps)
+
+    def to_dict(self) -> dict:
+        out: dict = {
+            "stateful": self.stateful,
+            "tax": self.tax,
+            "integer_shares": self.integer_shares,
+            "enforce_caps": self.enforce_caps,
+        }
+        if self.tax:
+            out["tax_short_rate"] = self.tax_short_rate
+            out["tax_long_rate"] = self.tax_long_rate
+            out["long_term_threshold_days"] = self.long_term_threshold_days
+        if self.enforce_caps:
+            out["per_name_cap"] = self.per_name_cap
+            out["sector_cap"] = self.sector_cap
+            out["sector_map_supplied"] = self.sector_map is not None
+            out["n_sector_mapped_tickers"] = (
+                len(self.sector_map) if self.sector_map else 0
+            )
+        if self.stateful:
+            out["initial_capital"] = self.initial_capital
+        return out
+
+
+@dataclass
+class TaxLot:
+    """One tax lot: entry date + entry price + basis, marked to market.
+
+    ``market_value`` evolves with the replay's per-bar ``fwd_return``
+    (returns-consistent pricing); ``cost_basis`` is fixed at entry.
+    ``shares`` is only populated under the integer-shares convention.
+    """
+
+    entry_date: str
+    entry_bar_index: int
+    cost_basis: float                # dollars at entry
+    market_value: float              # dollars, marked via fwd_return
+    entry_price: Optional[float] = None   # per-share, integer mode only
+    shares: float = 0.0                    # integer mode only
+
+
+@dataclass
+class PortfolioState:
+    """Carried portfolio state for the stateful replay mode."""
+
+    cash: float
+    lots: dict[str, list[TaxLot]] = field(default_factory=dict)
+    # Returns-evolved internal price per held ticker (integer mode).
+    # Anchored to the session close price at (re-)entry, then evolved
+    # multiplicatively by fwd_return so shares × price ≡ market value
+    # exactly (cash-conservation invariant).
+    internal_price: dict[str, float] = field(default_factory=dict)
+
+    def position_value(self, ticker: str) -> float:
+        return float(sum(lot.market_value for lot in self.lots.get(ticker, ())))
+
+    def position_shares(self, ticker: str) -> float:
+        return float(sum(lot.shares for lot in self.lots.get(ticker, ())))
+
+    def total_positions_value(self) -> float:
+        return float(
+            sum(lot.market_value for lots in self.lots.values() for lot in lots)
+        )
+
+    @property
+    def portfolio_value(self) -> float:
+        return float(self.cash) + self.total_positions_value()
 
 
 @dataclass
@@ -78,6 +232,22 @@ class ReplayResult:
     per_regime: dict[str, list[float]] = field(default_factory=dict)
     # Per-family violation counters (codex #131 review HIGH)
     violations_per_family: dict[str, int] = field(default_factory=dict)
+
+    # ── D6 convention outputs (opt-in; None ⇒ convention not engaged,
+    #    and the corresponding evidence keys are omitted so the default
+    #    evidence schema stays byte-identical) ──────────────────────────
+    deployed_fraction: Optional[list[float]] = None      # stateful
+    cost_paid: Optional[list[float]] = None              # stateful ($/session)
+    tax_paid: Optional[list[float]] = None               # stateful + tax
+    executed_exposure: Optional[list[float]] = None      # integer: ΣW executed
+    integer_residual: Optional[list[float]] = None       # integer: ΣW target−exec
+    name_cap_breaches: Optional[list[int]] = None        # enforce_caps
+    sector_cap_breaches: Optional[list[int]] = None      # enforce_caps
+    off_universe_liquidations: Optional[int] = None      # stateful
+    # Stateful accounting series (tests + audits; not serialized)
+    cash_series: Optional[list[float]] = None
+    positions_value_series: Optional[list[float]] = None
+    final_state: Optional["PortfolioState"] = None
 
     @property
     def sharpe_annual(self) -> Optional[float]:
@@ -131,7 +301,7 @@ class ReplayResult:
         return int(sum(self.violations_per_family.values()))
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "name": self.name,
             "bars": self.bars,
             "sharpe_annual": self.sharpe_annual,
@@ -148,6 +318,39 @@ class ReplayResult:
                 r: len(v) for r, v in self.per_regime.items()
             },
         }
+        # D6 convention keys — strictly ADDITIVE and only emitted when
+        # the corresponding convention was engaged, so the default
+        # evidence schema stays byte-identical (schema contract: new
+        # keys only, never change existing keys).
+        if self.deployed_fraction is not None:
+            out["deployed_fraction"] = [float(x) for x in self.deployed_fraction]
+            out["mean_deployed_fraction"] = (
+                float(np.mean(self.deployed_fraction))
+                if self.deployed_fraction else 0.0
+            )
+        if self.cost_paid is not None:
+            out["cost_paid"] = [float(x) for x in self.cost_paid]
+            out["total_cost_paid"] = float(np.sum(self.cost_paid))
+        if self.tax_paid is not None:
+            out["tax_paid"] = [float(x) for x in self.tax_paid]
+            out["total_tax_paid"] = float(np.sum(self.tax_paid))
+        if self.executed_exposure is not None:
+            out["E_executed"] = [float(x) for x in self.executed_exposure]
+        if self.integer_residual is not None:
+            out["integer_residual"] = [float(x) for x in self.integer_residual]
+        if self.name_cap_breaches is not None:
+            out["name_cap_breaches"] = [int(x) for x in self.name_cap_breaches]
+            out["total_name_cap_breaches"] = int(np.sum(self.name_cap_breaches))
+        if self.sector_cap_breaches is not None:
+            out["sector_cap_breaches"] = [
+                int(x) for x in self.sector_cap_breaches
+            ]
+            out["total_sector_cap_breaches"] = int(
+                np.sum(self.sector_cap_breaches)
+            )
+        if self.off_universe_liquidations is not None:
+            out["off_universe_liquidations"] = int(self.off_universe_liquidations)
+        return out
 
 
 # Hard-constraint families surfaced by ConstraintSnapshot.
@@ -218,12 +421,121 @@ def check_snapshot_feasibility(
     return fam
 
 
+def _call_allocator(
+    allocator: AllocatorFn,
+    snap: ConstraintSnapshot,
+    bar: AllocatorReplayBar,
+) -> AllocatorResult:
+    try:
+        return allocator(snap, mu=bar.mu, sigma=bar.sigma)
+    except TypeError:
+        # Allocator may not accept sigma (e.g. equal-weight).
+        return allocator(snap, mu=bar.mu)
+
+
+def apply_d6_cap_projection(
+    target_w: np.ndarray,
+    tickers: Sequence[str],
+    conv: "ReplayConventions",
+    *,
+    tol: float = 1e-9,
+) -> tuple[np.ndarray, int, int]:
+    """D6 §4 in-arm constraint enforcement — DOWN-ONLY projection.
+
+    Applies the per-name cap then the sector cap (via ``conv.sector_map``)
+    to the allocator's proposed ``target_w``. Both steps only ever REDUCE
+    weights (clip / proportional scale-down), so the projection cannot
+    introduce a new breach in the other family. Returns
+    ``(projected_w, n_name_breaches, n_sector_breaches)`` where the breach
+    counts are the PRE-projection violations — recorded per session
+    instead of silently allowing the breach (#445 gap 4).
+
+    Tickers absent from ``conv.sector_map`` carry no sector constraint
+    (no silent guessing of membership).
+    """
+    w = np.asarray(target_w, dtype=float).copy()
+
+    # Per-name cap — down-only clip.
+    over_name = w > conv.per_name_cap + tol
+    n_name_breaches = int(np.count_nonzero(over_name))
+    if n_name_breaches:
+        w = np.minimum(w, conv.per_name_cap)
+
+    # Sector cap — proportional scale-down of each over-cap sector.
+    n_sector_breaches = 0
+    if conv.sector_map:
+        sector_to_idx: dict[str, list[int]] = {}
+        for j, t in enumerate(tickers):
+            sec = conv.sector_map.get(t)
+            if sec and isinstance(sec, str):
+                sector_to_idx.setdefault(sec, []).append(j)
+        for _sec, idx_list in sorted(sector_to_idx.items()):
+            idx = np.asarray(idx_list, dtype=int)
+            load = float(w[idx].sum())
+            if load > conv.sector_cap + tol:
+                n_sector_breaches += 1
+                w[idx] *= conv.sector_cap / load
+    return w, n_name_breaches, n_sector_breaches
+
+
+def sector_map_coverage_gap(
+    bars: Sequence["AllocatorReplayBar"],
+    conv: "ReplayConventions",
+) -> tuple[str, ...]:
+    """Tickers appearing in any bar's snapshot but absent from
+    ``conv.sector_map`` (codex #180 review, 2026-07-10).
+
+    ``apply_d6_cap_projection`` deliberately leaves an unmapped ticker
+    unconstrained (no silent guessing of sector membership) — but a
+    *caller* that claims to be running a D6 sector-cap replay must not
+    let that permissive behavior silently convert a missing hard
+    constraint into no constraint. This function surfaces the gap so the
+    CLI/caller can decide to fail closed (default, D6-strict mode) or
+    proceed only under an explicit exploratory/non-decision-grade mode.
+
+    Returns an empty tuple when every ticker appearing in ``bars`` is a
+    key in ``conv.sector_map`` (including the vacuous case of zero bars
+    or a conventions object with ``enforce_caps=False``).
+    """
+    sector_map = conv.sector_map or {}
+    missing: set[str] = set()
+    for bar in bars:
+        for t in bar.snap.tickers:
+            if t not in sector_map:
+                missing.add(t)
+    return tuple(sorted(missing))
+
+
+def _record_family_violations(
+    res: ReplayResult,
+    snap: ConstraintSnapshot,
+    target_w: np.ndarray,
+    delta_w: np.ndarray,
+) -> None:
+    """Per-family feasibility check (codex #131 review HIGH-1)."""
+    family_viol = check_snapshot_feasibility(snap, target_w, delta_w)
+    for fam_name, count in family_viol.items():
+        if count > 0:
+            res.violations_per_family[fam_name] = (
+                res.violations_per_family.get(fam_name, 0) + count
+            )
+    if any(v > 0 for v in family_viol.values()):
+        res.cap_violations += 1  # legacy any-family counter
+
+
 def replay_one_allocator(
     name: str,
     allocator: AllocatorFn,
     bars: Sequence[AllocatorReplayBar],
+    conventions: Optional[ReplayConventions] = None,
 ) -> ReplayResult:
     """Run a single allocator over the bar sequence and collect metrics.
+
+    ``conventions`` is the opt-in D6 protocol convention set
+    (:class:`ReplayConventions`). ``None`` — or a conventions object
+    with nothing enabled — reproduces the original stateless harness
+    behavior EXACTLY (pinned byte-identical by
+    ``tests/test_replay_d6_conventions.py``).
 
     **no_candidates accounting** (codex #131 review HIGH-2): the
     allocator's returned ``target_w`` (typically zeros = liquidate to
@@ -233,33 +545,38 @@ def replay_one_allocator(
     turnover, which silently discarded the liquidation cost and
     over-stated baselines vs QP.
     """
+    if conventions is not None and conventions.stateful:
+        return _replay_one_allocator_stateful(name, allocator, bars, conventions)
+
+    enforce = conventions is not None and conventions.enforce_caps
     res = ReplayResult(name=name, bars=len(bars))
+    if enforce:
+        res.name_cap_breaches = []
+        res.sector_cap_breaches = []
     for bar in bars:
-        try:
-            alloc = allocator(bar.snap, mu=bar.mu, sigma=bar.sigma)
-        except TypeError:
-            # Allocator may not accept sigma (e.g. equal-weight).
-            alloc = allocator(bar.snap, mu=bar.mu)
+        alloc = _call_allocator(allocator, bar.snap, bar)
         if alloc.status == "no_candidates":
             res.fallback_to_no_candidates += 1
         # ALWAYS compute gross + cost from the allocator's own
         # target_w / delta_w — no_candidates means "go to cash" which
         # has a real liquidation cost.
-        gross = float(np.sum(alloc.target_w * bar.fwd_return))
-        turn = float(np.sum(np.abs(alloc.delta_w)))
+        target_w = alloc.target_w
+        delta_w = alloc.delta_w
+        if enforce:
+            # D6 §4 in-arm enforcement: the projected (executed) weights
+            # are what earns returns / pays costs; the pre-projection
+            # breach is recorded, not silently allowed.
+            target_w, n_name, n_sector = apply_d6_cap_projection(
+                target_w, bar.snap.tickers, conventions,
+            )
+            delta_w = target_w - bar.snap.w_current
+            res.name_cap_breaches.append(n_name)
+            res.sector_cap_breaches.append(n_sector)
+        gross = float(np.sum(target_w * bar.fwd_return))
+        turn = float(np.sum(np.abs(delta_w)))
         cost = turn * bar.cost_per_trade_bps * 1e-4
         daily = gross - cost
-        # Per-family feasibility check (codex #131 review HIGH-1)
-        family_viol = check_snapshot_feasibility(
-            bar.snap, alloc.target_w, alloc.delta_w,
-        )
-        for fam_name, count in family_viol.items():
-            if count > 0:
-                res.violations_per_family[fam_name] = (
-                    res.violations_per_family.get(fam_name, 0) + count
-                )
-        if any(v > 0 for v in family_viol.values()):
-            res.cap_violations += 1  # legacy any-family counter
+        _record_family_violations(res, bar.snap, target_w, delta_w)
         res.daily_returns_net.append(daily)
         res.turnover.append(turn)
         if bar.regime is not None:
@@ -267,19 +584,323 @@ def replay_one_allocator(
     return res
 
 
+# ── D6 stateful replay engine ───────────────────────────────────────
+
+
+def _parse_iso_date(s: str) -> Optional[datetime.date]:
+    try:
+        return datetime.date.fromisoformat(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _lot_hold_days(
+    lot: TaxLot, bar_date: str, bar_index: int,
+) -> int:
+    """Lot holding period in days — decides the D6 short/long tax rate.
+
+    Uses calendar days between ISO dates when both parse; falls back to
+    the bar-index difference (synthetic test sequences whose bar_date is
+    not ISO). The fallback treats one bar as one calendar day, which is
+    conservative for the long-term boundary.
+    """
+    entry = _parse_iso_date(lot.entry_date)
+    exit_ = _parse_iso_date(bar_date)
+    if entry is not None and exit_ is not None:
+        return (exit_ - entry).days
+    return bar_index - lot.entry_bar_index
+
+
+def _sell_from_lots(
+    state: PortfolioState,
+    ticker: str,
+    sell_value: float,
+    bar_date: str,
+    bar_index: int,
+    conv: ReplayConventions,
+) -> float:
+    """Consume lots FIFO for a sell leg; return the tax charged.
+
+    Tax per the D6 §1.1 frozen convention, reusing the rotation
+    ``tax_drag()`` convention: realized-gain fraction × rate (short
+    50% / long 32% by lot holding period); losses give zero drag.
+    Proceeds are credited to cash; tax is debited from cash.
+    Shares (integer mode) are consumed proportionally to the value
+    fraction taken from each lot, which is exact because every lot of
+    a ticker is marked at the same returns-evolved internal price.
+    """
+    lots = state.lots.get(ticker, [])
+    remaining = float(sell_value)
+    tax_total = 0.0
+    kept: list[TaxLot] = []
+    for lot in lots:
+        if remaining <= 1e-12:
+            kept.append(lot)
+            continue
+        take = min(lot.market_value, remaining)
+        fraction = take / lot.market_value if lot.market_value > 0 else 1.0
+        basis_consumed = lot.cost_basis * fraction
+        gain = take - basis_consumed
+        if conv.tax and take > 0:
+            hold_days = _lot_hold_days(lot, bar_date, bar_index)
+            # rotation.tax_drag(): drag is a FRACTION of position value
+            # (gain_pct × rate, 0 on losses/NaN); multiply back by the
+            # exit-leg value to get dollars — exactly gain × rate.
+            drag_pct = tax_drag(
+                gain / take,
+                hold_days,
+                conv.tax_short_rate,
+                conv.tax_long_rate,
+                conv.long_term_threshold_days,
+            )
+            tax_total += drag_pct * take
+        lot.market_value -= take
+        lot.cost_basis -= basis_consumed
+        lot.shares -= lot.shares * fraction
+        remaining -= take
+        if lot.market_value > 1e-12:
+            kept.append(lot)
+    if kept:
+        state.lots[ticker] = kept
+    else:
+        state.lots.pop(ticker, None)
+        state.internal_price.pop(ticker, None)
+    state.cash += float(sell_value) - tax_total
+    return tax_total
+
+
+def _replay_one_allocator_stateful(
+    name: str,
+    allocator: AllocatorFn,
+    bars: Sequence[AllocatorReplayBar],
+    conv: ReplayConventions,
+) -> ReplayResult:
+    """D6 stateful replay: carry positions / tax lots / cash across
+    sessions within one arm.
+
+    Accounting conventions (documented, exact):
+
+    * **PV accounting** — ``PV = cash + Σ lot market values`` at all
+      times. The per-session net return is ``PV_close / PV_open − 1``;
+      costs and taxes flow through cash, so they are embedded in the
+      return series by construction (cash-conservation invariant, D6
+      test requirement).
+    * **Returns-consistent pricing** — held positions are marked by the
+      same per-bar ``fwd_return`` the stateless harness uses. Under the
+      integer-shares convention, the per-ticker internal price is
+      anchored to the session close price at (re-)entry and then evolves
+      by ``fwd_return``, so ``shares × price ≡ market value`` exactly.
+      (Deviation from a pure close-to-close mark when sessions are
+      non-contiguous is a documented limitation; it keeps the stateful
+      and stateless arms driven by the identical return series.)
+    * **Off-universe forced liquidation** — a carried position whose
+      ticker is absent from the current session's universe is sold at
+      its carried value (zero-return exit) with cost + tax charged, and
+      counted in ``off_universe_liquidations``. This keeps the budget
+      the allocator sees exact (it can only reason about the session's
+      tickers).
+    * **Deployed fraction** — ``Σ position values / PV`` measured
+      post-trade each session: a REAL state variable, no longer ≡
+      turnover (#445 gap 3).
+    * **Hysteresis** — the session snapshot's ``w_current`` is replaced
+      with the carried weights before the allocator is called, so
+      no-trade bands / hysteresis are evaluable.
+    """
+    res = ReplayResult(name=name, bars=len(bars))
+    res.deployed_fraction = []
+    res.cost_paid = []
+    res.cash_series = []
+    res.positions_value_series = []
+    res.off_universe_liquidations = 0
+    if conv.tax:
+        res.tax_paid = []
+    if conv.integer_shares:
+        res.executed_exposure = []
+        res.integer_residual = []
+    if conv.enforce_caps:
+        res.name_cap_breaches = []
+        res.sector_cap_breaches = []
+
+    state = PortfolioState(cash=float(conv.initial_capital))
+
+    for t, bar in enumerate(bars):
+        pv_open = state.portfolio_value
+        bar_tickers = bar.snap.tickers
+        bar_ticker_set = set(bar_tickers)
+        session_tax = 0.0
+        session_traded = 0.0
+
+        # ── 1. Off-universe forced liquidation (zero-return exit) ──
+        for held in sorted(set(state.lots) - bar_ticker_set):
+            value = state.position_value(held)
+            session_tax += _sell_from_lots(
+                state, held, value, bar.bar_date, t, conv,
+            )
+            session_traded += value
+            res.off_universe_liquidations += 1
+
+        # ── 2. Carried weights → session snapshot ──────────────────
+        pv_base = state.portfolio_value
+        if pv_base <= 0:
+            raise ValueError(
+                f"stateful replay [{name}] bar {bar.bar_date}: portfolio "
+                f"value {pv_base} <= 0 — accounting is no longer meaningful."
+            )
+        w_current = np.array(
+            [state.position_value(tk) / pv_base for tk in bar_tickers],
+            dtype=float,
+        )
+        snap = dataclasses.replace(bar.snap, w_current=w_current)
+
+        # ── 3. Allocator sees the carried state ────────────────────
+        alloc = _call_allocator(allocator, snap, bar)
+        if alloc.status == "no_candidates":
+            res.fallback_to_no_candidates += 1
+        target_w = np.asarray(alloc.target_w, dtype=float)
+
+        # ── 4. D6 §4 in-arm caps (down-only projection) ────────────
+        if conv.enforce_caps:
+            target_w, n_name, n_sector = apply_d6_cap_projection(
+                target_w, bar_tickers, conv,
+            )
+            res.name_cap_breaches.append(n_name)
+            res.sector_cap_breaches.append(n_sector)
+
+        # ── 5. Execution — whole-share quantization (floor) ────────
+        target_dollars = target_w * pv_base
+        executed_dollars = target_dollars.copy()
+        executed_shares: Optional[np.ndarray] = None
+        if conv.integer_shares:
+            executed_shares = np.zeros(len(bar_tickers))
+            for i, tk in enumerate(bar_tickers):
+                if target_dollars[i] <= 1e-12 and not state.lots.get(tk):
+                    executed_dollars[i] = 0.0
+                    continue
+                price = state.internal_price.get(tk)
+                if price is None:
+                    price = (
+                        float(bar.prices[i]) if bar.prices is not None
+                        else float("nan")
+                    )
+                if not math.isfinite(price) or price <= 0.0:
+                    raise ValueError(
+                        f"stateful replay [{name}] bar {bar.bar_date}: "
+                        f"integer_shares needs a positive close price for "
+                        f"{tk}; got {price!r}. Supply per-bar prices (the "
+                        f"WF loader stamps ticker_forward_returns."
+                        f"close_price) — no silent fractional fallback."
+                    )
+                shares = math.floor(target_dollars[i] / price + 1e-12)
+                executed_shares[i] = float(shares)
+                executed_dollars[i] = float(shares) * price
+        executed_w = executed_dollars / pv_base
+        if conv.integer_shares:
+            res.executed_exposure.append(float(executed_w.sum()))
+            res.integer_residual.append(
+                float(target_w.sum() - executed_w.sum())
+            )
+
+        # ── 6. Trades vs carried book (sell legs then buy legs) ────
+        for i, tk in enumerate(bar_tickers):
+            cur_val = state.position_value(tk)
+            if conv.integer_shares:
+                delta_shares = executed_shares[i] - state.position_shares(tk)
+                if abs(delta_shares) < 1e-12:
+                    continue  # no trade — never touch prices
+                # A held name always carries a returns-evolved internal
+                # price; a new entry's price was validated finite in the
+                # quantization step above.
+                price = state.internal_price.get(tk)
+                if price is None:
+                    price = float(bar.prices[i])
+                delta = delta_shares * price
+            else:
+                price = None
+                delta = executed_dollars[i] - cur_val
+                delta_shares = 0.0
+            if delta < -1e-12:
+                session_tax += _sell_from_lots(
+                    state, tk, -delta, bar.bar_date, t, conv,
+                )
+                session_traded += -delta
+            elif delta > 1e-12:
+                if conv.integer_shares and tk not in state.internal_price:
+                    # (Re-)entry anchors the internal price to the
+                    # session close (D6 fill convention).
+                    state.internal_price[tk] = price
+                state.lots.setdefault(tk, []).append(
+                    TaxLot(
+                        entry_date=bar.bar_date,
+                        entry_bar_index=t,
+                        cost_basis=float(delta),
+                        market_value=float(delta),
+                        entry_price=price,
+                        shares=float(delta_shares),
+                    )
+                )
+                state.cash -= float(delta)
+                session_traded += delta
+
+        # ── 7. Linear cost: bps per side on every traded dollar ────
+        session_cost = session_traded * bar.cost_per_trade_bps * 1e-4
+        state.cash -= session_cost
+
+        # ── 8. Post-trade deployed fraction (real state variable) ──
+        positions_post = state.total_positions_value()
+        pv_post = state.cash + positions_post
+        res.deployed_fraction.append(
+            positions_post / pv_post if pv_post > 0 else 0.0
+        )
+
+        # ── 9. Feasibility accounting vs the session snapshot ──────
+        _record_family_violations(
+            res, snap, executed_w, executed_w - w_current,
+        )
+
+        # ── 10. Mark positions with the session's realised return ──
+        for i, tk in enumerate(bar_tickers):
+            lots = state.lots.get(tk)
+            if not lots:
+                continue
+            growth = 1.0 + float(bar.fwd_return[i])
+            for lot in lots:
+                lot.market_value *= growth
+            if tk in state.internal_price:
+                state.internal_price[tk] *= growth
+
+        # ── 11. Close the session ───────────────────────────────────
+        pv_close = state.portfolio_value
+        daily = pv_close / pv_open - 1.0
+        res.daily_returns_net.append(daily)
+        res.turnover.append(session_traded / pv_open if pv_open > 0 else 0.0)
+        res.cost_paid.append(session_cost)
+        if conv.tax:
+            res.tax_paid.append(session_tax)
+        res.cash_series.append(state.cash)
+        res.positions_value_series.append(state.total_positions_value())
+        if bar.regime is not None:
+            res.per_regime.setdefault(bar.regime, []).append(daily)
+
+    res.final_state = state
+    return res
+
+
 def replay_all(
     allocators: dict[str, AllocatorFn],
     bars: Sequence[AllocatorReplayBar],
+    conventions: Optional[ReplayConventions] = None,
 ) -> dict[str, ReplayResult]:
     """Run every allocator over the same bar sequence.
 
     Returns ``{name: ReplayResult}``. The bar sequence is shared so
     downstream paired-daily-returns + DSR / PBO comparisons key off
-    a consistent input.
+    a consistent input. ``conventions`` (opt-in) engages the D6
+    stateful / tax / integer-share / cap-enforcement conventions; the
+    default ``None`` preserves the original behavior exactly.
     """
     out: dict[str, ReplayResult] = {}
     for name, fn in allocators.items():
-        out[name] = replay_one_allocator(name, fn, bars)
+        out[name] = replay_one_allocator(name, fn, bars, conventions)
     return out
 
 
