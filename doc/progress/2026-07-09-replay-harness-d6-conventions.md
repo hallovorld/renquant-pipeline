@@ -1,13 +1,24 @@
-# Replay harness: opt-in D6 protocol conventions (stateful / tax / integer shares / in-arm caps)
+# Replay harness: opt-in D6 protocol conventions (stateful / tax / integer shares / in-arm caps)   (PR #180)
 
-**Date:** 2026-07-09
-**PR:** feat/replay-harness-d6-conventions
-**Context:** D6 preregistered replay protocol (orchestrator #443) — the exploratory
-run documented in orchestrator #445 found the allocator replay harness cannot honor
-the D6 §1.1 frozen conventions: (1) no tax drag, (2) no whole-share quantization,
-(3) stateless sessions (deployed fraction ≡ turnover; hysteresis unevaluable),
-(4) sector caps not enforced inside arms (the 35% gate was breached by every arm
-at ~5.7 candidates/session breadth, silently).
+STATUS:    delivered
+WHAT:      Adds D6 §1.1 frozen replay conventions (tax drag, whole-share
+           quantization, stateful sessions, in-arm sector caps) to the
+           allocator replay harness as strictly opt-in kwargs/CLI flags;
+           defaults stay byte-for-byte identical to pre-change behavior.
+WHY/DIR:   D6 preregistered replay protocol (orchestrator#443, merged) —
+           the exploratory run documented in orchestrator#445 found the
+           harness couldn't honor D6 §1.1's frozen conventions: (1) no tax
+           drag, (2) no whole-share quantization, (3) stateless sessions
+           (deployed fraction ≡ turnover; hysteresis unevaluable), (4)
+           sector caps not enforced inside arms (35% gate breached by every
+           arm silently at ~5.7 candidates/session breadth).
+EVIDENCE:  n/a (harness/tooling change; see "Not implemented / caveats"
+           below for the honest scope boundary against #443's final §2.3/§3
+           text, and Tests below for regression-pinning evidence)
+NEXT:      A D6 protocol runner (not yet built) to orchestrate the
+           §3(a)/(b)/(c) estimand decomposition; the deferred one-share
+           rescue + post-round cap/sector recheck belong in the live
+           governor/allocator implementation (#179), not this harness.
 
 ## What
 
