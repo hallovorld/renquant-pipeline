@@ -1,9 +1,23 @@
-# Deployment Governor kernel (D2–D4) — flag OFF
+# Deployment Governor kernel (D2–D4) — flag OFF   (PR #179)
 
-**Date:** 2026-07-09
-**PR:** pipeline feat/deployment-governor
-**Design:** orchestrator PR #443 — `doc/design/2026-07-09-deployment-governor-rfc.md`
-(§2.1/§2.2/§2.3 are the contract) + `doc/design/2026-07-09-governor-prereg-replay-protocol.md`.
+STATUS:    delivered
+WHAT:      Implements the Deployment Governor's three pipeline-owned layers
+           (L1 E*/L2 allocator/L3 execution) behind a top-level
+           `deployment_governor` config block, default OFF and
+           byte-identical to legacy behavior when off or malformed.
+WHY/DIR:   Implements orchestrator#443's D2-D4 deliverables
+           (`doc/design/2026-07-09-deployment-governor-rfc.md` §2.1/§2.2/§2.3
+           is the contract) now that #443 has merged. Strategy-104#50
+           (D5 PREPARE) already ships the config block with `enabled: false`
+           in ALL THREE configs (including shadow) and all values labeled
+           placeholders — S1 shadow arming is explicitly deferred to a
+           separate future PR after D6 tuning produces a frozen config.
+EVIDENCE:  n/a (flag-off byte-identical code change, not a model/data claim
+           — see Tests below for the regression-pinning evidence)
+NEXT:      D6 nested-selection tuning on the frozen tuning subset (per
+           orchestrator#443 §1) to produce a calibrated config; then a
+           separate dedicated PR flips `shadow.json`'s `enabled` flag for
+           S1 shadow arming.
 
 ## What
 
