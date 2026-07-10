@@ -237,6 +237,7 @@ def assemble_verdict(
     incumbent: str,
     win_rate_z_threshold: float = 2.0,
     constraints_decision_grade: bool = True,
+    execution_fidelity_ok: Optional[bool] = None,
 ) -> dict:
     """Apply the Step 4 non-negotiable gate + select promotion candidate.
 
@@ -246,6 +247,13 @@ def assemble_verdict(
     2. Pass the stricter §8 DSR/PBO gate.
     3. Have zero hard-constraint regressions.
     4. Be evaluated against decision-grade constraints.
+    5. (D6 engaged-conventions runs only) carry ``L3_FULL`` execution
+       fidelity. ``execution_fidelity_ok`` is a tri-state: ``None`` for
+       legacy/default-mode payloads (schema untouched — byte-identical
+       evidence), ``True``/``False`` when D6 conventions are engaged
+       (r2 #180 evidence contract). ``False`` fails the verdict closed:
+       a floor-only / degraded-conventions result can NEVER name a
+       promotion candidate.
     """
     candidates = [
         name for name, sig in significance.items()
@@ -264,6 +272,22 @@ def assemble_verdict(
         "win_rate_z_score_above_2": False,
         "decision_grade_constraints": bool(constraints_decision_grade),
     }
+    if execution_fidelity_ok is not None:
+        gate_bits["execution_fidelity_l3_full"] = bool(execution_fidelity_ok)
+    if execution_fidelity_ok is False:
+        return {
+            "promotion_candidate": None,
+            "rationale": (
+                "not promotion-eligible: execution fidelity is L1_L2_ONLY "
+                "— the D6 protocol (#443 §2.3) requires L3_FULL (stateful "
+                "+ tax + integer-shares with deferred rescue and post-round "
+                "rechecks + fail-closed cap enforcement) for end-to-end / "
+                "deployed-fraction / promotion evidence"
+            ),
+            "fallback_recommendation": incumbent,
+            "next_action": "iterate",
+            "non_negotiable_gate_passed": gate_bits,
+        }
     if not constraints_decision_grade:
         return {
             "promotion_candidate": None,
@@ -317,6 +341,10 @@ def assemble_verdict(
             "win_rate_z_score_above_2": bool(beats_incumbent_paired),
             "decision_grade_constraints": True,
         }
+        if execution_fidelity_ok is not None:
+            candidate_gate_bits["execution_fidelity_l3_full"] = bool(
+                execution_fidelity_ok
+            )
         if beats_incumbent_paired and passes_significance and passes_violation_gate:
             promotion_candidate = name
             gate_bits = candidate_gate_bits
@@ -346,13 +374,17 @@ def apply_promotion_gate_to_significance(
     violations: dict,
     *,
     constraints_decision_grade: bool,
+    execution_fidelity_ok: Optional[bool] = None,
 ) -> dict:
     """Fail closed significance flags once non-statistical gates are known.
 
     DSR/PBO answers "is this return stream statistically credible?"  It is
     not, by itself, a live promotion verdict.  The JSON should therefore not
     leave ``live_promotable_*`` true when the replay manifold is missing
-    load-bearing constraints or the allocator violates hard caps.
+    load-bearing constraints or the allocator violates hard caps — or, for
+    D6 engaged-conventions runs, when the execution fidelity is below
+    ``L3_FULL`` (``execution_fidelity_ok=False``; tri-state ``None`` means
+    legacy/default-mode payload, untouched).
     """
     out: dict = {}
     by_allocator = violations.get("by_allocator", {})
@@ -363,6 +395,11 @@ def apply_promotion_gate_to_significance(
             block_reasons.append("replay constraints are not decision-grade")
         if by_allocator.get(name, {}).get("rejected_for_promotion", True):
             block_reasons.append("allocator has hard-constraint violations")
+        if execution_fidelity_ok is False:
+            block_reasons.append(
+                "execution fidelity is L1_L2_ONLY — D6 promotion evidence "
+                "requires L3_FULL (#443 §2.3)"
+            )
 
         if block_reasons:
             block["diagnostic_only"] = True
@@ -423,37 +460,48 @@ def run_replay(
     # Block 5: violation report
     violation_block = violation_report_block(results)
     constraint_fidelity = constraint_fidelity_block(bars)
-    # execution_fidelity gate (codex #180 review, 2026-07-10): this harness's
-    # D6 conventions are L1/L2-ONLY — no deferred one-share rescue and no
-    # post-round cap/sector recheck on EXECUTED quantities (both belong to
-    # the live L3 governor implementation, pipeline#179's governor_sizing.py,
-    # not this harness). ANY engaged convention must therefore stamp
-    # promotion_eligible=False and fold into the SAME decision-grade gate
-    # that already blocks promotion on missing hard-constraint families —
-    # reusing the existing gate rather than adding a parallel one.
-    execution_fidelity_ok = conventions is None or not conventions.any_enabled
-    # Additive-only (mirrors the replay_conventions/per-allocator D6 keys
-    # elsewhere in this function): these fields are only added when a D6
-    # convention is actually engaged, so the pre-D6 default-mode evidence
-    # schema stays byte-identical (TestDefaultModeUnchanged pin).
-    if not execution_fidelity_ok:
-        constraint_fidelity["execution_fidelity"] = "L1_L2_ONLY"
-        constraint_fidelity["promotion_eligible"] = False
-        constraint_fidelity["missing_critical_families"] = list(
-            constraint_fidelity["missing_critical_families"]
-        ) + ["execution_fidelity_l1_l2_only"]
-        constraint_fidelity["decision_grade"] = False
+    # execution_fidelity gate (r1+r2 #180 evidence contract, merged with
+    # the parallel-session implementation): for engaged-conventions
+    # payloads, execution fidelity gates promotion mechanically.
+    # Tri-state None = legacy/default-mode payload (schema byte-identical,
+    # untouched). With the full RFC #443 §2.3 L3 implemented
+    # (round-down + deferred one-share rescue + post-round rechecks,
+    # _execute_integer_session), fidelity CAN be "L3_FULL" — only the
+    # full convention set with fail-closed sector coverage earns it;
+    # any degraded mode is "L1_L2_ONLY" and non-promotable.
+    execution_fidelity_ok: Optional[bool] = None
+    if conventions is not None and conventions.any_enabled:
+        execution_fidelity_ok = conventions.promotion_eligible
+        # Additive-only stamps (default-mode schema stays byte-identical,
+        # TestDefaultModeUnchanged pin): mirror the fidelity verdict in
+        # constraint_fidelity so a consumer reading only that block still
+        # sees it, and fold a degraded fidelity into the SAME
+        # decision-grade gate that blocks promotion on missing
+        # hard-constraint families.
+        constraint_fidelity["execution_fidelity"] = (
+            conventions.execution_fidelity
+        )
+        constraint_fidelity["promotion_eligible"] = bool(
+            conventions.promotion_eligible
+        )
+        if not conventions.promotion_eligible:
+            constraint_fidelity["missing_critical_families"] = list(
+                constraint_fidelity["missing_critical_families"]
+            ) + ["execution_fidelity_l1_l2_only"]
+            constraint_fidelity["decision_grade"] = False
     constraints_decision_grade = constraint_fidelity["decision_grade"]
     significance_block = apply_promotion_gate_to_significance(
         significance_block,
         violation_block,
         constraints_decision_grade=constraints_decision_grade,
+        execution_fidelity_ok=execution_fidelity_ok,
     )
 
     # Block 6: verdict
     verdict = assemble_verdict(
         significance_block, paired_block, violation_block, incumbent=incumbent,
         constraints_decision_grade=constraints_decision_grade,
+        execution_fidelity_ok=execution_fidelity_ok,
     )
 
     payload = {
@@ -476,14 +524,11 @@ def run_replay(
     # appears when a convention is engaged, so pre-D6 evidence stays
     # byte-identical and existing keys are never changed.
     if conventions is not None and conventions.any_enabled:
-        conv_dict = conventions.to_dict()
-        # codex #180 review, 2026-07-10: stamp the same execution_fidelity /
-        # promotion_eligible verdict here too (mirrors constraint_fidelity
-        # above) so a consumer reading ONLY this block still sees the L1/L2-
-        # only caveat, not just the convention config echo.
-        conv_dict["execution_fidelity"] = "L1_L2_ONLY"
-        conv_dict["promotion_eligible"] = False
-        payload["replay_conventions"] = conv_dict
+        # ReplayConventions.to_dict() already carries the computed
+        # execution_fidelity / promotion_eligible stamps (r2 #180) so a
+        # consumer reading ONLY this block still sees the fidelity
+        # verdict, not just the convention config echo.
+        payload["replay_conventions"] = conventions.to_dict()
     return payload
 
 
@@ -622,20 +667,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--sector-map-json", type=str, default=None,
         help="path to a JSON sector map for --enforce-caps: either a flat "
              "{ticker: sector} object or a config carrying a 'sector_map' "
-             "key. Sessions' tickers map through it; unmapped tickers "
-             "carry no sector constraint",
+             "key. Sessions' tickers map through it. FAIL-CLOSED: a map "
+             "that does not cover every active ticker in every replay bar "
+             "aborts the run (invalid_experiment artifact, exit 2) unless "
+             "--allow-partial-sector-map is set",
     )
     p.add_argument(
         "--allow-partial-sector-map", action="store_true",
-        help="research-only escape hatch (mirrors "
+        help="EXPLORATORY-ONLY escape hatch (mirrors "
              "--allow-overlapping-forward-horizon): with --enforce-caps, "
-             "proceed even when --sector-map-json does not cover every "
-             "active ticker across the replay bars. Without this flag, an "
+             "proceed even when --sector-map-json is missing or does not "
+             "cover every active ticker across the replay bars (unmapped "
+             "tickers carry no sector constraint). Without this flag, an "
              "incomplete map FAILS CLOSED (D6 §4 requires full sector-cap "
              "coverage; a missing hard constraint must not silently become "
-             "no constraint). The resulting run is always non-decision-grade "
-             "regardless of this flag (see execution_fidelity/"
-             "promotion_eligible in the output)",
+             "no constraint). The resulting run is stamped "
+             "non-decision-grade: execution_fidelity=L1_L2_ONLY, "
+             "promotion_eligible=false — it cannot pass the promotion gate",
     )
     p.add_argument("--per-name-cap", type=float, default=0.12,
                    help="D6 §4 per-name weight cap for --enforce-caps")
@@ -661,6 +709,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "weights carry into state)")
     if args.sector_map_json and not args.enforce_caps:
         p.error("--sector-map-json only has effect with --enforce-caps")
+    # NOTE: --enforce-caps sector coverage (incl. the no-map case) is
+    # validated AFTER bars load — see the sector_map_coverage_gap
+    # fail-closed check below, which writes a structured
+    # invalid_experiment artifact instead of a bare argparse error.
 
     if args.diagnose_readiness:
         from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (
@@ -880,6 +932,7 @@ def _build_conventions(args) -> Optional[ReplayConventions]:
         sector_cap=args.sector_cap,
         sector_map=sector_map,
         initial_capital=args.initial_capital,
+        allow_unmapped_sectors=args.allow_partial_sector_map,
     )
 
 

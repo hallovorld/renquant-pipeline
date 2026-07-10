@@ -1,8 +1,11 @@
 # Replay harness: opt-in D6 protocol conventions (stateful / tax / integer shares / in-arm caps)   (PR #180)
 
-STATUS:    delivered
-WHAT:      Adds D6 §1.1 frozen replay conventions (tax drag, whole-share
-           quantization, stateful sessions, in-arm sector caps) to the
+STATUS:    delivered (r1 + r2 review requirements folded in; two parallel
+           sessions' implementations reconciled by merge, see "Correction")
+WHAT:      Adds the D6 §1.1/§2.3/§4 frozen replay conventions (tax drag,
+           FULL L3 integer-aware execution with deferred one-share rescue
+           and post-round rechecks, stateful sessions, fail-closed in-arm
+           sector caps, execution-fidelity evidence stamps) to the
            allocator replay harness as strictly opt-in kwargs/CLI flags;
            defaults stay byte-for-byte identical to pre-change behavior.
 WHY/DIR:   D6 preregistered replay protocol (orchestrator#443, merged) —
@@ -11,61 +14,62 @@ WHY/DIR:   D6 preregistered replay protocol (orchestrator#443, merged) —
            drag, (2) no whole-share quantization, (3) stateless sessions
            (deployed fraction ≡ turnover; hysteresis unevaluable), (4)
            sector caps not enforced inside arms (35% gate breached by every
-           arm silently at ~5.7 candidates/session breadth).
-EVIDENCE:  n/a (harness/tooling change; see "Not implemented / caveats"
-           below for the honest scope boundary against #443's final §2.3/§3
-           text, and Tests below for regression-pinning evidence)
-NEXT:      Codex re-review of the fail-closed sector-map check and the
-           execution_fidelity/promotion_eligible stamping (see
-           "Correction" below). After that: a D6 protocol runner (not yet
-           built) to orchestrate the §3(a)/(b)/(c) estimand decomposition;
-           the deferred one-share rescue + post-round cap/sector recheck belong in the live
-           governor/allocator implementation (#179), not this harness.
+           arm silently at ~5.7 candidates/session breadth). Codex r1 on
+           #180 ruled floor-only quantization insufficient for the primary
+           cash-drag/deployed-fraction estimand → FULL L3 implemented here
+           (the scope ruling took the full option, not the exploratory-only
+           downgrade).
+EVIDENCE:  n/a (harness/tooling change; Tests below for regression-pinning
+           evidence, incl. a hand-computed deployment-understatement case)
+NEXT:      Codex re-review of the full-L3 implementation + the fail-closed
+           sector-map check + the execution_fidelity/promotion_eligible
+           stamps. After that: a D6 protocol runner (not yet built) to
+           orchestrate the §3(a)/(b)/(c) estimand decomposition over this
+           harness.
 
-## Correction (2026-07-10, same day — Codex review on the prior head)
+## Correction (2026-07-10 — Codex r1+r2 on #180, two implementations merged)
 
-Codex found two real gaps in the prior head:
+Codex r1 correctly identified that floor-only quantization can systematically
+understate deployment at this portfolio size, invalidating the primary
+cash-drag/deployed-fraction estimand — a floor-only run is NOT
+convention-faithful and must not be used as deployed-fraction, end-to-end, or
+promotion evidence. The scope ruling took the FULL option: this harness now
+implements the final merged RFC #443 §2.3 L3 contract (section below), so the
+earlier "the rescue belongs in the live governor implementation, not this
+harness" boundary is superseded.
+
+Codex r2 (reviewing an intermediate head) found two further gaps, implemented
+here and reconciled with a parallel session's independent implementation of
+the same points:
 
 1. **Sector-map coverage was silently permissive.** `--enforce-caps` with no
-   `--sector-map-json` (or a map covering only SOME active tickers) only
-   logged a warning; `apply_d6_cap_projection` then applied no sector
-   constraint at all to the uncovered tickers. For a run that claims D6
-   sector-cap fidelity, a missing hard constraint silently becoming no
-   constraint is a correctness bug, not a documented limitation. **Fixed**:
-   new `sector_map_coverage_gap()` (math module) scans every ticker across
-   every replay bar; `run_ab_replay.py`'s CLI now FAILS CLOSED (writes an
-   `invalid_experiment` artifact, exits 2) when the supplied map doesn't
-   cover every active ticker, unless the new `--allow-partial-sector-map`
-   escape hatch is passed (mirrors the existing
-   `--allow-overlapping-forward-horizon` research-only pattern) — and even
-   then the run is unconditionally stamped non-decision-grade (point 2).
-2. **Result-laundering risk**: this doc already documented the harness as
-   "L1/L2-only" in the caveats below, but the `## NEXT` section separately
-   called the resulting runs "convention-faithful arms" without repeating
-   that caveat — a reader of NEXT alone could mistake a floor-only result
-   for decision-grade D6 end-to-end evidence. **Fixed**: every payload
-   where ANY D6 convention is engaged now carries a machine-readable
-   `execution_fidelity: "L1_L2_ONLY"` / `promotion_eligible: false` stamp
-   (in both `constraint_fidelity` and `replay_conventions`), reusing the
-   EXISTING `constraints_decision_grade` gate that already blocks
-   promotion on missing hard-constraint families (`constraint_fidelity_
-   block`, `apply_promotion_gate_to_significance`, `assemble_verdict`) —
-   not a new parallel gate. `assemble_verdict` therefore always returns
-   `promotion_candidate: None` with an explicit "not decision-grade"
-   rationale whenever conventions are engaged, regardless of what the
-   underlying significance/violation blocks would otherwise show. Default
-   (no-conventions) evidence is unaffected — these keys are strictly
+   (or a partial) `--sector-map-json` only warned; `apply_d6_cap_projection`
+   applied no sector constraint to uncovered tickers — a missing hard
+   constraint silently became no constraint. **Fixed, fail-closed at two
+   layers**: `sector_map_coverage_gap()` (math module) scans every ticker
+   across every replay bar and the CLI writes a structured
+   `invalid_experiment` artifact (`reason=sector_map_incomplete`, exit 2) on
+   any gap; independently, `apply_d6_cap_projection` raises on any unmapped
+   active ticker at replay time (library callers). The permissive behavior
+   survives only behind `--allow-partial-sector-map` /
+   `ReplayConventions.allow_unmapped_sectors` (mirrors the
+   `--allow-overlapping-forward-horizon` research-only pattern), and such
+   runs are unconditionally stamped non-decision-grade.
+2. **Result-laundering risk**: a degraded-conventions run could be read as
+   decision-grade D6 evidence. **Fixed**: every payload where ANY D6
+   convention is engaged carries machine-readable
+   `execution_fidelity` / `promotion_eligible` stamps in BOTH
+   `constraint_fidelity` and `replay_conventions`. `"L3_FULL"` is earned
+   ONLY by the full convention set (stateful + tax + integer-shares +
+   fail-closed cap enforcement with a supplied sector map); anything less —
+   including any exploratory sector coverage — is `"L1_L2_ONLY"` and folds
+   into the existing `constraints_decision_grade` gate AND an explicit
+   verdict short-circuit: `assemble_verdict` returns
+   `promotion_candidate: None` with an explicit fidelity rationale, and
+   `apply_promotion_gate_to_significance` forces every block
+   `diagnostic_only` / non-promotable with a `promotion_block_reason`.
+   Default (no-conventions) evidence is unaffected — these keys are strictly
    additive, pinned by `TestDefaultModeUnchanged`.
-
-**Cross-check on the #179 reference** (read-only — #179 is already merged,
-not modified here): `pipeline#179`'s `governor_sizing.py` module docstring
-and `_execute_deltas`'s residual pass DO implement a generalized one-share
-deferred-rescue pattern (re-offering leftover cash one share at a time in
-conviction order, S6 A-3-style) — so the "belongs in the live governor
-implementation" pointer above is accurate, not just an assumption. Whether
-`#179` also implements a full post-round cap/sector/correlation recheck ON
-EXECUTED quantities was not independently re-verified here (out of this
-PR's scope).
 
 ## What
 
@@ -87,10 +91,62 @@ tolerance-free cross-platform pin can absorb.
 |---|---|
 | Linear cost 5 bps/side on every traded dollar | already present (`cost_per_trade_bps=5.0` × L1 traded weight = per-side per traded dollar); new `--cost-bps` re-stamps loaded bars |
 | Tax: realized-gain, short 50% / long 32%, lot holding period decides | `--tax` (stateful): FIFO lots, per-exit-leg `rotation.tax_drag()` convention (gain × rate; losses = zero drag); `--lt-threshold-days` 365 |
-| Whole-share quantization in all arms | `--integer-shares`: `floor(w·PV/p)` per bar; executed-state invariant (round DOWN; post-round executed weights carry into state); per-session `E_executed` + `integer_residual` |
+| Whole-share quantization in all arms | `--integer-shares`: full RFC #443 §2.3 L3 executed-state invariant (see next section); per-session `E_executed` + `integer_residual` + `rescue_buys` + `recheck_capdowns` |
 | Fill at session close price | share conversion anchors to the session `close_price` at (re-)entry; held positions are marked by the same per-bar `fwd_return` the stateless harness uses ("returns-consistent pricing" — see caveat) |
-| §4 caps: name ≤ 12%, sector ≤ 35% | `--enforce-caps` + `--sector-map-json`: down-only projection INSIDE the arm before returns; per-session breach counters replace silent allowance |
+| §4 caps: name ≤ 12%, sector ≤ 35% | `--enforce-caps` + `--sector-map-json`: down-only projection INSIDE the arm before returns; per-session breach counters replace silent allowance; FAIL-CLOSED on incomplete sector coverage (r2) |
 | Deployed fraction as an estimand; hysteresis | `--stateful`: positions/lots/cash carried across sessions per arm; allocators receive the carried `w_current`; `deployed_fraction` series in evidence |
+
+### RFC #443 §2.3 L3 — integer-aware execution (r1 scope ruling: FULL option)
+
+`_execute_integer_session` (`allocator_replay.py`) implements the final merged
+L3 contract, mirroring the production implementation
+(`kernel/pipeline/governor_sizing.py` `_fill_buys` + the S6 A-3 deferred
+one-share rescue in `kernel/pipeline/task_selection.py`):
+
+1. **Round DOWN default** — buy legs `floor(Δw·PV/p)` in conviction order
+   (shrunk-Kelly raw desc per the RFC's "conviction, defined", ticker tiebreak),
+   headroom-aware; sell legs `floor(Δw·PV/p)` with full liquidation at target≈0.
+2. **Deferred one-share rescue** — AFTER all round-down orders fund, leftover
+   investable headroom (cash − snapshot cash reserve, the task_selection
+   convention) is re-offered one share at a time in conviction order to names
+   still short of target (a floored-to-0 candidate rounds UP to exactly one
+   share) — each share only iff it fits the per-name cap AND the remaining
+   headroom; a name can overshoot its target by at most one share.
+3. **Post-round rechecks on EXECUTED quantities** — cash incl. reserve,
+   single-name cap, sector caps (snapshot families + D6 map when
+   `--enforce-caps`), and correlation-pair constraints; a violating BUY is
+   capped down one share at a time, lowest conviction first — never carried
+   in breach. Carried-drift breaches are not orders and stay visible via
+   the violation accounting.
+4. **Fee-aware affordability + hard reserve invariant (r3 P1 fix)** — Codex
+   r3 on #182 caught that fees were deducted AFTER the executor returned, so
+   an order exactly consuming the reserve-adjusted headroom left
+   `cash < reserve` post-fee (overstating deployment, the primary endpoint).
+   Fixed: fees are charged to cash AT trade time everywhere in the stateful
+   engine (sell legs, off-universe liquidations, buys — identical session
+   totals to the old aggregate deduction); every buy fill (main pass AND
+   each rescue iteration) is affordable only if `notional × (1 + fee)` fits
+   the remaining headroom; cap-down removals refund the fee-inclusive
+   amount, re-computing affordability per iteration. A hard post-execution
+   invariant raises if `cash < min(reserve × PV_base, cash_after_sells)`
+   after all taxes and costs — a breach means the sizing math is wrong.
+5. **Ledger** — per-session `E_executed`, `integer_residual = Σtarget −
+   E_executed`, plus `rescue_buys` / `recheck_capdowns` counters — all
+   computed from the final fee-aware executed quantities.
+
+Documented divergences from main's L3 (harness necessarily generalizes):
+- Sells are the arm's unconditional decisions (no improvement-positive pair
+  veto — that is governor pair-rotation logic, not a replay convention); buys
+  are therefore funded by post-sell cash in one pass rather than main's
+  interleaved `_fill_buys`/pair-sell/`_fill_buys` loop.
+- Both fill passes are bounded by the reserve-adjusted headroom (main's
+  governor main pass bounds by raw cash; the RFC recheck demands executed
+  cash incl. reserve, so the harness enforces it at fill time — equivalent
+  outcome, never in breach).
+- Main relies on L2 for sector/corr feasibility pre-round and carries the
+  ≤1-share sell overshoot; the harness rechecks executed BUY quantities
+  against sector/corr/name caps explicitly because replay arms are arbitrary
+  allocators with no L2 guarantee.
 
 ### Accounting conventions (stateful engine)
 
@@ -109,9 +165,13 @@ tolerance-free cross-platform pin can absorb.
 ### Evidence JSON (additive only)
 
 New keys appear ONLY when a convention is engaged: top-level `replay_conventions`
-provenance block; per-allocator `deployed_fraction`/`mean_deployed_fraction`,
-`cost_paid`/`total_cost_paid`, `tax_paid`/`total_tax_paid`, `E_executed`,
-`integer_residual`, `name_cap_breaches`/`sector_cap_breaches` (+ totals),
+provenance block (incl. `execution_fidelity`, `promotion_eligible`, sector
+coverage mode); `constraint_fidelity.execution_fidelity` /
+`.promotion_eligible` mirrors; per-allocator
+`deployed_fraction`/`mean_deployed_fraction`, `cost_paid`/`total_cost_paid`,
+`tax_paid`/`total_tax_paid`, `E_executed`, `integer_residual`,
+`rescue_buys`/`recheck_capdowns` (+ totals),
+`name_cap_breaches`/`sector_cap_breaches` (+ totals),
 `off_universe_liquidations`. No existing key changed. The WF loader now also
 stamps `ticker_forward_returns.close_price` onto bars (`AllocatorReplayBar.prices`,
 NaN when NULL; the integer-shares engine fails loud on a missing price — no
@@ -119,36 +179,35 @@ silent fractional fallback).
 
 ## Tests
 
-44 tests in `tests/test_replay_d6_conventions.py` (35 original + 9 new for
-the 2026-07-10 correction):
-byte-identity pin vs the pre-change fixture; inert all-defaults conventions;
-kwarg validation (tax/integer require stateful); exact cash conservation with
-cost+tax; deployed-fraction ≠ turnover; carried `w_current` reaches the
-allocator (vs stateless zeros contrast pin); off-universe liquidation; tax
-short/long boundary (363d → 50%, 365d → 32%) + loss → zero; floor conversion,
+Tests in `tests/test_replay_d6_conventions.py`:
+two-tier default-mode pin (deep-exact everywhere + byte-identity on the
+minting platform); inert all-defaults conventions; kwarg validation
+(tax/integer require stateful); exact cash conservation with cost+tax;
+deployed-fraction ≠ turnover; carried `w_current` reaches the allocator (vs
+stateless zeros contrast pin); off-universe liquidation; tax short/long
+boundary (363d → 50%, 365d → 32%) + loss → zero; floor conversion,
 executed-never-above-cap post-round, integral shares, post-round carry,
-missing-price fail-loud; sector projection down-only + proportional + unmapped
-tickers unconstrained + per-name clip + stateless/stateful breach counters;
-CLI end-to-end flags, default schema unchanged, flag validation, `--cost-bps`
-re-stamp, loader price stamping; **new**: `sector_map_coverage_gap` full/
-partial/no-map coverage (mixed mapped/unmapped tickers across bars); CLI
-fail-closed on partial and on no-sector-map (`invalid_experiment` +
-`reason=sector_map_incomplete`); `--allow-partial-sector-map` escape hatch
-(proceeds but stays non-decision-grade); execution_fidelity/
-promotion_eligible rejection even with FULL sector coverage; default-mode
-(no conventions) schema stays additive-only.
+missing-price fail-loud; L3: floored-to-0 rescue to exactly one share,
+rescue blocked by per-name cap / by reserve headroom, leftover-cash
+conviction ordering, deployment-not-understated at small PV (hand-computed
+0 → 0.903), name/sector/corr post-round cap-downs (lowest conviction first,
+zero recorded violations post-recheck), cash reserve never breached; r2:
+sector-map coverage-gap scans across all bars, fail-closed on mixed
+mapped/unmapped universes (stateless + stateful + CLI invalid_experiment
+artifact for partial AND missing maps), the `--allow-partial-sector-map`
+exploratory path stamped non-decision-grade, execution-fidelity stamps
+(L3_FULL earned only by the full set; degraded runs rejected end-to-end),
+and the negative gate proof (a candidate whose DSR/PBO flags pass and whose
+paired stats beat the incumbent still cannot be named without L3_FULL);
+sector projection down-only + proportional + per-name clip +
+stateless/stateful breach counters; CLI end-to-end flags, default schema
+unchanged, flag validation, `--cost-bps` re-stamp, loader price stamping.
 
-Full suite: **1364 passed, 8 skipped, 1 failed** in the authoring environment — the
-single failure
+Full suite (local, on main @ 9117f89 post-#179-merge): see PR body for the
+final counts — the single environmental failure
 (`test_xgboost_scorer_contract.py::test_panel_scoring_loads_real_xgboost_artifact_without_explicit_scores`)
-was pre-existing on pristine origin/main there (verified via `git stash` before any
-edit: 1329 passed, same 1 failed). Zero regressions. Re-run 2026-07-10 (post-#443
-merge, no rebase needed — main had not moved): **1372 passed, 7 skipped, 0 failed**
-— the previously-noted xgboost failure does not reproduce in this environment
-(likely an artifact-availability difference between environments, not a code
-change); no other discrepancy. Re-run again after this correction: **1487
-passed, 7 skipped, 0 failed** — zero regressions, xgboost failure still does
-not reproduce here.
+is pre-existing on pristine origin/main in this environment (fails
+identically without this branch's changes; passes in CI). Zero regressions.
 
 ## Not implemented / caveats (explicit)
 
@@ -160,46 +219,57 @@ not reproduce here.
 - The D6 §4 turnover / drawdown gates are estimand-level checks on the evidence
   output (protocol runner's job), not in-arm projections — only the name/sector
   caps are enforced in-arm, as #445 specified.
-- **Round-down only, no deferred one-share rescue** (verified against orchestrator
-  #443's final merged §2.3 L3 spec, 2026-07-10): the executed-integer-ledger
-  fields (`E_executed`, `integer_residual`) match §2.3's ledger convention, and
-  quantization is `floor(w·PV/p)` per §2.3's "round DOWN by default" rule — but
-  §2.3 additionally permits a round-UP rescue for one share when it fits within
-  the per-name cap AND remaining investable headroom, evaluated after round-down
-  orders are funded. This harness does not implement that rescue pass (it also
-  does not implement §2.3's post-round cap/sector recheck ON THE EXECUTED
-  quantities — `--enforce-caps` projects BEFORE quantization, not after). Both
-  omissions make the harness's integer-shares convention a conservative
-  (floor-only) approximation of the real L3 layer, sufficient for evaluating
-  L1/L2 allocator questions (this PR's actual scope) but NOT a literal
-  reproduction of L3's most sophisticated rescue/recheck logic — that logic
-  belongs in the live `deployment_governor.py`/`deployment_allocator.py`
-  implementation (orchestrator#443-D2/D3, tracked in the separate governor PR
-  #179), not this replay harness. **This limitation is now MECHANICALLY
-  enforced** (2026-07-10 correction above), not just documented: every
-  payload with any convention engaged carries
-  `execution_fidelity="L1_L2_ONLY"` / `promotion_eligible=False`, and the
-  promotion/verdict gate rejects it as decision-grade regardless of the
-  underlying significance numbers.
-- **L1/L2/combined attribution (§3(a)/(b)/(c))**: this PR provides the
-  CONVENTIONS (tax/integer/stateful/caps) that any of the three estimand
-  comparisons would run under; it does not itself orchestrate the (a)/(b)/(c)
-  decomposition (same-allocator-different-E* vs allocator-variants-at-matched-E*
-  vs combined-vs-incumbent) — that estimand-level orchestration is the D6
-  protocol runner's job (not yet built), consistent with the turnover/drawdown
-  gate note above. The pre-existing allocator registry (`equal_weight_top_k`,
-  `inverse_vol_top_k`, etc., from PR #130) already supports running multiple
-  allocator variants side by side, which (b) needs; (a)'s same-allocator/
-  different-E* comparison and (c)'s combined-system framing are not yet wired
-  since neither the Governor's E* output (#179) nor a protocol-runner harness
-  exist yet to supply the second arm.
 
 ## NEXT
 
-Orchestrator D6 protocol runs (S0 tuning/evaluation splits) can now pass
+Orchestrator D6 protocol runs (S0 tuning/evaluation splits) can pass
 `--stateful --tax --integer-shares --enforce-caps --sector-map-json <map>
---cost-bps 5 --fwd-horizon-days 1` for L1/L2-only convention-faithful arms
-(NOT decision-grade / NOT promotable — see the mechanical
-`execution_fidelity`/`promotion_eligible` stamp above; full L3 fidelity
-requires the live governor implementation, `pipeline#179`, already merged).
-Independent of (and not touching) that governor PR's kernel files.
+--cost-bps 5 --fwd-horizon-days 1` for L3_FULL (promotion-eligible) arms;
+anything less is stamped L1_L2_ONLY and mechanically non-promotable.
+Rebased/merged onto main @ 9117f89 (post-#179 merge); the governor/allocator
+kernel files are consumed read-only (`shrunk_kelly_raw` as the RFC conviction
+ordering key), never modified.
+
+## Correction (2026-07-10, PR #182 — P1 cash-reserve fee-timing bug; two fixes reconciled)
+
+Codex found a real P1 in `_execute_integer_session`: buy headroom was
+computed as `state.cash - cash_reserve*pv_base` **pre-fee**, but the
+session-level linear cost was deducted from cash only AFTER the executor
+returned. A buy that exactly filled pre-fee headroom therefore left
+post-fee cash BELOW the reserve floor — the docstring's "cash (incl.
+reserve) holds by construction" claim was false once a nonzero
+transaction cost applied. This changes the executed book and can
+overstate deployment, the primary cash-drag estimand.
+
+Two parallel sessions fixed this independently; the merged implementation
+(kept in full, superseding the interim sell-fee-liability variant) charges
+fees **at trade time** throughout the stateful engine:
+
+- Every trade — sell legs, off-universe forced liquidations, and buys —
+  debits its own fee (`notional × cost_bps × 1e-4`) from cash the moment
+  it executes, so `state.cash` is truthful at every step (the interim
+  variant reserved only the executor's OWN sell fees and missed
+  off-universe liquidation fees charged in the same session). Session
+  totals are identical to the previous aggregate end-of-session
+  deduction.
+- Each candidate buy's affordability — main pass AND every rescue
+  iteration — requires `notional × (1 + fee)` to fit the remaining
+  headroom; cap-down/recheck removals refund the fee-inclusive amount,
+  so the reservation stays correct across the whole sizing loop.
+- Hard post-execution invariant inside the executor: after ALL taxes and
+  costs, `cash ≥ min(reserve × PV_base, cash_after_sells)` or it RAISES
+  (`RuntimeError`, not a strippable `assert`). The `min()` floor covers
+  sessions that legitimately OPEN below reserve (carried losses), where
+  no buys are affordable and the reserve itself is unreachable — buys
+  must simply never reduce cash below it.
+
+**Tests** (`TestL3FeeAwareReserve` + the parallel session's boundary
+test, all passing under the merged engine): exact-headroom fill withholds
+the boundary share at 5 bps (50 → 49 shares; post-fee cash $5,097.55 ≥
+the $5,000 reserve) AND at an exaggerated 100 bps (cash 5,051 exact);
+zero-reserve exact-cash fill never overdraws (99 shares, cash +$1 vs the
+fee-blind −$100); the one-share rescue is fee-aware at the boundary
+(blocked at headroom $100.50 for a $101 fee-inclusive share; funded at
+$102 without crossing the reserve); multi-session integer chain
+cash-conservation identity exact with fees + taxes. The zero-cost
+sibling tests (fee = 0 degenerate case) are unchanged.

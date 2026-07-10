@@ -123,6 +123,47 @@ def _snap(n: int, tickers=None) -> ConstraintSnapshot:
     )
 
 
+def _snap_l3(
+    n: int,
+    tickers,
+    *,
+    cap: float = 1.0,
+    cash_reserve: float = 0.0,
+    sector_indicator=None,
+    sector_cap_vec=None,
+    corr_group_pairs=(),
+) -> ConstraintSnapshot:
+    """Snapshot builder with the knobs the RFC §2.3 L3 tests exercise."""
+    return ConstraintSnapshot(
+        n=n,
+        tickers=tuple(tickers),
+        w_current=np.zeros(n),
+        w_upper_hard=np.full(n, cap),
+        w_upper=np.full(n, cap),
+        w_lower=0.0,
+        dw_max=np.full(n, 2.0),
+        cash_reserve=cash_reserve,
+        turnover_max=None,
+        drawdown=0.0,
+        drawdown_limit=1.0,
+        gross_max=None,
+        wash_sale_mask=np.zeros(n, dtype=bool),
+        sector_indicator=(
+            np.asarray(sector_indicator, dtype=float)
+            if sector_indicator is not None else None
+        ),
+        sector_cap_vec=(
+            np.asarray(sector_cap_vec, dtype=float)
+            if sector_cap_vec is not None else None
+        ),
+        sector_names=(
+            tuple(f"S{i}" for i in range(len(sector_cap_vec)))
+            if sector_cap_vec is not None else None
+        ),
+        corr_group_pairs=tuple(corr_group_pairs),
+    )
+
+
 def _bar(
     date: str,
     *,
@@ -132,13 +173,26 @@ def _bar(
     cost_bps: float = 0.0,
     prices=None,
     regime=None,
+    cap: float = 1.0,
+    cash_reserve: float = 0.0,
+    sector_indicator=None,
+    sector_cap_vec=None,
+    corr_group_pairs=(),
+    sigma=None,
 ) -> AllocatorReplayBar:
     n = len(tickers)
     return AllocatorReplayBar(
         bar_date=date,
-        snap=_snap(n, tickers=tuple(tickers)),
+        snap=_snap_l3(
+            n, tuple(tickers), cap=cap, cash_reserve=cash_reserve,
+            sector_indicator=sector_indicator, sector_cap_vec=sector_cap_vec,
+            corr_group_pairs=corr_group_pairs,
+        ),
         mu=np.asarray(mu, dtype=float),
-        sigma=np.full(n, 0.10),
+        sigma=(
+            np.asarray(sigma, dtype=float) if sigma is not None
+            else np.full(n, 0.10)
+        ),
         fwd_return=np.asarray(fwd_return, dtype=float),
         regime=regime,
         cost_per_trade_bps=cost_bps,
@@ -476,26 +530,31 @@ class TestIntegerShares:
     def test_floor_conversion_and_residual_reported(self):
         # PV 10000, target 50% of AAA at price 333 → floor(5000/333)=15
         # shares = 4995 executed → E_executed 0.4995, residual 0.0005.
+        # cap=0.5 blocks the one-share rescue (15+1 shares = 0.5328 >
+        # cap), isolating the round-DOWN default.
         alloc = _fixed_target_allocator({"*": {"AAA": 0.50}})
         bars = [
             _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
-                 fwd_return=[0.0], prices=[333.0]),
+                 fwd_return=[0.0], prices=[333.0], cap=0.50),
         ]
         conv = ReplayConventions(stateful=True, integer_shares=True)
         res = replay_one_allocator("s", alloc, bars, conv)
         assert res.executed_exposure[0] == pytest.approx(0.4995, abs=1e-12)
         assert res.integer_residual[0] == pytest.approx(0.0005, abs=1e-12)
+        assert res.rescue_buys == [0]
+        assert res.recheck_capdowns == [0]
         st = res.final_state
         assert st.position_shares("AAA") == pytest.approx(15.0, abs=1e-12)
         assert st.position_value("AAA") == pytest.approx(4995.0, abs=1e-9)
         d = res.to_dict()
         assert d["E_executed"] == [pytest.approx(0.4995)]
         assert d["integer_residual"] == [pytest.approx(0.0005)]
+        assert d["total_rescue_buys"] == 0
 
     def test_executed_never_above_cap_post_round(self):
-        """Executed-state invariant: rounding is DOWN, so with the
-        per-name cap enforced pre-round, the executed weight can never
-        exceed the cap post-round."""
+        """Executed-state invariant: with the per-name cap enforced, the
+        executed weight can never exceed the cap post-round — floor-only
+        fills, cap-bounded rescue, and post-round recheck together."""
         rng = np.random.default_rng(7)
         alloc = _fixed_target_allocator(
             {"*": {"AAA": 0.40, "BBB": 0.30, "CCC": 0.20}}
@@ -510,16 +569,17 @@ class TestIntegerShares:
         ]
         conv = ReplayConventions(
             stateful=True, integer_shares=True, enforce_caps=True,
-            per_name_cap=0.12,
+            per_name_cap=0.12, allow_unmapped_sectors=True,
         )
         res = replay_one_allocator("s", alloc, bars, conv)
-        # Per-session: every executed exposure ≤ Σ caps; residual ≥ 0.
         for e, r in zip(res.executed_exposure, res.integer_residual):
-            assert e <= 3 * 0.12 + 1e-9
-            assert r >= -1e-12
-        # Reconstruct executed per-name weights from the carried state
-        # each session via the recorded series: the invariant is that
-        # the post-round book NEVER exceeds the cap.
+            assert e <= 3 * 0.12 + 1e-6
+            # A rescue may overshoot a name's target by at most one
+            # share (never its cap), so the residual can go marginally
+            # negative — bounded by the cap tolerance, nothing more.
+            assert r >= -1e-5
+        # The post-round book NEVER exceeds the cap at execution time
+        # (final-state check allows only post-execution return drift).
         st = res.final_state
         pv = st.portfolio_value
         for tk in tickers:
@@ -563,8 +623,10 @@ class TestIntegerShares:
         ]
         conv = ReplayConventions(stateful=True, integer_shares=True)
         replay_one_allocator("spy", spy, bars, conv)
-        # floor(5000/333)=15 shares → 4995/10000 (costless, zero-return)
-        assert seen[1] == pytest.approx(0.4995, abs=1e-12)
+        # floor(5000/333)=15 shares, then the deferred rescue adds one
+        # (still short of target, one share fits cap 1.0 + headroom):
+        # 16 × 333 / 10000 = 0.5328 is the EXECUTED weight that carries.
+        assert seen[1] == pytest.approx(0.5328, abs=1e-12)
 
     def test_missing_price_fails_loud(self):
         alloc = _fixed_target_allocator({"*": {"AAA": 0.50}})
@@ -574,6 +636,318 @@ class TestIntegerShares:
         conv = ReplayConventions(stateful=True, integer_shares=True)
         with pytest.raises(ValueError, match="positive close price"):
             replay_one_allocator("s", alloc, bars, conv)
+
+
+# ── 4b. RFC #443 §2.3 L3 — deferred rescue + post-round rechecks ────
+
+
+class TestL3DeferredRescue:
+    """The one-share rescue fires ONLY under the deferred-rescue
+    conditions (post-round-down, cap- and reserve-headroom-bounded)."""
+
+    def test_floored_to_zero_candidate_rescued_to_exactly_one_share(self):
+        # target 0.008 · PV 10000 = $80 < 1 share ($100) → floor 0.
+        # Rescue: one share = 1% PV ≤ cap AND ≤ headroom → exactly 1.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.008}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0]),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.rescue_buys == [1]
+        assert res.final_state.position_shares("AAA") == pytest.approx(1.0)
+        assert res.executed_exposure[0] == pytest.approx(0.01, abs=1e-12)
+
+    def test_rescue_blocked_by_per_name_cap(self):
+        # One share = 1% PV > cap 0.9% → rescue may NOT round up.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.008}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cap=0.009),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.rescue_buys == [0]
+        assert res.final_state.position_shares("AAA") == pytest.approx(0.0)
+        assert res.executed_exposure[0] == pytest.approx(0.0, abs=1e-12)
+
+    def test_rescue_blocked_by_reserve_headroom(self):
+        # Investable headroom = cash − reserve×PV = 10000 − 9950 = $50
+        # < 1 share ($100) → no rescue (task_selection convention).
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.008}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.995),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.rescue_buys == [0]
+        assert res.final_state.position_shares("AAA") == pytest.approx(0.0)
+
+    def test_rescue_spends_leftover_cash_in_conviction_order(self):
+        # Headroom after round-down fits only TWO rescue shares; the two
+        # highest-conviction (μ̂/σ̂²) names get them, the third does not.
+        alloc = _fixed_target_allocator(
+            {"*": {"AAA": 0.008, "BBB": 0.008, "CCC": 0.008}}
+        )
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB", "CCC"),
+                 mu=[0.02, 0.05, 0.04],       # conviction: BBB > CCC > AAA
+                 fwd_return=[0.0, 0.0, 0.0],
+                 prices=[100.0, 100.0, 100.0], cash_reserve=0.975),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert res.rescue_buys == [2]
+        assert st.position_shares("BBB") == pytest.approx(1.0)
+        assert st.position_shares("CCC") == pytest.approx(1.0)
+        assert st.position_shares("AAA") == pytest.approx(0.0)
+
+    def test_deployment_not_understated_at_small_pv(self):
+        """Hand-computed small-PV case: naive floor executes NOTHING
+        (every target < 1 share), understating deployment to 0; the
+        deferred rescue deploys 3 × $301 = $903 of $1000 → 0.903."""
+        alloc = _fixed_target_allocator(
+            {"*": {"AAA": 0.30, "BBB": 0.30, "CCC": 0.30}}
+        )
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB", "CCC"),
+                 mu=[0.05, 0.04, 0.03], fwd_return=[0.0, 0.0, 0.0],
+                 prices=[301.0, 301.0, 301.0]),
+        ]
+        conv = ReplayConventions(
+            stateful=True, integer_shares=True, initial_capital=1_000.0,
+        )
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.rescue_buys == [3]
+        assert res.executed_exposure[0] == pytest.approx(0.903, abs=1e-12)
+        assert res.deployed_fraction[0] == pytest.approx(0.903, abs=1e-12)
+        # Cash conservation with the rescue engaged stays exact.
+        assert res.final_state.cash == pytest.approx(97.0, abs=1e-9)
+
+
+class TestL3PostRoundRecheck:
+    """RFC #443 §2.3: cash/name/sector/corr re-verified on EXECUTED
+    quantities; violating buys are capped down — never carried in
+    breach."""
+
+    def test_name_cap_breach_capped_down(self):
+        # Allocator proposes 0.30 with hard cap 0.20 (no enforce_caps —
+        # the recheck itself must catch it): 30 shares round down, 10
+        # are removed → executed exactly at the cap.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.30}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cap=0.20),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.recheck_capdowns == [10]
+        assert res.executed_exposure[0] == pytest.approx(0.20, abs=1e-12)
+        assert res.final_state.position_shares("AAA") == pytest.approx(20.0)
+        # Never carried in breach → no w_upper_hard violation recorded.
+        assert res.violations_per_family.get("w_upper_hard", 0) == 0
+
+    def test_sector_cap_breach_capped_down_lowest_conviction_first(self):
+        # Both names in one sector capped at 0.25; targets 0.15 + 0.15.
+        # Post-round load 0.30 → 5 shares of the LOWER-conviction name
+        # (BBB, smaller μ̂) are removed → load exactly 0.25.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.15, "BBB": 0.15}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.06, 0.04],
+                 fwd_return=[0.0, 0.0], prices=[100.0, 100.0],
+                 sector_indicator=[[1.0, 1.0]], sector_cap_vec=[0.25]),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert res.recheck_capdowns == [5]
+        assert st.position_shares("AAA") == pytest.approx(15.0)
+        assert st.position_shares("BBB") == pytest.approx(10.0)
+        assert res.executed_exposure[0] == pytest.approx(0.25, abs=1e-12)
+        assert res.violations_per_family.get("sector_cap", 0) == 0
+
+    def test_corr_pair_breach_capped_down(self):
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.15, "BBB": 0.15}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.06, 0.04],
+                 fwd_return=[0.0, 0.0], prices=[100.0, 100.0],
+                 corr_group_pairs=((0, 1, 0.25),)),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert res.recheck_capdowns == [5]
+        assert st.position_shares("AAA") + st.position_shares("BBB") == (
+            pytest.approx(25.0)
+        )
+        # Lower-conviction BBB absorbed every removal.
+        assert st.position_shares("BBB") == pytest.approx(10.0)
+        assert res.violations_per_family.get("corr_group_cap", 0) == 0
+
+    def test_cash_reserve_holds_after_fees_at_the_exact_pre_fee_boundary(self):
+        # P1 fix (Codex review on #182): the pre-fix headroom check only
+        # reserved cash pre-fee, so a target that exactly fills pre-fee
+        # headroom left post-fee cash BELOW the reserve floor once the
+        # session-level linear cost was deducted. $10,000 PV, 50%
+        # reserve, 5bps cost: pre-fee-naive sizing buys 50 shares @ $100
+        # (invest=$5,000, cash=$5,000 == reserve exactly), then the
+        # $2.50 fee on that $5,000 traded pushes cash to $4,997.50 —
+        # BELOW the $5,000 reserve floor. The fee-aware fix must instead
+        # withhold the last share (49, not 50) so post-fee cash clears
+        # the reserve.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.80}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.50,
+                 cost_bps=5.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        # The fee-aware fix withholds the boundary share: 49, not the
+        # pre-fix 50 (which would have breached the reserve post-fee).
+        assert st.position_shares("AAA") == pytest.approx(49.0)
+        assert res.rescue_buys == [0]  # no room left for even one more
+        assert st.cash == pytest.approx(5_097.55, abs=1e-6)
+        # The invariant this whole fix exists to guarantee: reserve
+        # floor holds AFTER fees, not just pre-fee.
+        assert st.cash >= 5_000.0 - 1e-6
+
+    def test_cash_reserve_never_breached_by_fills(self):
+        # Reserve 50% of PV, zero cost: fills are headroom-bounded, so
+        # executed exposure stops at 0.50 and cash never dips below the
+        # reserve. (Zero-cost sibling of the fee-aware boundary test
+        # above — pins the fee_factor=1.0 degenerate case unchanged.)
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.80}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.50),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        assert res.executed_exposure[0] == pytest.approx(0.50, abs=1e-12)
+        assert res.final_state.cash == pytest.approx(5_000.0, abs=1e-9)
+        assert res.rescue_buys == [0]
+
+
+class TestL3FeeAwareReserve:
+    """r3 #182 P1: affordability must include the buy-side transaction
+    cost — an order that exactly consumes the reserve-adjusted headroom
+    must NOT leave cash < reserve once the D6 5 bps/side fee is charged.
+    These tests use an exaggerated 100 bps/side fee so one whole share's
+    fee is material at the headroom boundary."""
+
+    def test_exact_headroom_fill_withholds_last_share_for_fee(self):
+        # PV 10000, reserve 50% → headroom $5000; price 100, fee 1%.
+        # Fee-blind sizing buys 50 shares ($5000) then pays $50 fee →
+        # cash 4950 < 5000 (the P1 violation). Fee-aware sizing buys
+        # floor(5000 / 101) = 49 shares: the 50th share is withheld.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.60}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.50,
+                 cost_bps=100.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert st.position_shares("AAA") == pytest.approx(49.0)
+        # cash = 10000 − 4900 − 49 fee = 5051 ≥ reserve 5000, exact.
+        assert st.cash == pytest.approx(5_051.0, abs=1e-9)
+        assert st.cash >= 0.50 * 10_000.0
+        assert res.cost_paid[0] == pytest.approx(49.0, abs=1e-9)
+        # Ledger computed from the FINAL fee-aware executed quantities.
+        assert res.executed_exposure[0] == pytest.approx(0.49, abs=1e-12)
+        assert res.integer_residual[0] == pytest.approx(0.11, abs=1e-12)
+        assert res.rescue_buys == [0]
+
+    def test_zero_reserve_exact_cash_fill_never_overdraws(self):
+        # Reserve 0: fee-blind sizing would buy 100 shares ($10000) and
+        # end at cash −100. Fee-aware: floor(10000/101) = 99 shares →
+        # cash = 10000 − 9900 − 99 = +1.
+        alloc = _fixed_target_allocator({"*": {"AAA": 1.0}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cost_bps=100.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert st.position_shares("AAA") == pytest.approx(99.0)
+        assert st.cash == pytest.approx(1.0, abs=1e-9)
+        assert st.cash >= 0.0
+
+    def test_rescue_is_fee_aware_at_the_headroom_boundary(self):
+        # One share costs 100 + 1 fee = 101. Headroom $100.50 → the
+        # rescue must NOT fire (a fee-blind "price ≤ headroom" check
+        # would have fired and breached the reserve by 50¢).
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.008}})
+        blocked = _bar(
+            "2026-01-02", tickers=("AAA",), mu=[0.05], fwd_return=[0.0],
+            prices=[100.0], cash_reserve=0.98995, cost_bps=100.0,
+        )
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, [blocked], conv)
+        assert res.rescue_buys == [0]
+        assert res.final_state.position_shares("AAA") == pytest.approx(0.0)
+        assert res.final_state.cash == pytest.approx(10_000.0, abs=1e-9)
+        # Headroom $102 ≥ $101 → the rescue funds WITHOUT crossing
+        # the reserve.
+        funded = _bar(
+            "2026-01-02", tickers=("AAA",), mu=[0.05], fwd_return=[0.0],
+            prices=[100.0], cash_reserve=0.9898, cost_bps=100.0,
+        )
+        res2 = replay_one_allocator("s", alloc, [funded], conv)
+        assert res2.rescue_buys == [1]
+        st2 = res2.final_state
+        assert st2.position_shares("AAA") == pytest.approx(1.0)
+        # cash = 10000 − 100 − 1 = 9899 ≥ reserve 9898.
+        assert st2.cash == pytest.approx(9_899.0, abs=1e-9)
+        assert st2.cash >= 0.9898 * 10_000.0
+
+    def test_cash_conservation_exact_with_fees_in_integer_mode(self):
+        # Multi-session integer chain with 5 bps/side + tax: the PV
+        # identity (initial × Π(1+daily) == cash + positions) must hold
+        # exactly with fees charged at trade time, and the reserve
+        # invariant must hold every session.
+        alloc = _scripted_allocator([
+            {"AAA": 0.60}, {"AAA": 0.60}, {},
+        ])
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.10], prices=[50.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+            _bar("2026-01-03", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[55.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+            _bar("2026-01-04", tickers=("AAA",), mu=[-0.05],
+                 fwd_return=[0.0], prices=[55.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+        ]
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True,
+            initial_capital=10_000.0,
+        )
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        pv_close = st.portfolio_value
+        compounded = 10_000.0 * float(
+            np.prod(1.0 + np.asarray(res.daily_returns_net))
+        )
+        assert pv_close == pytest.approx(compounded, abs=1e-6)
+        # cash + positions == PV at every recorded session close.
+        for i in range(len(bars)):
+            assert res.cash_series[i] + res.positions_value_series[i] == (
+                pytest.approx(
+                    10_000.0 * float(np.prod(
+                        1.0 + np.asarray(res.daily_returns_net[: i + 1])
+                    )),
+                    abs=1e-6,
+                )
+            )
 
 
 # ── 5. In-arm cap enforcement ───────────────────────────────────────
@@ -602,7 +976,10 @@ class TestCapEnforcement:
         assert proj[2] == pytest.approx(0.10, abs=1e-12)
 
     def test_per_name_cap_clip_and_counter(self):
-        conv = ReplayConventions(enforce_caps=True, per_name_cap=0.12)
+        conv = ReplayConventions(
+            enforce_caps=True, per_name_cap=0.12,
+            allow_unmapped_sectors=True,   # name-cap-only = exploratory
+        )
         target = np.array([0.30, 0.10])
         proj, n_name, n_sector = apply_d6_cap_projection(
             target, ("AAA", "BBB"), conv,
@@ -611,10 +988,14 @@ class TestCapEnforcement:
         assert proj[0] == pytest.approx(0.12, abs=1e-12)
         assert proj[1] == pytest.approx(0.10, abs=1e-12)
 
-    def test_unmapped_ticker_carries_no_sector_constraint(self):
+    def test_unmapped_ticker_unconstrained_on_exploratory_path_only(self):
+        # The permissive semantics (unmapped ⇒ no sector constraint, no
+        # silent membership guessing) survive ONLY behind the explicit
+        # exploratory flag; without it this exact call fails closed
+        # (TestSectorMapFailClosed).
         conv = ReplayConventions(
             enforce_caps=True, per_name_cap=0.50, sector_cap=0.35,
-            sector_map={"AAA": "Tech"},
+            sector_map={"AAA": "Tech"}, allow_unmapped_sectors=True,
         )
         target = np.array([0.30, 0.45])
         proj, _, n_sector = apply_d6_cap_projection(
@@ -632,7 +1013,9 @@ class TestCapEnforcement:
             _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.05, 0.04],
                  fwd_return=[0.10, 0.10], cost_bps=10.0),
         ]
-        conv = ReplayConventions(enforce_caps=True, per_name_cap=0.12)
+        conv = ReplayConventions(
+            enforce_caps=True, per_name_cap=0.12, allow_unmapped_sectors=True,
+        )
         res = replay_one_allocator("s", alloc, bars, conv)
         # projected: [0.12, 0.10] → gross 0.022, turn 0.22, cost 0.00022
         assert res.daily_returns_net[0] == pytest.approx(
@@ -670,6 +1053,181 @@ class TestCapEnforcement:
         pv = st.portfolio_value
         tech = (st.position_value("AAA") + st.position_value("BBB")) / pv
         assert tech <= 0.20 + 1e-9
+
+
+# ── 5b. r2: sector-map fail-closed + execution-fidelity contract ────
+
+
+class TestSectorMapFailClosed:
+    """r2 #180: --enforce-caps must FAIL CLOSED when the sector map does
+    not cover every active ticker in every replay bar; the permissive
+    path survives only behind the explicit exploratory flag."""
+
+    def test_no_map_at_all_fails_closed_at_replay_time(self):
+        # Construction is allowed (callers need the object to run the
+        # sector_map_coverage_gap prescan) — the replay itself raises.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0]),
+        ]
+        conv = ReplayConventions(enforce_caps=True)
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
+
+    def test_mixed_mapped_unmapped_universe_fails_closed_stateless(self):
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10, "ZZZ": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "ZZZ"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0]),
+        ]
+        conv = ReplayConventions(
+            enforce_caps=True, sector_map={"AAA": "Tech"},
+        )
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
+
+    def test_mixed_mapped_unmapped_universe_fails_closed_stateful(self):
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10, "ZZZ": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "ZZZ"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0], prices=[100.0, 100.0]),
+        ]
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True, enforce_caps=True,
+            sector_map={"AAA": "Tech"},
+        )
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
+
+    def test_exploratory_flag_allows_partial_map_and_marks_evidence(self):
+        bars = build_default_fixture_bars()
+        conv = ReplayConventions(
+            stateful=True, enforce_caps=True,
+            sector_map={"AAA": "Tech"},          # partial on purpose
+            allow_unmapped_sectors=True,
+        )
+        payload = run_replay(
+            bars, list(FIXTURE_ALLOCATORS),
+            incumbent=FIXTURE_INCUMBENT,
+            pbo_n_slices=FIXTURE_PBO_N_SLICES,
+            conventions=conv,
+        )
+        rc = payload["replay_conventions"]
+        assert rc["sector_coverage"] == "exploratory_unmapped_allowed"
+        assert rc["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc["promotion_eligible"] is False
+
+
+class TestExecutionFidelityGate:
+    """r2 #180 evidence contract: engaged-conventions payloads carry
+    execution_fidelity/promotion_eligible, and the promotion gate
+    REJECTS anything below L3_FULL — a floor-only / degraded result can
+    never pass."""
+
+    _FULL_MAP = {"AAA": "Tech", "BBB": "Tech", "CCC": "Energy",
+                 "DDD": "Energy"}
+
+    def _payload(self, conv):
+        bars = [
+            dataclasses.replace(
+                b, prices=np.array([120.0, 55.0, 250.0, 33.0]),
+            )
+            for b in build_default_fixture_bars()
+        ]
+        return run_replay(
+            bars, list(FIXTURE_ALLOCATORS),
+            incumbent=FIXTURE_INCUMBENT,
+            pbo_n_slices=FIXTURE_PBO_N_SLICES,
+            conventions=conv,
+        )
+
+    def test_l3_full_stamp_when_all_conventions_engaged(self):
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True, enforce_caps=True,
+            sector_map=self._FULL_MAP,
+        )
+        assert conv.execution_fidelity == "L3_FULL"
+        payload = self._payload(conv)
+        rc = payload["replay_conventions"]
+        assert rc["execution_fidelity"] == "L3_FULL"
+        assert rc["promotion_eligible"] is True
+        assert rc["sector_coverage"] == "fail_closed"
+        gate = payload["verdict"]["non_negotiable_gate_passed"]
+        assert gate["execution_fidelity_l3_full"] is True
+
+    def test_degraded_conventions_cannot_name_promotion_candidate(self):
+        # Stateful-only (no tax, no integer shares, no cap enforcement)
+        # = L1_L2_ONLY: the verdict fails closed with an explicit
+        # fidelity rationale and every significance block is forced
+        # diagnostic-only / non-promotable.
+        conv = ReplayConventions(stateful=True)
+        assert conv.execution_fidelity == "L1_L2_ONLY"
+        payload = self._payload(conv)
+        rc = payload["replay_conventions"]
+        assert rc["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc["promotion_eligible"] is False
+        verdict = payload["verdict"]
+        assert verdict["promotion_candidate"] is None
+        assert "L1_L2_ONLY" in verdict["rationale"]
+        gate = verdict["non_negotiable_gate_passed"]
+        assert gate["execution_fidelity_l3_full"] is False
+        for name, sig in payload["significance"].items():
+            assert sig["diagnostic_only"] is True, name
+            assert sig["live_promotable_per_section_8"] is False, name
+            assert "L3_FULL" in sig["promotion_block_reason"], name
+
+    def test_gate_rejects_even_when_dsr_pbo_pass(self):
+        """Negative proof at the gate level: a candidate whose DSR/PBO
+        flags say 'promotable' and whose paired stats beat the incumbent
+        still CANNOT pass without L3_FULL fidelity."""
+        significance = {
+            "incumbent_arm": {"dsr": 0.99, "pbo": 0.05, "pbo_se": 0.01,
+                              "live_promotable_per_section_8": True},
+            "challenger_arm": {"dsr": 0.99, "pbo": 0.05, "pbo_se": 0.01,
+                               "live_promotable_per_section_8": True},
+        }
+        violations = {
+            "any_allocator_violated_any_family": False,
+            "by_allocator": {
+                "incumbent_arm": {"rejected_for_promotion": False},
+                "challenger_arm": {"rejected_for_promotion": False},
+            },
+        }
+        paired = {
+            "incumbent_arm_vs_challenger_arm": {
+                "n_bars": 400,
+                "delta_sharpe_annual": -2.0,      # challenger wins
+                "win_rate_a_beats_b": 0.30,       # challenger wins 70%
+            },
+        }
+        from renquant_pipeline.kernel.portfolio_qp.run_ab_replay import (
+            apply_promotion_gate_to_significance,
+            assemble_verdict,
+        )
+        # Sanity: WITH fidelity ok the challenger IS promotable…
+        verdict_ok = assemble_verdict(
+            significance, paired, violations, incumbent="incumbent_arm",
+            execution_fidelity_ok=True,
+        )
+        assert verdict_ok["promotion_candidate"] == "challenger_arm"
+        # …and WITHOUT L3_FULL fidelity it can NEVER be.
+        verdict = assemble_verdict(
+            significance, paired, violations, incumbent="incumbent_arm",
+            execution_fidelity_ok=False,
+        )
+        assert verdict["promotion_candidate"] is None
+        assert verdict["next_action"] == "iterate"
+        assert "L1_L2_ONLY" in verdict["rationale"]
+        gated = apply_promotion_gate_to_significance(
+            significance, violations,
+            constraints_decision_grade=True,
+            execution_fidelity_ok=False,
+        )
+        for name, sig in gated.items():
+            assert sig["live_promotable_per_section_8"] is False, name
+            assert sig["diagnostic_only"] is True, name
+            assert "L3_FULL" in sig["promotion_block_reason"], name
 
 
 class TestSectorMapCoverageGap:
@@ -764,7 +1322,10 @@ class TestExecutionFidelityPromotionGate:
         assert payload["replay_conventions"]["execution_fidelity"] == "L1_L2_ONLY"
         assert payload["replay_conventions"]["promotion_eligible"] is False
         assert payload["verdict"]["promotion_candidate"] is None
-        assert "not decision-grade" in payload["verdict"]["rationale"]
+        # Merged r1+r2 semantics: the verdict names the fidelity gap
+        # explicitly (execution fidelity short-circuit) rather than the
+        # generic constraint-fidelity wording.
+        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
         for name, sig in payload["significance"].items():
             assert sig["live_promotable_per_section_8"] is False
             assert sig["diagnostic_only"] is True
@@ -858,11 +1419,16 @@ class TestEvidenceSchemaAndCLI:
         assert rc["integer_shares"] and rc["enforce_caps"]
         assert rc["tax_short_rate"] == 0.50
         assert rc["tax_long_rate"] == 0.32
+        assert rc["execution_fidelity"] == "L3_FULL"
+        assert rc["promotion_eligible"] is True
+        assert rc["sector_coverage"] == "fail_closed"
         for name in FIXTURE_ALLOCATORS:
             block = payload["per_allocator"][name]
             assert len(block["deployed_fraction"]) == payload["n_bars"]
             assert len(block["E_executed"]) == payload["n_bars"]
             assert len(block["integer_residual"]) == payload["n_bars"]
+            assert len(block["rescue_buys"]) == payload["n_bars"]
+            assert len(block["recheck_capdowns"]) == payload["n_bars"]
             assert len(block["tax_paid"]) == payload["n_bars"]
             assert len(block["cost_paid"]) == payload["n_bars"]
             assert len(block["name_cap_breaches"]) == payload["n_bars"]
@@ -907,6 +1473,8 @@ class TestEvidenceSchemaAndCLI:
         assert rc_block["integer_shares"] is True
         assert rc_block["initial_capital"] == 25000.0
         assert rc_block["n_sector_mapped_tickers"] == 3
+        assert rc_block["execution_fidelity"] == "L3_FULL"
+        assert rc_block["promotion_eligible"] is True
         eq = payload["per_allocator"]["equal_weight_top_k"]
         assert len(eq["deployed_fraction"]) == payload["n_bars"]
         assert eq["total_cost_paid"] >= 0.0
@@ -992,6 +1560,12 @@ class TestEvidenceSchemaAndCLI:
         assert payload["constraint_fidelity"]["execution_fidelity"] == "L1_L2_ONLY"
         assert payload["constraint_fidelity"]["promotion_eligible"] is False
         assert payload["verdict"]["promotion_candidate"] is None
+        # Mirrored stamps in replay_conventions (merged r1+r2 contract).
+        rc_block = payload["replay_conventions"]
+        assert rc_block["sector_coverage"] == "exploratory_unmapped_allowed"
+        assert rc_block["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc_block["promotion_eligible"] is False
+        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
 
     def test_cli_default_flags_unchanged_payload_schema(self, tmp_path):
         db = tmp_path / "sim_runs.db"
