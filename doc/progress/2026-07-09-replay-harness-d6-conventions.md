@@ -229,3 +229,47 @@ anything less is stamped L1_L2_ONLY and mechanically non-promotable.
 Rebased/merged onto main @ 9117f89 (post-#179 merge); the governor/allocator
 kernel files are consumed read-only (`shrunk_kelly_raw` as the RFC conviction
 ordering key), never modified.
+
+## Correction (2026-07-10, PR #182 — P1 cash-reserve fee-timing bug; two fixes reconciled)
+
+Codex found a real P1 in `_execute_integer_session`: buy headroom was
+computed as `state.cash - cash_reserve*pv_base` **pre-fee**, but the
+session-level linear cost was deducted from cash only AFTER the executor
+returned. A buy that exactly filled pre-fee headroom therefore left
+post-fee cash BELOW the reserve floor — the docstring's "cash (incl.
+reserve) holds by construction" claim was false once a nonzero
+transaction cost applied. This changes the executed book and can
+overstate deployment, the primary cash-drag estimand.
+
+Two parallel sessions fixed this independently; the merged implementation
+(kept in full, superseding the interim sell-fee-liability variant) charges
+fees **at trade time** throughout the stateful engine:
+
+- Every trade — sell legs, off-universe forced liquidations, and buys —
+  debits its own fee (`notional × cost_bps × 1e-4`) from cash the moment
+  it executes, so `state.cash` is truthful at every step (the interim
+  variant reserved only the executor's OWN sell fees and missed
+  off-universe liquidation fees charged in the same session). Session
+  totals are identical to the previous aggregate end-of-session
+  deduction.
+- Each candidate buy's affordability — main pass AND every rescue
+  iteration — requires `notional × (1 + fee)` to fit the remaining
+  headroom; cap-down/recheck removals refund the fee-inclusive amount,
+  so the reservation stays correct across the whole sizing loop.
+- Hard post-execution invariant inside the executor: after ALL taxes and
+  costs, `cash ≥ min(reserve × PV_base, cash_after_sells)` or it RAISES
+  (`RuntimeError`, not a strippable `assert`). The `min()` floor covers
+  sessions that legitimately OPEN below reserve (carried losses), where
+  no buys are affordable and the reserve itself is unreachable — buys
+  must simply never reduce cash below it.
+
+**Tests** (`TestL3FeeAwareReserve` + the parallel session's boundary
+test, all passing under the merged engine): exact-headroom fill withholds
+the boundary share at 5 bps (50 → 49 shares; post-fee cash $5,097.55 ≥
+the $5,000 reserve) AND at an exaggerated 100 bps (cash 5,051 exact);
+zero-reserve exact-cash fill never overdraws (99 shares, cash +$1 vs the
+fee-blind −$100); the one-share rescue is fee-aware at the boundary
+(blocked at headroom $100.50 for a $101 fee-inclusive share; funded at
+$102 without crossing the reserve); multi-session integer chain
+cash-conservation identity exact with fees + taxes. The zero-cost
+sibling tests (fee = 0 degenerate case) are unchanged.

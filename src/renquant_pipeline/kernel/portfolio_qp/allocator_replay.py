@@ -789,15 +789,17 @@ def _execute_integer_session(
       investable headroom (cash minus the snapshot cash reserve — the
       task_selection rescue's reserve-aware headroom). A name may
       overshoot its target by at most one share.
-    * **Fee-aware affordability** (r3 #182 P1 fix): every fill —
-      main-pass and rescue alike — is affordable only if
-      ``notional × (1 + fee)`` fits the remaining headroom, where
-      ``fee = cost_per_trade_bps × 1e-4`` is the D6 §1.1 frozen per-side
-      linear cost. Fees are charged to cash AT trade time (sell legs
-      too), so an order that exactly fills the headroom can never leave
-      ``cash < reserve`` after fees; cap-down removals refund the full
-      fee-inclusive amount, re-computing affordability on every
-      rescue/cap-down iteration.
+    * **Fee-aware affordability** (r3 #182 P1 fix — the pre-fix
+      pre-fee headroom check alone left post-fee cash below the
+      reserve): every fill — main-pass and rescue alike — is affordable
+      only if ``notional × (1 + fee)`` fits the remaining headroom,
+      where ``fee = cost_per_trade_bps × 1e-4`` is the D6 §1.1 frozen
+      per-side linear cost. Fees are charged to cash AT trade time
+      (sell legs and off-universe liquidations too), so an order that
+      exactly fills the headroom can never leave ``cash < reserve``
+      after fees; cap-down removals refund the full fee-inclusive
+      amount, re-computing affordability on every rescue/cap-down
+      iteration.
     * **Post-round recheck on EXECUTED quantities** — cash incl. reserve
       (headroom-bounded, fee-inclusive fills + a hard post-execution
       invariant check below), single-name cap, sector caps (snapshot

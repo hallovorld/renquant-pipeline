@@ -787,9 +787,40 @@ class TestL3PostRoundRecheck:
         assert st.position_shares("BBB") == pytest.approx(10.0)
         assert res.violations_per_family.get("corr_group_cap", 0) == 0
 
+    def test_cash_reserve_holds_after_fees_at_the_exact_pre_fee_boundary(self):
+        # P1 fix (Codex review on #182): the pre-fix headroom check only
+        # reserved cash pre-fee, so a target that exactly fills pre-fee
+        # headroom left post-fee cash BELOW the reserve floor once the
+        # session-level linear cost was deducted. $10,000 PV, 50%
+        # reserve, 5bps cost: pre-fee-naive sizing buys 50 shares @ $100
+        # (invest=$5,000, cash=$5,000 == reserve exactly), then the
+        # $2.50 fee on that $5,000 traded pushes cash to $4,997.50 —
+        # BELOW the $5,000 reserve floor. The fee-aware fix must instead
+        # withhold the last share (49, not 50) so post-fee cash clears
+        # the reserve.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.80}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.50,
+                 cost_bps=5.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        # The fee-aware fix withholds the boundary share: 49, not the
+        # pre-fix 50 (which would have breached the reserve post-fee).
+        assert st.position_shares("AAA") == pytest.approx(49.0)
+        assert res.rescue_buys == [0]  # no room left for even one more
+        assert st.cash == pytest.approx(5_097.55, abs=1e-6)
+        # The invariant this whole fix exists to guarantee: reserve
+        # floor holds AFTER fees, not just pre-fee.
+        assert st.cash >= 5_000.0 - 1e-6
+
     def test_cash_reserve_never_breached_by_fills(self):
-        # Reserve 50% of PV: fills are headroom-bounded, so executed
-        # exposure stops at 0.50 and cash never dips below the reserve.
+        # Reserve 50% of PV, zero cost: fills are headroom-bounded, so
+        # executed exposure stops at 0.50 and cash never dips below the
+        # reserve. (Zero-cost sibling of the fee-aware boundary test
+        # above — pins the fee_factor=1.0 degenerate case unchanged.)
         alloc = _fixed_target_allocator({"*": {"AAA": 0.80}})
         bars = [
             _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
