@@ -59,6 +59,45 @@ from fixtures.d6_default_bars import (  # noqa: E402
 )
 
 FIXTURE_EVIDENCE = Path(__file__).parent / "fixtures" / "ab_replay_default_evidence.json"
+# Platform the pinned artifact was generated on (see d6_default_bars.py).
+# Byte-identity only holds where numpy/BLAS reduction order matches the
+# minting build; other platforms run the ULP-tolerant deep comparison.
+FIXTURE_PIN_PLATFORM = "darwin"
+
+
+def _assert_json_equal(a, b, path: str = "$") -> None:
+    """Deep-compare two parsed JSON trees.
+
+    EXACT on structure (key sets, list lengths), strings, booleans,
+    None, and integers; floats must agree within rel 1e-9 / abs 1e-12
+    — orders of magnitude tighter than any behavioral change, loose
+    enough to absorb cross-platform numpy/BLAS reduction-order ULP
+    noise (CI run 29071927009: last-digit repr differences ubuntu vs
+    darwin). This is the platform-independent form of the default-mode
+    pin; the byte-identity test below enforces the strict form on the
+    platform that minted the fixture.
+    """
+    if isinstance(a, dict) or isinstance(b, dict):
+        assert isinstance(a, dict) and isinstance(b, dict), path
+        assert sorted(a.keys()) == sorted(b.keys()), (
+            f"{path}: key sets differ: {sorted(a)} vs {sorted(b)}"
+        )
+        for k in a:
+            _assert_json_equal(a[k], b[k], f"{path}.{k}")
+    elif isinstance(a, list) or isinstance(b, list):
+        assert isinstance(a, list) and isinstance(b, list), path
+        assert len(a) == len(b), f"{path}: lengths {len(a)} vs {len(b)}"
+        for i, (x, y) in enumerate(zip(a, b)):
+            _assert_json_equal(x, y, f"{path}[{i}]")
+    elif isinstance(a, bool) or isinstance(b, bool) or a is None or b is None \
+            or isinstance(a, str) or isinstance(b, str):
+        assert a == b, f"{path}: {a!r} != {b!r}"
+    elif isinstance(a, int) and isinstance(b, int):
+        assert a == b, f"{path}: {a!r} != {b!r}"
+    else:
+        assert a == pytest.approx(b, rel=1e-9, abs=1e-12), (
+            f"{path}: {a!r} != {b!r}"
+        )
 
 
 # ── helpers ─────────────────────────────────────────────────────────
@@ -148,10 +187,35 @@ def _scripted_allocator(script: list[dict[str, float]]):
 
 
 class TestDefaultModeUnchanged:
-    def test_default_evidence_byte_identical_to_pre_change_pin(self):
+    def test_default_evidence_matches_pre_change_pin(self):
         """The pinned artifact was generated on the PRE-D6 code
-        (origin/main @ f6e818c). The opt-in conventions must not move a
-        single byte of default-mode evidence."""
+        (origin/main @ f6e818c). The opt-in conventions must not change
+        default-mode evidence: schema (key trees), strings, booleans and
+        integers EXACTLY; floats within reduction-order ULP noise
+        (platform-independent form of the pin — runs everywhere,
+        including CI's ubuntu/pip numpy)."""
+        payload = run_replay(
+            build_default_fixture_bars(),
+            list(FIXTURE_ALLOCATORS),
+            incumbent=FIXTURE_INCUMBENT,
+            pbo_n_slices=FIXTURE_PBO_N_SLICES,
+        )
+        rendered = json.loads(json.dumps(payload, indent=2, sort_keys=True))
+        pinned = json.loads(FIXTURE_EVIDENCE.read_text())
+        _assert_json_equal(rendered, pinned)
+
+    @pytest.mark.skipif(
+        sys.platform != FIXTURE_PIN_PLATFORM,
+        reason=(
+            "byte-identity only holds on the platform whose numpy/BLAS "
+            "build minted the fixture; other platforms differ in float "
+            "reduction order at the last ULP and are covered by "
+            "test_default_evidence_matches_pre_change_pin"
+        ),
+    )
+    def test_default_evidence_byte_identical_on_pin_platform(self):
+        """Strict form of the pin: on the minting platform the opt-in
+        conventions must not move a single byte of default evidence."""
         payload = run_replay(
             build_default_fixture_bars(),
             list(FIXTURE_ALLOCATORS),
