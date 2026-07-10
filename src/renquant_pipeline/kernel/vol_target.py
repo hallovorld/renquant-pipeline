@@ -45,8 +45,14 @@ def compute_vol_target_scale(
     window_days:  int   = 60,
     floor:        float = 0.30,
     ceiling:      float = 1.50,
+    annualization_days: float = 252.0,
 ) -> float:
     """Return the gross-exposure scale ``∈ [floor, ceiling]``.
+
+    ``annualization_days`` (crypto RFC 2026-07-10 P4): trading days per year
+    used to annualize realized vol — 252 for us_equity (default,
+    byte-identical), 365 for an always-open crypto market (√252 would
+    understate a 7-day/week return stream's annual vol).
 
     Fail-open contract: any malformed input (too few returns, non-finite
     target, non-finite realized vol, non-positive σ) returns 1.0.
@@ -66,7 +72,9 @@ def compute_vol_target_scale(
     var  = sum((r - mean) ** 2 for r in window) / (len(window) - 1)
     if not math.isfinite(var) or var <= 0:
         return 1.0
-    realized_vol = math.sqrt(var) * math.sqrt(252.0)
+    if not (math.isfinite(annualization_days) and annualization_days > 0):
+        return 1.0
+    realized_vol = math.sqrt(var) * math.sqrt(float(annualization_days))
     if not math.isfinite(realized_vol) or realized_vol <= 0:
         return 1.0
     raw_scale = target_vol / realized_vol

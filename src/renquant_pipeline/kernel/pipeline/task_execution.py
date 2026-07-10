@@ -212,11 +212,21 @@ class StampWashSaleTask(Task):
     Pins: only **full liquidates** stamp ``last_sell_dates`` (matches the
     2026-04-24 partial-trim wash-sale exemption); path-rule exits stamp
     ``last_stop_exit_dates`` regardless of partial-vs-full (G8 invariant).
+
+    Crypto RFC 2026-07-10 P5: for ``asset_class="crypto"`` a sell does NOT
+    stamp ``last_sell_dates`` at all — crypto is property, §1091 never
+    applies, so no wash-sale re-entry state may be created (the RFC strips
+    the wash-sale/re-entry knobs from the crypto config entirely). The G8
+    post-stop cooldown stamp is a RISK rail, not tax law, and still fires.
     """
 
     def run(self, ctx) -> "bool | None":
         if not ctx.fills:
             return True
+        from renquant_pipeline.kernel.asset_class import wash_sale_applies, resolve_asset_class  # noqa: PLC0415
+        stamp_wash = wash_sale_applies(
+            resolve_asset_class(getattr(ctx, "config", {}) or {})
+        )
         today = pd.Timestamp(ctx.today).date()
         # Reconstruct which fills came from which ExitSignal by ticker.
         exit_lookup: dict[str, str] = {}
@@ -229,7 +239,7 @@ class StampWashSaleTask(Task):
             t = fill.ticker
             held = ctx.execution_backend.get_position_quantity(t)
             # Full liquidate: backend now reports 0 shares (post-fill).
-            if held <= 0:
+            if held <= 0 and stamp_wash:
                 ctx.last_sell_dates[t] = today
             # G8: path-rule exits stamp cooldown date regardless of partial
             et = exit_lookup.get(t, "")

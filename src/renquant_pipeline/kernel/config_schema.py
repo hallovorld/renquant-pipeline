@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -50,6 +50,10 @@ class RegimeSchema(BaseModel):
 class StrategyConfigSchema(BaseModel):
     model_config = ConfigDict(extra="allow")
     model_name: str
+    # Crypto RFC 2026-07-10 P11: the ONE asset-class switch. Absent means
+    # us_equity (byte-identical legacy behavior); a typo'd value fails
+    # validation instead of silently trading under the wrong policy.
+    asset_class: Literal["us_equity", "crypto"] = "us_equity"
     watchlist: list[str] = Field(min_length=1)
     benchmark: str
     wash_sale_days: int = Field(ge=0, le=61)

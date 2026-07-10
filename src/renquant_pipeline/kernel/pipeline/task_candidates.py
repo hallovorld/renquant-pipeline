@@ -36,6 +36,9 @@ class WashSaleFilterTask(Task):
       - sales OUTSIDE window pass (rule doesn't apply)
 
     Config:
+      asset_class          : str — "crypto" bypasses §1091 entirely (crypto
+                             is PROPERTY; RFC 2026-07-10 P5). Absent ⇒
+                             "us_equity" ⇒ byte-identical equity behavior.
       wash_sale_days       : int — window in days (default 30)
       wash_sale_tax_rate   : float — combined federal+state rate (0.30)
       wash_sale_discount_rate : float — for NPV (0.05)
@@ -43,6 +46,7 @@ class WashSaleFilterTask(Task):
     """
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
+        from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
         from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
         wash_days = int(tc.config.get("wash_sale_days", 0))
         tax_rate = float(tc.config.get("wash_sale_tax_rate", 0.30))
@@ -58,6 +62,7 @@ class WashSaleFilterTask(Task):
             discount_rate=disc,
             estimated_hold_years=hold_yrs,
             expected_dollar_return=None,   # μ̂ not yet known at this stage
+            asset_class=resolve_asset_class(tc.config or {}),
         )
         if blocked:
             tc.blocked_by = f"wash_sale:{reason}"

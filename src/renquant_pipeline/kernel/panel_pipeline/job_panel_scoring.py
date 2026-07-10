@@ -3553,16 +3553,31 @@ class ApplyRealizedVolFallbackTask(Task):
         kelly_cfg = ctx.config.get("ranking", {}).get("kelly_sizing", {})
         if not bool(kelly_cfg.get("use_realized_vol_fallback", False)):
             return
+        # Crypto RFC 2026-07-10 P4/P7: σ-clip DEFAULTS and the annualization
+        # factor are asset-class-aware — us_equity keeps [0.05, 1.50] @ √252
+        # byte-identically; crypto defaults to [0.20, 3.00] @ √365 (realized
+        # crypto vol of 60–150%+ must not pin a 1.50 ceiling or Kelly cannot
+        # discriminate vol across names). Explicit config keys still win.
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            annualization_days_for,
+            resolve_asset_class,
+            sigma_clip_bounds_for,
+        )
+        asset_class = resolve_asset_class(ctx.config or {})
+        default_floor, default_ceiling = sigma_clip_bounds_for(asset_class)
+        ann_days = annualization_days_for(asset_class)
         window = int(kelly_cfg.get("realized_vol_window_days", 60))
-        floor = float(kelly_cfg.get("realized_vol_floor", 0.05))     # 5% σ floor
-        ceiling = float(kelly_cfg.get("realized_vol_ceiling", 1.50)) # 150% σ cap
+        floor = float(kelly_cfg.get("realized_vol_floor", default_floor))
+        ceiling = float(kelly_cfg.get("realized_vol_ceiling", default_ceiling))
 
         ohlcv = getattr(ctx, "ohlcv", None) or {}
         n_filled = 0
         for c in ctx.candidates:
             if getattr(c, "sigma", None) is not None and math.isfinite(c.sigma):
                 continue  # already populated by NGBoost
-            sig = _realized_vol_annualized(ohlcv.get(c.ticker), window)
+            sig = _realized_vol_annualized(
+                ohlcv.get(c.ticker), window, annualization_days=ann_days
+            )
             if sig is not None:
                 c.sigma = float(np.clip(sig, floor, ceiling))
                 n_filled += 1
@@ -3570,7 +3585,9 @@ class ApplyRealizedVolFallbackTask(Task):
         for ticker, hs in ctx.holdings.items():
             if getattr(hs, "sigma", None) is not None and math.isfinite(hs.sigma):
                 continue
-            sig = _realized_vol_annualized(ohlcv.get(ticker), window)
+            sig = _realized_vol_annualized(
+                ohlcv.get(ticker), window, annualization_days=ann_days
+            )
             if sig is not None:
                 hs.sigma = float(np.clip(sig, floor, ceiling))
 
@@ -3582,9 +3599,12 @@ class ApplyRealizedVolFallbackTask(Task):
             )
 
 
-def _realized_vol_annualized(df, window: int):
+def _realized_vol_annualized(df, window: int, *, annualization_days: float = 252.0):
     """Return annualized stdev of daily returns over last `window` bars,
     or None if df is missing / has insufficient history.
+
+    ``annualization_days`` (crypto RFC 2026-07-10 P4): 252 for us_equity
+    (default, byte-identical), 365 for the always-open crypto market.
 
     Pure function — mirrors RealizedVolGateTask._realized_vol_annualized
     so we don't create a kernel.pipeline → kernel.panel_pipeline cycle.
@@ -3603,7 +3623,7 @@ def _realized_vol_annualized(df, window: int):
     std = float(rets.std())
     if not math.isfinite(std):
         return None
-    return std * math.sqrt(252.0)
+    return std * math.sqrt(float(annualization_days))
 
 
 def _kelly_sigma_horizon_days(kelly_cfg: dict) -> float:

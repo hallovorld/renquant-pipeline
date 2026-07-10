@@ -34,11 +34,16 @@ except Exception:  # pragma: no cover — defensive, mcal is in .venv
 def _settle_date(sale_date: pd.Timestamp, n_days: int) -> pd.Timestamp:
     """Trading-day arithmetic: ``sale_date + n_days`` NYSE sessions.
 
+    ``n_days=0`` settles INSTANTLY (same date) — the crypto T+0 path
+    (RFC 2026-07-10 P3); no calendar is consulted.
+
     Falls back to calendar-day arithmetic (skipping weekends only) if
     pandas_market_calendars is unavailable. Holidays would then NOT
     skip — caller should treat that as a degraded path.
     """
     sale = pd.Timestamp(sale_date).normalize()
+    if n_days <= 0:
+        return sale
     if _NYSE is None:
         # Skip weekends only. Caller should warn.
         out = sale
@@ -91,6 +96,22 @@ class T2CashQueue:
 
     settlement_days: int = 1
     _pending: List[PendingCashEntry] = field(default_factory=list)
+
+    @classmethod
+    def for_asset_class(
+        cls, asset_class: str, *, equity_days: int = 1
+    ) -> "T2CashQueue":
+        """Settlement queue with the asset class's lag (RFC 2026-07-10 P3).
+
+        ``us_equity`` keeps T+``equity_days`` NYSE sessions (default 1,
+        byte-identical); ``crypto`` settles INSTANTLY (``settlement_days=0``
+        — proceeds drain the same bar, the T+1 queue is structurally
+        bypassed). Unknown asset classes fail closed in the policy module.
+        """
+        from renquant_pipeline.kernel.asset_class import settlement_days_for  # noqa: PLC0415
+        return cls(
+            settlement_days=settlement_days_for(asset_class, equity_days=equity_days)
+        )
 
     def add_pending(self, sale_date: pd.Timestamp, amount: float) -> None:
         """Queue proceeds for T+N settlement.

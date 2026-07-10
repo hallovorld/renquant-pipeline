@@ -60,6 +60,7 @@ class SimBackend(ExecutionBackend):
         exec_enabled: bool = False,
         t2_days: int = 0,
         allow_fractional: bool = False,
+        asset_class: str = "us_equity",
     ) -> None:
         if not math.isfinite(starting_cash) or starting_cash < 0:
             raise ValueError(
@@ -77,8 +78,13 @@ class SimBackend(ExecutionBackend):
         # backtests stay byte-identical. When True the sim MODELS fractional
         # quantities so the readonly/shadow/sim path validates live behaviour.
         self._allow_fractional = bool(allow_fractional)
-        # T+N only when execution model on AND t2_days > 0.
+        # T+N only when execution model on AND t2_days > 0. Crypto RFC
+        # 2026-07-10 P3: crypto settles instantly (T+0) — the settlement
+        # queue is structurally bypassed regardless of any configured
+        # t2_days, keyed off the ONE asset-class switch (never a hand-set 0).
+        from renquant_pipeline.kernel.asset_class import settlement_days_for  # noqa: PLC0415
         effective_t2 = t2_days if exec_enabled and t2_days > 0 else 0
+        effective_t2 = settlement_days_for(asset_class, equity_days=effective_t2)
         self._t2_queue: T2CashQueue | None = (
             T2CashQueue(settlement_days=effective_t2) if effective_t2 > 0 else None
         )

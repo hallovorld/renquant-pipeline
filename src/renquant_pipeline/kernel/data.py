@@ -1,6 +1,8 @@
 """OHLCV data fetching with local Parquet cache.
 
-Self-contained — no common/ imports.
+Self-contained — no hard common/ imports (kernel.asset_class soft-consumes
+renquant_common's canonical ALWAYS_OPEN calendar mode when present and
+degrades to identical local UTC-day arithmetic otherwise).
 """
 from __future__ import annotations
 
@@ -29,6 +31,29 @@ def _market_timestamp(value=None) -> pd.Timestamp:
         else:
             ts = ts.tz_convert("America/New_York")
     return ts
+
+
+def _last_completed_session(ref_ts: pd.Timestamp, asset_class: str):
+    """Most recent completed session as of ``ref_ts`` for the asset class.
+
+    Crypto RFC 2026-07-10 P1: for ``asset_class="crypto"`` the session
+    calendar is always-open (sessions = UTC calendar days; canonical mode in
+    ``renquant_common.market_calendar``), so weekend bars are REQUIRED and
+    the freshness clock is the last completed UTC day, not the last NYSE
+    close. Equity keeps the NYSE session clock byte-identically.
+    """
+    from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+        is_crypto,
+        last_completed_always_open_session,
+    )
+    if is_crypto(asset_class):
+        try:
+            return last_completed_always_open_session(ref_ts)
+        except Exception:
+            # Mirror the equity branch's degraded-path contract (None ⇒
+            # caller applies its conservative fallback).
+            return None
+    return _last_completed_nyse_session(ref_ts)
 
 
 def _last_completed_nyse_session(ref_ts: pd.Timestamp):
@@ -193,12 +218,16 @@ class LocalStore:
         start: str | None = None,
         end: str | None = None,
         tolerance_days: int | None = None,
+        asset_class: str = "us_equity",
     ) -> bool:
         """Check whether the local cache covers [start, end] AND is fresh.
 
         Freshness rule (default, ``tolerance_days=None``): cache.max_date
-        must be ≥ the last completed NYSE session as of the reference
-        timestamp. Reference is ``end`` if given, else the current wall
+        must be ≥ the last completed session as of the reference timestamp
+        — NYSE sessions for ``asset_class="us_equity"`` (the default,
+        byte-identical legacy behavior), UTC calendar days for
+        ``asset_class="crypto"`` (RFC 2026-07-10 P1: weekend bars required).
+        Reference is ``end`` if given, else the current wall
         clock. If ``end`` is a date-only string, it is interpreted as
         pre-close on that date; pass a timezone-aware post-close timestamp
         to require that same day's bar.
@@ -237,8 +266,8 @@ class LocalStore:
                 return False
             return True
 
-        # NYSE-aware staleness
-        last_complete = _last_completed_nyse_session(ref)
+        # Session-calendar-aware staleness (NYSE / always-open per asset class)
+        last_complete = _last_completed_session(ref, asset_class)
         if last_complete is not None:
             if cache_max.date() < last_complete:
                 return False
@@ -274,6 +303,7 @@ def fetch_ohlcv(
     provider: str = "yfinance",
     cache: bool = True,
     timeout_sec: float = 30.0,
+    asset_class: str = "us_equity",
 ) -> pd.DataFrame:
     """Fetch OHLCV data, using a local Parquet cache when possible.
 
@@ -284,7 +314,8 @@ def fetch_ohlcv(
     """
     store = _get_default_store()
 
-    if cache and store.has_range(symbol, start=start, end=end):
+    if cache and store.has_range(symbol, start=start, end=end,
+                                 asset_class=asset_class):
         cached = store.load(symbol, start=start, end=end)
         if cached is not None:
             return cached

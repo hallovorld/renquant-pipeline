@@ -73,7 +73,22 @@ class DataFreshnessGateTask(Task):
 
         ref_ts = self._ref_timestamp(ctx)
         ref_date = self._ref_date(getattr(ctx, "today", None), ref_ts)
-        last_close = self._last_completed_nyse_close(ref_date, ref_ts)
+        # Crypto RFC 2026-07-10 P1: crypto sessions are UTC calendar days —
+        # weekend bars are REQUIRED, and Sunday data must not be judged
+        # against Friday's NYSE close. Absent asset_class ⇒ us_equity ⇒
+        # byte-identical NYSE behavior.
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            is_crypto,
+            last_completed_always_open_session,
+            resolve_asset_class,
+        )
+        asset_class = resolve_asset_class(getattr(ctx, "config", {}) or {})
+        if is_crypto(asset_class):
+            last_close = last_completed_always_open_session(
+                ref_ts if ref_ts is not None else ref_date
+            )
+        else:
+            last_close = self._last_completed_nyse_close(ref_date, ref_ts)
 
         if last_close is None:
             log.warning(
@@ -119,11 +134,12 @@ class DataFreshnessGateTask(Task):
                 stale_syms.append((sym, max_d))
 
         if stale_syms:
+            calendar_label = "UTC-day" if is_crypto(asset_class) else "NYSE"
             sample = ", ".join(f"{s}@{d}" for s, d in stale_syms[:5])
             n = len(stale_syms)
             msg = (
                 f"DataFreshnessGateTask: PANEL STALE — {n} symbol(s) lack "
-                f"the last completed NYSE close ({last_close}). "
+                f"the last completed {calendar_label} close ({last_close}). "
                 f"Sample: {sample}"
                 + (f" (+{n - 5} more)" if n > 5 else "")
                 + ". Refusing to submit any orders. Run "

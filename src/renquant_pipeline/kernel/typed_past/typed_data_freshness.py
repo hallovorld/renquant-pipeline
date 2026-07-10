@@ -29,13 +29,21 @@ log = logging.getLogger("kernel.typed_past.data_freshness")
 
 
 class TypedDataFreshnessGate:
-    """Hard-fail when past.ohlcv is older than last completed NYSE session.
+    """Hard-fail when past.ohlcv is older than the last completed session.
+
+    Session calendar per asset class (crypto RFC 2026-07-10 P1): NYSE for
+    ``us_equity`` (default, byte-identical), UTC calendar days for
+    ``crypto`` (weekend bars required; freshness never judged against an
+    NYSE close).
 
     TypedTask contract: ``values_in_time(t, past) -> TaskResult``.
     """
 
-    def __init__(self, *, enabled: bool = True):
+    def __init__(self, *, enabled: bool = True, asset_class: str = "us_equity"):
+        from renquant_pipeline.kernel.asset_class import is_crypto  # noqa: PLC0415
         self.enabled = enabled
+        self.asset_class = asset_class
+        self._crypto = is_crypto(asset_class)  # validates the name fail-closed
 
     def values_in_time(self, t: pd.Timestamp, past: Past) -> TaskResult:
         if not self.enabled:
@@ -50,7 +58,13 @@ class TypedDataFreshnessGate:
             return TaskResult(continue_chain=True)
 
         ref_date = t.date() if isinstance(t, pd.Timestamp) else _dt.date.today()
-        last_close = _last_completed_nyse_close(ref_date)
+        if self._crypto:
+            from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+                last_completed_always_open_session,
+            )
+            last_close = last_completed_always_open_session(ref_date)
+        else:
+            last_close = _last_completed_nyse_close(ref_date)
         if last_close is None:
             log.warning(
                 "TypedDataFreshnessGate: no NYSE session in last 14d before %s",
@@ -60,9 +74,11 @@ class TypedDataFreshnessGate:
 
         max_d = past.ohlcv.index.max().date()
         if max_d < last_close:
+            calendar_label = "UTC-day" if self._crypto else "NYSE"
             msg = (
                 f"TypedDataFreshnessGate: PANEL STALE — max date {max_d} < "
-                f"last completed NYSE close {last_close}. Refusing to continue."
+                f"last completed {calendar_label} close {last_close}. "
+                "Refusing to continue."
             )
             log.error(msg)
             raise RuntimeError(msg)

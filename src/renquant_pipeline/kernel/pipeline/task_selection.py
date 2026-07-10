@@ -20,6 +20,7 @@ class PrepareSelectionTask(Task):
     """Compute open slots, apply BEAR cap, build SelectionContext → ctx._sel_ctx."""
 
     def run(self, ctx: InferenceContext) -> bool | None:
+        from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
         from renquant_pipeline.kernel.selection import SelectionContext  # noqa: PLC0415
 
         config         = ctx.config
@@ -85,6 +86,9 @@ class PrepareSelectionTask(Task):
             tiered_thresholds = tiered,
             open_slots        = open_slots,
             bear_only         = bool(ctx.bear_only),
+            # Crypto RFC 2026-07-10 P5: §1091 bypass keyed off the ONE
+            # top-level asset_class switch (absent ⇒ us_equity ⇒ identical).
+            asset_class       = resolve_asset_class(config),
         )
 
 

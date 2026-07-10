@@ -21,6 +21,12 @@ from .task_benchmark_sleeve import (
 log = logging.getLogger("kernel.pipeline.sell")
 
 
+def _tc_asset_class(tc: TickerInferenceContext) -> str:
+    """Asset class of the running config (P2 hold clocks); default us_equity."""
+    from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
+    return resolve_asset_class(getattr(tc, "config", {}) or {})
+
+
 # Module-level taxonomy of exit types — single source of truth so the
 # earnings-blackout veto, the SellGateB μ/σ guard, and any future
 # sector-conditional or regime-conditional sell gate all classify exits
@@ -167,10 +173,12 @@ class EvaluateExitsTask(Task):
     """Run the 5-exit priority chain; update tc.holding and tc.exit_signal."""
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
+        from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
         from renquant_pipeline.kernel.exits import compute_exits  # noqa: PLC0415
 
         sig, updated_hs = compute_exits(
-            tc.price, tc.today, tc.model_action, tc.holding, tc.exit_params
+            tc.price, tc.today, tc.model_action, tc.holding, tc.exit_params,
+            asset_class=resolve_asset_class(tc.config or {}),
         )
         tc.holding = updated_hs
 
@@ -397,6 +405,7 @@ class PanelConvictionExitTask(Task):
                 regime=soft_exit_thesis_regime(hs, getattr(tc, "regime", None)),
                 today=getattr(tc, "today", None),
                 holding=hs,
+                asset_class=_tc_asset_class(tc),
             )
             if suppress:
                 log.info(
@@ -517,6 +526,7 @@ class ModelProtectionExitTask(Task):
             regime=soft_exit_thesis_regime(hs, getattr(tc, "regime", None)),
             today=getattr(tc, "today", None),
             holding=hs,
+            asset_class=_tc_asset_class(tc),
         )
         if suppress:
             log.info("ModelProtectionExitTask [%s]: EXIT held by horizon gate (%s)",
