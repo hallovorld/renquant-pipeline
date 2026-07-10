@@ -15,10 +15,57 @@ WHY/DIR:   D6 preregistered replay protocol (orchestrator#443, merged) —
 EVIDENCE:  n/a (harness/tooling change; see "Not implemented / caveats"
            below for the honest scope boundary against #443's final §2.3/§3
            text, and Tests below for regression-pinning evidence)
-NEXT:      A D6 protocol runner (not yet built) to orchestrate the
-           §3(a)/(b)/(c) estimand decomposition; the deferred one-share
-           rescue + post-round cap/sector recheck belong in the live
+NEXT:      Codex re-review of the fail-closed sector-map check and the
+           execution_fidelity/promotion_eligible stamping (see
+           "Correction" below). After that: a D6 protocol runner (not yet
+           built) to orchestrate the §3(a)/(b)/(c) estimand decomposition;
+           the deferred one-share rescue + post-round cap/sector recheck belong in the live
            governor/allocator implementation (#179), not this harness.
+
+## Correction (2026-07-10, same day — Codex review on the prior head)
+
+Codex found two real gaps in the prior head:
+
+1. **Sector-map coverage was silently permissive.** `--enforce-caps` with no
+   `--sector-map-json` (or a map covering only SOME active tickers) only
+   logged a warning; `apply_d6_cap_projection` then applied no sector
+   constraint at all to the uncovered tickers. For a run that claims D6
+   sector-cap fidelity, a missing hard constraint silently becoming no
+   constraint is a correctness bug, not a documented limitation. **Fixed**:
+   new `sector_map_coverage_gap()` (math module) scans every ticker across
+   every replay bar; `run_ab_replay.py`'s CLI now FAILS CLOSED (writes an
+   `invalid_experiment` artifact, exits 2) when the supplied map doesn't
+   cover every active ticker, unless the new `--allow-partial-sector-map`
+   escape hatch is passed (mirrors the existing
+   `--allow-overlapping-forward-horizon` research-only pattern) — and even
+   then the run is unconditionally stamped non-decision-grade (point 2).
+2. **Result-laundering risk**: this doc already documented the harness as
+   "L1/L2-only" in the caveats below, but the `## NEXT` section separately
+   called the resulting runs "convention-faithful arms" without repeating
+   that caveat — a reader of NEXT alone could mistake a floor-only result
+   for decision-grade D6 end-to-end evidence. **Fixed**: every payload
+   where ANY D6 convention is engaged now carries a machine-readable
+   `execution_fidelity: "L1_L2_ONLY"` / `promotion_eligible: false` stamp
+   (in both `constraint_fidelity` and `replay_conventions`), reusing the
+   EXISTING `constraints_decision_grade` gate that already blocks
+   promotion on missing hard-constraint families (`constraint_fidelity_
+   block`, `apply_promotion_gate_to_significance`, `assemble_verdict`) —
+   not a new parallel gate. `assemble_verdict` therefore always returns
+   `promotion_candidate: None` with an explicit "not decision-grade"
+   rationale whenever conventions are engaged, regardless of what the
+   underlying significance/violation blocks would otherwise show. Default
+   (no-conventions) evidence is unaffected — these keys are strictly
+   additive, pinned by `TestDefaultModeUnchanged`.
+
+**Cross-check on the #179 reference** (read-only — #179 is already merged,
+not modified here): `pipeline#179`'s `governor_sizing.py` module docstring
+and `_execute_deltas`'s residual pass DO implement a generalized one-share
+deferred-rescue pattern (re-offering leftover cash one share at a time in
+conviction order, S6 A-3-style) — so the "belongs in the live governor
+implementation" pointer above is accurate, not just an assumption. Whether
+`#179` also implements a full post-round cap/sector/correlation recheck ON
+EXECUTED quantities was not independently re-verified here (out of this
+PR's scope).
 
 ## What
 
@@ -72,7 +119,8 @@ silent fractional fallback).
 
 ## Tests
 
-35 new tests in `tests/test_replay_d6_conventions.py`:
+44 tests in `tests/test_replay_d6_conventions.py` (35 original + 9 new for
+the 2026-07-10 correction):
 byte-identity pin vs the pre-change fixture; inert all-defaults conventions;
 kwarg validation (tax/integer require stateful); exact cash conservation with
 cost+tax; deployed-fraction ≠ turnover; carried `w_current` reaches the
@@ -82,7 +130,13 @@ executed-never-above-cap post-round, integral shares, post-round carry,
 missing-price fail-loud; sector projection down-only + proportional + unmapped
 tickers unconstrained + per-name clip + stateless/stateful breach counters;
 CLI end-to-end flags, default schema unchanged, flag validation, `--cost-bps`
-re-stamp, loader price stamping.
+re-stamp, loader price stamping; **new**: `sector_map_coverage_gap` full/
+partial/no-map coverage (mixed mapped/unmapped tickers across bars); CLI
+fail-closed on partial and on no-sector-map (`invalid_experiment` +
+`reason=sector_map_incomplete`); `--allow-partial-sector-map` escape hatch
+(proceeds but stays non-decision-grade); execution_fidelity/
+promotion_eligible rejection even with FULL sector coverage; default-mode
+(no conventions) schema stays additive-only.
 
 Full suite: **1364 passed, 8 skipped, 1 failed** in the authoring environment — the
 single failure
@@ -92,7 +146,9 @@ edit: 1329 passed, same 1 failed). Zero regressions. Re-run 2026-07-10 (post-#44
 merge, no rebase needed — main had not moved): **1372 passed, 7 skipped, 0 failed**
 — the previously-noted xgboost failure does not reproduce in this environment
 (likely an artifact-availability difference between environments, not a code
-change); no other discrepancy.
+change); no other discrepancy. Re-run again after this correction: **1487
+passed, 7 skipped, 0 failed** — zero regressions, xgboost failure still does
+not reproduce here.
 
 ## Not implemented / caveats (explicit)
 
@@ -119,7 +175,12 @@ change); no other discrepancy.
   reproduction of L3's most sophisticated rescue/recheck logic — that logic
   belongs in the live `deployment_governor.py`/`deployment_allocator.py`
   implementation (orchestrator#443-D2/D3, tracked in the separate governor PR
-  #179), not this replay harness.
+  #179), not this replay harness. **This limitation is now MECHANICALLY
+  enforced** (2026-07-10 correction above), not just documented: every
+  payload with any convention engaged carries
+  `execution_fidelity="L1_L2_ONLY"` / `promotion_eligible=False`, and the
+  promotion/verdict gate rejects it as decision-grade regardless of the
+  underlying significance numbers.
 - **L1/L2/combined attribution (§3(a)/(b)/(c))**: this PR provides the
   CONVENTIONS (tax/integer/stateful/caps) that any of the three estimand
   comparisons would run under; it does not itself orchestrate the (a)/(b)/(c)
@@ -137,5 +198,8 @@ change); no other discrepancy.
 
 Orchestrator D6 protocol runs (S0 tuning/evaluation splits) can now pass
 `--stateful --tax --integer-shares --enforce-caps --sector-map-json <map>
---cost-bps 5 --fwd-horizon-days 1` for convention-faithful arms. Independent of
-(and not touching) the open governor PR #179 kernel files.
+--cost-bps 5 --fwd-horizon-days 1` for L1/L2-only convention-faithful arms
+(NOT decision-grade / NOT promotable — see the mechanical
+`execution_fidelity`/`promotion_eligible` stamp above; full L3 fidelity
+requires the live governor implementation, `pipeline#179`, already merged).
+Independent of (and not touching) that governor PR's kernel files.

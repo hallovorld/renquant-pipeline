@@ -31,6 +31,7 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     ReplayConventions,
     paired_daily_returns,
     replay_all,
+    sector_map_coverage_gap,
 )
 from renquant_pipeline.kernel.portfolio_qp.alpha_portfolio import alpha_tilt_long_only
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (
@@ -422,16 +423,37 @@ def run_replay(
     # Block 5: violation report
     violation_block = violation_report_block(results)
     constraint_fidelity = constraint_fidelity_block(bars)
+    # execution_fidelity gate (codex #180 review, 2026-07-10): this harness's
+    # D6 conventions are L1/L2-ONLY — no deferred one-share rescue and no
+    # post-round cap/sector recheck on EXECUTED quantities (both belong to
+    # the live L3 governor implementation, pipeline#179's governor_sizing.py,
+    # not this harness). ANY engaged convention must therefore stamp
+    # promotion_eligible=False and fold into the SAME decision-grade gate
+    # that already blocks promotion on missing hard-constraint families —
+    # reusing the existing gate rather than adding a parallel one.
+    execution_fidelity_ok = conventions is None or not conventions.any_enabled
+    # Additive-only (mirrors the replay_conventions/per-allocator D6 keys
+    # elsewhere in this function): these fields are only added when a D6
+    # convention is actually engaged, so the pre-D6 default-mode evidence
+    # schema stays byte-identical (TestDefaultModeUnchanged pin).
+    if not execution_fidelity_ok:
+        constraint_fidelity["execution_fidelity"] = "L1_L2_ONLY"
+        constraint_fidelity["promotion_eligible"] = False
+        constraint_fidelity["missing_critical_families"] = list(
+            constraint_fidelity["missing_critical_families"]
+        ) + ["execution_fidelity_l1_l2_only"]
+        constraint_fidelity["decision_grade"] = False
+    constraints_decision_grade = constraint_fidelity["decision_grade"]
     significance_block = apply_promotion_gate_to_significance(
         significance_block,
         violation_block,
-        constraints_decision_grade=constraint_fidelity["decision_grade"],
+        constraints_decision_grade=constraints_decision_grade,
     )
 
     # Block 6: verdict
     verdict = assemble_verdict(
         significance_block, paired_block, violation_block, incumbent=incumbent,
-        constraints_decision_grade=constraint_fidelity["decision_grade"],
+        constraints_decision_grade=constraints_decision_grade,
     )
 
     payload = {
@@ -454,7 +476,14 @@ def run_replay(
     # appears when a convention is engaged, so pre-D6 evidence stays
     # byte-identical and existing keys are never changed.
     if conventions is not None and conventions.any_enabled:
-        payload["replay_conventions"] = conventions.to_dict()
+        conv_dict = conventions.to_dict()
+        # codex #180 review, 2026-07-10: stamp the same execution_fidelity /
+        # promotion_eligible verdict here too (mirrors constraint_fidelity
+        # above) so a consumer reading ONLY this block still sees the L1/L2-
+        # only caveat, not just the convention config echo.
+        conv_dict["execution_fidelity"] = "L1_L2_ONLY"
+        conv_dict["promotion_eligible"] = False
+        payload["replay_conventions"] = conv_dict
     return payload
 
 
@@ -596,6 +625,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
              "key. Sessions' tickers map through it; unmapped tickers "
              "carry no sector constraint",
     )
+    p.add_argument(
+        "--allow-partial-sector-map", action="store_true",
+        help="research-only escape hatch (mirrors "
+             "--allow-overlapping-forward-horizon): with --enforce-caps, "
+             "proceed even when --sector-map-json does not cover every "
+             "active ticker across the replay bars. Without this flag, an "
+             "incomplete map FAILS CLOSED (D6 §4 requires full sector-cap "
+             "coverage; a missing hard constraint must not silently become "
+             "no constraint). The resulting run is always non-decision-grade "
+             "regardless of this flag (see execution_fidelity/"
+             "promotion_eligible in the output)",
+    )
     p.add_argument("--per-name-cap", type=float, default=0.12,
                    help="D6 §4 per-name weight cap for --enforce-caps")
     p.add_argument("--sector-cap", type=float, default=0.35,
@@ -721,6 +762,56 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     conventions = _build_conventions(args)
 
+    # D6 §4 sector-cap fail-closed check (codex #180 review, 2026-07-10):
+    # apply_d6_cap_projection deliberately leaves an unmapped ticker
+    # unconstrained (no silent guessing of sector membership) — but that
+    # permissive behavior must not silently convert a missing hard
+    # constraint into "no sector cap at all" for a run that claims D6
+    # fidelity. Fail closed unless --allow-partial-sector-map explicitly
+    # opts into the research-only path (whose output is non-decision-grade
+    # regardless — see execution_fidelity in the payload).
+    if conventions is not None and conventions.enforce_caps:
+        gap = sector_map_coverage_gap(bars, conventions)
+        if gap and not args.allow_partial_sector_map:
+            invalid = {
+                "invalid_experiment": True,
+                "reason": "sector_map_incomplete",
+                "detail": (
+                    f"{len(gap)} ticker(s) appearing in the replay bars are "
+                    "not covered by --sector-map-json ("
+                    f"{'no map supplied' if not conventions.sector_map else 'partial map'}"
+                    "). D6 §4 requires the sector cap to bind on every "
+                    "active ticker; apply_d6_cap_projection leaves an "
+                    "unmapped ticker unconstrained, which would silently "
+                    "convert a missing hard constraint into no constraint. "
+                    "Supply a complete sector map, or pass "
+                    "--allow-partial-sector-map for a research-only run "
+                    "(marked non-decision-grade / non-promotable)."
+                ),
+                "missing_sector_map_tickers": list(gap),
+                "wf_artifact_root": args.wf_artifact_root,
+                "cut_range": [args.start_cut, args.end_cut],
+                "fwd_horizon_days": args.fwd_horizon_days,
+                "allocators": args.allocators.split(","),
+                "incumbent": args.incumbent,
+            }
+            out_path = Path(args.out)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(invalid, indent=2, sort_keys=True))
+            log.error(
+                "sector map missing %d ticker(s) — wrote invalid_experiment "
+                "to %s (pass --allow-partial-sector-map for a research-only "
+                "run)",
+                len(gap), out_path,
+            )
+            return 2
+        if gap:
+            log.warning(
+                "--allow-partial-sector-map: %d ticker(s) carry no sector "
+                "constraint (%s) — this run is non-decision-grade",
+                len(gap), ", ".join(gap[:10]) + ("..." if len(gap) > 10 else ""),
+            )
+
     payload = run_replay(
         bars, args.allocators.split(","),
         incumbent=args.incumbent,
@@ -774,11 +865,9 @@ def _build_conventions(args) -> Optional[ReplayConventions]:
                 f"--sector-map-json {args.sector_map_json!r} must contain a "
                 "JSON object ({ticker: sector} or {'sector_map': {...}})"
             )
-    if args.enforce_caps and not sector_map:
-        log.warning(
-            "--enforce-caps without --sector-map-json: only the per-name "
-            "cap is enforced; sector caps need a sector map"
-        )
+    # (sector-map coverage is validated after bars load, in main() — see
+    # sector_map_coverage_gap; that check supersedes the previous
+    # warn-only-if-no-map-at-all behavior with a fail-closed-by-default one)
     return ReplayConventions(
         stateful=args.stateful,
         tax=args.tax,

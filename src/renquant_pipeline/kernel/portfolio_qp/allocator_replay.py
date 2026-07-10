@@ -478,6 +478,34 @@ def apply_d6_cap_projection(
     return w, n_name_breaches, n_sector_breaches
 
 
+def sector_map_coverage_gap(
+    bars: Sequence["AllocatorReplayBar"],
+    conv: "ReplayConventions",
+) -> tuple[str, ...]:
+    """Tickers appearing in any bar's snapshot but absent from
+    ``conv.sector_map`` (codex #180 review, 2026-07-10).
+
+    ``apply_d6_cap_projection`` deliberately leaves an unmapped ticker
+    unconstrained (no silent guessing of sector membership) — but a
+    *caller* that claims to be running a D6 sector-cap replay must not
+    let that permissive behavior silently convert a missing hard
+    constraint into no constraint. This function surfaces the gap so the
+    CLI/caller can decide to fail closed (default, D6-strict mode) or
+    proceed only under an explicit exploratory/non-decision-grade mode.
+
+    Returns an empty tuple when every ticker appearing in ``bars`` is a
+    key in ``conv.sector_map`` (including the vacuous case of zero bars
+    or a conventions object with ``enforce_caps=False``).
+    """
+    sector_map = conv.sector_map or {}
+    missing: set[str] = set()
+    for bar in bars:
+        for t in bar.snap.tickers:
+            if t not in sector_map:
+                missing.add(t)
+    return tuple(sorted(missing))
+
+
 def _record_family_violations(
     res: ReplayResult,
     snap: ConstraintSnapshot,
