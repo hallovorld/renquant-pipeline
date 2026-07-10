@@ -32,6 +32,8 @@ ALLOWED_BROKERS: frozenset[str] = frozenset({
     "alpaca-shorts",
     "alpaca_shorts",
     "alpaca_shadow",    # 2026-05-19 full-e2e shadow via ReadOnlyBrokerWrapper
+    "alpaca_shadow_a",  # D6-§2a two-arm admission experiment, arm S-0.5
+    "alpaca_shadow_b",  # D6-§2a two-arm admission experiment, arm S-1.0 (control)
     "ibkr",
 })
 
