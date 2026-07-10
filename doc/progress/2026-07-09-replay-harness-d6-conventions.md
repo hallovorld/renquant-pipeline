@@ -73,10 +73,15 @@ tickers unconstrained + per-name clip + stateless/stateful breach counters;
 CLI end-to-end flags, default schema unchanged, flag validation, `--cost-bps`
 re-stamp, loader price stamping.
 
-Full suite: **1364 passed, 8 skipped, 1 failed** — the single failure
+Full suite: **1364 passed, 8 skipped, 1 failed** in the authoring environment — the
+single failure
 (`test_xgboost_scorer_contract.py::test_panel_scoring_loads_real_xgboost_artifact_without_explicit_scores`)
-is pre-existing on pristine origin/main in this environment (verified via
-`git stash` before any edit: 1329 passed, same 1 failed). Zero regressions.
+was pre-existing on pristine origin/main there (verified via `git stash` before any
+edit: 1329 passed, same 1 failed). Zero regressions. Re-run 2026-07-10 (post-#443
+merge, no rebase needed — main had not moved): **1372 passed, 7 skipped, 0 failed**
+— the previously-noted xgboost failure does not reproduce in this environment
+(likely an artifact-availability difference between environments, not a code
+change); no other discrepancy.
 
 ## Not implemented / caveats (explicit)
 
@@ -88,6 +93,34 @@ is pre-existing on pristine origin/main in this environment (verified via
 - The D6 §4 turnover / drawdown gates are estimand-level checks on the evidence
   output (protocol runner's job), not in-arm projections — only the name/sector
   caps are enforced in-arm, as #445 specified.
+- **Round-down only, no deferred one-share rescue** (verified against orchestrator
+  #443's final merged §2.3 L3 spec, 2026-07-10): the executed-integer-ledger
+  fields (`E_executed`, `integer_residual`) match §2.3's ledger convention, and
+  quantization is `floor(w·PV/p)` per §2.3's "round DOWN by default" rule — but
+  §2.3 additionally permits a round-UP rescue for one share when it fits within
+  the per-name cap AND remaining investable headroom, evaluated after round-down
+  orders are funded. This harness does not implement that rescue pass (it also
+  does not implement §2.3's post-round cap/sector recheck ON THE EXECUTED
+  quantities — `--enforce-caps` projects BEFORE quantization, not after). Both
+  omissions make the harness's integer-shares convention a conservative
+  (floor-only) approximation of the real L3 layer, sufficient for evaluating
+  L1/L2 allocator questions (this PR's actual scope) but NOT a literal
+  reproduction of L3's most sophisticated rescue/recheck logic — that logic
+  belongs in the live `deployment_governor.py`/`deployment_allocator.py`
+  implementation (orchestrator#443-D2/D3, tracked in the separate governor PR
+  #179), not this replay harness.
+- **L1/L2/combined attribution (§3(a)/(b)/(c))**: this PR provides the
+  CONVENTIONS (tax/integer/stateful/caps) that any of the three estimand
+  comparisons would run under; it does not itself orchestrate the (a)/(b)/(c)
+  decomposition (same-allocator-different-E* vs allocator-variants-at-matched-E*
+  vs combined-vs-incumbent) — that estimand-level orchestration is the D6
+  protocol runner's job (not yet built), consistent with the turnover/drawdown
+  gate note above. The pre-existing allocator registry (`equal_weight_top_k`,
+  `inverse_vol_top_k`, etc., from PR #130) already supports running multiple
+  allocator variants side by side, which (b) needs; (a)'s same-allocator/
+  different-E* comparison and (c)'s combined-system framing are not yet wired
+  since neither the Governor's E* output (#179) nor a protocol-runner harness
+  exist yet to supply the second arm.
 
 ## NEXT
 
