@@ -568,7 +568,7 @@ class TestIntegerShares:
         ]
         conv = ReplayConventions(
             stateful=True, integer_shares=True, enforce_caps=True,
-            per_name_cap=0.12,
+            per_name_cap=0.12, allow_unmapped_sectors=True,
         )
         res = replay_one_allocator("s", alloc, bars, conv)
         for e, r in zip(res.executed_exposure, res.integer_residual):
@@ -827,7 +827,10 @@ class TestCapEnforcement:
         assert proj[2] == pytest.approx(0.10, abs=1e-12)
 
     def test_per_name_cap_clip_and_counter(self):
-        conv = ReplayConventions(enforce_caps=True, per_name_cap=0.12)
+        conv = ReplayConventions(
+            enforce_caps=True, per_name_cap=0.12,
+            allow_unmapped_sectors=True,   # name-cap-only = exploratory
+        )
         target = np.array([0.30, 0.10])
         proj, n_name, n_sector = apply_d6_cap_projection(
             target, ("AAA", "BBB"), conv,
@@ -836,10 +839,14 @@ class TestCapEnforcement:
         assert proj[0] == pytest.approx(0.12, abs=1e-12)
         assert proj[1] == pytest.approx(0.10, abs=1e-12)
 
-    def test_unmapped_ticker_carries_no_sector_constraint(self):
+    def test_unmapped_ticker_unconstrained_on_exploratory_path_only(self):
+        # The permissive semantics (unmapped ⇒ no sector constraint, no
+        # silent membership guessing) survive ONLY behind the explicit
+        # exploratory flag; without it this exact call fails closed
+        # (TestSectorMapFailClosed).
         conv = ReplayConventions(
             enforce_caps=True, per_name_cap=0.50, sector_cap=0.35,
-            sector_map={"AAA": "Tech"},
+            sector_map={"AAA": "Tech"}, allow_unmapped_sectors=True,
         )
         target = np.array([0.30, 0.45])
         proj, _, n_sector = apply_d6_cap_projection(
@@ -857,7 +864,9 @@ class TestCapEnforcement:
             _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.05, 0.04],
                  fwd_return=[0.10, 0.10], cost_bps=10.0),
         ]
-        conv = ReplayConventions(enforce_caps=True, per_name_cap=0.12)
+        conv = ReplayConventions(
+            enforce_caps=True, per_name_cap=0.12, allow_unmapped_sectors=True,
+        )
         res = replay_one_allocator("s", alloc, bars, conv)
         # projected: [0.12, 0.10] → gross 0.022, turn 0.22, cost 0.00022
         assert res.daily_returns_net[0] == pytest.approx(
@@ -895,6 +904,173 @@ class TestCapEnforcement:
         pv = st.portfolio_value
         tech = (st.position_value("AAA") + st.position_value("BBB")) / pv
         assert tech <= 0.20 + 1e-9
+
+
+# ── 5b. r2: sector-map fail-closed + execution-fidelity contract ────
+
+
+class TestSectorMapFailClosed:
+    """r2 #180: --enforce-caps must FAIL CLOSED when the sector map does
+    not cover every active ticker in every replay bar; the permissive
+    path survives only behind the explicit exploratory flag."""
+
+    def test_conventions_reject_enforce_caps_without_map(self):
+        with pytest.raises(ValueError, match="FAIL-CLOSED"):
+            ReplayConventions(enforce_caps=True)
+
+    def test_mixed_mapped_unmapped_universe_fails_closed_stateless(self):
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10, "ZZZ": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "ZZZ"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0]),
+        ]
+        conv = ReplayConventions(
+            enforce_caps=True, sector_map={"AAA": "Tech"},
+        )
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
+
+    def test_mixed_mapped_unmapped_universe_fails_closed_stateful(self):
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10, "ZZZ": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "ZZZ"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0], prices=[100.0, 100.0]),
+        ]
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True, enforce_caps=True,
+            sector_map={"AAA": "Tech"},
+        )
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
+
+    def test_exploratory_flag_allows_partial_map_and_marks_evidence(self):
+        bars = build_default_fixture_bars()
+        conv = ReplayConventions(
+            stateful=True, enforce_caps=True,
+            sector_map={"AAA": "Tech"},          # partial on purpose
+            allow_unmapped_sectors=True,
+        )
+        payload = run_replay(
+            bars, list(FIXTURE_ALLOCATORS),
+            incumbent=FIXTURE_INCUMBENT,
+            pbo_n_slices=FIXTURE_PBO_N_SLICES,
+            conventions=conv,
+        )
+        rc = payload["replay_conventions"]
+        assert rc["sector_coverage"] == "exploratory_unmapped_allowed"
+        assert rc["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc["promotion_eligible"] is False
+
+
+class TestExecutionFidelityGate:
+    """r2 #180 evidence contract: engaged-conventions payloads carry
+    execution_fidelity/promotion_eligible, and the promotion gate
+    REJECTS anything below L3_FULL — a floor-only / degraded result can
+    never pass."""
+
+    _FULL_MAP = {"AAA": "Tech", "BBB": "Tech", "CCC": "Energy",
+                 "DDD": "Energy"}
+
+    def _payload(self, conv):
+        bars = [
+            dataclasses.replace(
+                b, prices=np.array([120.0, 55.0, 250.0, 33.0]),
+            )
+            for b in build_default_fixture_bars()
+        ]
+        return run_replay(
+            bars, list(FIXTURE_ALLOCATORS),
+            incumbent=FIXTURE_INCUMBENT,
+            pbo_n_slices=FIXTURE_PBO_N_SLICES,
+            conventions=conv,
+        )
+
+    def test_l3_full_stamp_when_all_conventions_engaged(self):
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True, enforce_caps=True,
+            sector_map=self._FULL_MAP,
+        )
+        assert conv.execution_fidelity == "L3_FULL"
+        payload = self._payload(conv)
+        rc = payload["replay_conventions"]
+        assert rc["execution_fidelity"] == "L3_FULL"
+        assert rc["promotion_eligible"] is True
+        assert rc["sector_coverage"] == "fail_closed"
+        gate = payload["verdict"]["non_negotiable_gate_passed"]
+        assert gate["execution_fidelity_l3_full"] is True
+
+    def test_degraded_conventions_cannot_name_promotion_candidate(self):
+        # Stateful-only (no tax, no integer shares, no cap enforcement)
+        # = L1_L2_ONLY: the verdict fails closed with an explicit
+        # fidelity rationale and every significance block is forced
+        # diagnostic-only / non-promotable.
+        conv = ReplayConventions(stateful=True)
+        assert conv.execution_fidelity == "L1_L2_ONLY"
+        payload = self._payload(conv)
+        rc = payload["replay_conventions"]
+        assert rc["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc["promotion_eligible"] is False
+        verdict = payload["verdict"]
+        assert verdict["promotion_candidate"] is None
+        assert "L1_L2_ONLY" in verdict["rationale"]
+        gate = verdict["non_negotiable_gate_passed"]
+        assert gate["execution_fidelity_l3_full"] is False
+        for name, sig in payload["significance"].items():
+            assert sig["diagnostic_only"] is True, name
+            assert sig["live_promotable_per_section_8"] is False, name
+            assert "L3_FULL" in sig["promotion_block_reason"], name
+
+    def test_gate_rejects_even_when_dsr_pbo_pass(self):
+        """Negative proof at the gate level: a candidate whose DSR/PBO
+        flags say 'promotable' and whose paired stats beat the incumbent
+        still CANNOT pass without L3_FULL fidelity."""
+        significance = {
+            "incumbent_arm": {"dsr": 0.99, "pbo": 0.05, "pbo_se": 0.01,
+                              "live_promotable_per_section_8": True},
+            "challenger_arm": {"dsr": 0.99, "pbo": 0.05, "pbo_se": 0.01,
+                               "live_promotable_per_section_8": True},
+        }
+        violations = {
+            "any_allocator_violated_any_family": False,
+            "by_allocator": {
+                "incumbent_arm": {"rejected_for_promotion": False},
+                "challenger_arm": {"rejected_for_promotion": False},
+            },
+        }
+        paired = {
+            "incumbent_arm_vs_challenger_arm": {
+                "n_bars": 400,
+                "delta_sharpe_annual": -2.0,      # challenger wins
+                "win_rate_a_beats_b": 0.30,       # challenger wins 70%
+            },
+        }
+        from renquant_pipeline.kernel.portfolio_qp.run_ab_replay import (
+            apply_promotion_gate_to_significance,
+            assemble_verdict,
+        )
+        # Sanity: WITH fidelity ok the challenger IS promotable…
+        verdict_ok = assemble_verdict(
+            significance, paired, violations, incumbent="incumbent_arm",
+            execution_fidelity_ok=True,
+        )
+        assert verdict_ok["promotion_candidate"] == "challenger_arm"
+        # …and WITHOUT L3_FULL fidelity it can NEVER be.
+        verdict = assemble_verdict(
+            significance, paired, violations, incumbent="incumbent_arm",
+            execution_fidelity_ok=False,
+        )
+        assert verdict["promotion_candidate"] is None
+        assert verdict["next_action"] == "iterate"
+        assert "L1_L2_ONLY" in verdict["rationale"]
+        gated = apply_promotion_gate_to_significance(
+            significance, violations,
+            constraints_decision_grade=True,
+            execution_fidelity_ok=False,
+        )
+        for name, sig in gated.items():
+            assert sig["live_promotable_per_section_8"] is False, name
+            assert sig["diagnostic_only"] is True, name
+            assert "L3_FULL" in sig["promotion_block_reason"], name
 
 
 # ── 6/7. Evidence schema + CLI wiring ───────────────────────────────
@@ -973,6 +1149,9 @@ class TestEvidenceSchemaAndCLI:
         assert rc["integer_shares"] and rc["enforce_caps"]
         assert rc["tax_short_rate"] == 0.50
         assert rc["tax_long_rate"] == 0.32
+        assert rc["execution_fidelity"] == "L3_FULL"
+        assert rc["promotion_eligible"] is True
+        assert rc["sector_coverage"] == "fail_closed"
         for name in FIXTURE_ALLOCATORS:
             block = payload["per_allocator"][name]
             assert len(block["deployed_fraction"]) == payload["n_bars"]
@@ -1024,6 +1203,8 @@ class TestEvidenceSchemaAndCLI:
         assert rc_block["integer_shares"] is True
         assert rc_block["initial_capital"] == 25000.0
         assert rc_block["n_sector_mapped_tickers"] == 3
+        assert rc_block["execution_fidelity"] == "L3_FULL"
+        assert rc_block["promotion_eligible"] is True
         eq = payload["per_allocator"]["equal_weight_top_k"]
         assert len(eq["deployed_fraction"]) == payload["n_bars"]
         assert eq["total_cost_paid"] >= 0.0
@@ -1069,6 +1250,44 @@ class TestEvidenceSchemaAndCLI:
                 "--integer-shares",
             ])
         assert exc.value.code == 2
+
+    def test_cli_enforce_caps_without_sector_map_fails_closed(self, tmp_path):
+        # r2 #180: no more warn-and-continue — decision-grade runs abort.
+        with pytest.raises(SystemExit) as exc:
+            main([
+                "--wf-artifact-root", str(tmp_path / "x.db"),
+                "--start-cut", "2024-02-01",
+                "--end-cut", "2024-02-20",
+                "--out", str(tmp_path / "o.json"),
+                "--enforce-caps",
+            ])
+        assert exc.value.code == 2
+
+    def test_cli_allow_unmapped_sectors_runs_marked_non_decision_grade(
+        self, tmp_path,
+    ):
+        db = tmp_path / "sim_runs.db"
+        _write_cli_db(db)
+        out = tmp_path / "evidence.json"
+        rc = main([
+            "--wf-artifact-root", str(db),
+            "--start-cut", "2024-02-01",
+            "--end-cut", "2024-02-20",
+            "--out", str(out),
+            "--allocators", "equal_weight_top_k,inverse_vol_top_k",
+            "--incumbent", "equal_weight_top_k",
+            "--fwd-horizon-days", "1",
+            "--pbo-n-slices", "4",
+            "--enforce-caps", "--allow-unmapped-sectors",
+        ])
+        assert rc == 0
+        payload = json.loads(out.read_text())
+        rc_block = payload["replay_conventions"]
+        assert rc_block["sector_coverage"] == "exploratory_unmapped_allowed"
+        assert rc_block["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc_block["promotion_eligible"] is False
+        assert payload["verdict"]["promotion_candidate"] is None
+        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
 
     def test_cli_cost_bps_restamps_bars(self, tmp_path):
         db = tmp_path / "sim_runs.db"

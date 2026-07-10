@@ -236,6 +236,7 @@ def assemble_verdict(
     incumbent: str,
     win_rate_z_threshold: float = 2.0,
     constraints_decision_grade: bool = True,
+    execution_fidelity_ok: Optional[bool] = None,
 ) -> dict:
     """Apply the Step 4 non-negotiable gate + select promotion candidate.
 
@@ -245,6 +246,13 @@ def assemble_verdict(
     2. Pass the stricter §8 DSR/PBO gate.
     3. Have zero hard-constraint regressions.
     4. Be evaluated against decision-grade constraints.
+    5. (D6 engaged-conventions runs only) carry ``L3_FULL`` execution
+       fidelity. ``execution_fidelity_ok`` is a tri-state: ``None`` for
+       legacy/default-mode payloads (schema untouched — byte-identical
+       evidence), ``True``/``False`` when D6 conventions are engaged
+       (r2 #180 evidence contract). ``False`` fails the verdict closed:
+       a floor-only / degraded-conventions result can NEVER name a
+       promotion candidate.
     """
     candidates = [
         name for name, sig in significance.items()
@@ -263,6 +271,22 @@ def assemble_verdict(
         "win_rate_z_score_above_2": False,
         "decision_grade_constraints": bool(constraints_decision_grade),
     }
+    if execution_fidelity_ok is not None:
+        gate_bits["execution_fidelity_l3_full"] = bool(execution_fidelity_ok)
+    if execution_fidelity_ok is False:
+        return {
+            "promotion_candidate": None,
+            "rationale": (
+                "not promotion-eligible: execution fidelity is L1_L2_ONLY "
+                "— the D6 protocol (#443 §2.3) requires L3_FULL (stateful "
+                "+ tax + integer-shares with deferred rescue and post-round "
+                "rechecks + fail-closed cap enforcement) for end-to-end / "
+                "deployed-fraction / promotion evidence"
+            ),
+            "fallback_recommendation": incumbent,
+            "next_action": "iterate",
+            "non_negotiable_gate_passed": gate_bits,
+        }
     if not constraints_decision_grade:
         return {
             "promotion_candidate": None,
@@ -316,6 +340,10 @@ def assemble_verdict(
             "win_rate_z_score_above_2": bool(beats_incumbent_paired),
             "decision_grade_constraints": True,
         }
+        if execution_fidelity_ok is not None:
+            candidate_gate_bits["execution_fidelity_l3_full"] = bool(
+                execution_fidelity_ok
+            )
         if beats_incumbent_paired and passes_significance and passes_violation_gate:
             promotion_candidate = name
             gate_bits = candidate_gate_bits
@@ -345,13 +373,17 @@ def apply_promotion_gate_to_significance(
     violations: dict,
     *,
     constraints_decision_grade: bool,
+    execution_fidelity_ok: Optional[bool] = None,
 ) -> dict:
     """Fail closed significance flags once non-statistical gates are known.
 
     DSR/PBO answers "is this return stream statistically credible?"  It is
     not, by itself, a live promotion verdict.  The JSON should therefore not
     leave ``live_promotable_*`` true when the replay manifold is missing
-    load-bearing constraints or the allocator violates hard caps.
+    load-bearing constraints or the allocator violates hard caps — or, for
+    D6 engaged-conventions runs, when the execution fidelity is below
+    ``L3_FULL`` (``execution_fidelity_ok=False``; tri-state ``None`` means
+    legacy/default-mode payload, untouched).
     """
     out: dict = {}
     by_allocator = violations.get("by_allocator", {})
@@ -362,6 +394,11 @@ def apply_promotion_gate_to_significance(
             block_reasons.append("replay constraints are not decision-grade")
         if by_allocator.get(name, {}).get("rejected_for_promotion", True):
             block_reasons.append("allocator has hard-constraint violations")
+        if execution_fidelity_ok is False:
+            block_reasons.append(
+                "execution fidelity is L1_L2_ONLY — D6 promotion evidence "
+                "requires L3_FULL (#443 §2.3)"
+            )
 
         if block_reasons:
             block["diagnostic_only"] = True
@@ -422,16 +459,24 @@ def run_replay(
     # Block 5: violation report
     violation_block = violation_report_block(results)
     constraint_fidelity = constraint_fidelity_block(bars)
+    # r2 #180 evidence contract: for engaged-conventions payloads, the
+    # execution fidelity gates promotion mechanically. Tri-state None =
+    # legacy/default-mode payload (schema byte-identical, untouched).
+    execution_fidelity_ok: Optional[bool] = None
+    if conventions is not None and conventions.any_enabled:
+        execution_fidelity_ok = conventions.promotion_eligible
     significance_block = apply_promotion_gate_to_significance(
         significance_block,
         violation_block,
         constraints_decision_grade=constraint_fidelity["decision_grade"],
+        execution_fidelity_ok=execution_fidelity_ok,
     )
 
     # Block 6: verdict
     verdict = assemble_verdict(
         significance_block, paired_block, violation_block, incumbent=incumbent,
         constraints_decision_grade=constraint_fidelity["decision_grade"],
+        execution_fidelity_ok=execution_fidelity_ok,
     )
 
     payload = {
@@ -593,8 +638,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--sector-map-json", type=str, default=None,
         help="path to a JSON sector map for --enforce-caps: either a flat "
              "{ticker: sector} object or a config carrying a 'sector_map' "
-             "key. Sessions' tickers map through it; unmapped tickers "
-             "carry no sector constraint",
+             "key. Sessions' tickers map through it. FAIL-CLOSED: a map "
+             "that does not cover every active ticker in every replay bar "
+             "aborts the run unless --allow-unmapped-sectors is set",
+    )
+    p.add_argument(
+        "--allow-unmapped-sectors", action="store_true",
+        help="EXPLORATORY ONLY: let --enforce-caps run with a missing or "
+             "partial sector map (unmapped tickers carry no sector "
+             "constraint). Marks the evidence non-decision-grade: "
+             "execution_fidelity=L1_L2_ONLY, promotion_eligible=false — "
+             "the payload cannot pass the promotion gate",
     )
     p.add_argument("--per-name-cap", type=float, default=0.12,
                    help="D6 §4 per-name weight cap for --enforce-caps")
@@ -620,6 +674,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "weights carry into state)")
     if args.sector_map_json and not args.enforce_caps:
         p.error("--sector-map-json only has effect with --enforce-caps")
+    if (args.enforce_caps and not args.sector_map_json
+            and not args.allow_unmapped_sectors):
+        p.error(
+            "--enforce-caps without --sector-map-json is FAIL-CLOSED "
+            "(r2 #180): the D6 §4 sector gate cannot be enforced blind. "
+            "Supply --sector-map-json, or pass --allow-unmapped-sectors "
+            "for an EXPLORATORY (non-decision-grade) run"
+        )
 
     if args.diagnose_readiness:
         from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (
@@ -775,9 +837,13 @@ def _build_conventions(args) -> Optional[ReplayConventions]:
                 "JSON object ({ticker: sector} or {'sector_map': {...}})"
             )
     if args.enforce_caps and not sector_map:
+        # main() already fail-closed unless --allow-unmapped-sectors was
+        # passed explicitly (r2 #180) — this warning marks the surviving
+        # EXPLORATORY path.
         log.warning(
-            "--enforce-caps without --sector-map-json: only the per-name "
-            "cap is enforced; sector caps need a sector map"
+            "--enforce-caps with --allow-unmapped-sectors and no sector "
+            "map: only the per-name cap is enforced; the evidence is "
+            "marked non-decision-grade (execution_fidelity=L1_L2_ONLY)"
         )
     return ReplayConventions(
         stateful=args.stateful,
@@ -791,6 +857,7 @@ def _build_conventions(args) -> Optional[ReplayConventions]:
         sector_cap=args.sector_cap,
         sector_map=sector_map,
         initial_capital=args.initial_capital,
+        allow_unmapped_sectors=args.allow_unmapped_sectors,
     )
 
 

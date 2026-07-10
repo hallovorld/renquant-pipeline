@@ -109,7 +109,18 @@ class ReplayConventions:
     * ``enforce_caps`` — apply the D6 §4 per-name / sector caps INSIDE
       the arm as a down-only projection before returns are computed,
       recording per-session breach counters instead of silently
-      allowing breaches. Sector caps need ``sector_map``.
+      allowing breaches. Sector caps need ``sector_map``; decision-grade
+      runs FAIL CLOSED when the map does not cover every active ticker
+      in every replay bar (r2 #180 review). The permissive behavior
+      survives only behind the explicit exploratory flag
+      ``allow_unmapped_sectors``, which marks the evidence
+      non-decision-grade.
+    * ``allow_unmapped_sectors`` — EXPLORATORY ONLY: lets
+      ``enforce_caps`` run with a missing/partial sector map (unmapped
+      tickers carry no sector constraint). Forces
+      ``execution_fidelity`` to ``"L1_L2_ONLY"`` and
+      ``promotion_eligible`` to False — the evidence cannot pass the
+      promotion gate.
     """
 
     stateful: bool = False
@@ -123,6 +134,7 @@ class ReplayConventions:
     sector_cap: float = D6_SECTOR_CAP
     sector_map: Optional[dict] = None      # ticker → sector name
     initial_capital: float = 10_000.0      # dollars; scale for share floors
+    allow_unmapped_sectors: bool = False   # exploratory only (r2 fail-closed)
 
     def __post_init__(self) -> None:
         if self.tax and not self.stateful:
@@ -142,10 +154,47 @@ class ReplayConventions:
                 f"ReplayConventions: initial_capital must be > 0, got "
                 f"{self.initial_capital}"
             )
+        if (self.enforce_caps and not self.sector_map
+                and not self.allow_unmapped_sectors):
+            raise ValueError(
+                "ReplayConventions: enforce_caps=True without a sector_map is "
+                "FAIL-CLOSED for decision-grade runs (r2 #180 review) — the "
+                "D6 §4 35% sector gate cannot be enforced blind. Supply a "
+                "sector_map covering every active ticker, or set "
+                "allow_unmapped_sectors=True for an EXPLORATORY run whose "
+                "evidence is marked non-decision-grade."
+            )
 
     @property
     def any_enabled(self) -> bool:
         return bool(self.stateful or self.enforce_caps)
+
+    @property
+    def execution_fidelity(self) -> str:
+        """Machine-readable evidence-contract stamp (r2 #180 review).
+
+        ``"L3_FULL"`` iff the FULL D6 execution-layer convention set is
+        engaged: stateful + tax + integer-shares (round-down, deferred
+        rescue, post-round rechecks) + fail-closed cap enforcement with
+        a supplied sector map. Anything less — including any exploratory
+        sector coverage — is ``"L1_L2_ONLY"``: usable for allocator-
+        ranking diagnostics but NOT deployed-fraction / end-to-end /
+        promotion evidence. The promotion gate rejects non-L3_FULL
+        payloads mechanically (see ``run_ab_replay``).
+        """
+        full = (
+            self.stateful
+            and self.tax
+            and self.integer_shares
+            and self.enforce_caps
+            and self.sector_map is not None
+            and not self.allow_unmapped_sectors
+        )
+        return "L3_FULL" if full else "L1_L2_ONLY"
+
+    @property
+    def promotion_eligible(self) -> bool:
+        return self.execution_fidelity == "L3_FULL"
 
     def to_dict(self) -> dict:
         out: dict = {
@@ -153,6 +202,8 @@ class ReplayConventions:
             "tax": self.tax,
             "integer_shares": self.integer_shares,
             "enforce_caps": self.enforce_caps,
+            "execution_fidelity": self.execution_fidelity,
+            "promotion_eligible": self.promotion_eligible,
         }
         if self.tax:
             out["tax_short_rate"] = self.tax_short_rate
@@ -164,6 +215,10 @@ class ReplayConventions:
             out["sector_map_supplied"] = self.sector_map is not None
             out["n_sector_mapped_tickers"] = (
                 len(self.sector_map) if self.sector_map else 0
+            )
+            out["sector_coverage"] = (
+                "exploratory_unmapped_allowed" if self.allow_unmapped_sectors
+                else "fail_closed"
             )
         if self.stateful:
             out["initial_capital"] = self.initial_capital
@@ -466,9 +521,26 @@ def apply_d6_cap_projection(
     counts are the PRE-projection violations — recorded per session
     instead of silently allowing the breach (#445 gap 4).
 
-    Tickers absent from ``conv.sector_map`` carry no sector constraint
-    (no silent guessing of membership).
+    **Sector coverage is FAIL-CLOSED** (r2 #180 review): any active
+    ticker not covered by ``conv.sector_map`` raises — a decision-grade
+    run must never silently leave a name outside the D6 §4 35% sector
+    gate. The permissive behavior (unmapped tickers carry no sector
+    constraint — no silent guessing of membership) survives only behind
+    the explicit exploratory flag ``conv.allow_unmapped_sectors``, whose
+    evidence is marked non-decision-grade.
     """
+    if not conv.allow_unmapped_sectors:
+        sector_map = conv.sector_map or {}
+        missing = [t for t in tickers if not sector_map.get(t)]
+        if missing:
+            raise ValueError(
+                f"enforce_caps FAIL-CLOSED: sector map does not cover active "
+                f"ticker(s) {missing} in this replay bar — the D6 §4 sector "
+                f"gate cannot be enforced blind (r2 #180 review). Supply a "
+                f"complete sector map, or set allow_unmapped_sectors=True / "
+                f"--allow-unmapped-sectors for an EXPLORATORY run whose "
+                f"evidence is marked non-decision-grade."
+            )
     w = np.asarray(target_w, dtype=float).copy()
 
     # Per-name cap — down-only clip.
