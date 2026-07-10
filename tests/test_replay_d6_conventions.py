@@ -38,6 +38,7 @@ from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (  # noqa: E4
     apply_d6_cap_projection,
     replay_all,
     replay_one_allocator,
+    sector_map_coverage_gap,
 )
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import (  # noqa: E402
     AllocatorResult,
@@ -914,9 +915,17 @@ class TestSectorMapFailClosed:
     not cover every active ticker in every replay bar; the permissive
     path survives only behind the explicit exploratory flag."""
 
-    def test_conventions_reject_enforce_caps_without_map(self):
-        with pytest.raises(ValueError, match="FAIL-CLOSED"):
-            ReplayConventions(enforce_caps=True)
+    def test_no_map_at_all_fails_closed_at_replay_time(self):
+        # Construction is allowed (callers need the object to run the
+        # sector_map_coverage_gap prescan) — the replay itself raises.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.10}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0]),
+        ]
+        conv = ReplayConventions(enforce_caps=True)
+        with pytest.raises(ValueError, match="does not cover active"):
+            replay_one_allocator("s", alloc, bars, conv)
 
     def test_mixed_mapped_unmapped_universe_fails_closed_stateless(self):
         alloc = _fixed_target_allocator({"*": {"AAA": 0.10, "ZZZ": 0.10}})
@@ -1073,6 +1082,119 @@ class TestExecutionFidelityGate:
             assert "L3_FULL" in sig["promotion_block_reason"], name
 
 
+class TestSectorMapCoverageGap:
+    """codex #180 review, 2026-07-10: apply_d6_cap_projection's per-bar
+    unmapped-ticker-is-unconstrained behavior is correct at the math layer
+    (test_unmapped_ticker_carries_no_sector_constraint above), but a CALLER
+    running a D6-labeled sector-cap replay must not let that silently
+    convert a missing hard constraint into no constraint across a whole
+    run. sector_map_coverage_gap surfaces exactly which tickers a supplied
+    map fails to cover, across ALL bars, so the caller can fail closed."""
+
+    def test_full_coverage_is_empty_gap(self):
+        conv = ReplayConventions(
+            enforce_caps=True,
+            sector_map={"AAA": "Tech", "BBB": "Tech", "CCC": "Energy"},
+        )
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0]),
+            _bar("2026-01-03", tickers=("BBB", "CCC"), mu=[0.04, 0.03],
+                 fwd_return=[0.0, 0.0]),
+        ]
+        assert sector_map_coverage_gap(bars, conv) == ()
+
+    def test_mixed_mapped_and_unmapped_tickers_across_bars(self):
+        """Mixed coverage: AAA/BBB mapped, CCC/DDD not — DDD only appears
+        in the second bar, proving the check scans EVERY bar, not just
+        the first."""
+        conv = ReplayConventions(
+            enforce_caps=True, sector_map={"AAA": "Tech", "BBB": "Tech"},
+        )
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB", "CCC"),
+                 mu=[0.05, 0.04, 0.03], fwd_return=[0.0, 0.0, 0.0]),
+            _bar("2026-01-03", tickers=("AAA", "DDD"),
+                 mu=[0.05, 0.02], fwd_return=[0.0, 0.0]),
+        ]
+        gap = sector_map_coverage_gap(bars, conv)
+        assert gap == ("CCC", "DDD")
+
+    def test_no_map_at_all_treats_every_ticker_as_missing(self):
+        conv = ReplayConventions(enforce_caps=True, sector_map=None)
+        bars = [
+            _bar("2026-01-02", tickers=("AAA", "BBB"), mu=[0.05, 0.04],
+                 fwd_return=[0.0, 0.0]),
+        ]
+        assert sector_map_coverage_gap(bars, conv) == ("AAA", "BBB")
+
+
+class TestExecutionFidelityPromotionGate:
+    """codex #180 review, 2026-07-10: this harness is L1/L2-only (no
+    deferred one-share rescue, no post-round executed-quantity cap/sector
+    recheck — see doc/progress caveats). ANY engaged D6 convention must
+    therefore stamp execution_fidelity=L1_L2_ONLY / promotion_eligible=
+    False and the verdict/promotion path must reject it as decision-grade,
+    even when every other gate (sector-map coverage, hard-constraint
+    families) is fully satisfied."""
+
+    def _decision_grade_bars(self, n=6):
+        # snap must carry sector_indicator/sector_cap_vec so
+        # constraint_fidelity_block's OWN check is satisfied — isolating
+        # that the rejection below comes from execution_fidelity, not a
+        # missing ConstraintSnapshot field.
+        bars = []
+        for d in range(2, 2 + n):
+            snap = _snap(2, tickers=("AAA", "BBB"))
+            snap = dataclasses.replace(
+                snap,
+                sector_indicator=np.array([[1.0, 1.0]]),
+                sector_cap_vec=np.array([0.99]),
+            )
+            bars.append(AllocatorReplayBar(
+                bar_date=f"2026-01-{d:02d}", snap=snap,
+                mu=np.array([0.05, 0.03]), sigma=np.full(2, 0.10),
+                fwd_return=np.array([0.01, 0.0]),
+            ))
+        return bars
+
+    def test_floor_only_result_is_rejected_even_with_full_sector_coverage(self):
+        bars = self._decision_grade_bars()
+        conv = ReplayConventions(
+            enforce_caps=True,
+            sector_map={"AAA": "Tech", "BBB": "Tech"},  # full coverage
+        )
+        payload = run_replay(
+            bars, ["equal_weight_top_k", "inverse_vol_top_k"],
+            incumbent="equal_weight_top_k", conventions=conv,
+        )
+        assert payload["constraint_fidelity"]["execution_fidelity"] == "L1_L2_ONLY"
+        assert payload["constraint_fidelity"]["promotion_eligible"] is False
+        assert payload["constraint_fidelity"]["decision_grade"] is False
+        assert payload["replay_conventions"]["execution_fidelity"] == "L1_L2_ONLY"
+        assert payload["replay_conventions"]["promotion_eligible"] is False
+        assert payload["verdict"]["promotion_candidate"] is None
+        # Merged r1+r2 semantics: the verdict names the fidelity gap
+        # explicitly (execution fidelity short-circuit) rather than the
+        # generic constraint-fidelity wording.
+        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
+        for name, sig in payload["significance"].items():
+            assert sig["live_promotable_per_section_8"] is False
+            assert sig["diagnostic_only"] is True
+
+    def test_no_conventions_engaged_stays_full_fidelity_and_promotable_schema(self):
+        """Default mode (conventions=None) must NOT carry the new keys at
+        all — additive-only, byte-identical to pre-D6 evidence."""
+        bars = self._decision_grade_bars()
+        payload = run_replay(
+            bars, ["equal_weight_top_k", "inverse_vol_top_k"],
+            incumbent="equal_weight_top_k", conventions=None,
+        )
+        assert "execution_fidelity" not in payload["constraint_fidelity"]
+        assert "promotion_eligible" not in payload["constraint_fidelity"]
+        assert "replay_conventions" not in payload
+
+
 # ── 6/7. Evidence schema + CLI wiring ───────────────────────────────
 
 
@@ -1210,6 +1332,93 @@ class TestEvidenceSchemaAndCLI:
         assert eq["total_cost_paid"] >= 0.0
         assert "E_executed" in eq and "integer_residual" in eq
 
+    def test_cli_enforce_caps_partial_sector_map_fails_closed(self, tmp_path):
+        """codex #180 review: a sector map covering only SOME of the
+        active tickers (GOOG missing here) must fail closed by default —
+        not silently proceed with GOOG unconstrained."""
+        db = tmp_path / "sim_runs.db"
+        _write_cli_db(db)
+        sector_map = tmp_path / "sectors.json"
+        sector_map.write_text(json.dumps({"AAPL": "Tech", "MSFT": "Tech"}))
+        out = tmp_path / "evidence.json"
+        rc = main([
+            "--wf-artifact-root", str(db),
+            "--start-cut", "2024-02-01",
+            "--end-cut", "2024-02-20",
+            "--out", str(out),
+            "--allocators", "equal_weight_top_k,inverse_vol_top_k",
+            "--incumbent", "equal_weight_top_k",
+            "--fwd-horizon-days", "1",
+            "--pbo-n-slices", "4",
+            "--enforce-caps",
+            "--sector-map-json", str(sector_map),
+        ])
+        assert rc == 2
+        invalid = json.loads(out.read_text())
+        assert invalid["invalid_experiment"] is True
+        assert invalid["reason"] == "sector_map_incomplete"
+        assert invalid["missing_sector_map_tickers"] == ["GOOG"]
+
+    def test_cli_enforce_caps_no_sector_map_fails_closed(self, tmp_path):
+        """No --sector-map-json at all with --enforce-caps must ALSO fail
+        closed (every ticker is "missing"), not just warn as before."""
+        db = tmp_path / "sim_runs.db"
+        _write_cli_db(db)
+        out = tmp_path / "evidence.json"
+        rc = main([
+            "--wf-artifact-root", str(db),
+            "--start-cut", "2024-02-01",
+            "--end-cut", "2024-02-20",
+            "--out", str(out),
+            "--allocators", "equal_weight_top_k,inverse_vol_top_k",
+            "--incumbent", "equal_weight_top_k",
+            "--fwd-horizon-days", "1",
+            "--pbo-n-slices", "4",
+            "--enforce-caps",
+        ])
+        assert rc == 2
+        invalid = json.loads(out.read_text())
+        assert invalid["invalid_experiment"] is True
+        assert invalid["reason"] == "sector_map_incomplete"
+        assert sorted(invalid["missing_sector_map_tickers"]) == [
+            "AAPL", "GOOG", "MSFT",
+        ]
+
+    def test_cli_allow_partial_sector_map_escape_hatch(self, tmp_path):
+        """--allow-partial-sector-map proceeds despite the gap, but the
+        result is stamped non-decision-grade / non-promotable regardless
+        (execution_fidelity is engaged-conventions-wide, not just a
+        sector-map-coverage flag)."""
+        db = tmp_path / "sim_runs.db"
+        _write_cli_db(db)
+        sector_map = tmp_path / "sectors.json"
+        sector_map.write_text(json.dumps({"AAPL": "Tech", "MSFT": "Tech"}))
+        out = tmp_path / "evidence.json"
+        rc = main([
+            "--wf-artifact-root", str(db),
+            "--start-cut", "2024-02-01",
+            "--end-cut", "2024-02-20",
+            "--out", str(out),
+            "--allocators", "equal_weight_top_k,inverse_vol_top_k",
+            "--incumbent", "equal_weight_top_k",
+            "--fwd-horizon-days", "1",
+            "--pbo-n-slices", "4",
+            "--enforce-caps",
+            "--sector-map-json", str(sector_map),
+            "--allow-partial-sector-map",
+        ])
+        assert rc == 0
+        payload = json.loads(out.read_text())
+        assert payload["constraint_fidelity"]["execution_fidelity"] == "L1_L2_ONLY"
+        assert payload["constraint_fidelity"]["promotion_eligible"] is False
+        assert payload["verdict"]["promotion_candidate"] is None
+        # Mirrored stamps in replay_conventions (merged r1+r2 contract).
+        rc_block = payload["replay_conventions"]
+        assert rc_block["sector_coverage"] == "exploratory_unmapped_allowed"
+        assert rc_block["execution_fidelity"] == "L1_L2_ONLY"
+        assert rc_block["promotion_eligible"] is False
+        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
+
     def test_cli_default_flags_unchanged_payload_schema(self, tmp_path):
         db = tmp_path / "sim_runs.db"
         _write_cli_db(db)
@@ -1250,44 +1459,6 @@ class TestEvidenceSchemaAndCLI:
                 "--integer-shares",
             ])
         assert exc.value.code == 2
-
-    def test_cli_enforce_caps_without_sector_map_fails_closed(self, tmp_path):
-        # r2 #180: no more warn-and-continue — decision-grade runs abort.
-        with pytest.raises(SystemExit) as exc:
-            main([
-                "--wf-artifact-root", str(tmp_path / "x.db"),
-                "--start-cut", "2024-02-01",
-                "--end-cut", "2024-02-20",
-                "--out", str(tmp_path / "o.json"),
-                "--enforce-caps",
-            ])
-        assert exc.value.code == 2
-
-    def test_cli_allow_unmapped_sectors_runs_marked_non_decision_grade(
-        self, tmp_path,
-    ):
-        db = tmp_path / "sim_runs.db"
-        _write_cli_db(db)
-        out = tmp_path / "evidence.json"
-        rc = main([
-            "--wf-artifact-root", str(db),
-            "--start-cut", "2024-02-01",
-            "--end-cut", "2024-02-20",
-            "--out", str(out),
-            "--allocators", "equal_weight_top_k,inverse_vol_top_k",
-            "--incumbent", "equal_weight_top_k",
-            "--fwd-horizon-days", "1",
-            "--pbo-n-slices", "4",
-            "--enforce-caps", "--allow-unmapped-sectors",
-        ])
-        assert rc == 0
-        payload = json.loads(out.read_text())
-        rc_block = payload["replay_conventions"]
-        assert rc_block["sector_coverage"] == "exploratory_unmapped_allowed"
-        assert rc_block["execution_fidelity"] == "L1_L2_ONLY"
-        assert rc_block["promotion_eligible"] is False
-        assert payload["verdict"]["promotion_candidate"] is None
-        assert "L1_L2_ONLY" in payload["verdict"]["rationale"]
 
     def test_cli_cost_bps_restamps_bars(self, tmp_path):
         db = tmp_path / "sim_runs.db"

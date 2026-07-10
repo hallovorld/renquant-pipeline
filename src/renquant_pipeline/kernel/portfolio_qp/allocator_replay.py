@@ -154,16 +154,12 @@ class ReplayConventions:
                 f"ReplayConventions: initial_capital must be > 0, got "
                 f"{self.initial_capital}"
             )
-        if (self.enforce_caps and not self.sector_map
-                and not self.allow_unmapped_sectors):
-            raise ValueError(
-                "ReplayConventions: enforce_caps=True without a sector_map is "
-                "FAIL-CLOSED for decision-grade runs (r2 #180 review) — the "
-                "D6 §4 35% sector gate cannot be enforced blind. Supply a "
-                "sector_map covering every active ticker, or set "
-                "allow_unmapped_sectors=True for an EXPLORATORY run whose "
-                "evidence is marked non-decision-grade."
-            )
+        # NOTE (r2 #180 merged design): enforce_caps WITHOUT a sector map
+        # is not rejected at construction — callers need the object to run
+        # the sector_map_coverage_gap prescan (the CLI writes a structured
+        # invalid_experiment artifact). The fail-closed guarantee is
+        # enforced at REPLAY time instead: apply_d6_cap_projection raises
+        # on any unmapped active ticker unless allow_unmapped_sectors.
 
     @property
     def any_enabled(self) -> bool:
@@ -564,6 +560,34 @@ def apply_d6_cap_projection(
                 n_sector_breaches += 1
                 w[idx] *= conv.sector_cap / load
     return w, n_name_breaches, n_sector_breaches
+
+
+def sector_map_coverage_gap(
+    bars: Sequence["AllocatorReplayBar"],
+    conv: "ReplayConventions",
+) -> tuple[str, ...]:
+    """Tickers appearing in any bar's snapshot but absent from
+    ``conv.sector_map`` (codex #180 review, 2026-07-10).
+
+    ``apply_d6_cap_projection`` deliberately leaves an unmapped ticker
+    unconstrained (no silent guessing of sector membership) — but a
+    *caller* that claims to be running a D6 sector-cap replay must not
+    let that permissive behavior silently convert a missing hard
+    constraint into no constraint. This function surfaces the gap so the
+    CLI/caller can decide to fail closed (default, D6-strict mode) or
+    proceed only under an explicit exploratory/non-decision-grade mode.
+
+    Returns an empty tuple when every ticker appearing in ``bars`` is a
+    key in ``conv.sector_map`` (including the vacuous case of zero bars
+    or a conventions object with ``enforce_caps=False``).
+    """
+    sector_map = conv.sector_map or {}
+    missing: set[str] = set()
+    for bar in bars:
+        for t in bar.snap.tickers:
+            if t not in sector_map:
+                missing.add(t)
+    return tuple(sorted(missing))
 
 
 def _record_family_violations(
