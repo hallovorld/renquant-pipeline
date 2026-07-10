@@ -216,3 +216,53 @@ anything less is stamped L1_L2_ONLY and mechanically non-promotable.
 Rebased/merged onto main @ 9117f89 (post-#179 merge); the governor/allocator
 kernel files are consumed read-only (`shrunk_kelly_raw` as the RFC conviction
 ordering key), never modified.
+
+## Correction (2026-07-10, PR #182 — P1 cash-reserve fee-timing bug)
+
+Codex found a real P1 in `_execute_integer_session`: buy headroom was
+computed as `state.cash - cash_reserve*pv_base` **pre-fee**, but
+`_replay_one_allocator_stateful` deducts the session-level linear cost
+(`session_traded * cost_per_trade_bps * 1e-4`, on ALL traded dollars —
+sells included) from cash only AFTER `_execute_integer_session` returns.
+A buy that exactly filled pre-fee headroom therefore left post-fee cash
+BELOW the reserve floor — the docstring's "cash (incl. reserve) holds by
+construction" claim was false once a nonzero transaction cost applied.
+This changes the executed book and can overstate deployment, the primary
+cash-drag estimand.
+
+**Fix**: `_execute_integer_session` is now fee-aware throughout:
+- This session's SELL-side fee liability (`traded * cost_bps * 1e-4`,
+  already fixed by the time buy-sizing starts) is reserved from headroom
+  up front.
+- Each candidate buy's affordability check divides by `fee_factor = 1 +
+  cost_bps*1e-4` instead of just the price, and `headroom` is debited/
+  credited by `p * fee_factor` (not just `p`) on every main-pass, rescue,
+  AND cap-down/recheck iteration — so the fee reservation stays correct
+  across the whole sizing loop, not just at the start.
+- `_replay_one_allocator_stateful` now asserts `state.cash >=
+  cash_reserve*pv_base - 1e-6` immediately after the session-level fee is
+  deducted, for every `integer_shares` session — a runtime guard against
+  regression, not just a corrected comment.
+
+Proof by construction (worked in the PR): if every buy is sized so
+`shares*p*fee_factor <= headroom`, then summing across all buys gives
+`cash_after_sells - sum(buy_invest) >= reserve_floor + sell_fee_liability +
+sum(buy_invest)*cost_bps*1e-4`, and since `session_cost =
+sell_fee_liability + sum(buy_invest)*cost_bps*1e-4` by definition, this is
+exactly `cash_final_pre_fee - session_cost >= reserve_floor`, i.e. the
+invariant holds post-fee.
+
+**New test**
+(`TestL3PostRoundRecheck::test_cash_reserve_holds_after_fees_at_the_exact_pre_fee_boundary`):
+$10,000 PV, 50% reserve, 5bps cost, target that pre-fix would buy exactly
+50 shares @ $100 (cash lands exactly at the $5,000 reserve pre-fee, then
+$2.50 of fee pushes it to $4,997.50 — below reserve). The fix withholds
+the boundary share (49, not 50), leaving post-fee cash at $5,097.55 —
+clears the reserve. The original `test_cash_reserve_never_breached_by_fills`
+(cost_bps=0, the `fee_factor=1.0` degenerate case) is unchanged and still
+passes byte-identically.
+
+Tests: `tests/test_replay_d6_conventions.py` 60 → 61. Full suite: 1504
+passed, 7 skipped, 0 failed — zero regressions (the fee-aware code path
+only activates when `cost_per_trade_bps > 0`, and only within the
+already-opt-in `integer_shares` convention).

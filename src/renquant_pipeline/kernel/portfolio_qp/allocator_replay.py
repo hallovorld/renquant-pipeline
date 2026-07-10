@@ -790,11 +790,15 @@ def _execute_integer_session(
       task_selection rescue's reserve-aware headroom). A name may
       overshoot its target by at most one share.
     * **Post-round recheck on EXECUTED quantities** — cash (incl.
-      reserve; guaranteed by construction since every fill is
-      headroom-bounded), single-name cap, sector caps (snapshot
-      families + the D6 caps when ``enforce_caps``), and
-      correlation-pair constraints are re-verified on the integer
-      quantities; a violating BUY is capped down one share at a time
+      reserve, AFTER the session-level linear transaction cost is
+      later applied — every fill is bounded by a FEE-AWARE headroom,
+      not just the raw reserve-adjusted cash; a P1 bug where the
+      pre-fee headroom check alone left post-fee cash below the
+      reserve was fixed per Codex review on #182), single-name cap,
+      sector caps (snapshot families + the D6 caps when
+      ``enforce_caps``), and correlation-pair constraints are
+      re-verified on the integer quantities; a violating BUY is
+      capped down one share at a time
       (lowest conviction first, deterministic tiebreak) — never carried
       in breach. Breaches attributable to carried drift or sell legs
       (down-only by construction) are not "orders" and remain visible
@@ -857,7 +861,26 @@ def _execute_integer_session(
     )
     # Investable headroom = cash minus the snapshot cash reserve (RFC
     # §2.3 "remaining investable headroom"; task_selection convention).
-    headroom = max(float(state.cash) - float(snap.cash_reserve) * pv_base, 0.0)
+    # Fee-aware (P1 fix, Codex review on #182): `_replay_one_allocator_
+    # stateful` deducts ONE session-level linear cost
+    # (`session_traded * cost_per_trade_bps * 1e-4`, on ALL traded
+    # dollars this session, sells included) from cash AFTER this
+    # function returns. A headroom check that only reserved the cash
+    # floor pre-fee let a buy exactly fill headroom and then go below
+    # the reserve once that fee was charged. `traded` here is exactly
+    # this session's SELL dollars (buys haven't started yet), so its
+    # fee liability is already fixed — reserve it before sizing buys;
+    # then charge each candidate buy its OWN fee too (`fee_factor`) so
+    # `headroom` stays fee-aware through every main-pass / rescue /
+    # cap-down iteration below.
+    cost_bps = float(bar.cost_per_trade_bps)
+    fee_factor = 1.0 + cost_bps * 1e-4
+    sell_fee_liability = traded * cost_bps * 1e-4
+    headroom = max(
+        float(state.cash) - float(snap.cash_reserve) * pv_base
+        - sell_fee_liability,
+        0.0,
+    )
     raws = [
         shrunk_kelly_raw(
             float(bar.mu[i]), float(bar.sigma[i]),
@@ -882,11 +905,11 @@ def _execute_integer_session(
         p = price_by_i[i]
         need_w = target_w[i] - realized[i]
         shares = min(int(need_w * pv_base / p + 1e-9),
-                     int((headroom + 1e-6) / p))
+                     int((headroom + 1e-6) / (p * fee_factor)))
         if shares >= 1:
             bought[i] += shares
             realized[i] += shares * p / pv_base
-            headroom -= shares * p
+            headroom -= shares * p * fee_factor
 
     # Deferred one-share rescue sweeps (governor_sizing residual pass /
     # S6 A-3): leftover headroom only, conviction order, cap-bounded.
@@ -898,20 +921,23 @@ def _execute_integer_session(
             if realized[i] >= target_w[i] - 1e-12:
                 continue
             p = price_by_i[i]
-            if p > headroom + 1e-6:
+            if p * fee_factor > headroom + 1e-6:
                 continue
             if realized[i] + p / pv_base > cap[i] + 1e-6:
                 continue
             bought[i] += 1
             realized[i] += p / pv_base
-            headroom -= p
+            headroom -= p * fee_factor
             n_rescue += 1
             progressed = True
 
     # Post-round recheck — cap down violating BUYS, one share at a
     # time, lowest conviction first (deterministic tiebreak). Cash
-    # (incl. reserve) holds by construction: every fill above was
-    # bounded by the reserve-adjusted headroom.
+    # (incl. reserve, AFTER the session-level fee is later applied)
+    # holds by construction: every fill above was bounded by the
+    # fee-aware, reserve-adjusted headroom (P1 fix, Codex review on
+    # #182 — the pre-fix comment claiming this "by construction" was
+    # false once the session-level transaction cost was applied).
     n_capdown = 0
 
     def _remove_one(i: int) -> None:
@@ -919,7 +945,7 @@ def _execute_integer_session(
         p = price_by_i[i]
         bought[i] -= 1
         realized[i] -= p / pv_base
-        headroom += p
+        headroom += p * fee_factor
         n_capdown += 1
 
     # 1. Single-name cap.
@@ -1137,6 +1163,20 @@ def _replay_one_allocator_stateful(
         # ── 7. Linear cost: bps per side on every traded dollar ────
         session_cost = session_traded * bar.cost_per_trade_bps * 1e-4
         state.cash -= session_cost
+
+        # L3_FULL cash-reserve invariant (Codex review on #182): must
+        # hold AFTER all taxes and costs are applied, not just pre-fee.
+        # _execute_integer_session's fee-aware headroom is what makes
+        # this true; assert it here as a runtime guard against
+        # regression, not merely a claim in a comment.
+        if conv.integer_shares:
+            reserve_floor = float(snap.cash_reserve) * pv_base
+            assert state.cash >= reserve_floor - 1e-6, (
+                f"stateful replay [{name}] bar {bar.bar_date}: L3_FULL "
+                f"cash-reserve invariant violated after fees/taxes — "
+                f"cash={state.cash!r} < reserve_floor={reserve_floor!r} "
+                f"(reserve_pct={snap.cash_reserve!r}, pv_base={pv_base!r})"
+            )
 
         # ── 8. Post-trade deployed fraction (real state variable) ──
         positions_post = state.total_positions_value()
