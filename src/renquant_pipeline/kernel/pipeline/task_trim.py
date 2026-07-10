@@ -45,6 +45,24 @@ class TrimHeldTask(Task):
     weight exceeds their Kelly target by `trim_threshold`."""
 
     def run(self, ctx: InferenceContext) -> bool | None:
+        # Deployment Governor ownership (RFC 2026-07-09, PR #179 follow-up):
+        # mirror of TopUpHeldTask's structural guard — when the Governor
+        # actually RAN this session (flag on AND no fault fallback), the L2
+        # allocator + delta execution already own every held name's target
+        # weight; a Kelly trim on top would fight the allocator's declared
+        # E_final. Structural no-op with a ledger-visible counter. Flag-off
+        # never sets the ownership attribute (byte-identical); fault-
+        # fallback sessions keep legacy trim ACTIVE by construction.
+        from .governor_sizing import governor_owns_sizing  # noqa: PLC0415
+        if governor_owns_sizing(ctx):
+            ctx.counters["trim_suppressed_governor_owns_sizing"] = (
+                ctx.counters.get("trim_suppressed_governor_owns_sizing", 0) + 1
+            )
+            log.info(
+                "TrimHeldTask: suppressed — Deployment Governor owns ALL "
+                "sizing this session (governor_owns_sizing=True)"
+            )
+            return
         kelly_cfg = ctx.config.get("ranking", {}).get("kelly_sizing", {})
         if not kelly_cfg.get("enabled", False):
             return

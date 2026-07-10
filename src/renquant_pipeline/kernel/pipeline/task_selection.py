@@ -151,6 +151,29 @@ class SizeAndEmitTask(Task):
             )
             return False
 
+        # Deployment Governor (RFC 2026-07-09 D2–D4, default OFF): when the
+        # top-level `deployment_governor.enabled` flag is on, L1/L2/L3
+        # (governor → down-only allocator → integer execution) own the
+        # sizing decision INSTEAD of the legacy multiplicative stack below.
+        # Scope: sizing only — the admission chain above (greedy loop,
+        # buy_blocked/skip_buys, and the signal-direction gate, re-applied
+        # identically inside the governor path) and every exit rule are
+        # untouched. BEAR defensive-sleeve sessions keep the legacy path
+        # (fixed-slot policy is not a Kelly-sizing decision). Fail-closed:
+        # a Governor fault (model fault / broken price feed / unmapped
+        # regime) falls through to the legacy path unchanged. Flag
+        # absent/false ⇒ BYTE-IDENTICAL behaviour (regression-pinned by
+        # tests/test_governor_sizing_integration.py).
+        from .governor_sizing import (  # noqa: PLC0415
+            governor_config,
+            governor_enabled,
+            run_governor_sizing,
+        )
+        if governor_enabled(ctx.config) and not bool(getattr(ctx, "bear_only", False)):
+            if run_governor_sizing(ctx, governor_config(ctx.config)):
+                return None
+            # Governor fault → legacy sizing path below (fail-closed).
+
         from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
             compute_position_size,
             conviction_score_for_object,
