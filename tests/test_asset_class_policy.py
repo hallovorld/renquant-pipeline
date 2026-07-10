@@ -117,6 +117,38 @@ class TestP1FreshnessCalendar:
         assert last_completed_always_open_session(self.REF) == SAT
         assert last_completed_always_open_session(SUN) == SAT
 
+    def test_utc_contract_near_midnight_boundary(self):
+        """UTC-contract pins (Codex review of renquant-common #27): the
+        pipeline-side UTC-day math — BOTH the local fallback and the common
+        consume path — must (a) treat NAIVE instants as UTC, never local/ET,
+        and (b) normalize AWARE instants to UTC before date extraction."""
+        from renquant_pipeline.kernel.asset_class import _utc_date_of
+
+        # (b) Aware instant straddling UTC midnight: 2026-06-28T20:30-04:00
+        # == 2026-06-29 00:30 UTC → UTC date is the 29th (wall date 28th),
+        # so the last completed always-open session is the 28th.
+        straddle = pd.Timestamp("2026-06-28T20:30:00-04:00")
+        assert _utc_date_of(straddle) == dt.date(2026, 6, 29)
+        assert last_completed_always_open_session(straddle) == SUN
+        aware = dt.datetime(
+            2026, 6, 28, 20, 30,
+            tzinfo=dt.timezone(dt.timedelta(hours=-4)),
+        )
+        assert _utc_date_of(aware) == dt.date(2026, 6, 29)
+        assert last_completed_always_open_session(aware) == SUN
+
+        # (a) Naive instants near UTC midnight are UTC, not ET: a naive
+        # 23:00 on the 28th stays on the 28th (ET reading would spill into
+        # the 29th UTC day and wrongly report the 28th as completed).
+        for hh in (20, 21, 22, 23):
+            naive = dt.datetime(2026, 6, 28, hh, 59)
+            assert _utc_date_of(naive) == SUN, hh
+            assert last_completed_always_open_session(naive) == SAT, hh
+        # Naive pandas Timestamp too (the DataFreshness ref-ts shape).
+        assert last_completed_always_open_session(
+            pd.Timestamp("2026-06-28 23:59:00")
+        ) == SAT
+
     def test_local_store_crypto_requires_saturday_bar_on_sunday(self, tmp_path):
         from renquant_pipeline.kernel.data import LocalStore
 
