@@ -35,8 +35,8 @@ dispersion) stamped for the decision ledger.
 
 ## Tests
 
-68 new (18 governor unit + 28 allocator unit + 22 integration); full suite
-1404 passed / 7 skipped.
+72 new (18 governor unit + 28 allocator unit + 26 integration); full suite
+1408 passed / 7 skipped.
 
 ## Scope notes / deviations from RFC (explicit)
 
@@ -47,5 +47,13 @@ dispersion) stamped for the decision ledger.
   the untouched exit stack.
 - Governor runs only when the selection chain reaches `SizeAndEmitTask`
   (a full book short-circuits at `PrepareSelectionTask`, as today).
-- `TopUpHeldTask`/`TrimHeldTask` are not auto-disabled when the Governor is
-  enabled — the D5 strategy config must not enable both stacks at once.
+- `TopUpHeldTask`/`TrimHeldTask` ownership: RESOLVED STRUCTURALLY
+  (follow-up commit). When the Governor actually ran (flag on AND no
+  fault fallback), `run_governor_sizing` stamps
+  `ctx._governor_owns_sizing`; TopUp/Trim then NO-OP with ledger counters
+  (`topup_suppressed_governor_owns_sizing` /
+  `trim_suppressed_governor_owns_sizing`) — the Governor owns ALL sizing
+  when active, so a live top-up would double-add to positions and pollute
+  S1 shadow data. Fault-fallback sessions never set the flag — legacy
+  top-up/trim stay fully ACTIVE; flag-off remains byte-identical (the
+  attribute never exists).

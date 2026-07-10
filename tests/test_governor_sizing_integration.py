@@ -416,3 +416,113 @@ def test_wash_sale_no_buy_mask_blocks_topup_of_held_name():
     _run(ctx)
     assert _order_map(ctx) == {}                        # no top-up emitted
     assert ctx.counters["governor_sessions"] == 1
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  Governor ownership: TopUpHeldTask / TrimHeldTask structural no-op
+#  (PR #179 follow-up — ownership is structural, not config discipline)
+# ═════════════════════════════════════════════════════════════════════
+
+from renquant_pipeline.kernel.pipeline.task_topup import TopUpHeldTask  # noqa: E402
+from renquant_pipeline.kernel.pipeline.task_trim import TrimHeldTask  # noqa: E402
+
+
+def _topup_shaped_holding(*, mu=0.05, sigma=0.2):
+    """Held name legacy TopUp WOULD add to: kelly target ≫ current weight,
+    positive signal, above the conviction floor."""
+    hs = _held(100.0, shares=1, mu=mu, sigma=sigma)     # current ≈ 0.01 PV
+    hs.kelly_target_pct = 0.10                          # delta 0.09 > 0.05
+    hs.rank_score = 0.6
+    hs.panel_score = 0.5
+    hs.expected_return = 0.05
+    return hs
+
+
+def _trim_shaped_holding():
+    """Held name legacy Trim WOULD reduce: current weight ≫ kelly target."""
+    hs = _held(100.0, shares=30, mu=0.05)               # current 0.30 PV
+    hs.kelly_target_pct = 0.10                          # delta 0.20 > 0.10
+    hs.rank_score = 0.6
+    hs.panel_score = 0.5
+    hs.expected_return = 0.05
+    return hs
+
+
+def _kelly_sizing_cfg():
+    return {"enabled": True, "top_up_threshold": 0.05,
+            "trim_enabled": True, "trim_threshold": 0.10}
+
+
+def test_flag_off_topup_and_trim_unchanged_by_guard():
+    """(c) flag-off: legacy TopUp/Trim behaviour, no suppression counter —
+    also proves the fixtures are genuinely top-up/trim shaped."""
+    cfg = _config()                                     # no governor block
+    cfg["ranking"]["kelly_sizing"] = _kelly_sizing_cfg()
+    ctx = _ctx([], [], cfg, cash=5_000.0, prices={"H": 100.0},
+               holdings={"H": _topup_shaped_holding()})
+    TopUpHeldTask().run(ctx)
+    assert [o["order_type"] for o in ctx.orders] == ["TOP_UP"]
+    assert "topup_suppressed_governor_owns_sizing" not in ctx.counters
+
+    ctx2 = _ctx([], [], cfg, cash=0.0, prices={"OVER": 100.0},
+                holdings={"OVER": _trim_shaped_holding()})
+    TrimHeldTask().run(ctx2)
+    assert [t for t, _ in ctx2.exits] == ["OVER"]
+    assert ctx2.exits[0][1].exit_type == "kelly_trim"
+    assert "trim_suppressed_governor_owns_sizing" not in ctx2.counters
+
+
+def test_governor_session_structurally_suppresses_topup_and_trim():
+    """(a→governor ran) TopUp/Trim NO-OP with counters: the Governor owns
+    ALL sizing this session — a live top-up would double-add to positions
+    the allocator already sized."""
+    cfg = _config(governor=_gov(hysteresis_band=0.0, max_step_per_session=1.0))
+    cfg["ranking"]["kelly_sizing"] = _kelly_sizing_cfg()
+    ctx = _ctx([_cand("A", mu=0.04)], ["A"], cfg, cash=5_000.0,
+               prices={"A": 50.0, "H": 100.0},
+               holdings={"H": _topup_shaped_holding()})
+    _run(ctx)                                           # governor owns sizing
+    assert ctx.counters["governor_sessions"] == 1
+    orders_after_governor = list(ctx.orders)
+    exits_after_governor = list(ctx.exits)
+
+    TopUpHeldTask().run(ctx)
+    TrimHeldTask().run(ctx)
+    assert ctx.orders == orders_after_governor          # nothing double-added
+    assert ctx.exits == exits_after_governor
+    assert ctx.counters["topup_suppressed_governor_owns_sizing"] == 1
+    assert ctx.counters["trim_suppressed_governor_owns_sizing"] == 1
+
+
+def test_hysteresis_hold_session_also_suppresses_topup():
+    """A hysteresis hold IS a sizing decision ("no reallocation") — TopUp
+    must not undo it."""
+    held = {"H": _held(100.0, shares=10, mu=0.014)}     # w=0.10, raw 0.105
+    held["H"].kelly_target_pct = 0.30                   # legacy would add
+    held["H"].rank_score = 0.6
+    held["H"].panel_score = 0.5
+    held["H"].expected_return = 0.05
+    cfg = _config(governor=_gov())                      # band 0.05 → hold
+    cfg["ranking"]["kelly_sizing"] = _kelly_sizing_cfg()
+    ctx = _ctx([], [], cfg, cash=5_000.0, prices={"H": 100.0}, holdings=held)
+    _run(ctx)
+    assert ctx.counters["governor_hysteresis_holds"] == 1
+    TopUpHeldTask().run(ctx)
+    assert ctx.orders == []
+    assert ctx.counters["topup_suppressed_governor_owns_sizing"] == 1
+
+
+def test_governor_fault_session_keeps_topup_active():
+    """(b) fault-fallback: Governor emitted no target → legacy path ran →
+    legacy TopUp semantics FULLY preserved (no suppression)."""
+    hs = _topup_shaped_holding(mu=None, sigma=None)     # kills the moments
+    cfg = _config(governor=_gov())
+    cfg["ranking"]["kelly_sizing"] = _kelly_sizing_cfg()
+    ctx = _ctx([], [], cfg, cash=5_000.0, prices={"H": 100.0},
+               holdings={"H": hs})
+    _run(ctx)                                           # model fault → legacy
+    assert ctx.counters["governor_fault_fallback_legacy"] == 1
+    TopUpHeldTask().run(ctx)
+    assert [o["order_type"] for o in ctx.orders] == ["TOP_UP"]
+    assert "topup_suppressed_governor_owns_sizing" not in ctx.counters
+    assert "trim_suppressed_governor_owns_sizing" not in ctx.counters

@@ -107,6 +107,24 @@ class TopUpHeldTask(Task):
     exceeds their current weight by `top_up_threshold`."""
 
     def run(self, ctx: InferenceContext) -> bool | None:
+        # Deployment Governor ownership (RFC 2026-07-09, PR #179 follow-up):
+        # when the Governor actually RAN this session (flag on AND no fault
+        # fallback), it owns ALL sizing — the L2 allocator already computed
+        # every held name's target weight, so a Kelly top-up here would
+        # double-add to positions and pollute S1 shadow data. Structural
+        # no-op with a ledger-visible counter. Flag-off sessions never set
+        # the ownership attribute (byte-identical), and fault-fallback
+        # sessions keep legacy top-up ACTIVE by construction.
+        from .governor_sizing import governor_owns_sizing  # noqa: PLC0415
+        if governor_owns_sizing(ctx):
+            ctx.counters["topup_suppressed_governor_owns_sizing"] = (
+                ctx.counters.get("topup_suppressed_governor_owns_sizing", 0) + 1
+            )
+            log.info(
+                "TopUpHeldTask: suppressed — Deployment Governor owns ALL "
+                "sizing this session (governor_owns_sizing=True)"
+            )
+            return
         kelly_cfg = ctx.config.get("ranking", {}).get("kelly_sizing", {})
         if not kelly_cfg.get("enabled", False):
             return

@@ -91,6 +91,24 @@ def governor_enabled(config: dict | None) -> bool:
     return bool(blk and blk.get("enabled", False))
 
 
+def governor_owns_sizing(ctx: Any) -> bool:
+    """True iff the Governor actually OWNED this session's sizing decision.
+
+    Set by :func:`run_governor_sizing` on every non-fault path (including
+    a hysteresis hold — "no reallocation" IS a sizing decision). When the
+    Governor owns sizing it owns ALL of it: ``TopUpHeldTask`` /
+    ``TrimHeldTask`` must NO-OP (structurally, not by config discipline) —
+    a live top-up would double-add to positions the allocator already
+    sized and pollute S1 shadow data.
+
+    False when the flag is off (attribute never set — byte-identical
+    legacy behaviour) AND on fault-fallback sessions (Governor emitted no
+    target → the legacy path ran, so legacy top-up/trim semantics are
+    fully preserved).
+    """
+    return bool(getattr(ctx, "_governor_owns_sizing", False))
+
+
 def _cfg(gov_cfg: dict, key: str) -> Any:
     value = gov_cfg.get(key)
     return GOVERNOR_DEFAULTS[key] if value is None else value
@@ -249,6 +267,11 @@ def run_governor_sizing(ctx: Any, gov_cfg: dict) -> bool:
         return _fault(ctx, "model_fault" if model_fault else "unmapped_regime")
 
     ctx.counters["governor_sessions"] = ctx.counters.get("governor_sessions", 0) + 1
+    # From here on every path returns True: the Governor owns ALL sizing
+    # this session — downstream sizing tasks (TopUpHeldTask/TrimHeldTask)
+    # check this via governor_owns_sizing() and NO-OP. Never set on the
+    # fault paths above, so fault-fallback keeps full legacy semantics.
+    ctx._governor_owns_sizing = True  # noqa: SLF001
 
     # ── Hysteresis hold: E* = E_current ⇒ NO reallocation this session ─
     if decision.hysteresis_held:
