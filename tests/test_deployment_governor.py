@@ -18,6 +18,7 @@ import math
 import pytest
 
 from renquant_pipeline.kernel.deployment_governor import (
+    L1_CANDIDATES,
     compute_session_target_exposure,
     shrunk_kelly_raw,
 )
@@ -256,26 +257,14 @@ def test_candidate_ceil_same_every_regime_regardless_of_slate():
         assert d.e_target == pytest.approx(ceil), regime
 
 
-def test_candidate_voltarget_uses_vol_target_scale():
-    # 60 identical-return days ⇒ realized_vol computable; target_vol=0.15
-    # default, floor/ceiling defaults [0.30, 1.50] from compute_vol_target_scale.
-    spy_returns = [0.001] * 60
-    d = _decide(raws={"A": 0.5}, caps={"A": 0.5}, regime="BULL_CALM",
-                hysteresis_band=0.0, l1_candidate="voltarget",
-                spy_returns=spy_returns)
-    assert d.l1_candidate == "voltarget"
-    assert d.e_vol is not None
-    assert d.e_target == pytest.approx(min(d.e_vol, 0.95))
-
-
-def test_candidate_voltarget_too_few_returns_fails_open_to_ceiling():
-    # compute_vol_target_scale fails open to 1.0 with <window_days returns;
-    # min(1.0, e_ceil) = e_ceil here since e_ceil < 1.0.
-    d = _decide(raws={"A": 0.5}, caps={"A": 0.5}, regime="BULL_CALM",
-                hysteresis_band=0.0, l1_candidate="voltarget",
-                spy_returns=[0.001] * 5)
-    assert d.e_vol == pytest.approx(1.0)
-    assert d.e_target == pytest.approx(0.95)
+def test_voltarget_is_not_a_selectable_candidate():
+    # (C) E*_voltarget removed pending a real top-k-weighted portfolio-vol
+    # estimator (post-#443-merge Codex review: the prior implementation
+    # mislabeled an SPY-proxied scale as the RFC's sigma_hat_pf). Requesting
+    # it is the same contract fault as any other unknown candidate string.
+    assert "voltarget" not in L1_CANDIDATES
+    assert _decide(raws={"A": 0.5}, caps={"A": 0.5}, regime="BULL_CALM",
+                   hysteresis_band=0.0, l1_candidate="voltarget") is None
 
 
 def test_unknown_l1_candidate_is_a_contract_fault():

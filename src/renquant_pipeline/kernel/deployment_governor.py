@@ -14,30 +14,42 @@ Algorithm (RFC §2.1, ceiling only — NO exposure floor):
                                                    ``fractional_kelly_top_k``)
     E_raw  = Σ_{i ∈ top-k} min(raw_i, cap_i)
 
-Three independent L1 candidates (RFC §2.1, r4 review — each defined fully
-and separately; only (B) is bounded by E_raw by construction):
+Two of the three independent L1 candidates from RFC §2.1 are implemented
+(r4 review — each defined fully and separately; only (B) is bounded by
+E_raw by construction):
 
     (A) E*_ceil      = E_ceil(regime)                     PREREGISTERED
                                                             CANDIDATE
     (B) E*_kelly     = min(E_raw, E_ceil(regime))          COMPARISON ARM
                                                             (E* ≤ E_raw
                                                             guaranteed)
-    (C) E*_voltarget = min(E_vol, E_ceil(regime))          COMPARISON ARM,
-        E_vol = compute_vol_target_scale(spy_returns, ...) — REUSES the
-        existing R-02 portfolio-vol-targeting convention
-        (``kernel/vol_target.py``: SPY-proxied realized vol, β≈1
-        assumption, already regime-overridable via
-        ``portfolio_qp/tasks.py::_resolve_regime_override`` — this is the
-        "existing regime-vol-band table" §2.1 refers to) rather than a
-        new weighted-portfolio-covariance estimate this codebase does not
-        have.
 
-Selected via ``l1_candidate`` ("ceil" | "kelly" | "voltarget", default
-"kelly" — the pre-existing behavior, preserved as the default so this
-addition is additive/non-breaking). D6 §2 Phase-2's confirmatory run picks
-which candidate becomes the live default; this function implements all
-three behind that one selector rather than hard-coding the winner ahead of
-the evaluation.
+**(C) E*_voltarget is NOT implemented here** (post-#443-merge Codex review):
+the RFC defines ``E_vol = σ_target / σ̂_pf`` where ``σ̂_pf`` MUST be the
+realized/forecast volatility of the PORTFOLIO at the current top-k
+E_raw-capped weights (i.e. ``sqrt(w^T Σ w)`` over the selected names' own
+covariance) — not a market-index proxy. This module's first attempt at
+(C) called ``kernel/vol_target.py::compute_vol_target_scale`` (an SPY-
+proxied, β≈1 realized-vol scale, honestly documented as a proxy in its own
+module) and mislabeled that proxy as the RFC's portfolio quantity; the two
+diverge whenever the selected slate is concentrated or its names'
+correlation structure differs from their correlation with SPY. A real
+``σ̂_pf`` needs the selected names' n×n covariance matrix — this codebase
+DOES compute one (``portfolio_qp/tasks.py::ComputeFullSigmaTask``, from a
+loaded correlation artifact + per-name σ), but only inside the QP
+pipeline's I/O/ctx-dependent task chain, which the Governor path is
+designed to REPLACE, not depend on (this pure function takes no ctx/I-O
+by contract, and the Governor's own pipeline integration never runs
+``ComputeFullSigmaTask``). Wiring correlation-artifact loading into the
+Governor path would be new cross-system integration, not a reuse of an
+existing convention — out of scope for this fix. ``voltarget`` is
+therefore removed from :data:`L1_CANDIDATES` until a real portfolio-vol
+estimator exists; re-add it then, following the same pattern as (A)/(B).
+
+Selected via ``l1_candidate`` ("ceil" | "kelly", default "kelly" — the
+pre-existing behavior, preserved as the default so this addition is
+additive/non-breaking). D6 §2 Phase-2's confirmatory run compares (A)
+against (B); (C) rejoins the comparison once it has a real implementation.
 
 Then, for whichever candidate produced E* above:
 
@@ -64,7 +76,6 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 from renquant_pipeline.kernel.regime import confidence_to_size_multiplier
-from renquant_pipeline.kernel.vol_target import compute_vol_target_scale
 
 __all__ = [
     "GovernorDecision",
@@ -72,7 +83,7 @@ __all__ = [
     "compute_session_target_exposure",
 ]
 
-L1_CANDIDATES = ("ceil", "kelly", "voltarget")
+L1_CANDIDATES = ("ceil", "kelly")
 
 
 def shrunk_kelly_raw(
@@ -146,8 +157,6 @@ def compute_session_target_exposure(
     model_fault: bool = False,
     mu: Mapping[str, float | None] | None = None,
     l1_candidate: str = "kelly",
-    spy_returns: "list | tuple | None" = None,
-    vol_target_cfg: Mapping[str, float] | None = None,
 ) -> Optional[GovernorDecision]:
     """Compute the session target gross exposure E* (RFC §2.1).
 
@@ -173,17 +182,11 @@ def compute_session_target_exposure(
     mu : optional name → μ̂ map, used only for the μ-dispersion slate stat.
     l1_candidate : one of :data:`L1_CANDIDATES` — which of the RFC §2.1
         candidates (A) ``"ceil"``, (B) ``"kelly"`` (default, pre-existing
-        behavior), (C) ``"voltarget"`` produces ``e_target``. An unknown
-        value is a contract fault → ``None`` (fail loud, no silent
-        fallback to a different candidate than requested).
-    spy_returns / vol_target_cfg : only consulted when
-        ``l1_candidate == "voltarget"``; passed through verbatim to
-        :func:`renquant_pipeline.kernel.vol_target.compute_vol_target_scale`
-        (``vol_target_cfg`` supplies ``target_vol``/``window_days``/
-        ``floor``/``ceiling``, defaults match that function's own —
-        the same regime-overridable config already resolved upstream by
-        ``portfolio_qp/tasks.py::_resolve_regime_override``, reused here
-        rather than a new regime-vol table).
+        behavior) produces ``e_target``. (C) ``"voltarget"`` is not yet
+        implemented (see module docstring) and is not a member of
+        :data:`L1_CANDIDATES`. An unknown value is a contract fault →
+        ``None`` (fail loud, no silent fallback to a different candidate
+        than requested).
 
     Returns
     -------
@@ -233,23 +236,14 @@ def compute_session_target_exposure(
         e_raw += min(admitted[name], cap)
 
     # ── L1 candidate selection (RFC §2.1) ──────────────────────────────
+    # (C) "voltarget" is not a member of L1_CANDIDATES (see module
+    # docstring) — l1_candidate is validated against L1_CANDIDATES above,
+    # so only "ceil"/"kelly" ever reach here.
     e_vol: float | None = None
     if l1_candidate == "ceil":
         # (A) preregistered candidate: independent of E_raw by
         # construction — the ceiling itself IS the pre-hysteresis target.
         e_pre = e_ceil
-    elif l1_candidate == "voltarget":
-        # (C) comparison arm: E_vol reuses the existing R-02 SPY-proxied
-        # vol-target scale (kernel/vol_target.py) as the exposure input.
-        vt_cfg = vol_target_cfg or {}
-        e_vol = compute_vol_target_scale(
-            spy_returns or [],
-            target_vol=float(vt_cfg.get("target_vol", 0.15)),
-            window_days=int(vt_cfg.get("window_days", 60)),
-            floor=float(vt_cfg.get("floor", 0.30)),
-            ceiling=float(vt_cfg.get("ceiling", 1.50)),
-        )
-        e_pre = min(e_vol, e_ceil)
     else:  # "kelly" (B), the pre-existing default behavior
         e_pre = min(e_raw, e_ceil)
 

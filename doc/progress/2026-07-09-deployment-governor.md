@@ -17,11 +17,13 @@ WHY/DIR:   Implements orchestrator#443's D2-D4 deliverables
            separate future PR after D6 tuning produces a frozen config.
 EVIDENCE:  n/a (flag-off byte-identical code change, not a model/data claim
            — see Tests below for the regression-pinning evidence)
-NEXT:      Codex code-level review of this round's fixes; then D6
-           nested-selection tuning on the frozen tuning subset (per
-           orchestrator#443 §1) to produce a calibrated config; then a
-           separate dedicated PR flips `shadow.json`'s `enabled` flag for
-           S1 shadow arming.
+NEXT:      Codex re-review of the voltarget correction below; then D6
+           nested-selection tuning (now A/B only: E*_ceil vs E*_kelly) on
+           the frozen tuning subset (per orchestrator#443 §1) to produce a
+           calibrated config; a real top-k-weighted portfolio-vol
+           estimator can re-add E*_voltarget as a later, separate PR; then
+           a separate dedicated PR flips `shadow.json`'s `enabled` flag
+           for S1 shadow arming.
 
 **PR:** pipeline feat/deployment-governor
 **Design:** orchestrator PR #443 (merged) — `doc/design/2026-07-09-deployment-governor-rfc.md`
@@ -79,12 +81,43 @@ arming. The risk is not live; confirmed by reading the config, not assumed.
 confirmatory run picking the live default. Added an `l1_candidate`
 selector (default `"kelly"`, preserving exact prior behavior including
 the original strict-inequality `ceiling_bound` semantics). Candidate (C)
-reuses the EXISTING R-02 SPY-proxied vol-target convention
-(`kernel/vol_target.py::compute_vol_target_scale`, already
-regime-overridable via `portfolio_qp/tasks.py::_resolve_regime_override`)
-rather than inventing a new portfolio-covariance estimate this codebase
-doesn't have — this is the "existing regime-vol-band table" §2.1 refers
-to.
+was FIRST implemented by reusing the existing R-02 SPY-proxied vol-target
+convention (`kernel/vol_target.py::compute_vol_target_scale`) — **this was
+wrong and was corrected the same day; see "voltarget correction" below.**
+
+### voltarget correction (2026-07-10, same day — new Codex review at the fix commit)
+
+Codex's next review caught an RFC-fidelity bug in the (C) implementation
+above: RFC §2.1 defines `sigma_hat_pf` as the realized/forecast volatility
+of the PORTFOLIO at the current top-k E_raw-capped weights
+(`sqrt(w^T Sigma w)` over the SELECTED names), not a market-index proxy —
+`compute_vol_target_scale`'s SPY-proxied, beta~1 scale (honestly documented
+as a proxy in its own module) is a materially different quantity whenever
+the selected slate is concentrated or its names' correlation structure
+diverges from their correlation with SPY. Investigated whether a real
+per-name covariance matrix is available to compute the RFC's actual
+quantity: this codebase DOES build one
+(`portfolio_qp/tasks.py::ComputeFullSigmaTask`, `Sigma = rho x sigma_i x
+sigma_j` from a loaded correlation artifact + per-name sigma), but only
+inside the QP pipeline's I/O/ctx-dependent task chain — which the
+Governor path is designed to REPLACE, not depend on, and which this pure,
+no-I/O function cannot invoke by its own architectural contract. Wiring
+correlation-artifact loading into the Governor's pipeline integration
+would be new cross-system integration work, not a reuse of an existing
+convention.
+
+**Resolution (Codex explicitly offered this as an acceptable alternative):
+removed `"voltarget"` from `L1_CANDIDATES` entirely** rather than ship a
+mislabeled proxy. `L1_CANDIDATES = ("ceil", "kelly")` until a real
+top-k-weighted portfolio-vol estimator exists; D6 Phase-2's confirmatory
+run now compares (A) vs (B) only. Removed the `compute_vol_target_scale`
+import, the `spy_returns`/`vol_target_cfg` parameters, and the voltarget
+branch from `compute_session_target_exposure`; kept the `e_vol` field on
+`GovernorDecision` (always `None` now) since `governor_sizing.py` already
+stamps it to the decision ledger and no candidate currently populates it.
+Replaced the two voltarget-behavior tests with one test asserting
+`"voltarget"` is absent from `L1_CANDIDATES` and is rejected as an unknown
+candidate, same as any other invalid string.
 
 **Gap 2 — L2's residual didn't carry the 3-source taxonomy.** RFC §2.2's
 corrected feasibility statement names three distinct reasons
