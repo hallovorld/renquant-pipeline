@@ -112,14 +112,27 @@ one-share rescue in `kernel/pipeline/task_selection.py`):
    still short of target (a floored-to-0 candidate rounds UP to exactly one
    share) — each share only iff it fits the per-name cap AND the remaining
    headroom; a name can overshoot its target by at most one share.
-3. **Post-round rechecks on EXECUTED quantities** — cash (incl. reserve;
-   headroom-bounded fills make it hold by construction), single-name cap,
-   sector caps (snapshot families + D6 map when `--enforce-caps`), and
-   correlation-pair constraints; a violating BUY is capped down one share at a
-   time, lowest conviction first — never carried in breach. Carried-drift
-   breaches are not orders and stay visible via the violation accounting.
-4. **Ledger** — per-session `E_executed`, `integer_residual = Σtarget −
-   E_executed`, plus `rescue_buys` / `recheck_capdowns` counters.
+3. **Post-round rechecks on EXECUTED quantities** — cash incl. reserve,
+   single-name cap, sector caps (snapshot families + D6 map when
+   `--enforce-caps`), and correlation-pair constraints; a violating BUY is
+   capped down one share at a time, lowest conviction first — never carried
+   in breach. Carried-drift breaches are not orders and stay visible via
+   the violation accounting.
+4. **Fee-aware affordability + hard reserve invariant (r3 P1 fix)** — Codex
+   r3 on #182 caught that fees were deducted AFTER the executor returned, so
+   an order exactly consuming the reserve-adjusted headroom left
+   `cash < reserve` post-fee (overstating deployment, the primary endpoint).
+   Fixed: fees are charged to cash AT trade time everywhere in the stateful
+   engine (sell legs, off-universe liquidations, buys — identical session
+   totals to the old aggregate deduction); every buy fill (main pass AND
+   each rescue iteration) is affordable only if `notional × (1 + fee)` fits
+   the remaining headroom; cap-down removals refund the fee-inclusive
+   amount, re-computing affordability per iteration. A hard post-execution
+   invariant raises if `cash < min(reserve × PV_base, cash_after_sells)`
+   after all taxes and costs — a breach means the sizing math is wrong.
+5. **Ledger** — per-session `E_executed`, `integer_residual = Σtarget −
+   E_executed`, plus `rescue_buys` / `recheck_capdowns` counters — all
+   computed from the final fee-aware executed quantities.
 
 Documented divergences from main's L3 (harness necessarily generalizes):
 - Sells are the arm's unconditional decisions (no improvement-positive pair

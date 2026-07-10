@@ -802,6 +802,123 @@ class TestL3PostRoundRecheck:
         assert res.rescue_buys == [0]
 
 
+class TestL3FeeAwareReserve:
+    """r3 #182 P1: affordability must include the buy-side transaction
+    cost — an order that exactly consumes the reserve-adjusted headroom
+    must NOT leave cash < reserve once the D6 5 bps/side fee is charged.
+    These tests use an exaggerated 100 bps/side fee so one whole share's
+    fee is material at the headroom boundary."""
+
+    def test_exact_headroom_fill_withholds_last_share_for_fee(self):
+        # PV 10000, reserve 50% → headroom $5000; price 100, fee 1%.
+        # Fee-blind sizing buys 50 shares ($5000) then pays $50 fee →
+        # cash 4950 < 5000 (the P1 violation). Fee-aware sizing buys
+        # floor(5000 / 101) = 49 shares: the 50th share is withheld.
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.60}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cash_reserve=0.50,
+                 cost_bps=100.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert st.position_shares("AAA") == pytest.approx(49.0)
+        # cash = 10000 − 4900 − 49 fee = 5051 ≥ reserve 5000, exact.
+        assert st.cash == pytest.approx(5_051.0, abs=1e-9)
+        assert st.cash >= 0.50 * 10_000.0
+        assert res.cost_paid[0] == pytest.approx(49.0, abs=1e-9)
+        # Ledger computed from the FINAL fee-aware executed quantities.
+        assert res.executed_exposure[0] == pytest.approx(0.49, abs=1e-12)
+        assert res.integer_residual[0] == pytest.approx(0.11, abs=1e-12)
+        assert res.rescue_buys == [0]
+
+    def test_zero_reserve_exact_cash_fill_never_overdraws(self):
+        # Reserve 0: fee-blind sizing would buy 100 shares ($10000) and
+        # end at cash −100. Fee-aware: floor(10000/101) = 99 shares →
+        # cash = 10000 − 9900 − 99 = +1.
+        alloc = _fixed_target_allocator({"*": {"AAA": 1.0}})
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[100.0], cost_bps=100.0),
+        ]
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        assert st.position_shares("AAA") == pytest.approx(99.0)
+        assert st.cash == pytest.approx(1.0, abs=1e-9)
+        assert st.cash >= 0.0
+
+    def test_rescue_is_fee_aware_at_the_headroom_boundary(self):
+        # One share costs 100 + 1 fee = 101. Headroom $100.50 → the
+        # rescue must NOT fire (a fee-blind "price ≤ headroom" check
+        # would have fired and breached the reserve by 50¢).
+        alloc = _fixed_target_allocator({"*": {"AAA": 0.008}})
+        blocked = _bar(
+            "2026-01-02", tickers=("AAA",), mu=[0.05], fwd_return=[0.0],
+            prices=[100.0], cash_reserve=0.98995, cost_bps=100.0,
+        )
+        conv = ReplayConventions(stateful=True, integer_shares=True)
+        res = replay_one_allocator("s", alloc, [blocked], conv)
+        assert res.rescue_buys == [0]
+        assert res.final_state.position_shares("AAA") == pytest.approx(0.0)
+        assert res.final_state.cash == pytest.approx(10_000.0, abs=1e-9)
+        # Headroom $102 ≥ $101 → the rescue funds WITHOUT crossing
+        # the reserve.
+        funded = _bar(
+            "2026-01-02", tickers=("AAA",), mu=[0.05], fwd_return=[0.0],
+            prices=[100.0], cash_reserve=0.9898, cost_bps=100.0,
+        )
+        res2 = replay_one_allocator("s", alloc, [funded], conv)
+        assert res2.rescue_buys == [1]
+        st2 = res2.final_state
+        assert st2.position_shares("AAA") == pytest.approx(1.0)
+        # cash = 10000 − 100 − 1 = 9899 ≥ reserve 9898.
+        assert st2.cash == pytest.approx(9_899.0, abs=1e-9)
+        assert st2.cash >= 0.9898 * 10_000.0
+
+    def test_cash_conservation_exact_with_fees_in_integer_mode(self):
+        # Multi-session integer chain with 5 bps/side + tax: the PV
+        # identity (initial × Π(1+daily) == cash + positions) must hold
+        # exactly with fees charged at trade time, and the reserve
+        # invariant must hold every session.
+        alloc = _scripted_allocator([
+            {"AAA": 0.60}, {"AAA": 0.60}, {},
+        ])
+        bars = [
+            _bar("2026-01-02", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.10], prices=[50.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+            _bar("2026-01-03", tickers=("AAA",), mu=[0.05],
+                 fwd_return=[0.0], prices=[55.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+            _bar("2026-01-04", tickers=("AAA",), mu=[-0.05],
+                 fwd_return=[0.0], prices=[55.0], cost_bps=5.0,
+                 cash_reserve=0.05),
+        ]
+        conv = ReplayConventions(
+            stateful=True, tax=True, integer_shares=True,
+            initial_capital=10_000.0,
+        )
+        res = replay_one_allocator("s", alloc, bars, conv)
+        st = res.final_state
+        pv_close = st.portfolio_value
+        compounded = 10_000.0 * float(
+            np.prod(1.0 + np.asarray(res.daily_returns_net))
+        )
+        assert pv_close == pytest.approx(compounded, abs=1e-6)
+        # cash + positions == PV at every recorded session close.
+        for i in range(len(bars)):
+            assert res.cash_series[i] + res.positions_value_series[i] == (
+                pytest.approx(
+                    10_000.0 * float(np.prod(
+                        1.0 + np.asarray(res.daily_returns_net[: i + 1])
+                    )),
+                    abs=1e-6,
+                )
+            )
+
+
 # ── 5. In-arm cap enforcement ───────────────────────────────────────
 
 

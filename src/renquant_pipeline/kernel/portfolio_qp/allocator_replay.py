@@ -769,7 +769,7 @@ def _execute_integer_session(
     pv_base: float,
     conv: ReplayConventions,
     bar_index: int,
-) -> tuple[np.ndarray, float, float, int, int]:
+) -> tuple[np.ndarray, float, float, float, int, int]:
     """RFC #443 §2.3 L3 — integer-aware execution (executed-state invariant).
 
     Mirrors the merged production L3 (kernel/pipeline/governor_sizing.py
@@ -789,9 +789,18 @@ def _execute_integer_session(
       investable headroom (cash minus the snapshot cash reserve — the
       task_selection rescue's reserve-aware headroom). A name may
       overshoot its target by at most one share.
-    * **Post-round recheck on EXECUTED quantities** — cash (incl.
-      reserve; guaranteed by construction since every fill is
-      headroom-bounded), single-name cap, sector caps (snapshot
+    * **Fee-aware affordability** (r3 #182 P1 fix): every fill —
+      main-pass and rescue alike — is affordable only if
+      ``notional × (1 + fee)`` fits the remaining headroom, where
+      ``fee = cost_per_trade_bps × 1e-4`` is the D6 §1.1 frozen per-side
+      linear cost. Fees are charged to cash AT trade time (sell legs
+      too), so an order that exactly fills the headroom can never leave
+      ``cash < reserve`` after fees; cap-down removals refund the full
+      fee-inclusive amount, re-computing affordability on every
+      rescue/cap-down iteration.
+    * **Post-round recheck on EXECUTED quantities** — cash incl. reserve
+      (headroom-bounded, fee-inclusive fills + a hard post-execution
+      invariant check below), single-name cap, sector caps (snapshot
       families + the D6 caps when ``enforce_caps``), and
       correlation-pair constraints are re-verified on the integer
       quantities; a violating BUY is capped down one share at a time
@@ -799,18 +808,29 @@ def _execute_integer_session(
       in breach. Breaches attributable to carried drift or sell legs
       (down-only by construction) are not "orders" and remain visible
       through the violation accounting instead.
+    * **Hard cash-reserve invariant** — after all buys, taxes, and
+      costs: ``cash ≥ min(reserve × PV_base, cash_after_sells)``
+      (buys must never take cash below the reserve; if the carried
+      session OPENED below reserve, buys are already impossible and the
+      floor is the post-sell cash itself). A breach raises — it would
+      mean the sizing math is wrong, and a silent breach would overstate
+      deployment, the primary cash-drag endpoint.
 
-    Returns ``(executed_w, traded_dollars, tax_dollars, n_rescue_buys,
-    n_recheck_capdowns)``. ``executed_w`` is the ACTUAL post-fill book
-    over the session's tickers — what carries into state (executed-state
-    invariant) and what ``E_executed`` / ``integer_residual =
-    Σtarget − E_executed`` are stamped from.
+    Returns ``(executed_w, traded_dollars, tax_dollars, cost_dollars,
+    n_rescue_buys, n_recheck_capdowns)``. ``executed_w`` is the ACTUAL
+    post-fill book over the session's tickers — what carries into state
+    (executed-state invariant) and what ``E_executed`` /
+    ``integer_residual = Σtarget − E_executed`` are stamped from, all
+    computed from the final fee-aware executed quantities.
     """
     snap = bar.snap
     tickers = snap.tickers
     n = len(tickers)
     traded = 0.0
     tax_total = 0.0
+    cost_total = 0.0
+    # D6 §1.1 frozen linear cost, per side, on every traded dollar.
+    fee = float(bar.cost_per_trade_bps) * 1e-4
 
     def _price_of(i: int, tk: str) -> float:
         p = state.internal_price.get(tk)
@@ -849,6 +869,11 @@ def _execute_integer_session(
         tax_total += _sell_from_lots(
             state, tk, sell_value, bar.bar_date, bar_index, conv,
         )
+        # Sell-side fee charged AT trade time (r3 #182 P1 fix) so the
+        # buy plan below sees the true post-sell cash.
+        sell_fee = sell_value * fee
+        state.cash -= sell_fee
+        cost_total += sell_fee
         traded += sell_value
 
     # ── Buy plan: round-down main pass + deferred rescue + recheck ──
@@ -857,7 +882,13 @@ def _execute_integer_session(
     )
     # Investable headroom = cash minus the snapshot cash reserve (RFC
     # §2.3 "remaining investable headroom"; task_selection convention).
-    headroom = max(float(state.cash) - float(snap.cash_reserve) * pv_base, 0.0)
+    # Cash here is already net of sell taxes AND sell fees. Every buy
+    # consumes notional × (1 + fee) of headroom (r3 #182 P1 fix): the
+    # buy-side fee is part of affordability, so a fill that exactly
+    # exhausts the headroom still leaves cash ≥ reserve after fees.
+    reserve_dollars = float(snap.cash_reserve) * pv_base
+    cash_after_sells = float(state.cash)
+    headroom = max(cash_after_sells - reserve_dollars, 0.0)
     raws = [
         shrunk_kelly_raw(
             float(bar.mu[i]), float(bar.sigma[i]),
@@ -877,19 +908,23 @@ def _execute_integer_session(
     bought: dict[int, int] = {i: 0 for i in buy_order}
 
     # Main pass — floor of the remaining delta, conviction order,
-    # headroom-aware (mirrors governor_sizing._fill_buys main pass).
+    # headroom-aware INCLUDING the buy-side fee (mirrors
+    # governor_sizing._fill_buys main pass; r3 #182 P1 fix: affordability
+    # is notional × (1 + fee) ≤ remaining headroom).
     for i in buy_order:
         p = price_by_i[i]
         need_w = target_w[i] - realized[i]
         shares = min(int(need_w * pv_base / p + 1e-9),
-                     int((headroom + 1e-6) / p))
+                     int((headroom + 1e-6) / (p * (1.0 + fee))))
         if shares >= 1:
             bought[i] += shares
             realized[i] += shares * p / pv_base
-            headroom -= shares * p
+            headroom -= shares * p * (1.0 + fee)
 
     # Deferred one-share rescue sweeps (governor_sizing residual pass /
     # S6 A-3): leftover headroom only, conviction order, cap-bounded.
+    # Affordability is fee-inclusive and re-evaluated on EVERY iteration
+    # (each fill changes the traded notional and hence the fee).
     n_rescue = 0
     progressed = True
     while progressed:
@@ -898,20 +933,23 @@ def _execute_integer_session(
             if realized[i] >= target_w[i] - 1e-12:
                 continue
             p = price_by_i[i]
-            if p > headroom + 1e-6:
+            if p * (1.0 + fee) > headroom + 1e-6:
                 continue
             if realized[i] + p / pv_base > cap[i] + 1e-6:
                 continue
             bought[i] += 1
             realized[i] += p / pv_base
-            headroom -= p
+            headroom -= p * (1.0 + fee)
             n_rescue += 1
             progressed = True
 
     # Post-round recheck — cap down violating BUYS, one share at a
     # time, lowest conviction first (deterministic tiebreak). Cash
-    # (incl. reserve) holds by construction: every fill above was
-    # bounded by the reserve-adjusted headroom.
+    # (incl. reserve) holds because every fill above was bounded by the
+    # reserve-adjusted, FEE-INCLUSIVE headroom — and is re-verified by
+    # the hard invariant check after execution below. Each removal
+    # refunds the full fee-inclusive amount, re-computing affordability
+    # per iteration.
     n_capdown = 0
 
     def _remove_one(i: int) -> None:
@@ -919,7 +957,7 @@ def _execute_integer_session(
         p = price_by_i[i]
         bought[i] -= 1
         realized[i] -= p / pv_base
-        headroom += p
+        headroom += p * (1.0 + fee)
         n_capdown += 1
 
     # 1. Single-name cap.
@@ -962,7 +1000,7 @@ def _execute_integer_session(
                 break
             _remove_one(min(removable, key=lambda k: (raws[k], tickers[k])))
 
-    # ── Execute the surviving buys ───────────────────────────────────
+    # ── Execute the surviving buys (fee charged at trade time) ───────
     for i in buy_order:
         if bought[i] < 1:
             continue
@@ -983,13 +1021,30 @@ def _execute_integer_session(
                 shares=float(bought[i]),
             )
         )
-        state.cash -= invest
+        buy_fee = invest * fee
+        state.cash -= invest + buy_fee
+        cost_total += buy_fee
         traded += invest
+
+    # ── Hard cash-reserve invariant (r3 #182 P1) ─────────────────────
+    # After ALL taxes and costs: buys must never have taken cash below
+    # the reserve. If the session opened below reserve (carried losses),
+    # no buys were affordable and the floor is the post-sell cash.
+    reserve_floor = min(reserve_dollars, cash_after_sells)
+    if state.cash < reserve_floor - 1e-6:
+        raise RuntimeError(
+            f"stateful replay [{name}] bar {bar.bar_date}: L3 cash-reserve "
+            f"invariant violated — cash {state.cash:.6f} < floor "
+            f"{reserve_floor:.6f} (reserve {reserve_dollars:.6f}, "
+            f"cash_after_sells {cash_after_sells:.6f}) after all taxes and "
+            f"costs. This is a sizing bug: it would overstate deployment, "
+            f"the primary cash-drag endpoint."
+        )
 
     executed_w = np.array(
         [state.position_value(tk) / pv_base for tk in tickers], dtype=float,
     )
-    return executed_w, traded, tax_total, n_rescue, n_capdown
+    return executed_w, traded, tax_total, cost_total, n_rescue, n_capdown
 
 
 def _replay_one_allocator_stateful(
@@ -1054,6 +1109,12 @@ def _replay_one_allocator_stateful(
         bar_ticker_set = set(bar_tickers)
         session_tax = 0.0
         session_traded = 0.0
+        # Linear cost (D6 §1.1: bps per side on every traded dollar) is
+        # charged to cash AT trade time (r3 #182 P1 fix) — an aggregate
+        # end-of-session deduction let a fill that exactly consumed the
+        # reserve-adjusted headroom end the session with cash < reserve.
+        session_cost = 0.0
+        fee = float(bar.cost_per_trade_bps) * 1e-4
 
         # ── 1. Off-universe forced liquidation (zero-return exit) ──
         for held in sorted(set(state.lots) - bar_ticker_set):
@@ -1061,6 +1122,9 @@ def _replay_one_allocator_stateful(
             session_tax += _sell_from_lots(
                 state, held, value, bar.bar_date, t, conv,
             )
+            liq_fee = value * fee
+            state.cash -= liq_fee
+            session_cost += liq_fee
             session_traded += value
             res.off_universe_liquidations += 1
 
@@ -1091,18 +1155,21 @@ def _replay_one_allocator_stateful(
             res.name_cap_breaches.append(n_name)
             res.sector_cap_breaches.append(n_sector)
 
-        # ── 5+6. Execution ──────────────────────────────────────────
+        # ── 5+6+7. Execution (fees charged at trade time) ───────────
         if conv.integer_shares:
             # RFC #443 §2.3 L3: round-down + deferred one-share rescue
             # + post-round rechecks on executed quantities (mirrors the
             # merged kernel/pipeline/governor_sizing.py semantics).
-            executed_w, int_traded, int_tax, n_rescue, n_capdown = (
+            # Fee-aware affordability + hard cash-reserve invariant
+            # live inside the executor (r3 #182 P1 fix).
+            executed_w, int_traded, int_tax, int_cost, n_rescue, n_capdown = (
                 _execute_integer_session(
                     name, state, bar, target_w, pv_base, conv, t,
                 )
             )
             session_traded += int_traded
             session_tax += int_tax
+            session_cost += int_cost
             res.executed_exposure.append(float(executed_w.sum()))
             res.integer_residual.append(
                 float(target_w.sum() - executed_w.sum())
@@ -1110,6 +1177,11 @@ def _replay_one_allocator_stateful(
             res.rescue_buys.append(n_rescue)
             res.recheck_capdowns.append(n_capdown)
         else:
+            # Continuous mode executes the arm's weights faithfully
+            # (exact execution; this mode is L1_L2_ONLY by the fidelity
+            # contract, so it never carries the deployed-fraction
+            # endpoint). Fees still charge at trade time — identical
+            # session totals to the previous aggregate deduction.
             executed_dollars = target_w * pv_base
             executed_w = executed_dollars / pv_base
             for i, tk in enumerate(bar_tickers):
@@ -1119,6 +1191,9 @@ def _replay_one_allocator_stateful(
                     session_tax += _sell_from_lots(
                         state, tk, -delta, bar.bar_date, t, conv,
                     )
+                    trade_fee = -delta * fee
+                    state.cash -= trade_fee
+                    session_cost += trade_fee
                     session_traded += -delta
                 elif delta > 1e-12:
                     state.lots.setdefault(tk, []).append(
@@ -1131,12 +1206,10 @@ def _replay_one_allocator_stateful(
                             shares=0.0,
                         )
                     )
-                    state.cash -= float(delta)
+                    trade_fee = float(delta) * fee
+                    state.cash -= float(delta) + trade_fee
+                    session_cost += trade_fee
                     session_traded += delta
-
-        # ── 7. Linear cost: bps per side on every traded dollar ────
-        session_cost = session_traded * bar.cost_per_trade_bps * 1e-4
-        state.cash -= session_cost
 
         # ── 8. Post-trade deployed fraction (real state variable) ──
         positions_post = state.total_positions_value()
