@@ -28,6 +28,7 @@ import numpy as np
 
 from renquant_pipeline.kernel.portfolio_qp.allocator_replay import (
     AllocatorReplayBar,
+    ReplayConventions,
     paired_daily_returns,
     replay_all,
 )
@@ -382,15 +383,19 @@ def run_replay(
     *,
     incumbent: str = "current_qp",
     pbo_n_slices: int = 16,
+    conventions: Optional[ReplayConventions] = None,
 ) -> dict:
     """Run the A/B replay end-to-end and return the verdict JSON dict.
 
     Allocators are looked up by name in the registry. The verdict
     structure matches the schema in PR #134 / the evidence-schema
-    research doc.
+    research doc. ``conventions`` (opt-in, D6 protocol) engages the
+    stateful / tax / integer-share / cap-enforcement conventions; the
+    default ``None`` reproduces the original evidence byte-for-byte
+    (new keys are only added when a convention is engaged).
     """
     allocators = {name: get_allocator(name) for name in allocator_names}
-    results = replay_all(allocators, bars)
+    results = replay_all(allocators, bars, conventions)
 
     # Block 1: per-allocator
     per_allocator = {name: r.to_dict() for name, r in results.items()}
@@ -429,7 +434,7 @@ def run_replay(
         constraints_decision_grade=constraint_fidelity["decision_grade"],
     )
 
-    return {
+    payload = {
         "as_of_date": "<set-by-caller>",
         "n_bars": len(bars),
         "n_unique_dates": len({b.bar_date for b in bars}),
@@ -445,6 +450,12 @@ def run_replay(
         "constraint_fidelity": constraint_fidelity,
         "verdict": verdict,
     }
+    # D6 conventions provenance — strictly ADDITIVE: the key only
+    # appears when a convention is engaged, so pre-D6 evidence stays
+    # byte-identical and existing keys are never changed.
+    if conventions is not None and conventions.any_enabled:
+        payload["replay_conventions"] = conventions.to_dict()
+    return payload
 
 
 def constraint_fidelity_block(bars: Sequence[AllocatorReplayBar]) -> dict:
@@ -544,7 +555,71 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="write a read-only replay readiness report to --out and exit "
              "without running allocators",
     )
+    # ── D6 protocol conventions (all OPT-IN; defaults preserve the
+    #    pre-D6 behavior and evidence byte-for-byte) ──────────────────
+    p.add_argument(
+        "--stateful", action="store_true",
+        help="D6: carry portfolio state (positions, tax lots, cash) across "
+             "sessions within an arm; deployed fraction becomes a real "
+             "state variable distinct from turnover, and allocators see "
+             "the carried w_current so hysteresis is evaluable",
+    )
+    p.add_argument(
+        "--tax", action="store_true",
+        help="D6 §1.1: charge realized-gain tax on every exit leg (short "
+             "50%% / long 32%%, lot holding period decides; rotation "
+             "tax_drag() convention). Requires --stateful",
+    )
+    p.add_argument(
+        "--integer-shares", action="store_true",
+        help="D6 §1.1: whole-share quantization floor(w·PV/p) per bar; "
+             "post-round executed weights carry into state. Requires "
+             "--stateful and close prices in the sim DB",
+    )
+    p.add_argument(
+        "--enforce-caps", action="store_true",
+        help="D6 §4: apply per-name/sector caps INSIDE each arm as a "
+             "down-only projection before returns; records per-session "
+             "breach counters instead of silently allowing breaches",
+    )
+    p.add_argument(
+        "--cost-bps", type=float, default=None,
+        help="linear transaction cost in bps per side on every traded "
+             "dollar (D6 §1.1 freezes 5). Default: keep each bar's "
+             "stamped cost (loader default 5.0) — passing the flag "
+             "re-stamps every loaded bar",
+    )
+    p.add_argument(
+        "--sector-map-json", type=str, default=None,
+        help="path to a JSON sector map for --enforce-caps: either a flat "
+             "{ticker: sector} object or a config carrying a 'sector_map' "
+             "key. Sessions' tickers map through it; unmapped tickers "
+             "carry no sector constraint",
+    )
+    p.add_argument("--per-name-cap", type=float, default=0.12,
+                   help="D6 §4 per-name weight cap for --enforce-caps")
+    p.add_argument("--sector-cap", type=float, default=0.35,
+                   help="D6 §4 sector weight cap for --enforce-caps")
+    p.add_argument("--tax-short-rate", type=float, default=0.50,
+                   help="D6 §1.1 short-term realized-gain tax rate")
+    p.add_argument("--tax-long-rate", type=float, default=0.32,
+                   help="D6 §1.1 long-term realized-gain tax rate")
+    p.add_argument("--lt-threshold-days", type=int, default=365,
+                   help="lot holding period (days) at which the long-term "
+                        "tax rate applies")
+    p.add_argument("--initial-capital", type=float, default=10_000.0,
+                   help="starting portfolio value in dollars for --stateful "
+                        "(sets the scale of whole-share floors)")
     args = p.parse_args(argv)
+
+    if args.tax and not args.stateful:
+        p.error("--tax requires --stateful (tax is charged on exit legs of "
+                "carried lots)")
+    if args.integer_shares and not args.stateful:
+        p.error("--integer-shares requires --stateful (post-round executed "
+                "weights carry into state)")
+    if args.sector_map_json and not args.enforce_caps:
+        p.error("--sector-map-json only has effect with --enforce-caps")
 
     if args.diagnose_readiness:
         from renquant_pipeline.kernel.portfolio_qp.wf_replay_loader import (
@@ -635,10 +710,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         return 2
 
+    # D6 --cost-bps: re-stamp every loaded bar's linear cost. Default
+    # (None) keeps the loader-stamped per-bar cost — no behavior change.
+    if args.cost_bps is not None:
+        import dataclasses as _dc
+        bars = [
+            _dc.replace(bar, cost_per_trade_bps=float(args.cost_bps))
+            for bar in bars
+        ]
+
+    conventions = _build_conventions(args)
+
     payload = run_replay(
         bars, args.allocators.split(","),
         incumbent=args.incumbent,
         pbo_n_slices=args.pbo_n_slices,
+        conventions=conventions,
     )
     payload["as_of_date"] = "2026-06-03"
     payload["wf_artifact_root"] = args.wf_artifact_root
@@ -665,6 +752,46 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     out_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
     log.info("wrote verdict JSON to %s", out_path)
     return 0
+
+
+def _build_conventions(args) -> Optional[ReplayConventions]:
+    """Assemble the opt-in D6 conventions from CLI flags.
+
+    Returns ``None`` when no convention flag is set, which routes the
+    replay through the original stateless code path untouched.
+    """
+    if not (args.stateful or args.enforce_caps):
+        return None
+    sector_map = None
+    if args.sector_map_json:
+        raw = json.loads(Path(args.sector_map_json).read_text())
+        if isinstance(raw, dict) and isinstance(raw.get("sector_map"), dict):
+            sector_map = raw["sector_map"]
+        elif isinstance(raw, dict):
+            sector_map = raw
+        else:
+            raise ValueError(
+                f"--sector-map-json {args.sector_map_json!r} must contain a "
+                "JSON object ({ticker: sector} or {'sector_map': {...}})"
+            )
+    if args.enforce_caps and not sector_map:
+        log.warning(
+            "--enforce-caps without --sector-map-json: only the per-name "
+            "cap is enforced; sector caps need a sector map"
+        )
+    return ReplayConventions(
+        stateful=args.stateful,
+        tax=args.tax,
+        integer_shares=args.integer_shares,
+        enforce_caps=args.enforce_caps,
+        tax_short_rate=args.tax_short_rate,
+        tax_long_rate=args.tax_long_rate,
+        long_term_threshold_days=args.lt_threshold_days,
+        per_name_cap=args.per_name_cap,
+        sector_cap=args.sector_cap,
+        sector_map=sector_map,
+        initial_capital=args.initial_capital,
+    )
 
 
 def _load_bars(args) -> list[AllocatorReplayBar]:
