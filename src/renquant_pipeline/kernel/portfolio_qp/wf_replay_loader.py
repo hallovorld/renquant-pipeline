@@ -269,7 +269,8 @@ def load_replay_bars_from_sim_db(
         # naturally via INNER JOIN + IS NOT NULL.
         cur.execute(
             f"""
-            SELECT s.date, s.ticker, s.mu, s.sigma, s.regime, t.{fwd_col}
+            SELECT s.date, s.ticker, s.mu, s.sigma, s.regime, t.{fwd_col},
+                   t.close_price
             FROM score_distribution s
             INNER JOIN ticker_forward_returns t
                 ON s.date = t.as_of_date AND s.ticker = t.ticker
@@ -294,6 +295,7 @@ def load_replay_bars_from_sim_db(
     mus: list[float] = []
     sigmas: list[float] = []
     fwds: list[float] = []
+    prices: list[float] = []
     regime_at_date: Optional[str] = None
 
     def _emit() -> None:
@@ -317,10 +319,15 @@ def load_replay_bars_from_sim_db(
                 fwd_return=np.asarray(fwds, dtype=float),
                 regime=regime_at_date,
                 cost_per_trade_bps=float(cost_per_trade_bps),
+                # Session close prices for the D6 whole-share
+                # quantization convention. NaN when the DB row has no
+                # close_price — the stateful engine fails loud if the
+                # integer-shares convention actually needs one.
+                prices=np.asarray(prices, dtype=float),
             )
         )
 
-    for date_str, ticker, mu, sigma, regime, fwd in rows:
+    for date_str, ticker, mu, sigma, regime, fwd, close_price in rows:
         if date_str != current_date:
             _emit()
             current_date = date_str
@@ -328,6 +335,7 @@ def load_replay_bars_from_sim_db(
             mus = []
             sigmas = []
             fwds = []
+            prices = []
             regime_at_date = regime
         # Regime within a single date must be constant. The
         # score_distribution table stamps one regime per (run_id,
@@ -338,6 +346,9 @@ def load_replay_bars_from_sim_db(
         mus.append(float(mu))
         sigmas.append(float(sigma))
         fwds.append(float(fwd))
+        prices.append(
+            float(close_price) if close_price is not None else float("nan")
+        )
     _emit()
     return bars
 
