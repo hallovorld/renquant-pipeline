@@ -17,7 +17,11 @@ on `run_ab_replay.py`). Defaults reproduce the pre-change behavior **byte-for-by
 — pinned by a fixture evidence JSON generated on origin/main @ f6e818c before any
 edit (`tests/fixtures/ab_replay_default_evidence.json` +
 `tests/fixtures/d6_default_bars.py`), so all existing committed evidence stays
-reproducible.
+reproducible. The pin is two-tier: byte-identical on the platform that minted the
+fixture (darwin), and exact-schema / integer-exact / float-ULP-tolerant (rel 1e-9)
+everywhere else — CI's ubuntu numpy differs from the minting build in float
+reduction order at the last ULP (observed in CI run 29071951222), which no
+tolerance-free cross-platform pin can absorb.
 
 ### D6 §1.1 mapping
 
