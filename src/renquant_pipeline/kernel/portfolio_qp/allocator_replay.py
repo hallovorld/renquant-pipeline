@@ -29,6 +29,7 @@ from typing import Callable, Optional, Sequence
 
 import numpy as np
 
+from renquant_pipeline.kernel.deployment_governor import shrunk_kelly_raw
 from renquant_pipeline.kernel.portfolio_qp.baseline_allocators import AllocatorResult
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
 from renquant_pipeline.kernel.rotation import tax_drag
@@ -93,11 +94,18 @@ class ReplayConventions:
       frozen convention: short 50% / long 32%, lot holding period
       decides), mirroring :func:`renquant_pipeline.kernel.rotation.tax_drag`
       (losses give zero drag). Requires ``stateful``.
-    * ``integer_shares`` — whole-share quantization: per bar, the
-      executed share count is ``floor(w · PV / p)``. Executed-state
-      invariant: rounding is always DOWN, and the post-round executed
-      weights (not the continuous targets) are what carries into
-      state. Requires ``stateful`` and per-bar ``prices``.
+    * ``integer_shares`` — RFC #443 §2.3 L3 integer-aware execution
+      (executed-state invariant), mirroring the merged production L3
+      (kernel/pipeline/governor_sizing.py): round DOWN by default
+      (``floor(Δw · PV / p)`` in conviction order), a deferred
+      one-share rescue on leftover investable headroom (cap- and
+      reserve-headroom-bounded, evaluated AFTER all round-down orders
+      fund), and post-round rechecks of cash (incl. reserve) /
+      single-name cap / sector cap / correlation pairs on the EXECUTED
+      quantities — violating buys are capped down, never carried in
+      breach. The post-round executed weights (not the continuous
+      targets) carry into state. Requires ``stateful`` and per-bar
+      ``prices``. See :func:`_execute_integer_session`.
     * ``enforce_caps`` — apply the D6 §4 per-name / sector caps INSIDE
       the arm as a down-only projection before returns are computed,
       recording per-session breach counters instead of silently
@@ -241,6 +249,8 @@ class ReplayResult:
     tax_paid: Optional[list[float]] = None               # stateful + tax
     executed_exposure: Optional[list[float]] = None      # integer: ΣW executed
     integer_residual: Optional[list[float]] = None       # integer: ΣW target−exec
+    rescue_buys: Optional[list[int]] = None              # integer: RFC §2.3 rescue
+    recheck_capdowns: Optional[list[int]] = None         # integer: RFC §2.3 recheck
     name_cap_breaches: Optional[list[int]] = None        # enforce_caps
     sector_cap_breaches: Optional[list[int]] = None      # enforce_caps
     off_universe_liquidations: Optional[int] = None      # stateful
@@ -338,6 +348,12 @@ class ReplayResult:
             out["E_executed"] = [float(x) for x in self.executed_exposure]
         if self.integer_residual is not None:
             out["integer_residual"] = [float(x) for x in self.integer_residual]
+        if self.rescue_buys is not None:
+            out["rescue_buys"] = [int(x) for x in self.rescue_buys]
+            out["total_rescue_buys"] = int(np.sum(self.rescue_buys))
+        if self.recheck_capdowns is not None:
+            out["recheck_capdowns"] = [int(x) for x in self.recheck_capdowns]
+            out["total_recheck_capdowns"] = int(np.sum(self.recheck_capdowns))
         if self.name_cap_breaches is not None:
             out["name_cap_breaches"] = [int(x) for x in self.name_cap_breaches]
             out["total_name_cap_breaches"] = int(np.sum(self.name_cap_breaches))
@@ -641,6 +657,245 @@ def _sell_from_lots(
     return tax_total
 
 
+# Conviction ordering key (RFC #443 §2.3, "conviction, defined"): the
+# shrunk fractional-Kelly raw, used ONLY as an ordering key. The
+# fraction is a positive scalar (ordering-invariant); shrinkage matches
+# the merged GOVERNOR_DEFAULTS (kernel/pipeline/governor_sizing.py).
+_CONVICTION_KELLY_FRACTION = 0.3
+_CONVICTION_MU_SHRINKAGE = 0.0
+
+
+def _execute_integer_session(
+    name: str,
+    state: PortfolioState,
+    bar: AllocatorReplayBar,
+    target_w: np.ndarray,
+    pv_base: float,
+    conv: ReplayConventions,
+    bar_index: int,
+) -> tuple[np.ndarray, float, float, int, int]:
+    """RFC #443 §2.3 L3 — integer-aware execution (executed-state invariant).
+
+    Mirrors the merged production L3 (kernel/pipeline/governor_sizing.py
+    ``_fill_buys`` + the S6 A-3 deferred one-share rescue in
+    kernel/pipeline/task_selection.py):
+
+    * **Round DOWN by default** — buy legs take ``floor(Δw·PV/p)`` shares
+      in conviction order (shrunk-Kelly raw desc, ticker tiebreak),
+      cash-aware; sell legs take ``floor(Δw·PV/p)`` shares (full
+      liquidation when the target is ~0), so a lower-priority name only
+      sees the cash genuinely left.
+    * **Deferred one-share rescue** — AFTER all round-down orders fund,
+      leftover investable headroom is re-offered one share at a time in
+      conviction order to names still short of target (a name that
+      floored to 0 rounds UP to exactly one share); each rescue share is
+      permitted only iff it fits the per-name cap AND the remaining
+      investable headroom (cash minus the snapshot cash reserve — the
+      task_selection rescue's reserve-aware headroom). A name may
+      overshoot its target by at most one share.
+    * **Post-round recheck on EXECUTED quantities** — cash (incl.
+      reserve; guaranteed by construction since every fill is
+      headroom-bounded), single-name cap, sector caps (snapshot
+      families + the D6 caps when ``enforce_caps``), and
+      correlation-pair constraints are re-verified on the integer
+      quantities; a violating BUY is capped down one share at a time
+      (lowest conviction first, deterministic tiebreak) — never carried
+      in breach. Breaches attributable to carried drift or sell legs
+      (down-only by construction) are not "orders" and remain visible
+      through the violation accounting instead.
+
+    Returns ``(executed_w, traded_dollars, tax_dollars, n_rescue_buys,
+    n_recheck_capdowns)``. ``executed_w`` is the ACTUAL post-fill book
+    over the session's tickers — what carries into state (executed-state
+    invariant) and what ``E_executed`` / ``integer_residual =
+    Σtarget − E_executed`` are stamped from.
+    """
+    snap = bar.snap
+    tickers = snap.tickers
+    n = len(tickers)
+    traded = 0.0
+    tax_total = 0.0
+
+    def _price_of(i: int, tk: str) -> float:
+        p = state.internal_price.get(tk)
+        if p is None:
+            p = float(bar.prices[i]) if bar.prices is not None else float("nan")
+        if not math.isfinite(p) or p <= 0.0:
+            raise ValueError(
+                f"stateful replay [{name}] bar {bar.bar_date}: "
+                f"integer_shares needs a positive close price for {tk}; "
+                f"got {p!r}. Supply per-bar prices (the WF loader stamps "
+                f"ticker_forward_returns.close_price) — no silent "
+                f"fractional fallback."
+            )
+        return float(p)
+
+    # ── Sell legs: floor the delta; full liquidation at target ≈ 0 ──
+    current_w = np.array(
+        [state.position_value(tk) / pv_base for tk in tickers], dtype=float,
+    )
+    for i, tk in enumerate(tickers):
+        cur_val = state.position_value(tk)
+        if cur_val <= 1e-12 or target_w[i] >= current_w[i] - 1e-12:
+            continue
+        p = _price_of(i, tk)
+        if target_w[i] <= 1e-12:
+            sell_value = cur_val                      # full liquidation
+        else:
+            cur_shares = state.position_shares(tk)
+            sell_shares = min(
+                int((current_w[i] - target_w[i]) * pv_base / p + 1e-9),
+                int(cur_shares + 0.5),
+            )
+            if sell_shares < 1:
+                continue
+            sell_value = sell_shares * p
+        tax_total += _sell_from_lots(
+            state, tk, sell_value, bar.bar_date, bar_index, conv,
+        )
+        traded += sell_value
+
+    # ── Buy plan: round-down main pass + deferred rescue + recheck ──
+    realized = np.array(
+        [state.position_value(tk) / pv_base for tk in tickers], dtype=float,
+    )
+    # Investable headroom = cash minus the snapshot cash reserve (RFC
+    # §2.3 "remaining investable headroom"; task_selection convention).
+    headroom = max(float(state.cash) - float(snap.cash_reserve) * pv_base, 0.0)
+    raws = [
+        shrunk_kelly_raw(
+            float(bar.mu[i]), float(bar.sigma[i]),
+            kelly_fraction=_CONVICTION_KELLY_FRACTION,
+            mu_shrinkage=_CONVICTION_MU_SHRINKAGE,
+        )
+        for i in range(n)
+    ]
+    buy_order = sorted(
+        (i for i in range(n) if target_w[i] - realized[i] > 1e-12),
+        key=lambda i: (-raws[i], tickers[i]),
+    )
+    price_by_i = {i: _price_of(i, tickers[i]) for i in buy_order}
+    cap = np.asarray(snap.w_upper_hard, dtype=float).copy()
+    if conv.enforce_caps:
+        cap = np.minimum(cap, conv.per_name_cap)
+    bought: dict[int, int] = {i: 0 for i in buy_order}
+
+    # Main pass — floor of the remaining delta, conviction order,
+    # headroom-aware (mirrors governor_sizing._fill_buys main pass).
+    for i in buy_order:
+        p = price_by_i[i]
+        need_w = target_w[i] - realized[i]
+        shares = min(int(need_w * pv_base / p + 1e-9),
+                     int((headroom + 1e-6) / p))
+        if shares >= 1:
+            bought[i] += shares
+            realized[i] += shares * p / pv_base
+            headroom -= shares * p
+
+    # Deferred one-share rescue sweeps (governor_sizing residual pass /
+    # S6 A-3): leftover headroom only, conviction order, cap-bounded.
+    n_rescue = 0
+    progressed = True
+    while progressed:
+        progressed = False
+        for i in buy_order:
+            if realized[i] >= target_w[i] - 1e-12:
+                continue
+            p = price_by_i[i]
+            if p > headroom + 1e-6:
+                continue
+            if realized[i] + p / pv_base > cap[i] + 1e-6:
+                continue
+            bought[i] += 1
+            realized[i] += p / pv_base
+            headroom -= p
+            n_rescue += 1
+            progressed = True
+
+    # Post-round recheck — cap down violating BUYS, one share at a
+    # time, lowest conviction first (deterministic tiebreak). Cash
+    # (incl. reserve) holds by construction: every fill above was
+    # bounded by the reserve-adjusted headroom.
+    n_capdown = 0
+
+    def _remove_one(i: int) -> None:
+        nonlocal headroom, n_capdown
+        p = price_by_i[i]
+        bought[i] -= 1
+        realized[i] -= p / pv_base
+        headroom += p
+        n_capdown += 1
+
+    # 1. Single-name cap.
+    for i in buy_order:
+        while realized[i] > cap[i] + 1e-9 and bought[i] >= 1:
+            _remove_one(i)
+    # 2. Sector caps — snapshot families + D6 map when enforce_caps.
+    groups: list[tuple[list[int], float]] = []
+    if snap.sector_indicator is not None and snap.sector_cap_vec is not None:
+        for row in range(snap.sector_indicator.shape[0]):
+            members = [int(j) for j in np.where(snap.sector_indicator[row] > 0.5)[0]]
+            if members:
+                groups.append((members, float(snap.sector_cap_vec[row])))
+    if conv.enforce_caps and conv.sector_map:
+        by_sec: dict[str, list[int]] = {}
+        for j, tk in enumerate(tickers):
+            sec = conv.sector_map.get(tk)
+            if sec and isinstance(sec, str):
+                by_sec.setdefault(sec, []).append(j)
+        for sec in sorted(by_sec):
+            groups.append((by_sec[sec], float(conv.sector_cap)))
+    for members, gcap in groups:
+        while float(realized[members].sum()) > gcap + 1e-9:
+            removable = [j for j in members if bought.get(j, 0) >= 1]
+            if not removable:
+                break   # carried-drift breach, not an order — stays
+                        # visible via the violation accounting.
+            _remove_one(min(removable, key=lambda k: (raws[k], tickers[k])))
+    # 3. Correlation-pair caps (snapshot convention: (i, j, cap)).
+    for trip in snap.corr_group_pairs or ():
+        try:
+            a, b, pcap = int(trip[0]), int(trip[1]), float(trip[2])
+        except (TypeError, IndexError, ValueError):
+            continue
+        if not (0 <= a < n and 0 <= b < n):
+            continue
+        while float(realized[a] + realized[b]) > pcap + 1e-9:
+            removable = [j for j in (a, b) if bought.get(j, 0) >= 1]
+            if not removable:
+                break
+            _remove_one(min(removable, key=lambda k: (raws[k], tickers[k])))
+
+    # ── Execute the surviving buys ───────────────────────────────────
+    for i in buy_order:
+        if bought[i] < 1:
+            continue
+        tk = tickers[i]
+        p = price_by_i[i]
+        invest = bought[i] * p
+        if tk not in state.internal_price:
+            # (Re-)entry anchors the internal price to the session
+            # close (D6 fill convention).
+            state.internal_price[tk] = p
+        state.lots.setdefault(tk, []).append(
+            TaxLot(
+                entry_date=bar.bar_date,
+                entry_bar_index=bar_index,
+                cost_basis=invest,
+                market_value=invest,
+                entry_price=p,
+                shares=float(bought[i]),
+            )
+        )
+        state.cash -= invest
+        traded += invest
+
+    executed_w = np.array(
+        [state.position_value(tk) / pv_base for tk in tickers], dtype=float,
+    )
+    return executed_w, traded, tax_total, n_rescue, n_capdown
+
+
 def _replay_one_allocator_stateful(
     name: str,
     allocator: AllocatorFn,
@@ -689,6 +944,8 @@ def _replay_one_allocator_stateful(
     if conv.integer_shares:
         res.executed_exposure = []
         res.integer_residual = []
+        res.rescue_buys = []
+        res.recheck_capdowns = []
     if conv.enforce_caps:
         res.name_cap_breaches = []
         res.sector_cap_breaches = []
@@ -738,80 +995,48 @@ def _replay_one_allocator_stateful(
             res.name_cap_breaches.append(n_name)
             res.sector_cap_breaches.append(n_sector)
 
-        # ── 5. Execution — whole-share quantization (floor) ────────
-        target_dollars = target_w * pv_base
-        executed_dollars = target_dollars.copy()
-        executed_shares: Optional[np.ndarray] = None
+        # ── 5+6. Execution ──────────────────────────────────────────
         if conv.integer_shares:
-            executed_shares = np.zeros(len(bar_tickers))
-            for i, tk in enumerate(bar_tickers):
-                if target_dollars[i] <= 1e-12 and not state.lots.get(tk):
-                    executed_dollars[i] = 0.0
-                    continue
-                price = state.internal_price.get(tk)
-                if price is None:
-                    price = (
-                        float(bar.prices[i]) if bar.prices is not None
-                        else float("nan")
-                    )
-                if not math.isfinite(price) or price <= 0.0:
-                    raise ValueError(
-                        f"stateful replay [{name}] bar {bar.bar_date}: "
-                        f"integer_shares needs a positive close price for "
-                        f"{tk}; got {price!r}. Supply per-bar prices (the "
-                        f"WF loader stamps ticker_forward_returns."
-                        f"close_price) — no silent fractional fallback."
-                    )
-                shares = math.floor(target_dollars[i] / price + 1e-12)
-                executed_shares[i] = float(shares)
-                executed_dollars[i] = float(shares) * price
-        executed_w = executed_dollars / pv_base
-        if conv.integer_shares:
+            # RFC #443 §2.3 L3: round-down + deferred one-share rescue
+            # + post-round rechecks on executed quantities (mirrors the
+            # merged kernel/pipeline/governor_sizing.py semantics).
+            executed_w, int_traded, int_tax, n_rescue, n_capdown = (
+                _execute_integer_session(
+                    name, state, bar, target_w, pv_base, conv, t,
+                )
+            )
+            session_traded += int_traded
+            session_tax += int_tax
             res.executed_exposure.append(float(executed_w.sum()))
             res.integer_residual.append(
                 float(target_w.sum() - executed_w.sum())
             )
-
-        # ── 6. Trades vs carried book (sell legs then buy legs) ────
-        for i, tk in enumerate(bar_tickers):
-            cur_val = state.position_value(tk)
-            if conv.integer_shares:
-                delta_shares = executed_shares[i] - state.position_shares(tk)
-                if abs(delta_shares) < 1e-12:
-                    continue  # no trade — never touch prices
-                # A held name always carries a returns-evolved internal
-                # price; a new entry's price was validated finite in the
-                # quantization step above.
-                price = state.internal_price.get(tk)
-                if price is None:
-                    price = float(bar.prices[i])
-                delta = delta_shares * price
-            else:
-                price = None
+            res.rescue_buys.append(n_rescue)
+            res.recheck_capdowns.append(n_capdown)
+        else:
+            executed_dollars = target_w * pv_base
+            executed_w = executed_dollars / pv_base
+            for i, tk in enumerate(bar_tickers):
+                cur_val = state.position_value(tk)
                 delta = executed_dollars[i] - cur_val
-                delta_shares = 0.0
-            if delta < -1e-12:
-                session_tax += _sell_from_lots(
-                    state, tk, -delta, bar.bar_date, t, conv,
-                )
-                session_traded += -delta
-            elif delta > 1e-12:
-                if conv.integer_shares and tk not in state.internal_price:
-                    # (Re-)entry anchors the internal price to the
-                    # session close (D6 fill convention).
-                    state.internal_price[tk] = price
-                state.lots.setdefault(tk, []).append(
-                    TaxLot(
-                        entry_date=bar.bar_date,
-                        entry_bar_index=t,
-                        cost_basis=float(delta),
-                        market_value=float(delta),
-                        entry_price=price,
-                        shares=float(delta_shares),
+                if delta < -1e-12:
+                    session_tax += _sell_from_lots(
+                        state, tk, -delta, bar.bar_date, t, conv,
                     )
-                )
-                state.cash -= float(delta)
-                session_traded += delta
+                    session_traded += -delta
+                elif delta > 1e-12:
+                    state.lots.setdefault(tk, []).append(
+                        TaxLot(
+                            entry_date=bar.bar_date,
+                            entry_bar_index=t,
+                            cost_basis=float(delta),
+                            market_value=float(delta),
+                            entry_price=None,
+                            shares=0.0,
+                        )
+                    )
+                    state.cash -= float(delta)
+                    session_traded += delta
 
         # ── 7. Linear cost: bps per side on every traded dollar ────
         session_cost = session_traded * bar.cost_per_trade_bps * 1e-4
