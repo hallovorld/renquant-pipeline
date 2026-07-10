@@ -226,3 +226,69 @@ def test_missing_cap_means_uncapped():
     d = _decide(raws={"A": 0.2}, caps={}, hysteresis_band=0.0)
     assert d.e_raw == pytest.approx(0.2)
     assert math.isfinite(d.e_target)
+
+
+# ── L1 candidate selection (RFC §2.1, r4/r9 review — all three arms) ──────
+
+def test_default_candidate_is_kelly_backward_compatible():
+    d = _decide(raws={"A": 0.2}, caps={"A": 0.12}, hysteresis_band=0.0)
+    assert d.l1_candidate == "kelly"
+    assert d.e_target == pytest.approx(0.12)  # min(e_raw, e_ceil)
+
+
+def test_candidate_ceil_ignores_e_raw_entirely():
+    # Weak slate (e_raw far below ceiling) — candidate (A) still targets
+    # the full regime ceiling, independent of conviction.
+    raws = {"A": 0.01}
+    d = _decide(raws=raws, caps={"A": 0.12}, regime="BULL_CALM",
+                hysteresis_band=0.0, l1_candidate="ceil")
+    assert d.l1_candidate == "ceil"
+    assert d.e_raw == pytest.approx(0.01)          # still reported
+    assert d.e_target == pytest.approx(0.95)       # = E_ceil(BULL_CALM)
+    assert d.ceiling_bound is True
+
+
+def test_candidate_ceil_same_every_regime_regardless_of_slate():
+    for regime, ceil in E_CEIL.items():
+        d = _decide(raws={}, caps={}, regime=regime,
+                    current_gross_exposure=ceil, hysteresis_band=0.0,
+                    l1_candidate="ceil")
+        assert d.e_target == pytest.approx(ceil), regime
+
+
+def test_candidate_voltarget_uses_vol_target_scale():
+    # 60 identical-return days ⇒ realized_vol computable; target_vol=0.15
+    # default, floor/ceiling defaults [0.30, 1.50] from compute_vol_target_scale.
+    spy_returns = [0.001] * 60
+    d = _decide(raws={"A": 0.5}, caps={"A": 0.5}, regime="BULL_CALM",
+                hysteresis_band=0.0, l1_candidate="voltarget",
+                spy_returns=spy_returns)
+    assert d.l1_candidate == "voltarget"
+    assert d.e_vol is not None
+    assert d.e_target == pytest.approx(min(d.e_vol, 0.95))
+
+
+def test_candidate_voltarget_too_few_returns_fails_open_to_ceiling():
+    # compute_vol_target_scale fails open to 1.0 with <window_days returns;
+    # min(1.0, e_ceil) = e_ceil here since e_ceil < 1.0.
+    d = _decide(raws={"A": 0.5}, caps={"A": 0.5}, regime="BULL_CALM",
+                hysteresis_band=0.0, l1_candidate="voltarget",
+                spy_returns=[0.001] * 5)
+    assert d.e_vol == pytest.approx(1.0)
+    assert d.e_target == pytest.approx(0.95)
+
+
+def test_unknown_l1_candidate_is_a_contract_fault():
+    assert _decide(raws={"A": 0.2}, caps={"A": 0.12},
+                   l1_candidate="bogus") is None
+
+
+def test_kelly_candidate_ceiling_bound_semantics_unchanged():
+    # Exact byte-identical boundary semantics check vs the pre-existing
+    # strict-inequality ceiling_bound for the default "kelly" candidate.
+    raws = {f"T{i}": 0.2 for i in range(8)}
+    caps = {t: 0.12 for t in raws}
+    d = _decide(raws=raws, caps=caps, regime="BULL_CALM",
+                current_gross_exposure=0.9, hysteresis_band=0.0)
+    assert d.e_raw == pytest.approx(0.96)
+    assert d.ceiling_bound is True

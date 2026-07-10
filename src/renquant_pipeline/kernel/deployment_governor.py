@@ -13,10 +13,37 @@ Algorithm (RFC §2.1, ceiling only — NO exposure floor):
                                                    same convention as
                                                    ``fractional_kelly_top_k``)
     E_raw  = Σ_{i ∈ top-k} min(raw_i, cap_i)
-    E*     = min(E_raw, E_ceil(regime))
-    then hysteresis:  |E* − E_current| ≤ band  ⇒  E* = E_current
-    then step limit:  |E* − E_current| ≤ max_step_per_session ×
-                      confidence_to_size_multiplier(confidence)
+
+Three independent L1 candidates (RFC §2.1, r4 review — each defined fully
+and separately; only (B) is bounded by E_raw by construction):
+
+    (A) E*_ceil      = E_ceil(regime)                     PREREGISTERED
+                                                            CANDIDATE
+    (B) E*_kelly     = min(E_raw, E_ceil(regime))          COMPARISON ARM
+                                                            (E* ≤ E_raw
+                                                            guaranteed)
+    (C) E*_voltarget = min(E_vol, E_ceil(regime))          COMPARISON ARM,
+        E_vol = compute_vol_target_scale(spy_returns, ...) — REUSES the
+        existing R-02 portfolio-vol-targeting convention
+        (``kernel/vol_target.py``: SPY-proxied realized vol, β≈1
+        assumption, already regime-overridable via
+        ``portfolio_qp/tasks.py::_resolve_regime_override`` — this is the
+        "existing regime-vol-band table" §2.1 refers to) rather than a
+        new weighted-portfolio-covariance estimate this codebase does not
+        have.
+
+Selected via ``l1_candidate`` ("ceil" | "kelly" | "voltarget", default
+"kelly" — the pre-existing behavior, preserved as the default so this
+addition is additive/non-breaking). D6 §2 Phase-2's confirmatory run picks
+which candidate becomes the live default; this function implements all
+three behind that one selector rather than hard-coding the winner ahead of
+the evaluation.
+
+Then, for whichever candidate produced E* above:
+
+    hysteresis:  |E* − E_current| ≤ band  ⇒  E* = E_current
+    step limit:  |E* − E_current| ≤ max_step_per_session ×
+                 confidence_to_size_multiplier(confidence)
 
 Fail-closed semantics (RFC §2.1):
 
@@ -37,12 +64,15 @@ from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
 from renquant_pipeline.kernel.regime import confidence_to_size_multiplier
+from renquant_pipeline.kernel.vol_target import compute_vol_target_scale
 
 __all__ = [
     "GovernorDecision",
     "shrunk_kelly_raw",
     "compute_session_target_exposure",
 ]
+
+L1_CANDIDATES = ("ceil", "kelly", "voltarget")
 
 
 def shrunk_kelly_raw(
@@ -97,6 +127,8 @@ class GovernorDecision:
     hysteresis_held: bool    # |E*−E_current| ≤ band → held at E_current
     step_limited: bool       # step clamp bound this session's move
     ceiling_bound: bool      # E_raw > E_ceil (ceiling was the binder)
+    l1_candidate: str = "kelly"   # which of (A)/(B)/(C) produced e_target
+    e_vol: float | None = None    # candidate (C)'s E_vol input, else None
     slate_stats: dict = field(default_factory=dict)
 
 
@@ -113,6 +145,9 @@ def compute_session_target_exposure(
     max_step_per_session: float,
     model_fault: bool = False,
     mu: Mapping[str, float | None] | None = None,
+    l1_candidate: str = "kelly",
+    spy_returns: "list | tuple | None" = None,
+    vol_target_cfg: Mapping[str, float] | None = None,
 ) -> Optional[GovernorDecision]:
     """Compute the session target gross exposure E* (RFC §2.1).
 
@@ -136,12 +171,28 @@ def compute_session_target_exposure(
     model_fault : True ⇒ return ``None`` (fail-closed; caller falls back
         to the legacy path). A weak slate must NOT set this.
     mu : optional name → μ̂ map, used only for the μ-dispersion slate stat.
+    l1_candidate : one of :data:`L1_CANDIDATES` — which of the RFC §2.1
+        candidates (A) ``"ceil"``, (B) ``"kelly"`` (default, pre-existing
+        behavior), (C) ``"voltarget"`` produces ``e_target``. An unknown
+        value is a contract fault → ``None`` (fail loud, no silent
+        fallback to a different candidate than requested).
+    spy_returns / vol_target_cfg : only consulted when
+        ``l1_candidate == "voltarget"``; passed through verbatim to
+        :func:`renquant_pipeline.kernel.vol_target.compute_vol_target_scale`
+        (``vol_target_cfg`` supplies ``target_vol``/``window_days``/
+        ``floor``/``ceiling``, defaults match that function's own —
+        the same regime-overridable config already resolved upstream by
+        ``portfolio_qp/tasks.py::_resolve_regime_override``, reused here
+        rather than a new regime-vol table).
 
     Returns
     -------
     GovernorDecision, or ``None`` on model fault / contract fault.
     """
     if model_fault:
+        return None
+
+    if l1_candidate not in L1_CANDIDATES:
         return None
 
     # Contract faults → fail-closed (None), never a silent default.
@@ -181,8 +232,33 @@ def compute_session_target_exposure(
         cap = _nonneg_finite(caps.get(name, math.inf), default=math.inf)
         e_raw += min(admitted[name], cap)
 
-    e_star = min(e_raw, e_ceil)
-    ceiling_bound = e_raw > e_ceil
+    # ── L1 candidate selection (RFC §2.1) ──────────────────────────────
+    e_vol: float | None = None
+    if l1_candidate == "ceil":
+        # (A) preregistered candidate: independent of E_raw by
+        # construction — the ceiling itself IS the pre-hysteresis target.
+        e_pre = e_ceil
+    elif l1_candidate == "voltarget":
+        # (C) comparison arm: E_vol reuses the existing R-02 SPY-proxied
+        # vol-target scale (kernel/vol_target.py) as the exposure input.
+        vt_cfg = vol_target_cfg or {}
+        e_vol = compute_vol_target_scale(
+            spy_returns or [],
+            target_vol=float(vt_cfg.get("target_vol", 0.15)),
+            window_days=int(vt_cfg.get("window_days", 60)),
+            floor=float(vt_cfg.get("floor", 0.30)),
+            ceiling=float(vt_cfg.get("ceiling", 1.50)),
+        )
+        e_pre = min(e_vol, e_ceil)
+    else:  # "kelly" (B), the pre-existing default behavior
+        e_pre = min(e_raw, e_ceil)
+
+    e_star = e_pre
+    # ceiling_bound: whether the regime ceiling was this session's binder.
+    # "kelly" keeps its exact original strict-inequality semantics
+    # (byte-identical to pre-candidate-selection behavior); the other two
+    # candidates use >= since e_pre == e_ceil there is itself a ceiling bind.
+    ceiling_bound = (e_raw > e_ceil) if l1_candidate == "kelly" else (e_pre >= e_ceil)
 
     # ── Hysteresis: aggregate no-trade band around E_current ──────────
     hysteresis_held = False
@@ -218,6 +294,8 @@ def compute_session_target_exposure(
         hysteresis_held=hysteresis_held,
         step_limited=step_limited,
         ceiling_bound=ceiling_bound,
+        l1_candidate=l1_candidate,
+        e_vol=e_vol,
         slate_stats=slate_stats,
     )
 

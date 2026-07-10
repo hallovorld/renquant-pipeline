@@ -51,11 +51,23 @@ class AllocationResult:
     not by themselves exceed E* (always, when no floors are passed).
     ``binding_constraints`` names every constraint family that reduced
     (or pinned) a weight, for decision-ledger stamping (RFC §2.2 step 5).
+    ``residual_reason`` classifies WHY ``residual > 0`` into the RFC
+    §2.2 three-source taxonomy (r4 review): ``"cap_sector"`` / ``"cap_corr"``
+    / ``"mask"`` (step-2 projections bound before E* did),
+    ``"breadth_bound"`` (fewer than ``top_k`` names were admitted at all —
+    a SELECT-stage condition), ``"low_conviction"`` (E_raw itself, before
+    any projection, was already below E* — the correct weak-slate output,
+    not a defect), or ``None`` when ``residual <= 0`` (fully deployed).
+    ``e_raw`` is the pre-projection capped-Kelly sum for the chosen
+    top-k names — distinct from ``e_final`` (post-projection/scale) and
+    needed to distinguish ``low_conviction`` from the other two sources.
     """
 
     weights: dict[str, float]
     e_final: float
     residual: float
+    e_raw: float = 0.0
+    residual_reason: str | None = None
     binding_constraints: dict = field(default_factory=dict)
 
 
@@ -126,6 +138,20 @@ def allocate_down_only(
         if w < admitted[name] - _EPS:
             binding["per_name_cap"].append(name)
         weights[name] = w
+
+    # RFC §2.2 corrected feasibility statement: E_raw = Σ min(raw_i, cap_i)
+    # over the chosen top-k, BEFORE any step-2 projection — needed to
+    # distinguish "low_conviction" (E_raw itself < E*) from step-2
+    # projections being the actual binder.
+    e_raw = float(sum(weights.values()))
+    # Breadth is a SELECT-stage fact: fewer than top_k CANDIDATES reached
+    # this stage at all (``raws``, the full input population) — distinct
+    # from "enough candidates arrived but most have zero/weak raw", which
+    # is low_conviction (a Kelly-formula outcome, not a candidate-count
+    # shortfall). Checking against ``order``/``admitted`` (already
+    # filtered to positive-raw names) would make breadth_bound fire on
+    # almost every ordinary weak-slate day, swallowing low_conviction.
+    breadth_bound = len(raws) < k
 
     # Conviction rank for trim ordering (lowest conviction trimmed first).
     conviction = dict(admitted)
@@ -206,6 +232,7 @@ def allocate_down_only(
 
     # ── Step 3: Σw > E* → proportional scale-DOWN of reducible mass ───
     total = sum(weights.values())
+    e_proj = total  # post-step-2, pre-step-3 — RFC §2.2's E_proj
     if total > e_star_f + _EPS:
         floor_total = sum(_floor(n) for n in weights)
         reducible_total = total - floor_total
@@ -225,6 +252,26 @@ def allocate_down_only(
     e_final = float(sum(weights.values()))
     residual = float(e_star_f - e_final)
 
+    # RFC §2.2 corrected feasibility statement: classify WHY residual > 0
+    # into the three-source taxonomy (r4 review). Checked in the RFC's
+    # own stated precedence: breadth (a SELECT-stage fact) first, then
+    # whether step-2 projections were the actual binder (e_proj < e_raw),
+    # then low_conviction (E_raw itself already below E*, independent of
+    # any projection — the correct weak-slate output, not a defect).
+    residual_reason: str | None = None
+    if residual > _EPS:
+        if breadth_bound:
+            residual_reason = "breadth_bound"
+        elif e_proj < e_raw - _EPS and e_star_f >= e_proj - _EPS:
+            if binding["sector_cap"]:
+                residual_reason = "cap_sector"
+            elif binding["corr_pair_cap"]:
+                residual_reason = "cap_corr"
+            elif binding["no_buy"]:
+                residual_reason = "mask"
+        if residual_reason is None and e_raw < e_star_f - _EPS:
+            residual_reason = "low_conviction"
+
     # INVARIANT: no output weight ever exceeds its cap (floored names:
     # never above max(cap, floor) — the allocation never ADDS past cap).
     for name, w in weights.items():
@@ -240,6 +287,8 @@ def allocate_down_only(
         weights=weights,
         e_final=e_final,
         residual=residual,
+        e_raw=e_raw,
+        residual_reason=residual_reason,
         binding_constraints=binding,
     )
 

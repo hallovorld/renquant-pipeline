@@ -281,7 +281,8 @@ def run_governor_sizing(ctx: Any, gov_cfg: dict) -> bool:
             ctx.counters.get("governor_hysteresis_holds", 0) + 1
         )
         _stamp_ledger(ctx, decision, e_final=e_current, residual=0.0,
-                      binding={"hysteresis_hold": True})
+                      binding={"hysteresis_hold": True},
+                      e_executed=e_current, integer_residual=0.0)
         log.info(
             "governor_sizing: HYSTERESIS HOLD — E*=%.3f within band of "
             "E_current=%.3f; no reallocation", decision.e_target, e_current,
@@ -423,6 +424,7 @@ def _execute_deltas(ctx, gov_cfg, decision, alloc, candidates, held,
     from renquant_pipeline.kernel.exits import ExitSignal  # noqa: PLC0415
     from renquant_pipeline.kernel.rotation import tax_drag  # noqa: PLC0415
     pairs_emitted = 0
+    sold_shares: dict[str, int] = {}
     for t in sell_names:
         demand = _unfilled_demand()
         if demand <= _EPS:
@@ -484,6 +486,7 @@ def _execute_deltas(ctx, gov_cfg, decision, alloc, candidates, held,
         ctx.exits.append((t, sig))
         pairs_emitted += 1
         remaining_cash += proceeds
+        sold_shares[t] = sold_shares.get(t, 0) + sell_shares
         ctx.counters["governor_pair_sells"] = (
             ctx.counters.get("governor_pair_sells", 0) + 1
         )
@@ -550,15 +553,32 @@ def _execute_deltas(ctx, gov_cfg, decision, alloc, candidates, held,
             t, order["order_type"], shares, price, invest, targets[t] * 100,
         )
 
+    # ── L3 executed-state invariant (RFC §2.3): E_executed = the ACTUAL
+    #    post-fill/post-sell exposure from realized whole-share quantities,
+    #    distinct from L2's continuous E_final. integer_residual is the
+    #    gap the whole-share rounding (never the L2 allocator) is
+    #    responsible for. ─────────────────────────────────────────────
+    executed_w = dict(current_w)
+    for t in buy_names:
+        executed_w[t] = realized_w[t]
+    for t, shares in sold_shares.items():
+        price = _finite(prices.get(t)) or 0.0
+        executed_w[t] = max(current_w.get(t, 0.0) - shares * price / pv, 0.0)
+    e_executed = float(sum(executed_w.values()))
+    integer_residual = float(alloc.e_final - e_executed)
+
     _stamp_ledger(ctx, decision, e_final=alloc.e_final,
                   residual=alloc.residual,
-                  binding=alloc.binding_constraints)
+                  binding=alloc.binding_constraints,
+                  e_executed=e_executed,
+                  integer_residual=integer_residual)
     spent = starting_cash - remaining_cash
     log.info(
         "governor_sizing: %d buy order(s), %d pair sell(s) "
-        "(E*=%.3f E_final=%.3f residual=%.3f spent=$%.0f/$%.0f)",
+        "(E*=%.3f E_final=%.3f E_executed=%.3f integer_residual=%.3f "
+        "spent=$%.0f/$%.0f)",
         orders_emitted, pairs_emitted, decision.e_target, alloc.e_final,
-        alloc.residual, spent, starting_cash,
+        e_executed, integer_residual, spent, starting_cash,
     )
 
 
@@ -581,8 +601,16 @@ def _fault(ctx, reason: str) -> bool:
 
 
 def _stamp_ledger(ctx, decision, *, e_final: float, residual: float,
-                  binding: dict) -> None:
-    """Decision-ledger payload (RFC §2.1 weak-slate auditability)."""
+                  binding: dict, e_executed: float, integer_residual: float,
+                  ) -> None:
+    """Decision-ledger payload (RFC §2.1 weak-slate auditability).
+
+    Three auditable numbers, one per layer (RFC §2.3): ``e_target`` (L1's
+    E*), ``e_final``/``residual`` (L2's continuous declared exposure),
+    ``e_executed``/``integer_residual`` (L3's ACTUAL post-fill exposure
+    from realized whole-share quantities, and the whole-share rounding
+    gap — distinct from L2's continuous residual).
+    """
     ctx._deployment_governor = {  # noqa: SLF001
         "e_target": decision.e_target,
         "e_raw": decision.e_raw,
@@ -591,10 +619,14 @@ def _stamp_ledger(ctx, decision, *, e_final: float, residual: float,
         "hysteresis_held": decision.hysteresis_held,
         "step_limited": decision.step_limited,
         "ceiling_bound": decision.ceiling_bound,
+        "l1_candidate": decision.l1_candidate,
+        "e_vol": decision.e_vol,
         "slate_stats": decision.slate_stats,
         "e_final": e_final,
         "residual": residual,
         "binding_constraints": binding,
+        "e_executed": e_executed,
+        "integer_residual": integer_residual,
     }
 
 

@@ -222,3 +222,113 @@ def test_no_sell_floor_never_added_above_cap_by_allocation():
         e_star=0.5, current_weights={"HELD": 0.14}, no_sell={"HELD"},
     )
     assert res.weights["HELD"] == pytest.approx(0.14)   # floor, not raw/cap
+
+
+# ── Residual-reason taxonomy (RFC §2.2 corrected feasibility statement,
+#    r4 review — three distinct sources of "cannot reach declared E*") ────
+
+def test_residual_none_when_fully_deployed():
+    res = _alloc(raws={"A": 0.5}, caps={"A": 0.5}, e_star=0.5, top_k=8)
+    assert res.residual == pytest.approx(0.0)
+    assert res.residual_reason is None
+
+
+def test_residual_low_conviction_when_e_raw_below_e_star():
+    # E_raw = 0.05 < E* = 0.5, no projections involved, top_k=1 matches
+    # the single candidate exactly so breadth_bound cannot fire — this
+    # isolates "weak conviction on a full slate" from "too few candidates".
+    res = _alloc(raws={"A": 0.05}, caps={"A": 0.12}, e_star=0.5, top_k=1)
+    assert res.e_raw == pytest.approx(0.05)
+    assert res.residual == pytest.approx(0.45)
+    assert res.residual_reason == "low_conviction"
+
+
+def test_residual_breadth_bound_when_fewer_candidates_than_top_k():
+    # Breadth is a SELECT-stage fact: fewer than top_k candidates reached
+    # this stage AT ALL (len(raws) < top_k), independent of how strong
+    # their individual raws are (both are individually strong here).
+    raws = {"A": 0.05, "B": 0.05}
+    res = _alloc(raws=raws, caps={t: 0.12 for t in raws}, e_star=0.5, top_k=8)
+    assert res.residual_reason == "breadth_bound"
+
+
+def test_residual_low_conviction_not_breadth_when_enough_candidates_are_weak():
+    # A FULL top_k slate of candidates, but with mostly-zero/negative raw
+    # (the ordinary weak-signal-day case) — len(raws) >= top_k, so this
+    # must read low_conviction, not breadth_bound.
+    raws = {"A": 0.05, "B": 0.0, "C": -0.1, "D": 0.0}
+    res = _alloc(raws=raws, caps={t: 0.12 for t in raws}, e_star=0.5, top_k=4)
+    assert res.residual_reason == "low_conviction"
+
+
+def test_residual_cap_sector_when_projection_is_the_binder():
+    # E_raw (0.30) < E* (0.5) would normally read low_conviction, but a
+    # tight sector cap trims E_raw down further BEFORE E* ever binds —
+    # the sector cap is the actual reason, not aggregate conviction.
+    # top_k=2 matches the 2 candidates so breadth_bound cannot fire.
+    raws = {"A": 0.15, "B": 0.15}
+    caps = {"A": 0.15, "B": 0.15}
+    res = _alloc(raws=raws, caps=caps, e_star=0.5, top_k=2,
+                sector_by_name={"A": "tech", "B": "tech"},
+                sector_caps={"tech": 0.10})
+    assert res.e_raw == pytest.approx(0.30)
+    assert res.residual_reason == "cap_sector"
+
+
+def test_residual_cap_corr_when_correlation_pair_is_the_binder():
+    raws = {"A": 0.15, "B": 0.15}
+    caps = {"A": 0.15, "B": 0.15}
+    res = _alloc(raws=raws, caps=caps, e_star=0.5, top_k=2,
+                corr_pair_caps=[("A", "B", 0.10)])
+    assert res.residual_reason == "cap_corr"
+
+
+def test_residual_mask_when_no_buy_is_the_binder():
+    raws = {"A": 0.30}
+    caps = {"A": 0.30}
+    res = _alloc(raws=raws, caps=caps, e_star=0.5, top_k=1,
+                current_weights={"A": 0.05}, no_buy=["A"])
+    assert res.e_raw == pytest.approx(0.30)
+    assert res.residual_reason == "mask"
+
+
+def test_e_raw_reported_distinct_from_e_final_when_scaled_down():
+    # Σw (0.6) > E* (0.5): step 3 scales down proportionally. E_raw is the
+    # PRE-projection/pre-scale sum (0.6 here, no projections engaged), and
+    # residual should be ~0 (E_final clamps to exactly E*), not tagged.
+    raws = {"A": 0.30, "B": 0.30}
+    caps = {"A": 0.30, "B": 0.30}
+    res = _alloc(raws=raws, caps=caps, e_star=0.5, top_k=8)
+    assert res.e_raw == pytest.approx(0.6)
+    assert res.e_final == pytest.approx(0.5)
+    assert res.residual == pytest.approx(0.0)
+    assert res.residual_reason is None
+
+
+# ── Conviction, defined (RFC §2.3 r2 minor point) — raw_i is used ONLY as
+#    an ordering key (top-k membership, trim priority); it sets the weight
+#    exactly ONCE via min(raw_i, cap_i) and is never a SEPARATE multiplier
+#    stacked on top of that weight (the retired conviction×sigma bug). ────
+
+def test_raw_sets_weight_once_not_as_a_separate_multiplier():
+    # Two names with the SAME cap: raw below cap sets the weight directly
+    # (w = raw), never scaled by any further conviction factor.
+    res = _alloc(raws={"A": 0.07, "B": 0.03}, caps={"A": 0.12, "B": 0.12},
+                 e_star=1.0, top_k=8)
+    assert res.weights["A"] == pytest.approx(0.07)
+    assert res.weights["B"] == pytest.approx(0.03)
+
+
+def test_trim_priority_is_pure_rank_not_magnitude_scaled():
+    # Sector cap forces a trim; the lowest-conviction name absorbs the
+    # ENTIRE cut (pure rank-ordered trim), not a magnitude-weighted split
+    # across both names — proving raw's role here is ordering, not scaling.
+    raws = {"A": 0.20, "B": 0.05}
+    caps = {"A": 0.20, "B": 0.20}
+    res = _alloc(raws=raws, caps=caps, e_star=1.0, top_k=2,
+                sector_by_name={"A": "tech", "B": "tech"},
+                sector_caps={"tech": 0.20})
+    # Total pre-trim = 0.25, cap = 0.20, excess = 0.05 — B (lower
+    # conviction) trimmed first and fully absorbs it (0.05 - 0.05 = 0).
+    assert res.weights["A"] == pytest.approx(0.20)
+    assert "B" not in res.weights
