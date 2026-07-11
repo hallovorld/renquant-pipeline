@@ -1658,16 +1658,25 @@ def record_order_outcomes(
     truth): a lower-ranked status arriving after a higher-ranked state is
     counted ``stale`` and ignored (late submitted never overwrites
     partially_filled/filled; cancel/reject never overwrites filled);
-    ``filled_qty`` never decreases; ``fill_price`` is retained when the
-    event omits it (a partial fill followed by a cancel keeps the executed
-    quantity and price). Replaying the identical event is idempotent.
+    ``filled_qty`` never decreases — clamped to the prior value (never
+    applied) when an event at the SAME or a higher rank reports a smaller
+    quantity (e.g. a duplicated/misordered partial-fill event), and this is
+    counted ``qty_regressed`` + logged rather than silently clamped (Codex
+    #190: a qty decrease must be an observable anomaly, not just a no-op);
+    ``fill_price`` is retained when the event omits it (a partial fill
+    followed by a cancel keeps the executed quantity and price). Replaying
+    the identical event is idempotent.
 
-    Returns ``{"updated": n, "stale": n, "unmatched": n, "skipped": n}``.
-    Fail-soft: disabled persistence returns all-zero counts; nothing here
-    raises on malformed outcomes — but every non-applied outcome is
-    OBSERVABLE (counted, logged, and audited when unmatched).
+    Returns ``{"updated": n, "stale": n, "unmatched": n, "skipped": n,
+    "qty_regressed": n}``. Fail-soft: disabled persistence returns all-zero
+    counts; nothing here raises on malformed outcomes — but every
+    non-applied outcome, and every clamped regression, is OBSERVABLE
+    (counted, logged, and audited when unmatched).
     """
-    counts = {"updated": 0, "stale": 0, "unmatched": 0, "skipped": 0}
+    counts = {
+        "updated": 0, "stale": 0, "unmatched": 0, "skipped": 0,
+        "qty_regressed": 0,
+    }
     if conn is None:
         return counts
     for outcome in outcomes:
@@ -1734,6 +1743,19 @@ def record_order_outcomes(
                 new_qty = event_qty
             else:
                 new_qty = max(cur_qty, event_qty)
+                if event_qty < cur_qty:
+                    # Same-or-higher-rank event but a SMALLER quantity: the
+                    # decrease is clamped (never applied) — but per Codex
+                    # #190 that must be an observable anomaly, not a silent
+                    # no-op, so it's counted + logged distinctly from a
+                    # plain rank-stale event.
+                    counts["qty_regressed"] += 1
+                    log.warning(
+                        "fill-truth: filled_qty regression ignored for "
+                        "order %s (status %r): event reports %.6g, "
+                        "retaining recorded %.6g",
+                        broker_order_id, status, event_qty, cur_qty,
+                    )
             new_price = event_price if event_price is not None else cur_price
             conn.execute(
                 "UPDATE trades SET fill_status = ?, filled_qty = ?, "

@@ -47,13 +47,17 @@ Population, two halves:
    partially_filled=2 < canceled/rejected/expired=3 < filled=4): a
    lower-ranked out-of-order/late event is counted `stale` and ignored (late
    `accepted` never overwrites a fill; a cancel never overwrites a full
-   fill); `filled_qty` never decreases; a partial fill followed by a cancel
-   retains the executed qty+price; a late fill after a recorded cancel is
-   broker truth and applies; exact replays are idempotent. Unrecognized
-   broker vocabulary maps to the EXPLICIT `unknown` state (logged) — never
-   interpretable as canceled/unfilled. Returns observable counts
-   `{updated, stale, unmatched, skipped}`; fail-soft throughout (disabled
-   persistence / malformed entries never raise, never silently vanish).
+   fill); `filled_qty` never decreases — a same-or-higher-rank event
+   reporting a SMALLER quantity has its qty/price clamped to the prior
+   recorded value (never applied) AND is counted `qty_regressed` + logged
+   (an observable anomaly, not a silent clamp); a partial fill followed by
+   a cancel retains the executed qty+price; a late fill after a recorded
+   cancel is broker truth and applies; exact replays are idempotent.
+   Unrecognized broker vocabulary maps to the EXPLICIT `unknown` state
+   (logged) — never interpretable as canceled/unfilled. Returns observable
+   counts `{updated, stale, unmatched, skipped, qty_regressed}`; fail-soft
+   throughout (disabled persistence / malformed entries never raise, never
+   silently vanish).
 
 ### Review round (Codex #190 CHANGES_REQUESTED — all points taken)
 
@@ -66,6 +70,16 @@ Population, two halves:
    interleavings of the same event set converge to the same state).
 3. Unknown broker vocabulary → explicit `unknown` state (distinct from NULL
    = pre-contract/never-reconciled); all fail-soft paths counted + logged.
+4. **Same-day addendum** (small additive follow-up on top of the round-2
+   commit, still same review cycle): a `filled_qty` decrease at the SAME or
+   a HIGHER rank (e.g. `partially_filled` qty=2 → `partially_filled` qty=1,
+   or `filled` qty=3 → `filled` qty=2 — neither is a rank regression, so
+   neither was counted `stale`) was being clamped correctly but silently —
+   no counter, no log. Per Codex's literal ask ("log/flag this as an
+   anomaly rather than silently applying it"), this is now counted
+   `qty_regressed` and logged at `warning`, distinct from `stale`. Two new
+   tests pin this (`test_filled_qty_never_decreases`,
+   `test_filled_qty_regression_at_filled_rank_is_also_flagged`).
 
 ## Landing note (consumer wiring — umbrella-owned, NOT in this PR)
 
@@ -86,15 +100,20 @@ ships here; the live path wires it with one line per site in
 
 ## Evidence
 
-- `tests/test_fill_truth_persistence.py` (26 tests): the ZM shape (pending →
+- `tests/test_fill_truth_persistence.py` (27 tests): the ZM shape (pending →
   canceled, 0 fills — the DB now answers "was ZM bought?" without the broker
   API); the NFLX fill shape (qty+price+timestamp write-back); write-time
   `submitted` stamping with order-id lift; unmatched-outcome auditing (no
-  guessing); the 8 monotonic/out-of-order/replay/convergence cases; unknown-
-  vocabulary state; run-id scoping; fail-soft counted paths; legacy-DB
-  migration (today's schema minus the 5 columns → migrates, old rows read
-  NULL); `ensure_schema` idempotence; builder passthrough.
-- Full suite: 1687 passed, 8 skipped.
+  guessing); the 9 monotonic/out-of-order/replay/convergence cases
+  (including the `qty_regressed` observability addendum at both
+  `partially_filled` and `filled` rank); unknown-vocabulary state; run-id
+  scoping; fail-soft counted paths; legacy-DB migration (today's schema
+  minus the 5 columns → migrates, old rows read NULL); `ensure_schema`
+  idempotence; builder passthrough.
+- Full suite: 1680 passed, 8 skipped, plus 3 pre-existing failures unrelated
+  to this change (a D6 replay evidence-pin float mismatch and an XGBoost
+  artifact scorer test — both fail identically on the unmodified branch tip,
+  i.e. environment/fixture drift, not a regression from this work).
 - Backward compatibility: additive columns only; the new
   `idx_trades_broker_order` index is created AFTER column migrations in
   `ensure_schema` so legacy DBs migrate cleanly; no positional-column

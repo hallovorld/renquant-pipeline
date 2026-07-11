@@ -223,7 +223,8 @@ class TestRecordOrderOutcomes:
         # disabled persistence
         counts = record_order_outcomes(None, [{"broker_order_id": "x",
                                                 "fill_status": "canceled"}])
-        assert counts == {"updated": 0, "stale": 0, "unmatched": 0, "skipped": 0}
+        assert counts == {"updated": 0, "stale": 0, "unmatched": 0,
+                          "skipped": 0, "qty_regressed": 0}
         # garbage entries: no status / non-dict -> skipped, never raise
         counts = record_order_outcomes(conn, [
             {"broker_order_id": "known-id"},   # no status
@@ -317,17 +318,38 @@ class TestMonotonicTransitions:
         assert row[3] == 2.0 and row[4] == 72.60  # executed facts retained
 
     def test_filled_qty_never_decreases(self, tmp_path):
+        """Codex #190: a filled_qty decrease must be REJECTED/NO-OPED and
+        FLAGGED as an anomaly — not silently clamped. Same-rank event (both
+        `partially_filled`) so this isolates the qty invariant from the
+        rank/stale invariant tested elsewhere."""
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
             "broker_order_id": "oid-1", "fill_status": "partially_filled",
             "filled_qty": 2,
         }])
-        record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "oid-1", "fill_status": "partially_filled",
             "filled_qty": 1,  # out-of-order smaller partial
         }])
+        assert counts["qty_regressed"] == 1   # observable, not silent
+        assert counts["stale"] == 0            # same rank — not a rank-stale event
         (row,) = _fill_rows(conn, "NFLX")
-        assert row[3] == 2.0
+        assert row[3] == 2.0                   # never regressed to 1
+
+    def test_filled_qty_regression_at_filled_rank_is_also_flagged(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3, "fill_price": 72.62,
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 2,  # erroneous/duplicated smaller "filled" report
+        }])
+        assert counts["qty_regressed"] == 1
+        assert counts["updated"] == 1  # status re-applied, qty retained
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[3] == 3.0
 
     def test_late_fill_after_recorded_cancel_applies_broker_truth(self, tmp_path):
         conn = self._seed(tmp_path)
