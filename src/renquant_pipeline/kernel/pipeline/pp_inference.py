@@ -614,6 +614,22 @@ class InferencePipeline:
         except Exception:
             log.exception("S5 DecisionLedgerWriteTask raised (fail-open)")
 
+        # 2026-07-11 FUNNEL-INTEGRITY (operator mandate after the 07-08/09
+        # admission outage — two sessions of zero buy capability reported as
+        # a normal "no trade"): classify this session's buy-funnel outcome
+        # into a first-class verdict (ECONOMIC_TRADE / ECONOMIC_NO_TRADE /
+        # DEGRADED / STRUCTURAL_BLOCK) and publish ctx.funnel_integrity for
+        # run-bundle persistence + the umbrella ntfy OUTAGE-vs-no-trade
+        # title. Runs LAST so it sees the final funnel state (post-selection,
+        # post-rotation, post-ledger). OBSERVE-ONLY + fail-isolated (its own
+        # crash never darks the run) — same isolation contract as
+        # AdmissionShadowLoggerTask. Kill switch: funnel_integrity.enabled.
+        # Deliberately NOT in SellOnlyPipeline: the exit-only variant has no
+        # buy funnel to judge and runs ~every 12 min intraday (a misleading
+        # per-tick verdict would be false-OUTAGE spam, not observability).
+        from .task_funnel_integrity import FunnelIntegrityTask  # noqa: PLC0415
+        FunnelIntegrityTask().run(ctx)
+
         # Audit fix ROT-COUNTER (Bug L, 2026-04-25): pre-fix this logged
         # `len(ctx.rotations)` which is "pairs CONSIDERED by find_rotation_pairs",
         # not "pairs EMITTED to broker". Iter3 produced rotations=1 in the log
