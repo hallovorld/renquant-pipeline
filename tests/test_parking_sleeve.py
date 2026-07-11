@@ -1,4 +1,4 @@
-"""S7 lane-B parking sleeve — β-budgeted SPY/SGOV sweep, shadow mode.
+"""S7 lane-B parking sleeve — β-budgeted SPY/SGOV sweep, shadow + live modes.
 
 Contract: renquant-orchestrator doc/research/2026-07-02-rs1-parking-sleeve.md
 (RS-1) + doc/design/2026-07-02-104-capability-program.md §1.3. Pins:
@@ -6,7 +6,14 @@ Contract: renquant-orchestrator doc/research/2026-07-02-rs1-parking-sleeve.md
 * flag absent / disabled ⇒ the task is byte-inert (ctx unchanged, no file);
 * shadow mode computes the β-budget sweep across scenarios (idle cash
   above/below reserve, BEAR fully-off, regime-reserve scaling, several
-  w_pos points, sell-first funding) and NEVER places orders;
+  w_pos points, sell-first funding) and NEVER places orders — byte-identical
+  to the original #157 behavior even when live-era config keys
+  (max_sleeve_pct) are present;
+* live mode (this change) emits REAL SGOV-floor intents only: SGOV buys of
+  idle cash above the reserves, SGOV sells FIRST whenever cash is needed
+  (free-before-need), cumulative max_sleeve_pct cap against the real broker
+  holding (strategy-104 #44 semantics), §1091 wash-sale engine on re-buys,
+  fail-closed when the SGOV price is missing, and NEVER a SPY order;
 * the RS-1 §4/§5 monitoring metrics (sleeve contribution, DD-budget
   consumption) are emitted in every record's book_state.
 """
@@ -21,6 +28,7 @@ import math
 import pytest
 
 from renquant_pipeline.context import InferenceContext
+from renquant_pipeline.kernel.exits import HoldingState
 from renquant_pipeline.kernel.pipeline.task_parking_sleeve import (
     ECONOMIC_BOOK_STATE_FIELDS,
     OPERATIONAL_BOOK_STATE_FIELDS,
@@ -63,6 +71,21 @@ def _enabled(**extra) -> dict:
     out = {"enabled": True, "mode": "shadow"}
     out.update(extra)
     return out
+
+
+def _live(**extra) -> dict:
+    out = {"enabled": True, "mode": "live"}
+    out.update(extra)
+    return out
+
+
+def _sgov_holding(shares: float, entry_price: float = 100.0) -> HoldingState:
+    return HoldingState(
+        entry_price=entry_price,
+        entry_date=dt.date(2026, 6, 1),
+        high_watermark=entry_price,
+        shares=float(shares),
+    )
 
 
 def _read_log(tmp_path):
@@ -376,14 +399,14 @@ class TestShadowTask:
         assert state["spy_qty"] == 0.0
         assert state["sgov_value"] == 0.0
 
-    def test_live_mode_is_unimplemented_and_places_nothing(self, tmp_path):
-        ctx = _ctx(tmp_path, sleeve=_enabled(mode="live"))
+    def test_unknown_mode_treated_as_shadow_places_nothing(self, tmp_path):
+        ctx = _ctx(tmp_path, sleeve=_enabled(mode="paper"))
 
         ParkingSleeveShadowTask().run(ctx)
 
         assert ctx.orders == []
         assert ctx.exits == []
-        assert ctx.counters["parking_sleeve_live_mode_unimplemented"] == 1
+        assert ctx.counters["parking_sleeve_bad_mode"] == 1
         rows = _read_log(tmp_path)
         assert rows and all(r["book_state"]["live_orders_placed"] is False for r in rows)
 
@@ -531,3 +554,316 @@ class TestScorecardSeparation:
 
     def test_economic_scorecard_empty_log_is_not_authorization_grade(self):
         assert build_economic_scorecard([]) == {"authorization_grade": False, "n_sessions": 0}
+
+
+# ── planner: live-era parameters (cap + SGOV-only) ─────────────────────────
+
+
+class TestPlannerLiveParams:
+
+    def test_max_sleeve_cap_binds_target(self):
+        plan = compute_parking_sleeve_plan(
+            pv=10_000.0, cash=8_000.0, positions_value=2_000.0,
+            spy_qty=0.0, spy_price=None, sgov_value=0.0, sgov_price=100.0,
+            max_sleeve_pct=0.50, sgov_only=True,
+        )
+        # deployable 7500 pre-cap → capped at 0.5·PV = 5000
+        assert plan["deployable"] == pytest.approx(5_000.0)
+        assert plan["sleeve_cap_bound"] is True
+        assert plan["reason"] == "max_sleeve_cap_enforced"
+        assert plan["target_sgov_value"] == pytest.approx(5_000.0)
+
+    def test_default_cap_of_one_never_binds(self):
+        capped = compute_parking_sleeve_plan(
+            pv=10_000.0, cash=8_000.0, positions_value=2_000.0,
+            spy_qty=0.0, spy_price=100.0, sgov_value=0.0, sgov_price=100.0,
+        )
+        assert capped["sleeve_cap_bound"] is False
+        assert capped["reason"] == "sweep_idle_cash"  # unchanged vs #157
+
+    def test_sgov_only_forces_zero_spy_frac(self):
+        plan = compute_parking_sleeve_plan(
+            pv=10_000.0, cash=8_000.0, positions_value=2_000.0,
+            spy_qty=0.0, spy_price=100.0, sgov_value=0.0, sgov_price=100.0,
+            sgov_only=True,
+        )
+        assert plan["sleeve_spy_frac"] == 0.0
+        assert plan["target_spy_value"] == 0.0
+        assert all(a["symbol"] == "SGOV" for a in plan["actions"])
+
+    def test_cumulative_cap_over_cap_plans_sell_down(self):
+        # Sleeve already 60% of PV with a 50% cap ⇒ plan a $1000 sell-down.
+        plan = compute_parking_sleeve_plan(
+            pv=10_000.0, cash=500.0, positions_value=3_500.0,
+            spy_qty=0.0, spy_price=None, sgov_value=6_000.0, sgov_price=100.0,
+            max_sleeve_pct=0.50, sgov_only=True,
+        )
+        assert plan["deployable"] == pytest.approx(5_000.0)
+        sells = [a for a in plan["actions"] if a["action"] == "SELL"]
+        assert len(sells) == 1 and sells[0]["symbol"] == "SGOV"
+        assert sells[0]["notional"] == pytest.approx(1_000.0)
+
+
+# ── live mode: real SGOV-floor emission ─────────────────────────────────────
+
+
+def _live_ctx(tmp_path, **overrides):
+    return _ctx(tmp_path, sleeve=_live(), **overrides)
+
+
+class TestLiveMode:
+
+    def test_live_buy_emits_whole_share_sgov_order_and_never_spy(self, tmp_path):
+        ctx = _live_ctx(tmp_path)  # pv 10k, cash 8k, SGOV 100
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert len(ctx.orders) == 1
+        order = ctx.orders[0]
+        assert order["ticker"] == "SGOV"
+        assert order["order_type"] == "PARKING_SLEEVE_BUY"
+        # deployable 7500 → cumulative cap (default 0.50) → 5000; whole
+        # shares at 100 with the 3bps buy-cost multiplier ⇒ 49 shares.
+        assert order["shares"] == 49.0
+        assert order["invest"] == pytest.approx(4_900.0)
+        assert order["source_job"] == "ParkingSleeveJob"
+        # SPY arm is dark: never a SPY order or exit from the live sleeve.
+        assert all(o["ticker"] != "SPY" for o in ctx.orders)
+        assert ctx.exits == []
+        assert ctx.counters["parking_sleeve_live_orders"] == 1
+
+    def test_live_buy_leaves_reserve_and_pending_funded(self, tmp_path):
+        ctx = _live_ctx(tmp_path)
+        ctx.orders.append({"ticker": "AAPL", "invest": 1_000.0, "shares": 5, "price": 200.0})
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        sleeve_buys = [o for o in ctx.orders if o["ticker"] == "SGOV"]
+        assert len(sleeve_buys) == 1
+        invest = sleeve_buys[0]["invest"]
+        pending = 1_000.0
+        reserve = 0.05 * 10_000.0
+        # CRITICAL liquidity invariant: the sleeve buy never digs into the
+        # pending main-strategy buys or the operational reserve.
+        assert ctx.cash - pending - invest >= reserve - 1e-9
+
+    def test_live_sell_first_frees_cash_before_admitted_buys_need_it(self, tmp_path):
+        ctx = _live_ctx(tmp_path, cash=500.0)
+        ctx.holdings["SGOV"] = _sgov_holding(75.0)
+        ctx.orders.append({"ticker": "AAPL", "invest": 6_000.0, "shares": 30, "price": 200.0})
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        # A $6000 admitted buy with $500 cash ⇒ the sleeve SELLS first.
+        assert len(ctx.exits) == 1
+        ticker, sig = ctx.exits[0]
+        assert ticker == "SGOV"
+        assert sig.exit_type == "parking_sleeve_sweep"
+        assert sig.quantity == 61.0  # ceil(6000 / (100 · sell-proceeds mult))
+        # Net proceeds (after friction) cover the full funding shortfall.
+        from renquant_pipeline.kernel.pipeline.task_benchmark_sleeve import (
+            _sell_proceeds_multiplier,
+        )
+        freed = sig.quantity * 100.0 * _sell_proceeds_multiplier(ctx.config)
+        assert freed >= 6_000.0 - 1e-6
+        # No sleeve buy in the same bar; the main order is untouched.
+        assert [o["ticker"] for o in ctx.orders] == ["AAPL"]
+        # Free-before-need at execution: exits are executed before buys.
+        from renquant_pipeline.kernel.pipeline.pp_execution import (
+            BuysJob, ExecutionPipeline, ExitsJob,
+        )
+        jobs = ExecutionPipeline().jobs
+        assert isinstance(jobs[0], ExitsJob) and isinstance(jobs[1], BuysJob)
+
+    def test_live_cumulative_cap_counts_real_holding_across_sessions(self, tmp_path):
+        # 45 SGOV shares already held (45% of PV) — new deployment must be
+        # capped at the 5% headroom below the 50% cumulative cap.
+        ctx = _live_ctx(tmp_path, cash=3_000.0)
+        ctx.holdings["SGOV"] = _sgov_holding(45.0)
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        sleeve_buys = [o for o in ctx.orders if o["ticker"] == "SGOV"]
+        assert len(sleeve_buys) == 1
+        assert sleeve_buys[0]["shares"] == 4.0  # $500 headroom ⇒ 4 whole shares
+        assert 45.0 * 100.0 + sleeve_buys[0]["invest"] <= 0.50 * 10_000.0 + 1e-9
+
+    def test_live_over_cap_sleeve_sells_down_to_cap(self, tmp_path):
+        ctx = _live_ctx(tmp_path, cash=500.0)
+        ctx.holdings["SGOV"] = _sgov_holding(60.0)  # 60% of PV > 50% cap
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == []
+        assert len(ctx.exits) == 1
+        _ticker, sig = ctx.exits[0]
+        assert sig.quantity == 11.0  # ≈ $1000 over cap, ceil'd for friction
+        rows = _read_log(tmp_path)
+        assert _summaries(rows)[-1]["reason"] == "max_sleeve_cap_enforced"
+
+    def test_live_missing_sgov_price_fail_closed_no_buys(self, tmp_path):
+        ctx = _live_ctx(tmp_path, prices={"SPY": 100.0, "AAPL": 200.0, "OXY": 48.0})
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == []
+        assert ctx.exits == []
+        assert ctx.counters["parking_sleeve_live_missing_sgov_price"] == 1
+        rows = _read_log(tmp_path)
+        assert rows
+        summary = _summaries(rows)[-1]
+        assert summary["book_state"]["live_orders_placed"] is False
+        assert "sgov_price_missing_live_fail_closed" in summary["book_state"]["blocked"]
+        assert summary["reason"] == "sgov_price_missing_fail_closed"
+
+    def test_live_missing_price_with_shortfall_still_frees_cash_via_full_exit(self, tmp_path):
+        ctx = _live_ctx(
+            tmp_path, cash=100.0,
+            prices={"SPY": 100.0, "AAPL": 200.0, "OXY": 48.0},
+        )
+        ctx.holdings["SGOV"] = _sgov_holding(75.0)
+        ctx.orders.append({"ticker": "AAPL", "invest": 6_000.0, "shares": 30, "price": 200.0})
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        # Fail-closed still honors free-before-need: a FULL exit (no price
+        # needed) frees the position when the book needs the cash.
+        assert len(ctx.exits) == 1
+        ticker, sig = ctx.exits[0]
+        assert ticker == "SGOV"
+        assert sig.quantity is None  # full liquidation
+        assert [o["ticker"] for o in ctx.orders] == ["AAPL"]  # no sleeve buys
+        assert ctx.counters["parking_sleeve_live_missing_sgov_price"] == 1
+        rows = _read_log(tmp_path)
+        assert _summaries(rows)[-1]["reason"] == "sgov_price_missing_fail_closed_full_exit"
+
+    def test_live_wash_sale_blocks_rebuy_after_recent_loss_sale(self, tmp_path):
+        ctx = _live_ctx(tmp_path)
+        ctx.last_sell_dates["SGOV"] = dt.date(2026, 6, 28)  # 4d ago
+        ctx.last_sell_pls["SGOV"] = -12.0  # LOSS ⇒ §1091 applies
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == []
+        assert ctx.counters["parking_sleeve_live_wash_sale_blocked"] == 1
+        rows = _read_log(tmp_path)
+        assert "sgov_wash_sale_blocked" in _summaries(rows)[-1]["book_state"]["blocked"]
+
+    def test_live_wash_sale_gain_sale_passes(self, tmp_path):
+        ctx = _live_ctx(tmp_path)
+        ctx.last_sell_dates["SGOV"] = dt.date(2026, 6, 28)
+        ctx.last_sell_pls["SGOV"] = +12.0  # GAIN ⇒ §1091 does not apply
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert len(ctx.orders) == 1 and ctx.orders[0]["ticker"] == "SGOV"
+
+    def test_live_buy_gates_block_buys(self, tmp_path):
+        ctx = _live_ctx(tmp_path, skip_buys=True)
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == []
+        assert ctx.counters["parking_sleeve_live_buy_gated"] == 1
+        rows = _read_log(tmp_path)
+        assert "live_buy_gates_blocked" in _summaries(rows)[-1]["book_state"]["blocked"]
+
+    def test_live_bear_sweeps_real_sleeve_off_even_with_buys_gated(self, tmp_path):
+        # Exits-always-allowed: sells fire in BEAR regardless of buy gates.
+        ctx = _live_ctx(tmp_path, cash=500.0, regime="BEAR", skip_buys=True)
+        ctx.holdings["SGOV"] = _sgov_holding(75.0)
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == []
+        assert len(ctx.exits) == 1
+        _ticker, sig = ctx.exits[0]
+        assert sig.quantity is None  # full liquidation
+        rows = _read_log(tmp_path)
+        assert _summaries(rows)[-1]["reason"] == "bear_regime_sleeve_off"
+
+    def test_live_symbol_already_touched_stands_down(self, tmp_path):
+        ctx = _live_ctx(tmp_path)
+        ctx.orders.append({"ticker": "SGOV", "invest": 100.0, "shares": 1, "price": 100.0})
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert len(ctx.orders) == 1  # nothing stacked on top
+        assert ctx.exits == []
+        assert ctx.counters["parking_sleeve_live_symbol_already_touched"] == 1
+
+    def test_live_idempotency_same_date_never_reemits(self, tmp_path):
+        ctx1 = _live_ctx(tmp_path)
+        ParkingSleeveShadowTask().run(ctx1)
+        assert len(ctx1.orders) == 1
+
+        ctx2 = _live_ctx(tmp_path)  # same date, fresh ctx (a retry)
+        ParkingSleeveShadowTask().run(ctx2)
+
+        assert ctx2.orders == []
+        assert ctx2.exits == []
+        assert ctx2.counters["parking_sleeve_duplicate_date_skipped"] == 1
+
+    def test_live_rows_logged_with_live_mode_and_real_book_state(self, tmp_path):
+        ctx = _live_ctx(tmp_path)
+        ParkingSleeveShadowTask().run(ctx)
+
+        rows = _read_log(tmp_path)
+        assert rows
+        for row in rows:
+            assert {"date", "action", "symbol", "qty", "notional",
+                    "reason", "book_state"} <= set(row)
+            assert row["book_state"]["mode"] == "live"
+            assert row["book_state"]["live_orders_placed"] is True
+            assert row["book_state"]["sgov_valuation_mode"] == "mark_to_market"
+        summary = _summaries(rows)[-1]
+        # shadow_state mirrors the REAL post-trade book (49 shares at cost).
+        assert summary["shadow_state"]["spy_qty"] == 0.0
+        assert summary["shadow_state"]["sgov_value"] == pytest.approx(4_900.0)
+
+    def test_live_failure_never_breaks_pipeline(self, tmp_path):
+        # log_path pointing at a directory → open() fails inside the task
+        ctx = _ctx(tmp_path, sleeve=_live(log_path=str(tmp_path)))
+
+        ParkingSleeveShadowTask().run(ctx)  # must not raise
+
+        assert ctx.counters.get("parking_sleeve_error") == 1
+
+
+# ── shadow-mode regression: byte-identical to #157 ─────────────────────────
+
+
+class TestShadowByteIdenticalRegression:
+
+    def test_shadow_ignores_live_era_config_keys(self, tmp_path):
+        base_dir = tmp_path / "base"
+        keyed_dir = tmp_path / "keyed"
+        base_dir.mkdir()
+        keyed_dir.mkdir()
+
+        ctx_base = _ctx(base_dir, sleeve=_enabled())
+        ParkingSleeveShadowTask().run(ctx_base)
+        ctx_keyed = _ctx(keyed_dir, sleeve=_enabled(max_sleeve_pct=0.50))
+        ParkingSleeveShadowTask().run(ctx_keyed)
+
+        rows_base = _read_log(base_dir)
+        rows_keyed = _read_log(keyed_dir)
+        assert rows_base == rows_keyed, \
+            "shadow mode must NOT apply max_sleeve_pct (byte-identical #157 corpus)"
+        assert ctx_keyed.orders == [] and ctx_keyed.exits == []
+
+    def test_shadow_never_touches_orders_even_with_holdings(self, tmp_path):
+        ctx = _ctx(tmp_path, sleeve=_enabled())
+        ctx.holdings["SGOV"] = _sgov_holding(10.0)
+        orders_before = copy.deepcopy(ctx.orders)
+
+        ParkingSleeveShadowTask().run(ctx)
+
+        assert ctx.orders == orders_before
+        assert ctx.exits == []
+        # The shadow book still starts empty — real holdings are a LIVE
+        # concept; shadow keeps its own JSONL book (per #157).
+        rows = _read_log(tmp_path)
+        bs = _summaries(rows)[-1]["book_state"]
+        assert bs["mode"] == "shadow"
+        assert bs["live_orders_placed"] is False
