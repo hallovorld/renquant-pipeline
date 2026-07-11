@@ -717,6 +717,83 @@ class TestP5WashSaleBypass:
             "AAPL", _cfg(), {"AAPL": SUN - dt.timedelta(days=5)},
         )
 
+    def test_governor_sizing_no_sell_1091_guard_bypassed_for_validated_crypto_only(
+        self, monkeypatch,
+    ):
+        """Found while fixing the no-buy threading gap above: run_governor_
+        sizing's INLINE §1091 no-sell guard (blocking the sale of a loss
+        lot bought inside the wash-sale window) was not asset-class-aware
+        at all — it never called wash_sale_applies_for_ticker, so a
+        validated crypto pair held at a loss inside the window was wrongly
+        floored at its current weight even though §1091 never applies to
+        it. An asset_class="crypto"-tagged but unvalidated ticker, and a
+        plain equity ticker, must still be floored (fail closed / pinned)."""
+        import renquant_pipeline.kernel.pipeline.governor_sizing as gs_mod
+        from renquant_pipeline.context import InferenceContext
+        from renquant_pipeline.kernel.exits import HoldingState
+
+        gov_cfg = {
+            "enabled": True,
+            "e_ceil_by_regime": {"BULL_CALM": 0.95},
+            "hysteresis_band": 0.0,
+            "kelly_fraction": 0.3,
+            "mu_shrinkage": 0.0,
+            "top_k": 8,
+            "max_step_per_session": 1.0,
+        }
+
+        def _held():
+            return HoldingState(
+                entry_price=100.0, entry_date=SUN - dt.timedelta(days=5),
+                high_watermark=100.0, shares=5, mu=0.04, sigma=0.2,
+            )
+
+        def _cfg(**top):
+            cfg = {
+                "regime_params": {"BULL_CALM": {
+                    "max_position_pct": 0.12, "cash_reserve_pct": 0.0,
+                    "max_concurrent_positions": 8,
+                }},
+                "ranking": {"panel_scoring": {
+                    "enabled": True,
+                    "sizing": {"enabled": True, "floor": 0.0, "ceiling": 1.0,
+                               "min_mult": 0.5},
+                    "sigma_sizing": {},
+                }, "kelly_sizing": {"enabled": False}},
+                "regime": {}, "wash_sale_days": 30, "min_hold_days": 0,
+                "deployment_governor": gov_cfg,
+            }
+            cfg.update(top)
+            return cfg
+
+        def _no_sell_for(ticker, cfg):
+            captured: dict[str, set] = {}
+            real_allocate = gs_mod.allocate_down_only
+
+            def _spy(**kwargs):
+                captured["no_sell"] = set(kwargs["no_sell"])
+                return real_allocate(**kwargs)
+
+            monkeypatch.setattr(gs_mod, "allocate_down_only", _spy)
+            ctx = InferenceContext(
+                config=cfg, today=SUN, regime="BULL_CALM", confidence=1.0,
+                bear_only=False, portfolio_value=10_000.0, cash=5_000.0,
+                # Held at a loss: entry 100.0, current price 50.0.
+                prices={ticker: 50.0}, ranked=[], models={},
+                holdings={ticker: _held()}, last_sell_dates={},
+            )
+            ctx._selected = []  # noqa: SLF001
+            gs_mod.run_governor_sizing(ctx, gov_cfg)
+            return captured["no_sell"]
+
+        assert "BTC/USD" not in _no_sell_for(
+            "BTC/USD", _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+        )
+        assert "XYZ-TOKEN" in _no_sell_for(
+            "XYZ-TOKEN", _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+        )
+        assert "AAPL" in _no_sell_for("AAPL", _cfg())
+
     def test_joint_action_wash_check_bypassed_for_validated_crypto_only(self):
         """Codex re-review of #183 (7aa82cf5): JointActionTask's buy-leg
         wash-sale check called is_wash_sale_blocked_with_cost with no
