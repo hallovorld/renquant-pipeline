@@ -3,17 +3,28 @@
 The #484 forensics found 5 ZM "buy_pending" rows in the runs DB and 0 broker
 fills — nothing in the DB distinguished a canceled intent from a fill, so
 every consumer overcounted buys and basic facts required the broker API.
-These tests pin the contract (round 2, post Codex review on #190): attempt
-rows are stamped ``submitted`` with the broker order id at write time;
-broker-confirmed outcomes are written back via ``record_order_outcomes``
-keyed by broker order identity ONLY, under monotonic transition rules that
-out-of-order/replayed broker events cannot rewind; unmatched outcomes become
-explicit audit entries, never guesses; the schema change is additive (old
-DBs migrate, old rows read back with NULL = never reconciled).
+These tests pin the contract (round 3, post Codex review on #190): attempt
+rows are stamped ``submitted`` with the broker order id (and broker account
+id) at write time; broker-confirmed outcomes are written back via
+``record_order_outcomes`` keyed by the CANONICAL identity
+``(broker_account_id, broker_order_id)`` — round 2 made ``broker_order_id``
+mandatory but it alone is not a unique row identity (the same id can
+legitimately be logged on more than one row); round 3 narrows the match key
+and rejects/audits any outcome that still names more than one row rather
+than mass-updating them. Transitions are monotonic by rank, AND (round 3)
+a same-rank event with an older origin timestamp than what is already
+recorded cannot clobber it. The match-and-apply for each outcome is an
+atomic DB-level transaction (``BEGIN IMMEDIATE``), closing the
+read-then-write race between two connections against the same on-disk file.
+Unmatched/ambiguous outcomes become explicit audit entries, never guesses;
+the schema change is additive (old DBs migrate, old rows read back with
+NULL = never reconciled).
 """
 from __future__ import annotations
 
 import datetime
+import sqlite3
+import threading
 
 from renquant_pipeline.kernel.persistence import (
     FILL_STATUS_CANCELED,
@@ -33,6 +44,11 @@ from renquant_pipeline.kernel.trade_events import (
 )
 
 RUN_DATE = datetime.date(2026, 7, 7)
+
+# Canonical order identity is (broker_account_id, broker_order_id) as of
+# round 3 (Codex #190). Most tests operate against a single account; use
+# this constant so intent-side and outcome-side dicts stay consistent.
+ACCOUNT = "alpaca-acct-1"
 
 
 def _conn(tmp_path):
@@ -135,6 +151,38 @@ class TestRecordTradesStamping:
         (row,) = _fill_rows(conn, "ZM")
         assert row[2] == FILL_STATUS_UNKNOWN
 
+    def test_broker_account_id_is_stamped_alongside_order_id(self, tmp_path):
+        """Round 3 (Codex #190): canonical order identity is
+        (broker_account_id, broker_order_id) — the account half must be
+        lifted at write time the same way the order id already is, or
+        record_order_outcomes could never match this row by that identity."""
+        conn = _conn(tmp_path)
+        run_id = _run(conn)
+        record_trades(conn, run_id, [{
+            "ticker": "NFLX", "action": "buy", "date": "2026-06-24",
+            "shares": 3, "price": 72.62,
+            "broker_account_id": ACCOUNT, "broker_order_id": "alpaca-nflx-0624",
+        }])
+        row = conn.execute(
+            "SELECT broker_account_id, broker_order_id FROM trades"
+            " WHERE ticker = 'NFLX'"
+        ).fetchone()
+        assert row == (ACCOUNT, "alpaca-nflx-0624")
+
+    def test_broker_account_id_lifted_from_decision_inputs(self, tmp_path):
+        conn = _conn(tmp_path)
+        run_id = _run(conn)
+        record_trades(conn, run_id, [{
+            "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
+            "decision_inputs": {"order_id": "alpaca-zm-0707",
+                                "account_id": ACCOUNT},
+        }])
+        row = conn.execute(
+            "SELECT broker_account_id, broker_order_id FROM trades"
+            " WHERE ticker = 'ZM'"
+        ).fetchone()
+        assert row == (ACCOUNT, "alpaca-zm-0707")
+
 
 # ── post-execution outcome write-back ─────────────────────────────────────────
 
@@ -144,10 +192,11 @@ class TestRecordOrderOutcomes:
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-            "shares": 2, "price": 85.68, "order_id": "alpaca-zm-0707",
+            "shares": 2, "price": 85.68,
+            "broker_account_id": ACCOUNT, "order_id": "alpaca-zm-0707",
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "alpaca-zm-0707",
+            "broker_account_id": ACCOUNT, "broker_order_id": "alpaca-zm-0707",
             "fill_status": "canceled",
             "filled_qty": 0,
             "fill_updated_at": "2026-07-07T22:56:00Z",
@@ -168,10 +217,11 @@ class TestRecordOrderOutcomes:
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "NFLX", "action": "buy_pending", "date": "2026-06-24",
-            "shares": 3, "price": 72.50, "broker_order_id": "alpaca-nflx-0624",
+            "shares": 3, "price": 72.50,
+            "broker_account_id": ACCOUNT, "broker_order_id": "alpaca-nflx-0624",
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "alpaca-nflx-0624",
+            "broker_account_id": ACCOUNT, "broker_order_id": "alpaca-nflx-0624",
             "fill_status": "filled", "filled_qty": 3,
             "filled_avg_price": 72.62, "filled_at": "2026-06-24T13:30:00Z",
         }])
@@ -182,9 +232,10 @@ class TestRecordOrderOutcomes:
         assert row[5] == "2026-06-24T13:30:00Z"
 
     def test_no_ticker_date_guessing_unmatched_is_audited(self, tmp_path):
-        """Codex #190: outcome mutation is keyed by broker order identity
-        ONLY — no ticker+date fallback (two same-ticker attempts in one day
-        would be indistinguishable). Unmatched -> audit entry, row untouched."""
+        """Codex #190: outcome mutation is keyed by canonical broker order
+        identity ONLY — no ticker+date fallback (two same-ticker attempts in
+        one day would be indistinguishable). Unmatched -> audit entry, row
+        untouched."""
         conn = _conn(tmp_path)
         run_id = _run(conn)
         record_trades(conn, run_id, [{
@@ -202,11 +253,73 @@ class TestRecordOrderOutcomes:
         assert len(audits) == 1 and audits[0][0] == "ZM"
         assert "no_broker_order_id" in audits[0][1]
 
+    def test_no_broker_account_id_is_audited(self, tmp_path):
+        """Round 3 (Codex #190): broker_account_id is the other mandatory
+        half of the canonical identity. Supplying broker_order_id but not
+        broker_account_id must not fall back to matching by order id alone
+        — it is audited exactly like a missing order id, and the row is
+        left untouched."""
+        conn = _conn(tmp_path)
+        run_id = _run(conn)
+        record_trades(conn, run_id, [{
+            "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
+            "broker_account_id": ACCOUNT, "broker_order_id": "id-1",
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "id-1", "fill_status": "canceled",
+        }])
+        assert counts["unmatched"] == 1 and counts["updated"] == 0
+        (row,) = _fill_rows(conn, "ZM")
+        assert row[2] == FILL_STATUS_SUBMITTED  # untouched, never guessed
+        audits = _unmatched_audits(conn)
+        assert len(audits) == 1
+        assert "no_broker_account_id" in audits[0][1]
+
+    def test_duplicate_shared_id_without_run_id_is_ambiguous(self, tmp_path):
+        """The exact case Codex's review flagged: broker_order_id is
+        indexed but NOT unique, and two rows can legitimately share the
+        same canonical (broker_account_id, broker_order_id) pair (e.g. a
+        resubmission, or a logging duplicate across runs). A broker-sync
+        call with no run_id to disambiguate must NOT mass-update both rows
+        — it must reject the match outright and audit it as ambiguous."""
+        conn = _conn(tmp_path)
+        r1 = _run(conn, "r1")
+        r2 = _run(conn, "r2")
+        for run_id in (r1, r2):
+            record_trades(conn, run_id, [{
+                "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
+                "shares": 2, "price": 85.68,
+                "broker_account_id": ACCOUNT, "broker_order_id": "shared-id",
+            }])
+        before = _fill_rows(conn, "ZM")
+
+        counts = record_order_outcomes(conn, [{
+            "ticker": "ZM",
+            "broker_account_id": ACCOUNT, "broker_order_id": "shared-id",
+            "fill_status": "canceled",
+        }])  # no run_id -> cannot disambiguate
+
+        assert counts["ambiguous"] == 1
+        assert counts["updated"] == 0
+        # neither row was mutated
+        assert _fill_rows(conn, "ZM") == before
+        statuses = [r[2] for r in _fill_rows(conn, "ZM")]
+        assert statuses == [FILL_STATUS_SUBMITTED, FILL_STATUS_SUBMITTED]
+
+        rowids = [r[0] for r in conn.execute(
+            "SELECT rowid FROM trades WHERE ticker='ZM' ORDER BY rowid"
+        ).fetchall()]
+        audits = _unmatched_audits(conn)
+        assert len(audits) == 1 and audits[0][0] == "ZM"
+        assert "ambiguous_match" in audits[0][1]
+        for rid in rowids:
+            assert str(rid) in audits[0][1]  # both conflicting rowids named
+
     def test_unknown_order_id_is_audited(self, tmp_path):
         conn = _conn(tmp_path)
         _run(conn)
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "never-seen",
+            "broker_account_id": ACCOUNT, "broker_order_id": "never-seen",
             "fill_status": "canceled",
         }])
         assert counts["unmatched"] == 1
@@ -218,13 +331,13 @@ class TestRecordOrderOutcomes:
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-            "broker_order_id": "known-id",
+            "broker_account_id": ACCOUNT, "broker_order_id": "known-id",
         }])
         # disabled persistence
         counts = record_order_outcomes(None, [{"broker_order_id": "x",
                                                 "fill_status": "canceled"}])
         assert counts == {"updated": 0, "stale": 0, "unmatched": 0,
-                          "skipped": 0, "qty_regressed": 0}
+                          "skipped": 0, "qty_regressed": 0, "ambiguous": 0}
         # garbage entries: no status / non-dict -> skipped, never raise
         counts = record_order_outcomes(conn, [
             {"broker_order_id": "known-id"},   # no status
@@ -235,16 +348,22 @@ class TestRecordOrderOutcomes:
         assert row[2] == FILL_STATUS_SUBMITTED
 
     def test_run_id_scope_limits_updates(self, tmp_path):
+        """Round 3: run_id remains an optional ADDITIONAL narrowing filter
+        on top of the canonical (broker_account_id, broker_order_id)
+        identity — it can disambiguate a legitimately-duplicated identity
+        pair (unlike the no-run_id case above, which must reject it)."""
         conn = _conn(tmp_path)
         r1 = _run(conn, "r1")
         r2 = _run(conn, "r2")
         for run_id in (r1, r2):
             record_trades(conn, run_id, [{
                 "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-                "shares": 2, "price": 85.68, "broker_order_id": "shared-id",
+                "shares": 2, "price": 85.68,
+                "broker_account_id": ACCOUNT, "broker_order_id": "shared-id",
             }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "shared-id", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "shared-id",
+            "fill_status": "canceled",
         }], run_id=r2)
         assert counts["updated"] == 1
         statuses = [r[2] for r in _fill_rows(conn, "ZM")]
@@ -255,10 +374,11 @@ class TestRecordOrderOutcomes:
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-            "broker_order_id": "id-1",
+            "broker_account_id": ACCOUNT, "broker_order_id": "id-1",
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "id-1", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "id-1",
+            "fill_status": "canceled",
         }])
         assert counts["updated"] == 1
         (row,) = _fill_rows(conn, "ZM")
@@ -268,23 +388,26 @@ class TestRecordOrderOutcomes:
 # ── monotonic transitions (out-of-order / replayed broker events) ─────────────
 
 class TestMonotonicTransitions:
-    def _seed(self, tmp_path, order_id="oid-1"):
+    def _seed(self, tmp_path, order_id="oid-1", account_id=ACCOUNT):
         conn = _conn(tmp_path)
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "NFLX", "action": "buy_pending", "date": "2026-06-24",
-            "shares": 3, "price": 72.50, "broker_order_id": order_id,
+            "shares": 3, "price": 72.50,
+            "broker_account_id": account_id, "broker_order_id": order_id,
         }])
         return conn
 
     def test_late_submitted_never_overwrites_filled(self, tmp_path):
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3, "fill_price": 72.62,
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "accepted",  # late event
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "accepted",  # late event
         }])
         assert counts["stale"] == 1 and counts["updated"] == 0
         (row,) = _fill_rows(conn, "NFLX")
@@ -293,11 +416,13 @@ class TestMonotonicTransitions:
     def test_cancel_never_overwrites_filled(self, tmp_path):
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3, "fill_price": 72.62,
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "canceled",
         }])
         assert counts["stale"] == 1
         (row,) = _fill_rows(conn, "NFLX")
@@ -306,11 +431,13 @@ class TestMonotonicTransitions:
     def test_partial_then_cancel_retains_executed_qty_and_price(self, tmp_path):
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled",
             "filled_qty": 2, "fill_price": 72.60,
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "canceled",
         }])
         assert counts["updated"] == 1
         (row,) = _fill_rows(conn, "NFLX")
@@ -324,11 +451,13 @@ class TestMonotonicTransitions:
         rank/stale invariant tested elsewhere."""
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled",
             "filled_qty": 2,
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled",
             "filled_qty": 1,  # out-of-order smaller partial
         }])
         assert counts["qty_regressed"] == 1   # observable, not silent
@@ -339,11 +468,13 @@ class TestMonotonicTransitions:
     def test_filled_qty_regression_at_filled_rank_is_also_flagged(self, tmp_path):
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3, "fill_price": 72.62,
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 2,  # erroneous/duplicated smaller "filled" report
         }])
         assert counts["qty_regressed"] == 1
@@ -354,10 +485,12 @@ class TestMonotonicTransitions:
     def test_late_fill_after_recorded_cancel_applies_broker_truth(self, tmp_path):
         conn = self._seed(tmp_path)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "canceled",
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3, "fill_price": 72.62,
         }])
         assert counts["updated"] == 1
@@ -367,7 +500,8 @@ class TestMonotonicTransitions:
     def test_replay_is_idempotent(self, tmp_path):
         conn = self._seed(tmp_path)
         event = {
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3, "filled_avg_price": 72.62,
             "filled_at": "2026-06-24T13:30:00Z",
         }
@@ -380,10 +514,13 @@ class TestMonotonicTransitions:
     def test_concurrent_replay_orderings_converge(self, tmp_path):
         """Two interleavings of the same event set end in the same state."""
         events = [
-            {"broker_order_id": "oid-1", "fill_status": "accepted"},
-            {"broker_order_id": "oid-1", "fill_status": "partially_filled",
+            {"broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+             "fill_status": "accepted"},
+            {"broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+             "fill_status": "partially_filled",
              "filled_qty": 2, "fill_price": 72.60},
-            {"broker_order_id": "oid-1", "fill_status": "filled",
+            {"broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+             "fill_status": "filled",
              "filled_qty": 3, "fill_price": 72.62,
              "fill_updated_at": "2026-06-24T13:30:00Z"},
         ]
@@ -405,18 +542,161 @@ class TestMonotonicTransitions:
     def test_unknown_broker_state_recorded_as_explicit_unknown(self, tmp_path):
         conn = self._seed(tmp_path)
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "done_for_day",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "done_for_day",
         }])
         assert counts["updated"] == 1
         (row,) = _fill_rows(conn, "NFLX")
         assert row[2] == FILL_STATUS_UNKNOWN
         # and a later real outcome still applies (unknown is low-rank)
         record_order_outcomes(conn, [{
-            "broker_order_id": "oid-1", "fill_status": "filled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "filled",
             "filled_qty": 3,
         }])
         (row,) = _fill_rows(conn, "NFLX")
         assert row[2] == FILL_STATUS_FILLED
+
+    def test_same_rank_older_event_does_not_clobber_newer(self, tmp_path):
+        """Round 3 (Codex #190, point 2): a same-rank event whose OWN origin
+        timestamp is older than what's already recorded carries no new
+        information and must be rejected outright (not partially applied
+        with only qty clamped) — even though a naive qty/price "equal or
+        larger" check would otherwise let it through."""
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled", "filled_qty": 2,
+            "fill_price": 72.60, "fill_updated_at": "2026-06-24T14:00:00Z",
+        }])
+        # a same-rank event with a LARGER qty/price but an OLDER timestamp
+        # than what's recorded -- must still be rejected, not applied.
+        counts = record_order_outcomes(conn, [{
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled", "filled_qty": 2.5,
+            "fill_price": 72.90, "fill_updated_at": "2026-06-24T13:00:00Z",
+        }])
+        assert counts["stale"] == 1
+        assert counts["updated"] == 0
+        assert counts["qty_regressed"] == 0  # rejected outright, not clamped
+        (row,) = _fill_rows(conn, "NFLX")
+        # the older same-rank event's larger qty/price never applied
+        assert row[2] == "partially_filled"
+        assert row[3] == 2.0 and row[4] == 72.60
+
+    def test_same_rank_newer_event_still_applies(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled", "filled_qty": 2,
+            "fill_price": 72.60, "fill_updated_at": "2026-06-24T14:00:00Z",
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_account_id": ACCOUNT, "broker_order_id": "oid-1",
+            "fill_status": "partially_filled", "filled_qty": 2.5,
+            "fill_price": 72.90, "fill_updated_at": "2026-06-24T15:00:00Z",
+        }])
+        assert counts["stale"] == 0
+        assert counts["updated"] == 1
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[3] == 2.5 and row[4] == 72.90
+
+
+# ── DB-level atomicity (real two-connection race) ─────────────────────────────
+
+class TestConcurrentAtomicity:
+    def test_two_connection_race_converges_to_filled(self, tmp_path):
+        """Codex #190 round 3, point 2: a REAL race between two on-disk
+        SQLite connections (not two cursors on one connection, not a serial
+        simulation). Without the BEGIN IMMEDIATE fix, both connections could
+        read the pre-race `submitted` status before either writes, so
+        whichever UPDATE physically lands last would win regardless of
+        rank -- a lower-rank `partially_filled` write could clobber a
+        higher-rank `filled` write depending on OS thread scheduling.
+
+        Repeated across many fresh orders with a barrier forcing both
+        threads to start concurrently, alternating which one is launched
+        first, so the race window is actually exercised each time rather
+        than usually-fine-because-fast. The final state must be `filled`
+        (the higher rank) every single time, regardless of which thread's
+        write happens to land second."""
+        db_path = tmp_path / "runs.db"
+        seed_conn = get_connection(
+            {"persistence": {"enabled": True, "db_path": str(db_path)}}
+        )
+        run_id = _run(seed_conn)
+
+        iterations = 20
+        for i in range(iterations):
+            order_id = f"race-{i}"
+            record_trades(seed_conn, run_id, [{
+                "ticker": "NFLX", "action": "buy_pending", "date": "2026-06-24",
+                "shares": 3, "price": 72.50,
+                "broker_account_id": ACCOUNT, "broker_order_id": order_id,
+            }])
+
+            barrier = threading.Barrier(2)
+            errors: list[BaseException] = []
+
+            def _apply(outcome, own_conn):
+                try:
+                    barrier.wait(timeout=5)
+                    record_order_outcomes(own_conn, [outcome])
+                except BaseException as exc:  # noqa: BLE001 - surfaced below
+                    errors.append(exc)
+
+            # check_same_thread=False: each connection is opened here (main
+            # thread) but driven from its own worker thread below -- that is
+            # exactly the "two real connections" shape this test needs, not
+            # two cursors sharing one connection.
+            conn_filled = sqlite3.connect(
+                db_path, isolation_level=None, timeout=5.0, check_same_thread=False,
+            )
+            conn_partial = sqlite3.connect(
+                db_path, isolation_level=None, timeout=5.0, check_same_thread=False,
+            )
+            try:
+                t_filled = threading.Thread(
+                    target=_apply,
+                    args=(
+                        {"broker_account_id": ACCOUNT, "broker_order_id": order_id,
+                         "fill_status": "filled", "filled_qty": 3,
+                         "fill_price": 72.62},
+                        conn_filled,
+                    ),
+                )
+                t_partial = threading.Thread(
+                    target=_apply,
+                    args=(
+                        {"broker_account_id": ACCOUNT, "broker_order_id": order_id,
+                         "fill_status": "partially_filled", "filled_qty": 2,
+                         "fill_price": 72.60},
+                        conn_partial,
+                    ),
+                )
+                # Alternate launch order across iterations so neither thread
+                # systematically wins the OS scheduler race.
+                threads = (
+                    [t_filled, t_partial] if i % 2 == 0 else [t_partial, t_filled]
+                )
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+            finally:
+                conn_filled.close()
+                conn_partial.close()
+
+            assert not errors, f"iteration {i}: thread raised {errors!r}"
+            row = seed_conn.execute(
+                "SELECT fill_status, filled_qty, fill_price FROM trades"
+                " WHERE broker_order_id = ?",
+                (order_id,),
+            ).fetchone()
+            assert row == (FILL_STATUS_FILLED, 3.0, 72.62), (
+                f"iteration {i}: final state must be filled regardless of "
+                f"thread write order, got {row}"
+            )
 
 
 # ── backward compatibility (additive schema) ──────────────────────────────────
@@ -425,14 +705,13 @@ class TestBackwardCompatibleSchema:
     def _legacy_db(self, tmp_path):
         """A pre-contract DB: today's trades table minus the fill-truth
         columns (exactly what production DBs look like before this change)."""
-        import sqlite3
-
         path = tmp_path / "runs.db"
         conn = sqlite3.connect(path, isolation_level=None)
         ensure_schema(conn)
         conn.execute("DROP INDEX IF EXISTS idx_trades_broker_order")
+        conn.execute("DROP INDEX IF EXISTS idx_trades_broker_account_order")
         for col in ("broker_order_id", "fill_status", "filled_qty",
-                    "fill_price", "fill_updated_at"):
+                    "fill_price", "fill_updated_at", "broker_account_id"):
             conn.execute(f"ALTER TABLE trades DROP COLUMN {col}")
         conn.execute(
             "INSERT INTO trades (run_id, trade_date, ticker, action, shares, price)"
@@ -446,12 +725,12 @@ class TestBackwardCompatibleSchema:
         conn = _conn(tmp_path)  # get_connection -> ensure_schema migration
         cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
         assert {"broker_order_id", "fill_status", "filled_qty",
-                "fill_price", "fill_updated_at"} <= cols
+                "fill_price", "fill_updated_at", "broker_account_id"} <= cols
         row = conn.execute(
-            "SELECT fill_status, filled_qty, broker_order_id FROM trades"
-            " WHERE run_id='legacy-run'"
+            "SELECT fill_status, filled_qty, broker_order_id, broker_account_id"
+            " FROM trades WHERE run_id='legacy-run'"
         ).fetchone()
-        assert row == (None, None, None)  # never reconciled, never assumed filled
+        assert row == (None, None, None, None)  # never reconciled, never assumed filled
 
     def test_legacy_db_accepts_new_writes_after_migration(self, tmp_path):
         self._legacy_db(tmp_path)
@@ -459,10 +738,11 @@ class TestBackwardCompatibleSchema:
         run_id = _run(conn, "r-new")
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-            "broker_order_id": "id-1",
+            "broker_account_id": ACCOUNT, "broker_order_id": "id-1",
         }])
         counts = record_order_outcomes(conn, [{
-            "broker_order_id": "id-1", "fill_status": "canceled",
+            "broker_account_id": ACCOUNT, "broker_order_id": "id-1",
+            "fill_status": "canceled",
         }])
         assert counts["updated"] == 1
 

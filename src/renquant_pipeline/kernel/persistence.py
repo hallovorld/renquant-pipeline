@@ -96,6 +96,21 @@ _FILL_STATUS_RANK = {
 }
 
 
+def _parse_event_ts(value: Any) -> datetime.datetime | None:
+    """Best-effort ISO-8601 parse of a broker event timestamp.
+
+    Used only to order same-rank fill-truth events (Codex #190 round 3):
+    when parsing fails (or the value is absent) callers fall back to a
+    lexicographic string comparison, which is still correct for the
+    common case of two timestamps in the same format."""
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 def normalize_fill_status(value: Any) -> str | None:
     """Broker/producer status text → canonical fill status (fail-soft).
 
@@ -232,6 +247,12 @@ CREATE TABLE IF NOT EXISTS trades (
     -- systematically overcounted buys and basic facts required the broker
     -- API. Additive columns; pre-contract rows read back with NULLs
     -- (= outcome unknown, not "filled").
+    -- Round-3 addition (Codex #190 review): broker_order_id alone is not a
+    -- unique row identity (legitimately duplicated across runs/resubmits),
+    -- so canonical order identity for record_order_outcomes matching is the
+    -- pair (broker_account_id, broker_order_id). Additive/NULL for rows
+    -- written before this column existed, same as the rest of this block.
+    broker_account_id TEXT,      -- broker account id; part of canonical order identity
     broker_order_id TEXT,        -- broker-assigned order id (Alpaca uuid)
     fill_status     TEXT,        -- submitted|partially_filled|filled|canceled|rejected|expired
     filled_qty      REAL,        -- broker-confirmed filled quantity
@@ -763,6 +784,9 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("filled_qty",            "REAL"),
         ("fill_price",            "REAL"),
         ("fill_updated_at",       "TEXT"),
+        # Round-3 (Codex #190): canonical order identity is
+        # (broker_account_id, broker_order_id), not broker_order_id alone.
+        ("broker_account_id",     "TEXT"),
     ],
     "ticker_forward_returns": [
         ("fwd_60d",               "REAL"),
@@ -1057,6 +1081,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_trades_broker_order "
         "ON trades(broker_order_id)"
+    )
+    # Round-3 (Codex #190): the canonical match key for record_order_outcomes
+    # is (broker_account_id, broker_order_id), not broker_order_id alone.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_broker_account_order "
+        "ON trades(broker_account_id, broker_order_id)"
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_run ON ticker_daily_state(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_run ON score_distribution(run_id)")
@@ -1507,6 +1537,18 @@ def record_trades(
                 value = inputs.get("order_id")
         return str(value) if value else None
 
+    def _broker_account_id(t: dict) -> str | None:
+        # Round-3 (Codex #190): canonical order identity is
+        # (broker_account_id, broker_order_id). Lifted the same way
+        # broker_order_id is — direct key, then decision_inputs fallback —
+        # so intent rows carry it whenever a caller supplies it.
+        value = t.get("broker_account_id") or t.get("account_id")
+        if not value:
+            inputs = t.get("decision_inputs")
+            if isinstance(inputs, dict):
+                value = inputs.get("broker_account_id") or inputs.get("account_id")
+        return str(value) if value else None
+
     def _fill_status(t: dict) -> str | None:
         explicit = normalize_fill_status(t.get("fill_status"))
         if explicit is not None:
@@ -1571,6 +1613,7 @@ def record_trades(
             _none_or_float(t.get("filled_qty")),
             _none_or_float(t.get("fill_price") or t.get("filled_avg_price")),
             t.get("fill_updated_at") or t.get("filled_at"),
+            _broker_account_id(t),
         ))
     if rows:
         conn.executemany(
@@ -1589,8 +1632,8 @@ def record_trades(
                    order_type, source, source_job, source_task, order_source,
                    attribution_version, score_snapshot_json, decision_inputs_json,
                    broker_order_id, fill_status, filled_qty, fill_price,
-                   fill_updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   fill_updated_at, broker_account_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
 
@@ -1600,21 +1643,28 @@ def _record_outcome_unmatched(
     outcome: dict,
     reason: str,
     run_id: str | None,
+    *,
+    extra: dict[str, Any] | None = None,
 ) -> None:
     """Append an ORDER_OUTCOME_UNMATCHED audit row (never guess a match).
 
-    Codex #190: an outcome that cannot be bound to a row by broker order
-    identity is left as an explicit unreconciled record with an audit entry
-    — silent loss of reconciliation is the failure mode this contract
-    exists to remove. Rows land in the existing append-only
-    ``reconciliation_actions`` audit table."""
+    Codex #190: an outcome that cannot be bound to a row by canonical order
+    identity — round 3: ``(broker_account_id, broker_order_id)`` — is left
+    as an explicit unreconciled record with an audit entry — silent loss of
+    reconciliation is the failure mode this contract exists to remove. Rows
+    land in the existing append-only ``reconciliation_actions`` audit
+    table. ``extra`` merges additional detail (e.g. the conflicting rowids
+    for an ``ambiguous_match``)."""
     detail = {
         "reason": reason,
+        "broker_account_id": outcome.get("broker_account_id") or outcome.get("account_id"),
         "broker_order_id": outcome.get("broker_order_id") or outcome.get("order_id"),
         "fill_status": outcome.get("fill_status") or outcome.get("status"),
         "filled_qty": outcome.get("filled_qty"),
         "trade_date": outcome.get("trade_date"),
     }
+    if extra:
+        detail.update(extra)
     log.warning("fill-truth: order outcome UNMATCHED (%s): %s", reason, detail)
     conn.execute(
         """INSERT INTO reconciliation_actions
@@ -1643,21 +1693,39 @@ def record_order_outcomes(
     live runner's broker sync / pre-open cancel gate, where the fill info
     already exists) calls this with one outcome dict per order:
 
-      ``broker_order_id`` (or ``order_id``) — MANDATORY match key; outcome
-      mutation is keyed by broker order identity ONLY (Codex #190: a
-      ticker+date fallback cannot distinguish multiple same-ticker
-      attempts/cancels in one day — exactly the case this contract must get
-      right). Outcomes without it, or matching no row, are recorded as
-      explicit ``ORDER_OUTCOME_UNMATCHED`` audit entries, never guessed.
+      ``broker_account_id`` (or ``account_id``) + ``broker_order_id`` (or
+      ``order_id``) — MANDATORY canonical match key (Codex #190 round 3):
+      ``broker_order_id`` alone is not a unique row identity — the same id
+      can legitimately be logged on more than one ``trades`` row (a
+      resubmission, or a logging duplicate across runs), so matching by
+      order id alone risks mass-mutating rows that were never all the same
+      real order. The pair ``(broker_account_id, broker_order_id)`` is the
+      canonical identity; a ticker+date fallback is never used (multiple
+      same-ticker attempts/cancels in one day are indistinguishable that
+      way). Outcomes missing either half of the identity, matching no row,
+      or matching MORE THAN ONE row after narrowing by this identity, are
+      recorded as explicit ``ORDER_OUTCOME_UNMATCHED`` audit entries (with
+      reasons ``no_broker_account_id`` / ``no_broker_order_id`` /
+      ``no_matching_row`` / ``ambiguous_match`` respectively) — never
+      guessed, and an ambiguous match never mutates any of the conflicting
+      rows. An optional ``run_id`` further narrows the match (useful when a
+      caller knows which run's attempt row an outcome belongs to).
       ``fill_status`` — required; normalized via :func:`normalize_fill_status`
       (unrecognized vocabulary becomes the explicit ``unknown`` state);
       ``filled_qty`` / ``fill_price`` — optional; ``fill_updated_at`` —
-      optional ISO timestamp (default: now UTC).
+      optional ISO timestamp (default: now UTC) — this is the broker's own
+      event timestamp when supplied, not just our write time.
 
     MONOTONIC transitions (out-of-order/replayed broker events cannot rewind
     truth): a lower-ranked status arriving after a higher-ranked state is
     counted ``stale`` and ignored (late submitted never overwrites
-    partially_filled/filled; cancel/reject never overwrites filled);
+    partially_filled/filled; cancel/reject never overwrites filled). A
+    SAME-ranked event with an ``fill_updated_at`` OLDER than what is already
+    recorded is also counted ``stale`` and ignored outright — Codex #190
+    round 3: an out-of-order same-rank event carries no new information and
+    must not clobber a possibly-different price/status a newer same-rank
+    event already set; this check runs BEFORE the quantity-regression clamp
+    below so an old event is rejected wholesale, not partially applied.
     ``filled_qty`` never decreases — clamped to the prior value (never
     applied) when an event at the SAME or a higher rank reports a smaller
     quantity (e.g. a duplicated/misordered partial-fill event), and this is
@@ -1667,15 +1735,31 @@ def record_order_outcomes(
     followed by a cancel keeps the executed quantity and price). Replaying
     the identical event is idempotent.
 
+    ATOMICITY (Codex #190 round 3): :func:`get_connection` opens connections
+    in autocommit mode (``isolation_level=None``), so there is no implicit
+    transaction for a read-then-write pattern to ride on — two connections
+    against the same on-disk DB could otherwise both read a stale status
+    before either writes. Each outcome's match-and-apply is therefore
+    wrapped in an explicit ``BEGIN IMMEDIATE`` / ``COMMIT``/``ROLLBACK``:
+    ``BEGIN IMMEDIATE`` acquires SQLite's RESERVED lock up front (before the
+    SELECT), which blocks any other connection from starting its own write
+    transaction until this one finishes — closing the read-then-write race
+    window. If the lock cannot be acquired, ``sqlite3.OperationalError``
+    ("database is locked") propagates to the caller rather than being
+    swallowed as an ordinary stale/skip outcome — legitimate contention is
+    the caller's to retry, not something this function should silently
+    absorb (the Python driver's own default busy-timeout already retries
+    briefly before this can happen).
+
     Returns ``{"updated": n, "stale": n, "unmatched": n, "skipped": n,
-    "qty_regressed": n}``. Fail-soft: disabled persistence returns all-zero
-    counts; nothing here raises on malformed outcomes — but every
-    non-applied outcome, and every clamped regression, is OBSERVABLE
-    (counted, logged, and audited when unmatched).
+    "qty_regressed": n, "ambiguous": n}``. Fail-soft: disabled persistence
+    returns all-zero counts; nothing here raises on malformed outcomes —
+    but every non-applied outcome, and every clamped regression, is
+    OBSERVABLE (counted, logged, and audited when unmatched/ambiguous).
     """
     counts = {
         "updated": 0, "stale": 0, "unmatched": 0, "skipped": 0,
-        "qty_regressed": 0,
+        "qty_regressed": 0, "ambiguous": 0,
     }
     if conn is None:
         return counts
@@ -1696,21 +1780,17 @@ def record_order_outcomes(
             counts["unmatched"] += 1
             _record_outcome_unmatched(conn, outcome, "no_broker_order_id", run_id)
             continue
+        broker_account_id = outcome.get("broker_account_id") or outcome.get("account_id")
+        if not broker_account_id:
+            counts["unmatched"] += 1
+            _record_outcome_unmatched(conn, outcome, "no_broker_account_id", run_id)
+            continue
 
-        where = "broker_order_id = ?"
-        params: list[Any] = [str(broker_order_id)]
+        where = "broker_account_id = ? AND broker_order_id = ?"
+        params: list[Any] = [str(broker_account_id), str(broker_order_id)]
         if run_id is not None:
             where += " AND run_id = ?"
             params.append(run_id)
-        rows = conn.execute(
-            f"SELECT rowid, fill_status, filled_qty, fill_price FROM trades"
-            f" WHERE {where}",
-            params,
-        ).fetchall()
-        if not rows:
-            counts["unmatched"] += 1
-            _record_outcome_unmatched(conn, outcome, "no_matching_row", run_id)
-            continue
 
         stamped_at = str(
             outcome.get("fill_updated_at")
@@ -1726,9 +1806,57 @@ def record_order_outcomes(
             else outcome.get("filled_avg_price")
         )
         new_rank = _FILL_STATUS_RANK.get(status, 1)
-        for rowid, cur_status, cur_qty, cur_price in rows:
+
+        # BEGIN IMMEDIATE up front: acquire the write lock BEFORE the read,
+        # closing the TOCTOU window between the SELECT and the UPDATE below
+        # (Codex #190 round 3, point 2). Left outside the try/finally: if it
+        # fails, no transaction was ever opened, so there is nothing to roll
+        # back — propagate immediately rather than treating contention as a
+        # data-level outcome.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            log.warning(
+                "fill-truth: could not acquire write lock for order "
+                "account=%s id=%s -- propagating to caller rather than "
+                "silently treating contention as stale/skipped",
+                broker_account_id, broker_order_id,
+            )
+            raise
+
+        try:
+            rows = conn.execute(
+                f"SELECT rowid, fill_status, filled_qty, fill_price, "
+                f"fill_updated_at FROM trades WHERE {where}",
+                params,
+            ).fetchall()
+
+            if not rows:
+                conn.execute("ROLLBACK")
+                counts["unmatched"] += 1
+                _record_outcome_unmatched(conn, outcome, "no_matching_row", run_id)
+                continue
+
+            if len(rows) > 1:
+                # Codex #190 round 3: the canonical identity still names more
+                # than one row (e.g. a resubmission or a logging duplicate
+                # legitimately sharing the same broker order). Update NONE of
+                # them — a broker event that can't be bound to exactly one
+                # row is not fill truth for any of them.
+                ambiguous_rowids = [r[0] for r in rows]
+                conn.execute("ROLLBACK")
+                counts["ambiguous"] += 1
+                _record_outcome_unmatched(
+                    conn, outcome, "ambiguous_match", run_id,
+                    extra={"ambiguous_rowids": ambiguous_rowids},
+                )
+                continue
+
+            rowid, cur_status, cur_qty, cur_price, cur_updated_at = rows[0]
             cur_rank = _FILL_STATUS_RANK.get(cur_status, 0)
+
             if new_rank < cur_rank:
+                conn.execute("ROLLBACK")
                 counts["stale"] += 1
                 log.info(
                     "fill-truth: stale event %r ignored for order %s "
@@ -1736,6 +1864,32 @@ def record_order_outcomes(
                     status, broker_order_id, cur_status,
                 )
                 continue
+
+            if new_rank == cur_rank:
+                # Same-rank event: only an OLDER origin timestamp than what
+                # is already recorded is out-of-order (an equal timestamp is
+                # a replay and must stay idempotent-applied). Parse when
+                # possible; fall back to lexicographic string comparison for
+                # unparsable/mixed formats.
+                incoming_ts = _parse_event_ts(stamped_at)
+                recorded_ts = _parse_event_ts(cur_updated_at)
+                if incoming_ts is not None and recorded_ts is not None:
+                    is_older = incoming_ts < recorded_ts
+                else:
+                    is_older = bool(
+                        cur_updated_at and stamped_at
+                        and str(stamped_at) < str(cur_updated_at)
+                    )
+                if is_older:
+                    conn.execute("ROLLBACK")
+                    counts["stale"] += 1
+                    log.info(
+                        "fill-truth: same-rank out-of-order event %r ignored "
+                        "for order %s (event ts %s older than recorded %s)",
+                        status, broker_order_id, stamped_at, cur_updated_at,
+                    )
+                    continue
+
             # filled_qty never decreases; price retained when event omits it.
             if event_qty is None:
                 new_qty = cur_qty
@@ -1762,8 +1916,11 @@ def record_order_outcomes(
                 "fill_price = ?, fill_updated_at = ? WHERE rowid = ?",
                 (status, new_qty, new_price, stamped_at, rowid),
             )
+            conn.execute("COMMIT")
             counts["updated"] += 1
-    conn.commit()
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
     return counts
 
 
