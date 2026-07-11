@@ -90,22 +90,44 @@ manifests: dataset/axis id + freshness rule + how it is validated):
       }
     }
 
-A consumed built-in axis with NO declared contract is still checked with the
-defaults, and the gate warns LOUDLY (``missing_contracts`` in the block) so
-new inputs get contracts.
+DAY-ONE CONTRACT SCOPE (Codex review, PR #187): a consumed built-in axis with
+NO reviewed contract entry (or a malformed one) is NOT evaluated at all — no
+checker runs, no freshness verdict (pass or fail) is ever assigned. It is
+recorded as ``verdict: "unverified"`` (see :data:`AXIS_UNVERIFIED`) plus a
+``missing_contracts`` entry, and the gate warns LOUDLY so it gets a contract.
+An unverified axis can NEVER alarm (``degraded``) and can NEVER block — both
+require an operator-reviewed ``data_contracts.axes[name]`` entry. Blocking is
+a SEPARATE, stricter bar on top of that: the reviewed contract must also
+declare ``policy: fail_closed`` explicitly (the default policy for every
+declared axis is still ``degrade_with_alarm``).
 
-FAIL POLICY, honoured per axis (``policy`` in the axis contract):
+FAIL POLICY, honoured per axis (``policy`` in the axis contract), enforced
+ONLY on the BUY side (Codex review, PR #187 — see "CONTROL-FLOW / ORDERING"
+below):
 
-  * ``fail_closed``         — a violated (or unverifiable) axis ABORTS the run
-    loudly, exactly like ``DataFreshnessGateTask`` today. Fail-isolated
+  * ``fail_closed``         — a violated (or unverifiable) axis BLOCKS NEW
+    BUYS ONLY for this bar (``ctx.buy_blocked = True``, applied by
+    :meth:`DataAvailabilityGateTask.enforce_buy_block` strictly AFTER the
+    sell/exit pass has already run — see wiring note below). Fail-isolated
     construction does NOT apply: if the checker for a fail-closed axis
-    crashes, the input cannot be verified and the gate refuses to proceed.
-  * ``degrade_with_alarm``  — the DAY-ONE DEFAULT for every axis: the run
-    proceeds; the alarm lands in ``ctx.data_availability`` (run bundle) +
-    ``ctx.counters`` and is ntfy-visible via :func:`notification_fields`
-    (same stamping pattern as the umbrella #463 ``universe_health`` /
-    ``universe_collapse`` fields — this module only EMITS the fields; the
-    umbrella wires them). Checker crashes are fail-isolated here.
+    crashes, the input cannot be verified and the axis is treated as blocked
+    (an unverifiable input is a fail, not a pass) — but this STILL never
+    raises and STILL never touches sells/exits.
+  * ``degrade_with_alarm``  — the DAY-ONE DEFAULT for every declared axis: the
+    run proceeds; the alarm lands in ``ctx.data_availability`` (run bundle) +
+    ``ctx.counters``. Checker crashes are fail-isolated here.
+
+CONTROL-FLOW / ORDERING (Codex review, PR #187 — P1 fix): ``run()`` (called
+EARLY in ``InferencePipeline``, before ``RegimeJob``) ONLY records the
+verdict — it verifies every axis, stamps ``ctx.data_availability`` +
+counters, and logs loudly, but it NEVER raises and NEVER touches
+``ctx.buy_blocked``. The actual buy-side enforcement is a SEPARATE method,
+:meth:`DataAvailabilityGateTask.enforce_buy_block`, wired into
+``InferencePipeline`` AFTER the sell/exit pass (``TickerSellJob`` and its
+downstream exit-refinement tasks) has already executed for this bar. This
+ordering is a hard invariant: a data-availability verdict — however it is
+computed — may gate NEW BUYS ONLY; it must NEVER be able to suppress a
+risk-reducing sell/exit decision. Neither method ever raises.
 
 OUTPUT CONTRACT (``ctx.data_availability``, schema ``data_availability.v1``):
 
@@ -116,16 +138,30 @@ OUTPUT CONTRACT (``ctx.data_availability``, schema ``data_availability.v1``):
   axes_evaluated[], missing_contracts[], error``
 
 Counters mirror: ``data_availability_fired`` / ``data_availability_degraded``
-/ ``data_availability_blocked`` / ``data_availability_errors``.
+/ ``data_availability_blocked`` / ``data_availability_errors`` /
+``data_availability_buy_blocked`` (set only by ``enforce_buy_block`` when it
+actually applies the block).
 
-CONTRACT (hard): OBSERVE/VERIFY ONLY — no signal, decision, sizing or order
-state is mutated; ZERO decision-logic change. The only behavioural effect is
-the abort for axes an operator has EXPLICITLY opted into ``fail_closed``
-(none by default). Kill switch: ``data_availability.enabled = false``.
+CONTRACT: VERIFY-ONLY with respect to sells/exits — no exit, holding, or
+portfolio state is ever read or mutated by this task. It is NOT
+behavior-invariant with respect to BUYS once any axis is declared
+``fail_closed``: a violated fail_closed axis DOES change decision state
+(``ctx.buy_blocked = True``), by design — this task is buy-decision-affecting
+in that configuration, not zero-behavior-change. No axis is fail_closed by
+default, so day-one rollout has no behavioural effect until an operator
+opts an axis in. Kill switch: ``data_availability.enabled = false``.
 Deliberately NOT in SellOnlyPipeline: this is buy-input verification; the
 sell path keeps its own ``DataFreshnessGateTask`` and must never be blocked
 by a buy-side input alarm (same reasoning as P-FUND-FRESHNESS sell-only
 exemption and FunnelIntegrityTask's sell-only skip).
+
+REPO SCOPE (Codex review, PR #187): this module publishes the versioned
+``data_availability`` block ONLY (the structured verdict data). It does not
+format ntfy titles/pages — that is umbrella/orchestrator monitor-layer
+territory (see ``renquant-orchestrator``), out of scope for this repo. A
+follow-up consumer PR in renquant-orchestrator is expected to render
+``ctx.data_availability`` into operator-facing notifications; it is not
+implemented here.
 """
 from __future__ import annotations
 
@@ -154,6 +190,11 @@ AXIS_OK = "ok"
 AXIS_VIOLATION = "violation"
 AXIS_SKIP = "skip"
 AXIS_ERROR = "error"
+# Day-one contract-scope rule (Codex review, PR #187): an axis with no
+# reviewed data_contracts entry is not evaluated — no pass/fail verdict is
+# ever assigned, so it can never alarm (degraded) or block. Distinct from
+# AXIS_SKIP (a declared-but-inapplicable axis, e.g. empty watchlist).
+AXIS_UNVERIFIED = "unverified"
 
 VERDICT_AVAILABLE = "AVAILABLE"
 VERDICT_DEGRADED = "DEGRADED"
@@ -892,46 +933,11 @@ BUILTIN_CHECKERS: "dict[str, Callable[[Any, dict], AxisResult]]" = {
 }
 
 
-# ── Notification contract (umbrella #463 universe_health stamping pattern) ───
-
-def notification_fields(block: "dict | None") -> dict[str, Any]:
-    """ntfy-adapter for the umbrella: consumes ``ctx.data_availability``.
-
-    Returns ``{"degraded": bool, "blocked": bool, "title_tag": str,
-    "line": str}``. The umbrella stamps the block verbatim into the run
-    bundle (``bundle["data_availability"]``) plus the top-level boolean
-    (``bundle["data_availability_degraded"]``) exactly like #463 stamps
-    ``universe_health`` + ``universe_collapse``. Emitted here; wired there.
-    """
-    if not isinstance(block, dict) or not block.get("verdict"):
-        return {
-            "degraded": False,
-            "blocked": False,
-            "title_tag": "UNKNOWN",
-            "line": "data availability: not evaluated",
-        }
-    verdict = str(block["verdict"])
-    tag = {
-        VERDICT_BLOCKED: "DATA-BLOCKED",
-        VERDICT_DEGRADED: "DATA-DEGRADED",
-        VERDICT_AVAILABLE: "DATA-OK",
-    }.get(verdict, "UNKNOWN")
-    fired = block.get("fired") or []
-    fired_names = ", ".join(
-        str(f.get("axis", "?")) for f in fired if isinstance(f, dict)
-    )
-    line = f"data availability: {verdict}"
-    if fired_names:
-        line += f" [{fired_names}]"
-    error = block.get("error")
-    if error:
-        line += f" (gate error: {error})"
-    return {
-        "degraded": bool(block.get("degraded")),
-        "blocked": bool(block.get("blocked")),
-        "title_tag": tag,
-        "line": line,
-    }
+# NOTE (Codex review, PR #187): this module deliberately does NOT expose an
+# ntfy/notification-formatting helper. It publishes ``ctx.data_availability``
+# (the versioned, structured verdict block) only; title/page rendering for
+# operator-facing alerts is orchestrator monitor-layer territory (a separate
+# consumer PR in renquant-orchestrator), not this repo's concern.
 
 
 # ── The task ──────────────────────────────────────────────────────────────────
@@ -939,9 +945,22 @@ def notification_fields(block: "dict | None") -> dict[str, Any]:
 class DataAvailabilityGateTask:
     """Pre-decision input availability & vintage verification (module docstring).
 
-    Verify-only. Aborts ONLY for axes an operator explicitly declared
-    ``policy: fail_closed`` (none by default). Everything else degrades with
-    an alarm in ``ctx.data_availability`` + counters.
+    Split into two methods (Codex review, PR #187 P1 fix — see module
+    docstring "CONTROL-FLOW / ORDERING"):
+
+      * :meth:`run` — called EARLY (before ``RegimeJob``). RECORDS ONLY:
+        verifies every declared axis, stamps ``ctx.data_availability`` +
+        counters, logs loudly. NEVER raises. NEVER touches
+        ``ctx.buy_blocked``.
+      * :meth:`enforce_buy_block` — called AFTER the sell/exit pass has
+        already executed for this bar. Applies the buy-side block a
+        fail_closed axis violation recorded, via the same errata-C
+        ``ctx.buy_blocked`` choke point every other buy gate uses. NEVER
+        raises. Cannot touch sells/exits — they already ran.
+
+    This split is the whole point of the fix: input-availability may gate
+    NEW BUYS ONLY, and must never be able to suppress a risk-reducing
+    sell/exit decision, no matter which axis or policy is involved.
     """
 
     def __init__(
@@ -960,20 +979,19 @@ class DataAvailabilityGateTask:
         if run_mode.strip().lower().replace("_", "-").startswith("sell-only"):
             return True    # buy-input gate; the sell path is never blocked here
 
+        fail_closed_declared = self._any_fail_closed_declared(cfg)
         try:
             block, blocked = self._build_block(ctx, cfg)
             setattr(ctx, CTX_ATTR, block)
             self._mirror_counters(ctx, block)
-        except Exception as exc:  # noqa: BLE001 — verify-only: fail-isolated…
-            self._record_error(ctx, exc)
-            if self._any_fail_closed_declared(cfg):
-                # …EXCEPT when an operator demanded fail-closed verification:
-                # an unverifiable input is a fail, not a pass.
-                raise RuntimeError(
-                    "DataAvailabilityGateTask: gate crashed while at least one "
-                    "axis is declared policy=fail_closed — inputs cannot be "
-                    f"verified; refusing to proceed ({type(exc).__name__}: {exc})"
-                ) from exc
+        except Exception as exc:  # noqa: BLE001 — verify-only: ALWAYS fail-
+            # isolated. This method never raises, regardless of whether a
+            # fail_closed axis is declared — an unverifiable input under
+            # fail_closed still only means "record blocked=True", never
+            # "abort the pipeline". Sells/exits have not run yet at this
+            # wiring position (see pp_inference.py); this call must return
+            # normally so they get the chance to.
+            self._record_error(ctx, exc, fail_closed_declared=fail_closed_declared)
             return True
 
         fired = block["fired"]
@@ -992,17 +1010,61 @@ class DataAvailabilityGateTask:
             )
         if blocked:
             names = ", ".join(r.axis for r in blocked)
+            log.error(
+                "DataAvailabilityGateTask: INPUT UNAVAILABLE — fail-closed "
+                "axis(es) violated: %s. Recorded as blocked=True; NEW BUYS "
+                "will be gated AFTER the sell/exit pass via "
+                "enforce_buy_block() (see pp_inference.py wiring) — "
+                "sells/exits for this bar are NEVER suppressed by this gate.",
+                names,
+            )
+        return True
+
+    def enforce_buy_block(self, ctx: Any) -> bool:
+        """Apply the buy-side block recorded by :meth:`run`.
+
+        MUST be called AFTER the sell/exit pass has already executed for
+        this bar (see ``pp_inference.InferencePipeline.run()`` wiring — right
+        after the ``TickerSellJob`` loop and its downstream exit-refinement
+        tasks, before Phase 2b's buy candidate scan). Reads back
+        ``ctx.data_availability["blocked"]`` (set only by :meth:`run`, never
+        by this method) and, only when true, sets ``ctx.buy_blocked = True``
+        — the same errata-C choke point every other buy gate honours
+        (``job_gates.BuyGatesJob``, ``task_gates`` macro gates,
+        ``panel_scoring.PanelScoringJob``). This can NEVER suppress a sell or
+        exit: those are computed strictly before this method is ever
+        invoked, and this method never reads or writes ``ctx.exits`` /
+        ``ctx.holdings``. Never raises.
+        """
+        block = getattr(ctx, CTX_ATTR, None)
+        if not isinstance(block, dict) or not block.get("blocked"):
+            return True
+
+        fail_closed_fired = [
+            f for f in (block.get("fired") or [])
+            if isinstance(f, dict) and f.get("policy") == POLICY_FAIL_CLOSED
+        ]
+        if fail_closed_fired:
+            names = ", ".join(str(f.get("axis")) for f in fail_closed_fired)
             reasons = "; ".join(
-                f"{r.axis}: {'; '.join(r.violations) or r.error or r.verdict}"
-                for r in blocked
+                f"{f.get('axis')}: {f.get('reason')}" for f in fail_closed_fired
             )
-            msg = (
-                f"DataAvailabilityGateTask: INPUT UNAVAILABLE — fail-closed "
-                f"axis(es) violated: {names}. {reasons}. Refusing to proceed "
-                f"(policy=fail_closed declared in data_contracts)."
-            )
-            log.error(msg)
-            raise RuntimeError(msg)
+        else:
+            # The whole-task crash path (_record_error) has no per-axis
+            # detail — still a real block, just without axis-level reasons.
+            names = "unknown (gate crashed before axis-level detail was recorded)"
+            reasons = str(block.get("error") or "no detail")
+        log.error(
+            "DataAvailabilityGateTask: INPUT UNAVAILABLE — fail-closed "
+            "axis(es) violated: %s. %s. Blocking NEW BUYS ONLY for this bar "
+            "(policy=fail_closed declared in data_contracts); sells/exits "
+            "for this bar already executed above and are unaffected.",
+            names, reasons,
+        )
+        ctx.buy_blocked = True
+        counters = getattr(ctx, "counters", None)
+        if isinstance(counters, dict):
+            counters["data_availability_buy_blocked"] = 1
         return True
 
     # Internal ---------------------------------------------------------------
@@ -1028,21 +1090,24 @@ class DataAvailabilityGateTask:
             declared = declared_axes.get(name)
             if declared is None:
                 missing_contracts.append(name)
-                declared = {}
-            elif not isinstance(declared, dict):
+                results[name] = self._unverified_result(name)
+                continue
+            if not isinstance(declared, dict):
                 log.warning(
                     "data_contracts.axes[%r] is not a mapping — ignoring it",
                     name,
                 )
-                declared = {}
+                missing_contracts.append(name)
+                results[name] = self._unverified_result(name)
+                continue
             contract = {**DEFAULT_CONTRACTS.get(name, {}), **declared}
             results[name] = self._run_checker(
-                ctx, name, contract,
-                declared_in_config=name not in missing_contracts,
-                checker=checker,
+                ctx, name, contract, declared_in_config=True, checker=checker,
             )
 
         # Custom declared axes (dataset presence contracts — the SGOV class).
+        # These only ever exist because an operator wrote a config entry, so
+        # they are always "declared" — no unverified path applies to them.
         for name, declared in declared_axes.items():
             if name in self._checkers:
                 continue
@@ -1055,10 +1120,11 @@ class DataAvailabilityGateTask:
         if missing_contracts:
             log.warning(
                 "DataAvailabilityGateTask: NO DATA CONTRACT declared for "
-                "consumed input axis(es): %s — checked with built-in defaults. "
-                "Declare each under config.data_contracts.axes (schema %s) so "
-                "freshness budgets / coverage floors / fail policies are "
-                "explicit.",
+                "consumed input axis(es): %s — evaluation SKIPPED (day-one "
+                "contract-scope rule: recorded as unverified, no freshness "
+                "verdict assigned; cannot alarm or block). Declare each "
+                "under config.data_contracts.axes (schema %s) with an "
+                "explicit policy before it can ever alarm or block.",
                 ", ".join(missing_contracts), CONTRACTS_SCHEMA_VERSION,
             )
 
@@ -1093,12 +1159,33 @@ class DataAvailabilityGateTask:
                 for r in fired
             ],
             "axes_evaluated": [
-                name for name, r in results.items() if r.verdict != AXIS_SKIP
+                name for name, r in results.items()
+                if r.verdict not in (AXIS_SKIP, AXIS_UNVERIFIED)
             ],
             "missing_contracts": missing_contracts,
             "error": None,
         }
         return block, blocked
+
+    @staticmethod
+    def _unverified_result(name: str) -> AxisResult:
+        """Day-one contract-scope rule: no reviewed contract → no verdict.
+
+        Never evaluated (the checker is not even called), never contributes
+        to ``fired`` (verdict is neither ``violation`` nor ``error``), so it
+        can never alarm or block. ``policy`` is inert here (degrade is the
+        harmless default) — there is nothing this axis could ever enforce.
+        """
+        r = AxisResult(name, verdict=AXIS_UNVERIFIED)
+        r.policy = POLICY_DEGRADE
+        r.contract_declared = False
+        r.evidence["note"] = (
+            "no reviewed data_contracts entry for this axis — evaluation "
+            "skipped (day-one contract-scope rule); declare "
+            f"config.data_contracts.axes[{name!r}] with an explicit policy "
+            "before this axis can ever alarm or block"
+        )
+        return r
 
     def _run_checker(
         self, ctx: Any, name: str, contract: dict, *,
@@ -1148,10 +1235,14 @@ class DataAvailabilityGateTask:
         counters["data_availability_blocked"] = int(bool(block["blocked"]))
 
     @staticmethod
-    def _record_error(ctx: Any, exc: Exception) -> None:
+    def _record_error(
+        ctx: Any, exc: Exception, *, fail_closed_declared: bool = False,
+    ) -> None:
         log.exception(
-            "DataAvailabilityGateTask failed — verify-only, run continues "
-            "(no fail_closed axis declared)",
+            "DataAvailabilityGateTask failed — verify-only, run() always "
+            "continues (never raises); recorded blocked=%s for "
+            "enforce_buy_block() to apply after the sell/exit pass",
+            fail_closed_declared,
         )
         try:
             counters = getattr(ctx, "counters", None)
@@ -1159,14 +1250,20 @@ class DataAvailabilityGateTask:
                 counters["data_availability_errors"] = (
                     int(counters.get("data_availability_errors", 0)) + 1
                 )
+                if fail_closed_declared:
+                    counters["data_availability_blocked"] = 1
             if not isinstance(getattr(ctx, CTX_ATTR, None), dict):
                 setattr(ctx, CTX_ATTR, {
                     "schema": SCHEMA_VERSION,
                     "date": _session_date(ctx).isoformat(),
                     "run_mode": getattr(ctx, "_run_mode", None),
-                    "verdict": None,
+                    # An unverifiable input under a declared fail_closed axis
+                    # is a fail, not a pass — record blocked=True so
+                    # enforce_buy_block() gates buys. Sells/exits are never
+                    # touched: this method only ever writes ctx.data_availability.
+                    "verdict": VERDICT_BLOCKED if fail_closed_declared else None,
                     "degraded": False,
-                    "blocked": False,
+                    "blocked": bool(fail_closed_declared),
                     "axes": {},
                     "fired": [],
                     "axes_evaluated": [],

@@ -19,35 +19,49 @@ axis:
 
 Plus the gate mechanics:
 
-* contracts DECLARED, not hardcoded — a consumed axis with no contract is
-  checked with defaults AND loudly warned (missing_contracts);
-* per-axis fail policy: fail_closed aborts loudly; degrade_with_alarm (the
-  day-one default for EVERY axis) proceeds with the alarm in
-  ctx.data_availability + counters;
+* day-one CONTRACT SCOPE (Codex review, PR #187): a consumed axis with no
+  reviewed contract entry is NOT evaluated — recorded as unverified (no
+  freshness verdict), never alarms, never blocks;
+* per-axis fail policy, enforced BUY-SIDE ONLY (Codex review, PR #187):
+  fail_closed records blocked=True in run() (never raises) and is applied
+  by enforce_buy_block() — called ONLY after the sell/exit pass — via
+  ctx.buy_blocked; degrade_with_alarm (the day-one default for every
+  declared axis) proceeds with the alarm in ctx.data_availability +
+  counters;
 * clean pass → verdict AVAILABLE, nothing fired, nothing raised;
 * fail isolation: a checker crash under degrade never darks the run; under
-  fail_closed it blocks (an unverifiable input is a fail, not a pass); a
-  whole-task crash is swallowed unless a fail_closed axis is declared;
-* ZERO behavior change to decision state (regression pin);
+  fail_closed it is recorded as blocked (an unverifiable input is a fail,
+  not a pass) but STILL never raises; a whole-task crash is swallowed
+  regardless of fail_closed declarations (run() never raises);
+* ZERO decision-logic change to SELLS ever; buy_blocked IS mutated by
+  enforce_buy_block when a fail_closed axis fires (buy-decision-affecting
+  by design, not behavior-invariant);
 * kill switch + sell-only skip;
-* the notification contract (#463 universe_health stamping pattern);
-* pp_inference wiring (early in InferencePipeline only, before RegimeJob,
-  never in SellOnlyPipeline).
+* repo scope: no notification/ntfy formatting helper lives in this module;
+* pp_inference wiring: run() early in InferencePipeline (before RegimeJob,
+  never in SellOnlyPipeline); enforce_buy_block() AFTER the sell/exit pass,
+  before the buy candidate scan — plus a full-pipeline integration test
+  proving a fail_closed violation still emits a real sell/exit.
 """
 from __future__ import annotations
 
 import datetime
 import inspect
 import json
+import sys
+import types
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from renquant_pipeline.context import InferenceContext
+from renquant_pipeline.kernel.exits import HoldingState
 from renquant_pipeline.kernel.pipeline.task_data_availability import (
     AXIS_ERROR,
     AXIS_OK,
     AXIS_SKIP,
+    AXIS_UNVERIFIED,
     AXIS_VIOLATION,
     BUILTIN_CHECKERS,
     CTX_ATTR,
@@ -60,7 +74,6 @@ from renquant_pipeline.kernel.pipeline.task_data_availability import (
     VERDICT_DEGRADED,
     AxisResult,
     DataAvailabilityGateTask,
-    notification_fields,
 )
 
 TODAY = datetime.date(2026, 7, 10)
@@ -250,10 +263,14 @@ class TestAncientModelVintage:
 
     def _cfg(self, tmp_path, **artifact_kw) -> dict:
         artifact = _panel_artifact(tmp_path, **artifact_kw)
-        return {"ranking": {"panel_scoring": {
+        cfg = {"ranking": {"panel_scoring": {
             "enabled": True, "kind": "panel_ltr_xgboost",
             "artifact_path": str(artifact),
         }}}
+        # Declared (day-one contract-scope rule) so the axis is evaluated —
+        # empty entry keeps the built-in defaults + degrade policy.
+        cfg.update(_contract({"panel_model_artifact": {}}))
+        return cfg
 
     def test_ancient_vintage_fires_degrade_by_default(self, tmp_path):
         cfg = self._cfg(tmp_path, trained="2025-01-15", cutoff="2024-11-30")
@@ -266,22 +283,31 @@ class TestAncientModelVintage:
         assert any("train_cutoff_stale" in v for v in axis["violations"])
         assert axis["as_of"] == "2024-11-30"
 
-    def test_fail_closed_policy_aborts_loudly(self, tmp_path):
+    def test_fail_closed_policy_blocks_buys_not_the_run(self, tmp_path):
+        """Codex review (PR #187): fail_closed no longer raises from run().
+
+        It records blocked=True; enforce_buy_block() (called AFTER the
+        sell/exit pass in the real pipeline) is what actually gates buys.
+        """
         cfg = self._cfg(tmp_path, trained="2025-01-15", cutoff="2024-11-30")
         cfg.update(_contract(
             {"panel_model_artifact": {"policy": "fail_closed"}}))
         ctx = _ctx(config_extra=cfg)
-        with pytest.raises(RuntimeError, match="INPUT UNAVAILABLE"):
-            DataAvailabilityGateTask().run(ctx)
-        # The block is stamped BEFORE the abort so the bundle still sees it.
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True   # never raises
         assert _block(ctx)["verdict"] == VERDICT_BLOCKED
         assert _block(ctx)["blocked"] is True
+        assert ctx.buy_blocked is False   # NOT applied yet — run() only records
+        assert task.enforce_buy_block(ctx) is True
+        assert ctx.buy_blocked is True
+        assert ctx.counters["data_availability_buy_blocked"] == 1
 
     def test_missing_artifact_file_fires(self, tmp_path):
         cfg = {"ranking": {"panel_scoring": {
             "enabled": True, "kind": "panel_ltr_xgboost",
             "artifact_path": str(tmp_path / "gone.json"),
         }}}
+        cfg.update(_contract({"panel_model_artifact": {}}))
         ctx = _ctx(config_extra=cfg)
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "panel_model_artifact")
@@ -295,6 +321,7 @@ class TestAncientModelVintage:
             "enabled": True, "kind": "panel_ltr_xgboost",
             "artifact_path": str(artifact),
         }}}
+        cfg.update(_contract({"panel_model_artifact": {}}))
         ctx = _ctx(config_extra=cfg)
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "panel_model_artifact")
@@ -311,8 +338,9 @@ class TestAncientModelVintage:
             "stamped:model_content_sha256")
 
     def test_panel_scoring_disabled_skips(self):
-        ctx = _ctx(config_extra={"ranking": {"panel_scoring": {
-            "enabled": False}}})
+        cfg = {"ranking": {"panel_scoring": {"enabled": False}}}
+        cfg.update(_contract({"panel_model_artifact": {}}))
+        ctx = _ctx(config_extra=cfg)
         DataAvailabilityGateTask().run(ctx)
         assert _axis(ctx, "panel_model_artifact")["verdict"] == AXIS_SKIP
 
@@ -394,7 +422,8 @@ class TestAdmissionCoverageCollapse:
 
     def test_collapse_fires(self):
         # Only 1/5 of the watchlist admitted+fresh → coverage 0.2 < 0.5.
-        ctx = _ctx(models=_fresh_models(["AAA"]))
+        ctx = _ctx(models=_fresh_models(["AAA"]),
+                   config_extra=_contract({"admission_model_metadata": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "admission_model_metadata")
         assert axis["verdict"] == AXIS_VIOLATION
@@ -407,7 +436,8 @@ class TestAdmissionCoverageCollapse:
         # Admitted but stale-by-cutoff (the incident's exact mechanism —
         # reuses job_universe._classify_cutoffs, not a re-implementation).
         stale = _fresh_models(WATCHLIST, cutoff="2026-03-01")   # 131d > 60d
-        ctx = _ctx(models=stale)
+        ctx = _ctx(models=stale,
+                   config_extra=_contract({"admission_model_metadata": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "admission_model_metadata")
         assert axis["coverage"] == 0.0
@@ -415,7 +445,7 @@ class TestAdmissionCoverageCollapse:
         assert axis["verdict"] == AXIS_VIOLATION
 
     def test_healthy_universe_passes(self):
-        ctx = _ctx()
+        ctx = _ctx(config_extra=_contract({"admission_model_metadata": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "admission_model_metadata")
         assert axis["verdict"] == AXIS_OK
@@ -425,7 +455,7 @@ class TestAdmissionCoverageCollapse:
 class TestOhlcvBars:
     def test_missing_symbol_and_coverage_fire(self):
         ohlcv = _fresh_ohlcv(WATCHLIST[:-1] + ["SPY"])   # EEE absent
-        ctx = _ctx(ohlcv=ohlcv)
+        ctx = _ctx(ohlcv=ohlcv, config_extra=_contract({"ohlcv_bars": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "ohlcv_bars")
         assert axis["verdict"] == AXIS_VIOLATION
@@ -436,14 +466,14 @@ class TestOhlcvBars:
     def test_stale_symbol_fires(self):
         ohlcv = _fresh_ohlcv(WATCHLIST + ["SPY"])
         ohlcv["AAA"] = _bars(TODAY - datetime.timedelta(days=10))
-        ctx = _ctx(ohlcv=ohlcv)
+        ctx = _ctx(ohlcv=ohlcv, config_extra=_contract({"ohlcv_bars": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "ohlcv_bars")
         assert any("bars_stale" in v for v in axis["violations"])
         assert axis["as_of"] == (TODAY - datetime.timedelta(days=10)).isoformat()
 
     def test_fresh_universe_passes(self):
-        ctx = _ctx()
+        ctx = _ctx(config_extra=_contract({"ohlcv_bars": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "ohlcv_bars")
         assert axis["verdict"] == AXIS_OK
@@ -454,11 +484,13 @@ class TestOhlcvBars:
 class TestCalibrator:
     def test_required_but_missing_fires(self, tmp_path):
         artifact = _panel_artifact(tmp_path)   # no calibration block
-        ctx = _ctx(config_extra={"ranking": {"panel_scoring": {
+        cfg = {"ranking": {"panel_scoring": {
             "enabled": True, "kind": "panel_ltr_xgboost",
             "artifact_path": str(artifact),
             "global_calibration": {"required": True},
-        }}})
+        }}}
+        cfg.update(_contract({"calibrator": {}}))
+        ctx = _ctx(config_extra=cfg)
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "calibrator")
         assert axis["verdict"] == AXIS_VIOLATION
@@ -466,7 +498,7 @@ class TestCalibrator:
             "missing_global_calibration" in v for v in axis["violations"])
 
     def test_unconfigured_skips(self):
-        ctx = _ctx()
+        ctx = _ctx(config_extra=_contract({"calibrator": {}}))
         DataAvailabilityGateTask().run(ctx)
         assert _axis(ctx, "calibrator")["verdict"] == AXIS_SKIP
 
@@ -475,10 +507,12 @@ class TestCalibrator:
             "method": "linear", "slope": 1.2, "intercept": -0.1,
             "required": True, "model_content_sha256": "ab" * 32,
         })
-        ctx = _ctx(config_extra={"ranking": {"panel_scoring": {
+        cfg = {"ranking": {"panel_scoring": {
             "enabled": True, "kind": "panel_ltr_xgboost",
             "artifact_path": str(artifact),
-        }}})
+        }}}
+        cfg.update(_contract({"calibrator": {}}))
+        ctx = _ctx(config_extra=cfg)
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "calibrator")
         assert axis["verdict"] == AXIS_OK
@@ -487,14 +521,16 @@ class TestCalibrator:
 
 class TestRegimeAndAccountAxes:
     def test_benchmark_missing_fires(self):
-        ctx = _ctx(ohlcv=_fresh_ohlcv(WATCHLIST))   # no SPY
+        ctx = _ctx(ohlcv=_fresh_ohlcv(WATCHLIST),   # no SPY
+                   config_extra=_contract({"regime_inputs": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "regime_inputs")
         assert any(
             "benchmark_bars_missing:SPY" in v for v in axis["violations"])
 
     def test_account_snapshot_absent_fires(self):
-        ctx = _ctx(portfolio_value=0.0, cash=0.0)
+        ctx = _ctx(portfolio_value=0.0, cash=0.0,
+                   config_extra=_contract({"account_snapshot": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "account_snapshot")
         assert any(
@@ -504,6 +540,7 @@ class TestRegimeAndAccountAxes:
         ctx = _ctx(
             account_snapshot_at=pd.Timestamp("2026-07-08 10:00:00"),
             run_timestamp=datetime.datetime(2026, 7, 10, 10, 0, 0),
+            config_extra=_contract({"account_snapshot": {}}),
         )
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "account_snapshot")
@@ -511,7 +548,7 @@ class TestRegimeAndAccountAxes:
             "account_snapshot_stale" in v for v in axis["violations"])
 
     def test_missing_stamp_is_evidence_not_violation(self):
-        ctx = _ctx()
+        ctx = _ctx(config_extra=_contract({"account_snapshot": {}}))
         DataAvailabilityGateTask().run(ctx)
         axis = _axis(ctx, "account_snapshot")
         assert axis["verdict"] == AXIS_OK
@@ -531,6 +568,51 @@ class TestContracts:
             "NO DATA CONTRACT" in rec.message for rec in caplog.records)
         for name in BUILTIN_CHECKERS:
             assert block["axes"][name]["contract_declared"] is False
+
+    def test_missing_contract_axis_is_unverified_not_evaluated(self):
+        """Codex review (PR #187): day-one contract-scope rule.
+
+        An axis with no reviewed contract entry gets NO freshness verdict
+        (neither pass nor fail) — it is recorded as unverified and can never
+        alarm or block, even under conditions (here: a coverage collapse)
+        that WOULD have fired a violation had a contract been declared.
+        """
+        # Coverage collapse condition (would fire admission_coverage_collapse
+        # if the axis were evaluated) — but NO data_contracts section at all.
+        ctx = _ctx(models=_fresh_models(["AAA"]))
+        DataAvailabilityGateTask().run(ctx)
+        block = _block(ctx)
+        axis = _axis(ctx, "admission_model_metadata")
+        assert axis["verdict"] == AXIS_UNVERIFIED
+        assert axis["violations"] == []
+        assert axis["policy"] == POLICY_DEGRADE
+        assert axis["contract_declared"] is False
+        assert "admission_model_metadata" in block["missing_contracts"]
+        assert "admission_model_metadata" not in block["axes_evaluated"]
+        # Never contributes to fired/degraded/blocked.
+        assert block["fired"] == []
+        assert block["degraded"] is False
+        assert block["verdict"] == VERDICT_AVAILABLE
+
+    def test_malformed_contract_entry_is_also_unverified(self):
+        """A non-mapping contract entry is treated the same as absent."""
+        ctx = _ctx(config_extra=_contract({"admission_model_metadata": "oops"}),
+                    models=_fresh_models(["AAA"]))
+        DataAvailabilityGateTask().run(ctx)
+        axis = _axis(ctx, "admission_model_metadata")
+        assert axis["verdict"] == AXIS_UNVERIFIED
+        assert "admission_model_metadata" in _block(ctx)["missing_contracts"]
+
+    def test_fail_closed_on_missing_contract_axis_is_impossible(self, tmp_path):
+        """An operator cannot declare fail_closed for an axis that has no
+        contract at all — the axis stays unverified and inert regardless of
+        how badly the underlying input is broken."""
+        ctx = _ctx(models={})   # 0/5 coverage — would be a hard violation
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True
+        assert _block(ctx)["blocked"] is False
+        task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is False
 
     def test_declared_contract_suppresses_warning(self, tmp_path, caplog):
         ctx = _ctx(tmp_path, clean=True)
@@ -589,27 +671,43 @@ class TestFailPolicy:
         assert fired[0]["policy"] == POLICY_DEGRADE
         assert "dataset_missing" in fired[0]["reason"]
 
-    def test_fail_closed_aborts(self, tmp_path):
+    def test_fail_closed_records_blocked_without_raising(self, tmp_path):
+        """Codex review (PR #187): fail_closed no longer aborts run()."""
         ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
             "path": str(tmp_path / "gone.parquet"),
             "policy": "fail_closed"}}))
-        with pytest.raises(RuntimeError, match="fundamentals_serving_axis"):
-            DataAvailabilityGateTask().run(ctx)
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True   # never raises
         assert ctx.counters["data_availability_blocked"] == 1
         assert _axis(ctx, "fundamentals_serving_axis")["policy"] == (
             POLICY_FAIL_CLOSED)
+        assert ctx.buy_blocked is False   # not enforced until enforce_buy_block
+        assert task.enforce_buy_block(ctx) is True
+        assert ctx.buy_blocked is True
 
-    def test_mixed_policies_abort_names_only_fail_closed_axes(self, tmp_path):
+    def test_mixed_policies_buy_block_names_only_fail_closed_axes(
+            self, tmp_path, caplog):
         ctx = _ctx(
             models=_fresh_models(["AAA"]),        # degrade violation
-            config_extra=_contract({"fundamentals_serving_axis": {
-                "path": str(tmp_path / "gone.parquet"),
-                "policy": "fail_closed"}}),
+            config_extra=_contract({
+                "admission_model_metadata": {},    # declared → degrade (default)
+                "fundamentals_serving_axis": {
+                    "path": str(tmp_path / "gone.parquet"),
+                    "policy": "fail_closed"},
+            }),
         )
-        with pytest.raises(RuntimeError) as excinfo:
-            DataAvailabilityGateTask().run(ctx)
-        assert "fundamentals_serving_axis" in str(excinfo.value)
-        assert "admission_model_metadata" not in str(excinfo.value)
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True   # never raises
+        block = _block(ctx)
+        assert block["blocked"] is True
+        assert block["degraded"] is True   # both axes fired
+        caplog.clear()   # isolate enforce_buy_block's own message from run()'s
+        with caplog.at_level("ERROR"):
+            task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is True
+        messages = "\n".join(rec.message for rec in caplog.records)
+        assert "fundamentals_serving_axis" in messages
+        assert "admission_model_metadata" not in messages
 
 
 # ── Fail isolation ────────────────────────────────────────────────────────────
@@ -622,20 +720,26 @@ class TestFailIsolation:
     def test_checker_crash_under_degrade_never_darks_the_run(self):
         checkers = dict(BUILTIN_CHECKERS)
         checkers["ohlcv_bars"] = _boom
-        ctx = _ctx()
+        # Must be DECLARED for the checker to run at all under the day-one
+        # contract-scope rule — an undeclared axis is never even checked.
+        ctx = _ctx(config_extra=_contract({"ohlcv_bars": {}}))
         assert DataAvailabilityGateTask(checkers=checkers).run(ctx) is True
         axis = _axis(ctx, "ohlcv_bars")
         assert axis["verdict"] == AXIS_ERROR
         assert "checker exploded" in axis["error"]
         assert _block(ctx)["verdict"] == VERDICT_DEGRADED
 
-    def test_checker_crash_under_fail_closed_blocks(self):
+    def test_checker_crash_under_fail_closed_blocks_buys_not_the_run(self):
         checkers = dict(BUILTIN_CHECKERS)
         checkers["ohlcv_bars"] = _boom
         ctx = _ctx(config_extra=_contract(
             {"ohlcv_bars": {"policy": "fail_closed"}}))
-        with pytest.raises(RuntimeError, match="ohlcv_bars"):
-            DataAvailabilityGateTask(checkers=checkers).run(ctx)
+        task = DataAvailabilityGateTask(checkers=checkers)
+        assert task.run(ctx) is True   # never raises
+        assert _block(ctx)["blocked"] is True
+        assert ctx.buy_blocked is False
+        task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is True
 
     def test_whole_task_crash_swallowed_without_fail_closed(self, monkeypatch):
         task = DataAvailabilityGateTask()
@@ -648,10 +752,17 @@ class TestFailIsolation:
         assert ctx.counters["data_availability_errors"] == 1
         block = _block(ctx)
         assert block["verdict"] is None
+        assert block["blocked"] is False
         assert "assembly" in block["error"]
+        task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is False
 
-    def test_whole_task_crash_with_fail_closed_declared_raises(
+    def test_whole_task_crash_with_fail_closed_declared_blocks_buys_not_the_run(
             self, monkeypatch):
+        """Codex review (PR #187): even the whole-task-crash path must never
+        raise from run() — an unverifiable input under a declared fail_closed
+        axis is recorded as blocked=True for enforce_buy_block(), not an
+        abort of the pipeline (which would also dark the sell/exit pass)."""
         task = DataAvailabilityGateTask()
         monkeypatch.setattr(
             task, "_build_block",
@@ -659,13 +770,22 @@ class TestFailIsolation:
         )
         ctx = _ctx(config_extra=_contract(
             {"ohlcv_bars": {"policy": "fail_closed"}}))
-        with pytest.raises(RuntimeError, match="refusing to proceed"):
-            task.run(ctx)
+        assert task.run(ctx) is True   # never raises
+        block = _block(ctx)
+        assert block["verdict"] == VERDICT_BLOCKED
+        assert block["blocked"] is True
+        assert ctx.counters["data_availability_blocked"] == 1
+        assert ctx.buy_blocked is False   # not applied until enforce_buy_block
+        task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is True
 
     def test_one_axis_crash_does_not_take_other_axes_dark(self):
         checkers = dict(BUILTIN_CHECKERS)
         checkers["ohlcv_bars"] = _boom
-        ctx = _ctx()
+        ctx = _ctx(config_extra=_contract({
+            "ohlcv_bars": {}, "admission_model_metadata": {},
+            "regime_inputs": {},
+        }))
         DataAvailabilityGateTask(checkers=checkers).run(ctx)
         assert _axis(ctx, "admission_model_metadata")["verdict"] == AXIS_OK
         assert _axis(ctx, "regime_inputs")["verdict"] == AXIS_OK
@@ -677,8 +797,11 @@ class TestBehaviorInvariance:
     def test_degrade_violations_do_not_mutate_decision_state(self, tmp_path):
         ctx = _ctx(
             models=_fresh_models(["AAA"]),   # coverage collapse (degrade)
-            config_extra=_contract({"fundamentals_serving_axis": {
-                "path": str(tmp_path / "gone.parquet")}}),
+            config_extra=_contract({
+                "admission_model_metadata": {},   # declared → real violation
+                "fundamentals_serving_axis": {
+                    "path": str(tmp_path / "gone.parquet")},
+            }),
         )
         before = {
             "candidates": list(ctx.candidates),
@@ -688,7 +811,12 @@ class TestBehaviorInvariance:
             "holdings": dict(ctx.holdings),
             "models": {k: dict(v) for k, v in ctx.models.items()},
         }
-        DataAvailabilityGateTask().run(ctx)
+        task = DataAvailabilityGateTask()
+        task.run(ctx)
+        assert _block(ctx)["degraded"] is True   # sanity: a real violation fired
+        assert _block(ctx)["blocked"] is False
+        # enforce_buy_block is also a no-op here — nothing was fail_closed.
+        task.enforce_buy_block(ctx)
         assert list(ctx.candidates) == before["candidates"]
         assert list(ctx.exits) == before["exits"]
         assert ctx.skip_buys == before["skip_buys"]
@@ -696,55 +824,51 @@ class TestBehaviorInvariance:
         assert dict(ctx.holdings) == before["holdings"]
         assert {k: dict(v) for k, v in ctx.models.items()} == before["models"]
 
+    def test_fail_closed_buy_block_mutates_only_buy_blocked(self, tmp_path):
+        """The one intentional exception to behavior-invariance (module
+        docstring): a fail_closed axis DOES mutate ctx.buy_blocked via
+        enforce_buy_block — nothing else (never exits/candidates/holdings)."""
+        ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
+            "path": str(tmp_path / "gone.parquet"),
+            "policy": "fail_closed"}}))
+        before = {
+            "candidates": list(ctx.candidates),
+            "exits": list(ctx.exits),
+            "holdings": dict(ctx.holdings),
+        }
+        task = DataAvailabilityGateTask()
+        task.run(ctx)
+        task.enforce_buy_block(ctx)
+        assert ctx.buy_blocked is True   # the one sanctioned mutation
+        assert list(ctx.candidates) == before["candidates"]
+        assert list(ctx.exits) == before["exits"]
+        assert dict(ctx.holdings) == before["holdings"]
+
     def test_kill_switch(self):
         ctx = _ctx(config_extra={"data_availability": {"enabled": False}},
                    portfolio_value=0.0, cash=0.0)
-        assert DataAvailabilityGateTask().run(ctx) is True
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True
         assert getattr(ctx, CTX_ATTR, None) is None
         assert "data_availability_fired" not in ctx.counters
+        assert task.enforce_buy_block(ctx) is True   # no-op, never raises
+        assert ctx.buy_blocked is False
 
     def test_sell_only_skips(self):
         ctx = _ctx(portfolio_value=0.0, cash=0.0)
         ctx._run_mode = "sell-only"
-        assert DataAvailabilityGateTask().run(ctx) is True
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True
         assert getattr(ctx, CTX_ATTR, None) is None
+        assert task.enforce_buy_block(ctx) is True   # no-op, never raises
+        assert ctx.buy_blocked is False
 
 
-# ── Notification contract (#463 universe_health stamping pattern) ────────────
 
-class TestNotificationFields:
-    def test_not_evaluated(self):
-        fields = notification_fields(None)
-        assert fields["degraded"] is False
-        assert fields["blocked"] is False
-        assert fields["title_tag"] == "UNKNOWN"
-
-    def test_degraded(self, tmp_path):
-        ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
-            "path": str(tmp_path / "gone.parquet")}}))
-        DataAvailabilityGateTask().run(ctx)
-        fields = notification_fields(_block(ctx))
-        assert fields["degraded"] is True
-        assert fields["blocked"] is False
-        assert fields["title_tag"] == "DATA-DEGRADED"
-        assert "fundamentals_serving_axis" in fields["line"]
-
-    def test_clean(self, tmp_path):
-        ctx = _ctx(tmp_path, clean=True)
-        DataAvailabilityGateTask().run(ctx)
-        fields = notification_fields(_block(ctx))
-        assert fields["title_tag"] == "DATA-OK"
-        assert fields["degraded"] is False
-
-    def test_blocked(self, tmp_path):
-        ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
-            "path": str(tmp_path / "gone.parquet"),
-            "policy": "fail_closed"}}))
-        with pytest.raises(RuntimeError):
-            DataAvailabilityGateTask().run(ctx)
-        fields = notification_fields(_block(ctx))
-        assert fields["blocked"] is True
-        assert fields["title_tag"] == "DATA-BLOCKED"
+# NOTE (Codex review, PR #187): no notification-formatting contract lives
+# here anymore. This module publishes ctx.data_availability (the versioned,
+# structured block) only; ntfy title/page rendering belongs to a separate
+# orchestrator-repo consumer, not renquant-pipeline.
 
 
 # ── pp_inference wiring ───────────────────────────────────────────────────────
@@ -753,12 +877,31 @@ class TestWiring:
     def test_runs_early_in_inference_pipeline_before_regime(self):
         from renquant_pipeline.kernel.pipeline import pp_inference
         source = inspect.getsource(pp_inference.InferencePipeline.run)
-        gate = source.index("DataAvailabilityGateTask().run(ctx)")
+        gate = source.index("_data_availability_gate.run(ctx)")
         regime = source.index("RegimeJob().run(ctx)")
         freshness = source.index("DataFreshnessGateTask().run(ctx)")
         assert freshness < gate < regime, (
-            "gate must run EARLY: after the OHLCV freshness gate, before any "
-            "decision logic (RegimeJob)"
+            "gate.run() must run EARLY: after the OHLCV freshness gate, "
+            "before any decision logic (RegimeJob) — RECORD ONLY, never "
+            "raises, never touches ctx.buy_blocked"
+        )
+
+    def test_enforce_buy_block_runs_after_the_sell_pass_before_buy_scan(self):
+        """Codex review (PR #187) P1 fix: the buy-side block application
+        must be wired strictly AFTER TickerSellJob (and its downstream
+        exit-refinement tasks) and BEFORE the buy candidate scan — never
+        before sells, so it can never suppress a risk-reducing exit."""
+        from renquant_pipeline.kernel.pipeline import pp_inference
+        source = inspect.getsource(pp_inference.InferencePipeline.run)
+        gate_record = source.index("_data_availability_gate.run(ctx)")
+        sell_pass = source.index("run_parallel(sell_tctxs, TickerSellJob())")
+        short_cover = source.index("ShortCoverStopLossTask().run(ctx)")
+        enforce = source.index("_data_availability_gate.enforce_buy_block(ctx)")
+        buy_scan_cfg = source.index('score_db_cfg = ctx.config.get("score_db")')
+        assert gate_record < sell_pass < short_cover < enforce < buy_scan_cfg, (
+            "enforce_buy_block() must run after every sell/exit-evaluating "
+            "task (TickerSellJob through ShortCoverStopLossTask) and before "
+            "the Phase 2b buy candidate scan"
         )
 
     def test_not_wired_into_sell_only_pipeline(self):
@@ -773,3 +916,158 @@ class TestWiring:
         assert r2.finalize().verdict == AXIS_VIOLATION
         r3 = AxisResult("x")
         assert r3.finalize().verdict == AXIS_OK
+
+
+# ── Full-pipeline integration: fail_closed must never suppress a sell ────────
+
+class TestFailClosedNeverSuppressesSells:
+    """Codex review (PR #187) P1 — the whole point of the fix.
+
+    Runs the REAL ``InferencePipeline().run(ctx)`` (not just the gate task in
+    isolation) with a declared fail_closed data-availability violation, and
+    proves a real stop-loss exit still fires for a held position. The buy
+    universe is left empty (no models loaded) so the test never crosses the
+    model-scoring boundary (xgboost / panel_scoring) — see
+    tests/test_lift_pp_inference.py for why a full run() is otherwise
+    avoided; TickerSellJob's path-rule exits (compute_exits) do not depend
+    on a live model score (ScoreModelTask degrades to model_action="hold"
+    when ctx.models[ticker] is None), so this is a safe, real exercise of
+    the sell path.
+
+    ``renquant_pipeline.kernel.meta_label.{task_meta_label_veto,
+    job_meta_label_log}`` are not yet lifted into this repo (a separate,
+    pre-existing gap — see test_lift_pp_inference.py's "NOT exercised here"
+    note); ``InferencePipeline.run()`` imports them unconditionally, so a
+    minimal fail-open stub is installed for the duration of this test only.
+    The stub mirrors their documented no-op-by-default contract
+    (meta_label veto/logging disabled unless explicitly opted in) and does
+    not touch the control-flow ordering under test.
+    """
+
+    HELD = "ZZZ"
+
+    @pytest.fixture(autouse=True)
+    def _stub_unlifted_meta_label_modules(self, monkeypatch):
+        veto_mod = types.ModuleType(
+            "renquant_pipeline.kernel.meta_label.task_meta_label_veto")
+
+        class _NoOpMetaLabelVetoTask:
+            def run(self, ctx):
+                return None
+
+        veto_mod.MetaLabelVetoTask = _NoOpMetaLabelVetoTask
+
+        log_mod = types.ModuleType(
+            "renquant_pipeline.kernel.meta_label.job_meta_label_log")
+
+        class _NoOpMetaLabelLoggingJob:
+            def should_skip(self, ctx):
+                return True   # matches "no-op in prod" documented default
+
+            def run(self, ctx):
+                return None
+
+        log_mod.MetaLabelLoggingJob = _NoOpMetaLabelLoggingJob
+
+        monkeypatch.setitem(
+            sys.modules,
+            "renquant_pipeline.kernel.meta_label.task_meta_label_veto",
+            veto_mod,
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "renquant_pipeline.kernel.meta_label.job_meta_label_log",
+            log_mod,
+        )
+
+    def _spy_bars(self, n: int = 260) -> pd.DataFrame:
+        rng = np.random.default_rng(0)
+        rets = rng.normal(0.0004, 0.007, n)   # calm bull — avoids BEAR carve-outs
+        closes = 100.0 * np.cumprod(1.0 + rets)
+        idx = pd.bdate_range(end=pd.Timestamp(TODAY), periods=n)
+        return pd.DataFrame(
+            {"open": closes, "high": closes * 1.001, "low": closes * 0.999,
+             "close": closes, "volume": 1_000_000.0},
+            index=idx,
+        )
+
+    def _held_bars(self, entry_price: float, current_price: float,
+                    n: int = 30) -> pd.DataFrame:
+        idx = pd.bdate_range(end=pd.Timestamp(TODAY), periods=n)
+        closes = np.linspace(entry_price, current_price, n)
+        return pd.DataFrame(
+            {"open": closes, "high": closes * 1.001, "low": closes * 0.999,
+             "close": closes, "volume": 100_000.0},
+            index=idx,
+        )
+
+    def _full_ctx(self, tmp_path):
+        from renquant_pipeline.kernel import regime as regime_mod
+
+        entry_price = 100.0
+        current_price = 88.0   # -12% — well past a 5% stop_loss_pct
+        regime_params = {
+            r: {"stop_loss_pct": 0.05}
+            for r in ("BULL_CALM", "BULL_VOLATILE", "CHOPPY", "BEAR")
+        }
+        config = {
+            "watchlist": [],           # empty buy universe on purpose
+            "benchmark": "SPY",
+            "regime_params": regime_params,
+            "data_freshness": {"enabled": False},   # unrelated gate; not under test
+            "data_contracts": {
+                "schema": "data_contracts.v1",
+                "axes": {
+                    "fundamentals_serving_axis": {
+                        "path": str(tmp_path / "nope.parquet"),  # missing → violation
+                        "policy": "fail_closed",
+                    },
+                },
+            },
+        }
+        ctx = InferenceContext(config=config, today=TODAY)
+        ctx._run_mode = "full"
+        ctx.regime_state = regime_mod.RegimeState()
+        ctx.gmm = None
+        ctx.spy_returns = list(
+            pd.Series(self._spy_bars()["close"]).pct_change().dropna()
+        )
+        ctx.ohlcv = {
+            "SPY": self._spy_bars(),
+            self.HELD: self._held_bars(entry_price, current_price),
+        }
+        ctx.prices = {self.HELD: current_price}
+        ctx.models = {}   # no models at all → empty buy universe, no scoring
+        ctx.holdings = {
+            self.HELD: HoldingState(
+                entry_price=entry_price,
+                entry_date=TODAY - datetime.timedelta(days=30),
+                high_watermark=entry_price,
+                shares=10.0,
+            ),
+        }
+        ctx.portfolio_value = 10_000.0
+        ctx.cash = 2_000.0
+        return ctx
+
+    def test_fail_closed_violation_still_emits_a_real_exit(self, tmp_path):
+        from renquant_pipeline.kernel.pipeline.pp_inference import InferencePipeline
+
+        ctx = self._full_ctx(tmp_path)
+        InferencePipeline().run(ctx)   # must not raise
+
+        # The data-availability gate DID record a fail-closed block…
+        block = _block(ctx)
+        assert block["blocked"] is True
+        assert block["verdict"] == VERDICT_BLOCKED
+        # …which gated NEW BUYS (the intended, sanctioned effect)…
+        assert ctx.buy_blocked is True
+        assert ctx.candidates == []   # empty buy universe either way
+        # …but the held position's stop-loss exit STILL fired — the whole
+        # point of the fix: a data-availability block must never suppress
+        # a risk-reducing sell/exit decision.
+        assert len(ctx.exits) == 1
+        ticker, signal = ctx.exits[0]
+        assert ticker == self.HELD
+        assert signal.should_exit is True
+        assert signal.exit_type == "stop_loss"

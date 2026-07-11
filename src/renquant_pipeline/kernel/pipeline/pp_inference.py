@@ -353,17 +353,21 @@ class InferencePipeline:
         # budget + universe coverage) BEFORE any scoring or decision logic.
         # INPUT-side complement of FunnelIntegrityTask (which judges the
         # OUTPUT funnel at the END of the run) — no overlap in responsibility.
-        # Per-axis policy: fail_closed aborts loudly (DataFreshnessGate
-        # pattern); degrade_with_alarm — the day-one default for EVERY axis —
-        # proceeds with the alarm in ctx.data_availability + counters (run
-        # bundle + ntfy fields via notification_fields, the #463
-        # universe_health stamping pattern). Kill switch:
-        # data_availability.enabled = false. Deliberately NOT in
+        #
+        # Codex review (PR #187) P1 fix: this call RECORDS ONLY — it stamps
+        # ctx.data_availability + counters and logs loudly, but NEVER raises
+        # and NEVER touches ctx.buy_blocked. A data-availability verdict may
+        # gate NEW BUYS ONLY, and must never be able to suppress a
+        # risk-reducing sell/exit decision. The actual buy-side enforcement
+        # (enforce_buy_block, below) is wired AFTER the sell/exit pass has
+        # already executed for this bar — see that call site for why.
+        # Kill switch: data_availability.enabled = false. Deliberately NOT in
         # SellOnlyPipeline: buy-input verification must never block the
         # risk-exit path (same reasoning as the P-FUND-FRESHNESS sell-only
         # exemption).
         from .task_data_availability import DataAvailabilityGateTask  # noqa: PLC0415
-        DataAvailabilityGateTask().run(ctx)
+        _data_availability_gate = DataAvailabilityGateTask()
+        _data_availability_gate.run(ctx)
 
         RegimeJob().run(ctx)
         DrawdownJob().run(ctx)
@@ -412,6 +416,19 @@ class InferencePipeline:
         # active only for sim research unless backend parity is added.
         from .task_short_cover import ShortCoverStopLossTask  # noqa: PLC0415
         ShortCoverStopLossTask().run(ctx)
+
+        # Codex review (PR #187) P1 fix: apply the data-availability buy-side
+        # block HERE — strictly AFTER every sell/exit-evaluating task above
+        # (TickerSellJob, DrawdownFlattenTask, MetaLabelVetoTask,
+        # LimitSellsPerBarTask, ShortCoverStopLossTask) has already run for
+        # this bar. A fail_closed axis violation recorded by the early
+        # DataAvailabilityGateTask().run(ctx) call sets ctx.buy_blocked=True
+        # (never raises), which every buy-side job below already honours
+        # (RankingJob.should_skip, SelectionJob, TopUpHeldTask, TrimHeldTask,
+        # BenchmarkSleeveTask, ParkingSleeveShadowTask, JointActionJob) —
+        # exactly the same errata-C choke point BuyGatesJob uses. This can
+        # never suppress a sell/exit: those are already computed above.
+        _data_availability_gate.enforce_buy_block(ctx)
 
         score_db_cfg = ctx.config.get("score_db") or {}
         scan_when_buy_blocked = bool(score_db_cfg.get("scan_when_buy_blocked", True))

@@ -118,3 +118,68 @@ skip). Verify-only: zero decision-logic change.
   bug class) — stamp presence/resolvability only.
 * No fail_closed default anywhere; flipping axes to fail_closed is an
   operator config decision after soak.
+
+## 2026-07-11 update — Codex CHANGES_REQUESTED fixes
+
+Codex's review of the first version of this PR raised three findings, all
+fixed on this branch:
+
+1. **P1 (safety, the big one): fail_closed could suppress a sell/exit.**
+   `DataAvailabilityGateTask` was wired before `RegimeJob`/`BuyGatesJob`/the
+   sell pass, and its `run()` raised `RuntimeError` on a fail_closed axis
+   violation. That exception propagated out of `InferencePipeline.run()`
+   BEFORE `TickerSellJob` ever executed — a data-availability problem could
+   silently cancel a bar's risk exits. Exempting only `SellOnlyPipeline`
+   didn't help: an ordinary full daily run can carry an urgent sell.
+   **Fix**: split the task into `run()` (called at the same early position —
+   records the verdict into `ctx.data_availability` + counters, logs loudly,
+   but NEVER raises and NEVER touches `ctx.buy_blocked`) and a new
+   `enforce_buy_block(ctx)` (wired AFTER `TickerSellJob` and every
+   downstream exit-refining task — `DrawdownFlattenTask`,
+   `MetaLabelVetoTask`, `LimitSellsPerBarTask`, `ShortCoverStopLossTask` —
+   and BEFORE the Phase 2b buy-candidate scan). `enforce_buy_block` sets
+   `ctx.buy_blocked = True` when a fail_closed axis fired — the same
+   errata-C choke point every other buy gate uses (`job_gates.BuyGatesJob`,
+   macro gates, `panel_scoring.PanelScoringJob`) — and never raises. New
+   integration test `TestFailClosedNeverSuppressesSells` in
+   `tests/test_data_availability.py` runs the REAL
+   `InferencePipeline().run(ctx)` with a forced fail_closed violation and
+   asserts a real stop_loss exit still lands in `ctx.exits` while
+   `ctx.buy_blocked` is set.
+2. **Contract scope: an undeclared axis could still alarm.** Previously, a
+   built-in axis with no `data_contracts.axes` entry was still evaluated
+   against built-in defaults, so an unreviewed axis could produce a
+   DEGRADED verdict that looked authoritative. **Fix**: a missing (or
+   malformed) contract entry now means the axis is NOT evaluated at all —
+   the checker is never called; the axis is recorded `verdict: "unverified"`
+   (new `AXIS_UNVERIFIED` constant) with no violations, and can never enter
+   `fired`/`degraded`/`blocked`. Only an axis with an explicit, reviewed
+   `data_contracts.axes[name]` entry can ever alarm; blocking is a further,
+   separate bar — that same entry must ALSO declare `policy: fail_closed`.
+   `tests/test_data_availability.py::TestContracts` covers both the
+   unverified record and the (im)possibility of fail_closed on an
+   undeclared axis.
+3. **Repo/ownership scope: pipeline was formatting ntfy text.** The
+   `notification_fields()` helper (title/tag/line rendering for the
+   umbrella's ntfy adapter) has been deleted from this module. This repo now
+   publishes `ctx.data_availability` (the versioned, structured block) only.
+   Title/page rendering for operator-facing alerts is orchestrator
+   monitor-layer territory — a follow-up consumer PR in
+   `renquant-orchestrator` is expected to render it; **not implemented
+   here** (out of scope for this repo, and not something the pipeline agent
+   should build).
+
+**Framing correction**: this task is NOT "behavior-invariant" — once any
+axis is declared `fail_closed`, a violation DOES mutate decision state
+(`ctx.buy_blocked = True`), by design. No axis defaults to fail_closed, so
+day-one rollout has zero behavioural effect until an operator opts one in;
+from that point on it is explicitly **buy-decision-affecting**. Any further
+escalation (e.g. defaulting an axis to fail_closed more broadly) requires a
+staged design + shadow evidence — that is future work, not covered by this
+PR.
+
+Full suite after the fixes: 1614 passed, 8 skipped (same 3 pre-existing
+environment-version-mismatch failures unrelated to this change —
+`test_replay_d6_conventions.py` numpy/scipy pin drift,
+`test_xgboost_scorer_contract.py` xgboost version drift — confirmed present
+before this branch's changes too).
