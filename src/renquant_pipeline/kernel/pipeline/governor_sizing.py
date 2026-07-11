@@ -294,10 +294,18 @@ def run_governor_sizing(ctx: Any, gov_cfg: dict) -> bool:
     min_hold_days = int(config.get("min_hold_days", 0))
     no_buy: set[str] = set()
     no_sell: set[str] = set()
+    from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+        resolve_asset_class,
+        resolve_validated_crypto_spot_pairs,
+    )
     from renquant_pipeline.kernel.selection import is_wash_sale_blocked  # noqa: PLC0415
+    gov_asset_class = resolve_asset_class(config)
+    gov_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(config)
     for ticker, hs in held.items():
         if is_wash_sale_blocked(ticker, ctx.today, ctx.last_sell_dates or {},
-                                wash_days):
+                                wash_days,
+                                asset_class=gov_asset_class,
+                                validated_crypto_pairs=gov_validated_crypto_pairs):
             no_buy.add(ticker)
         entry_date = _coerce_date(getattr(hs, "entry_date", None))
         days_held = (ctx.today - entry_date).days if entry_date else None

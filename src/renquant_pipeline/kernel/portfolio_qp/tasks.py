@@ -468,9 +468,13 @@ class AlignQPHorizonUnitsTask(Task):
     forward-return estimate over `panel_ltr.lookahead_days`, while the
     realized-vol fallback is explicitly annualized. This task converts σ
     before Σ is built so risk and expected-return units match.
+
+    De-annualization divisor per asset class (crypto RFC 2026-07-10 P4):
+    252 trading days for us_equity (byte-identical default), 365 for the
+    always-open crypto market.
     """
     name = "AlignQPHorizonUnitsTask"
-    TRADING_DAYS_PER_YEAR = 252.0
+    TRADING_DAYS_PER_YEAR = 252.0  # equity; crypto resolves 365 via asset_class
 
     def run(self, ctx) -> bool | None:
         cfg = _qp_cfg(ctx)
@@ -484,7 +488,11 @@ class AlignQPHorizonUnitsTask(Task):
             return _record_qp_horizon_issue(ctx, cfg, "missing_mu_horizon")
         if getattr(ctx, "_qp_sigma_horizon_scaled", False):
             return
-        scale = _qp_sigma_horizon_scale(unit, horizon)
+        from renquant_pipeline.kernel.asset_class import annualization_days_for  # noqa: PLC0415
+        scale = _qp_sigma_horizon_scale(
+            unit, horizon,
+            annualization_days=annualization_days_for(_ctx_asset_class(ctx)),
+        )
         if scale is None:
             return _record_qp_horizon_issue(ctx, cfg, f"unknown_sigma_unit:{unit}")
         sig = np.asarray(sigma, dtype=float)
@@ -666,6 +674,12 @@ class ComputeWashSaleMaskTask(Task):
             min_reentry=min_reentry,
             held_tickers=held_tickers,
             calibrator_saturated=bool(getattr(ctx, "_calibrator_saturated", False)),
+            # Crypto RFC 2026-07-10 P5: §1091 leg of the mask is bypassed for
+            # asset_class=crypto (property) AND a ticker-level validated
+            # spot-pair check (Codex hardening, pipeline#183); anti-churn +
+            # saturation-abstain legs are NOT §1091 and stay asset-class-agnostic.
+            asset_class=_ctx_asset_class(ctx),
+            validated_crypto_pairs=_ctx_validated_crypto_pairs(ctx),
         )
         ctx._qp_wash_mask = mask  # noqa: SLF001
         if n_wash or n_churn or n_sat:
@@ -1273,6 +1287,7 @@ class ApplyExposureScalingTask(Task):
 
 
 def _compute_vt_scale(ctx, vt_cfg: dict) -> float:
+    from renquant_pipeline.kernel.asset_class import annualization_days_for  # noqa: PLC0415
     from renquant_pipeline.kernel.vol_target import compute_vol_target_scale  # noqa: PLC0415
     return compute_vol_target_scale(
         getattr(ctx, "spy_returns", None) or [],
@@ -1280,6 +1295,8 @@ def _compute_vt_scale(ctx, vt_cfg: dict) -> float:
         window_days = int  (vt_cfg.get("window_days", 60)),
         floor       = float(vt_cfg.get("floor",       0.30)),
         ceiling     = float(vt_cfg.get("ceiling",     1.50)),
+        # P4: 252 (us_equity, byte-identical default) vs 365 (crypto).
+        annualization_days=annualization_days_for(_ctx_asset_class(ctx)),
     )
 
 
@@ -1455,6 +1472,7 @@ class ApplySoftSellGuardMaskTask(Task):
                 regime=thesis_regime,
                 today=getattr(ctx, "today", None),
                 holding=hs,
+                asset_class=_ctx_asset_class(ctx),
             )
             if suppress:
                 mask[i] = True
@@ -2780,11 +2798,13 @@ def _qp_soft_sell_block_reason(ctx, ticker: str, sol, i: int) -> str | None:
         trading_holding_days,
     )
     thesis_regime = soft_exit_thesis_regime(hs, getattr(ctx, "regime", None))
+    asset_class = _ctx_asset_class(ctx)
     suppress, why = soft_exit_horizon_suppression(
         panel_cfg=panel_cfg,
         regime=thesis_regime,
         today=getattr(ctx, "today", None),
         holding=hs,
+        asset_class=asset_class,
     )
     if suppress:
         return "qp_soft_sell_horizon:" + why
@@ -2796,6 +2816,7 @@ def _qp_soft_sell_block_reason(ctx, ticker: str, sol, i: int) -> str | None:
             shares=pending_shares,
             today=getattr(ctx, "today", None),
             lot_method=str(cfg.get("qp_tax_lot_method", "fifo")).lower(),
+            asset_class=asset_class,
         )
         if lot_days is not None and lot_days < min_days:
             return (
@@ -2858,6 +2879,7 @@ def _disposed_lot_min_holding_days(
     shares: Any,
     today: Any,
     lot_method: str,
+    asset_class: str = "us_equity",
 ) -> int | None:
     """Minimum age among lots a QP soft sell would actually dispose."""
     from renquant_pipeline.kernel.pipeline.soft_exit_guards import trading_holding_days  # noqa: PLC0415
@@ -2872,13 +2894,13 @@ def _disposed_lot_min_holding_days(
         return None
     lots = list(getattr(holding, "lots", None) or [])
     if not lots:
-        return trading_holding_days(today, holding)
+        return trading_holding_days(today, holding, asset_class=asset_class)
 
     method = str(lot_method or "fifo").lower()
     if method == "hifo":
         ordered = sorted(lots, key=lambda lot: -float(getattr(lot, "price", 0.0) or 0.0))
     elif method == "avg":
-        return trading_holding_days(today, holding)
+        return trading_holding_days(today, holding, asset_class=asset_class)
     else:
         ordered = lots
 
@@ -2901,7 +2923,9 @@ def _disposed_lot_min_holding_days(
             continue
         from types import SimpleNamespace  # noqa: PLC0415
 
-        age = trading_holding_days(today, SimpleNamespace(entry_date=lot_date))
+        age = trading_holding_days(
+            today, SimpleNamespace(entry_date=lot_date), asset_class=asset_class
+        )
         if age is None:
             return None
         min_days = age if min_days is None else min(min_days, age)
@@ -3468,6 +3492,26 @@ _QP_PER_REGIME_KEYS = (
 )
 
 
+def _ctx_asset_class(ctx) -> str:
+    """Asset class of the running strategy config (crypto RFC 2026-07-10).
+
+    Keys hold clocks (P2), annualization (P4), and the wash-sale mask (P5)
+    off the ONE top-level ``asset_class`` switch; absent ⇒ ``us_equity`` ⇒
+    byte-identical legacy behavior.
+    """
+    from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
+    return resolve_asset_class(getattr(ctx, "config", {}) or {})
+
+
+def _ctx_validated_crypto_pairs(ctx) -> "frozenset[str]":
+    """P5 hardening (Codex review, pipeline#183): the explicitly-declared
+    validated non-security spot-pair allowlist — required alongside
+    ``asset_class == "crypto"`` for the §1091 bypass, see
+    ``wash_sale_applies_for_ticker``."""
+    from renquant_pipeline.kernel.asset_class import resolve_validated_crypto_spot_pairs  # noqa: PLC0415
+    return resolve_validated_crypto_spot_pairs(getattr(ctx, "config", {}) or {})
+
+
 def _qp_cfg(ctx) -> dict:
     base = dict((ctx.config.get("rotation", {}).get("joint_actions", {})) or {})
     regime = getattr(ctx, "regime", None)
@@ -3492,11 +3536,15 @@ def _resolve_qp_mu_horizon_days(ctx, cfg: dict) -> int | None:
     return horizon if horizon > 0 else None
 
 
-def _qp_sigma_horizon_scale(unit: str, horizon_days: int) -> float | None:
+def _qp_sigma_horizon_scale(
+    unit: str, horizon_days: int, *, annualization_days: float = 252.0
+) -> float | None:
     if unit in {"horizon", "period", "matched"}:
         return 1.0
     if unit in {"annual", "annualized", "ann"}:
-        return math.sqrt(float(horizon_days) / 252.0)
+        # P4: de-annualize with the asset class's trading-day count
+        # (252 equity — byte-identical default — / 365 crypto).
+        return math.sqrt(float(horizon_days) / float(annualization_days))
     if unit == "daily":
         return math.sqrt(float(horizon_days))
     return None
@@ -3567,8 +3615,16 @@ def _compute_qp_wash_mask(
     min_reentry: int,
     held_tickers: set[str],
     calibrator_saturated: bool,
+    asset_class: str = "us_equity",
+    validated_crypto_pairs: "frozenset[str] | None" = None,
 ) -> tuple[np.ndarray, int, int, int]:
-    """Build QP block mask for wash-sale, anti-churn, and saturation abstain."""
+    """Build QP block mask for wash-sale, anti-churn, and saturation abstain.
+
+    ``asset_class="crypto"`` (RFC 2026-07-10 P5) bypasses ONLY the §1091
+    wash-sale leg (single source of truth: ``is_wash_sale_blocked_with_cost``);
+    the min-reentry anti-churn and calibrator-saturation legs are risk
+    controls, not tax law, and apply to every asset class.
+    """
     from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
     mask = np.zeros(len(tickers), dtype=bool)
     n_wash = n_churn = n_sat = 0
@@ -3580,6 +3636,8 @@ def _compute_qp_wash_mask(
                 last_sell_dates=last_sell_dates,
                 last_sell_pls=last_sell_pls,
                 wash_sale_days=wash_days,
+                asset_class=asset_class,
+                validated_crypto_pairs=validated_crypto_pairs,
             )
             if blocked:
                 mask[i] = True

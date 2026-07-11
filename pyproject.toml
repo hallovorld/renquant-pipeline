@@ -13,7 +13,12 @@ dependencies = [
   # — 2026-07-01 fix for the recurring calibrator/scorer fingerprint-mismatch
   # fail-closed, 05-27/06-22/07-01). Structural dependency, not just a
   # version-range bump: below 0.8.1 this module does not exist.
-  "renquant-common>=0.8.1,<1.0",
+  # >=0.11.0: market_calendar ALWAYS_OPEN mode (crypto RFC M2/P1, common
+  # PR #27) — the crypto asset-class policy delegates its freshness clock
+  # to the shared calendar UNCONDITIONALLY and fails closed below this
+  # version (no local calendar fork; Codex re-review of pipeline #183).
+  # Merge order: common #27 first, then this repo's crypto policy.
+  "renquant-common>=0.11.0,<1.0",
   "renquant-base-data>=0.1.0",
   "renquant-artifacts>=0.1.0",
   "cvxpy>=1.4",

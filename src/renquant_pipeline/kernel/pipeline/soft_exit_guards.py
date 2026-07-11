@@ -12,7 +12,7 @@ import logging
 import math
 from typing import Any
 
-from renquant_pipeline.kernel.exits import nyse_trading_days_between
+from renquant_pipeline.kernel.exits import trading_days_between
 
 log = logging.getLogger(__name__)
 
@@ -35,11 +35,16 @@ def holding_days(today: Any, holding: Any) -> int | None:
     return max(0, (today - entry_date).days)
 
 
-def trading_holding_days(today: Any, holding: Any) -> int | None:
+def trading_holding_days(
+    today: Any, holding: Any, *, asset_class: str = "us_equity"
+) -> int | None:
+    """Thesis-age in trading days (crypto RFC 2026-07-10 P2: calendar days
+    for ``asset_class="crypto"`` — positions age over weekends; default
+    ``us_equity`` counts NYSE sessions byte-identically)."""
     entry_date = getattr(holding, "entry_date", None)
     if not isinstance(today, datetime.date) or not isinstance(entry_date, datetime.date):
         return None
-    return nyse_trading_days_between(entry_date, today)
+    return trading_days_between(entry_date, today, asset_class=asset_class)
 
 
 def _configured_min_days(panel_cfg: dict[str, Any], regime: str | None) -> int:
@@ -94,12 +99,17 @@ def soft_exit_horizon_suppression(
     regime: str | None,
     today: Any,
     holding: Any,
+    asset_class: str = "us_equity",
 ) -> tuple[bool, str]:
-    """Return True when a model-driven soft exit should wait for thesis age."""
+    """Return True when a model-driven soft exit should wait for thesis age.
+
+    ``asset_class`` selects the hold clock (P2): NYSE sessions (default)
+    vs calendar days (crypto).
+    """
     min_days = _configured_min_days(panel_cfg, regime)
     if min_days <= 0:
         return False, ""
-    days = trading_holding_days(today, holding)
+    days = trading_holding_days(today, holding, asset_class=asset_class)
     if days is None:
         return False, ""
     if days < min_days:

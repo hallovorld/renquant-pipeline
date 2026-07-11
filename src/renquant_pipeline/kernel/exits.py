@@ -1,6 +1,8 @@
 """Exit-check pure functions — all 5 exit types + tax-aware hold gate.
 
-Self-contained: only datetime, dataclasses.  No common/ imports.
+Self-contained: only datetime, dataclasses.  No hard common/ imports
+(kernel.asset_class provides the asset-class hold/streak clock dispatch,
+crypto RFC 2026-07-10 P2).
 Priority order (highest → lowest):
   1. trailing_stop   (regime-configured, peak-gain armed)
   2. stop_loss       (regime-configured cumulative loss from entry)
@@ -72,6 +74,40 @@ def _is_nyse_trading_day(d: datetime.date) -> bool:
     except Exception:
         # Defensive — if pmc unavailable, fall back to weekday-only check.
         return True   # weekday already passed; assume trading day
+
+
+def is_trading_day(d: datetime.date, *, asset_class: str = "us_equity") -> bool:
+    """Asset-class-aware trading-day predicate (crypto RFC 2026-07-10 P2).
+
+    ``us_equity`` (default) delegates to the NYSE calendar byte-identically;
+    ``crypto`` trades 24/7 — every calendar day is a trading day, so streak
+    clocks advance on weekends and holidays.
+    """
+    from renquant_pipeline.kernel.asset_class import is_crypto  # noqa: PLC0415
+    if is_crypto(asset_class):
+        return True
+    return _is_nyse_trading_day(d)
+
+
+def trading_days_between(
+    start: datetime.date,
+    end: datetime.date,
+    *,
+    asset_class: str = "us_equity",
+) -> int:
+    """Asset-class-aware hold-clock day count (crypto RFC 2026-07-10 P2).
+
+    Entry day is day zero in BOTH modes. ``us_equity`` (default) counts NYSE
+    sessions byte-identically to :func:`nyse_trading_days_between`; ``crypto``
+    counts CALENDAR days — positions age over weekends, matching the
+    calendar-day label horizon of an always-open market.
+    """
+    from renquant_pipeline.kernel.asset_class import is_crypto  # noqa: PLC0415
+    if is_crypto(asset_class):
+        if not isinstance(start, datetime.date) or not isinstance(end, datetime.date):
+            return 0
+        return max(0, (end - start).days)
+    return nyse_trading_days_between(start, end)
 
 
 @lru_cache(maxsize=4096)
@@ -728,13 +764,22 @@ def check_model_sell(
     consecutive_required: int,  # e.g. 3
     min_hold_days: int,         # model-sell blocked before this many days
     today: datetime.date,
+    *,
+    asset_class: str = "us_equity",
 ) -> tuple[HoldingState, ExitSignal]:
     """Accumulate consecutive sell signals; exit when streak meets required.
 
     Streak only counts after min_hold_days.  Returns updated state and exit.
+
+    Crypto RFC 2026-07-10 P2: for ``asset_class="crypto"`` the min-hold clock
+    counts CALENDAR days and every day is a trading day (streaks move and may
+    fire on weekends — a 24/7 market has no non-trading days to freeze on).
+    Default ``us_equity`` keeps the NYSE behavior byte-identical.
     """
     if min_hold_days > 0:
-        days_held = nyse_trading_days_between(state.entry_date, today)
+        days_held = trading_days_between(
+            state.entry_date, today, asset_class=asset_class
+        )
         if days_held < min_hold_days:
             # Don't touch streak — can't have earned streak yet
             return state, _NO_EXIT
@@ -748,9 +793,10 @@ def check_model_sell(
     # incremented streak from 2 → 3 → triggered model_sell on GOOG/AMZN/BA
     # within 24 hours. User: "today is not a trading day, streak shouldn't
     # be > 1!" Fix: skip increment + skip reset on non-trading days. The
-    # streak should reflect TRADING-day signals only.
-    is_trading_day = _is_nyse_trading_day(today)
-    if not is_trading_day:
+    # streak should reflect TRADING-day signals only. (Crypto: every day
+    # IS a trading day, so the streak legitimately moves on weekends.)
+    trading_day = is_trading_day(today, asset_class=asset_class)
+    if not trading_day:
         # Sunday / market holiday — leave streak unchanged. Don't reset
         # either (otherwise a Sun e2e would clear a legitimate streak).
         pass
@@ -774,7 +820,7 @@ def check_model_sell(
     # Path-dependent rules (stop_loss, trailing, SDL, max_hold) are NOT
     # affected — those go through compute_exits's other branches and
     # represent risk management that must always fire.
-    if not is_trading_day:
+    if not trading_day:
         return state, _NO_EXIT
 
     if state.sell_streak >= consecutive_required:
@@ -817,8 +863,16 @@ def compute_exits(
     model_action: str,
     state: HoldingState,
     params: dict,
+    *,
+    asset_class: str = "us_equity",
 ) -> tuple[ExitSignal, HoldingState]:
     """Run all exits in priority order; return first triggered signal.
+
+    ``asset_class`` (crypto RFC 2026-07-10 P2): governs the model-sell
+    streak/min-hold clocks — NYSE trading days for ``us_equity`` (default,
+    byte-identical), calendar days for ``crypto``. Path-risk exits
+    (trailing/stop/SDL/max-hold) already use price paths + calendar days
+    and are asset-class-agnostic.
 
     params keys (all optional, default disabled if absent or zero):
       trailing_stop_trigger_pct, trailing_stop_trail_pct  — trailing stop (BULL_CALM)
@@ -925,6 +979,7 @@ def compute_exits(
                 int(params.get("consecutive_sell_signals", 3)),
                 effective_model_sell_min_hold_days(params, state, current_price),
                 today,
+                asset_class=asset_class,
             )
             return _NO_EXIT, state
 
@@ -934,5 +989,6 @@ def compute_exits(
         int(params.get("consecutive_sell_signals", 3)),
         effective_model_sell_min_hold_days(params, state, current_price),
         today,
+        asset_class=asset_class,
     )
     return sig, state

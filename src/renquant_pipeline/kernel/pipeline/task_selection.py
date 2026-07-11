@@ -20,6 +20,10 @@ class PrepareSelectionTask(Task):
     """Compute open slots, apply BEAR cap, build SelectionContext → ctx._sel_ctx."""
 
     def run(self, ctx: InferenceContext) -> bool | None:
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            resolve_asset_class,
+            resolve_validated_crypto_spot_pairs,
+        )
         from renquant_pipeline.kernel.selection import SelectionContext  # noqa: PLC0415
 
         config         = ctx.config
@@ -85,6 +89,13 @@ class PrepareSelectionTask(Task):
             tiered_thresholds = tiered,
             open_slots        = open_slots,
             bear_only         = bool(ctx.bear_only),
+            # Crypto RFC 2026-07-10 P5 (ticker-scoped hardening, pipeline#183):
+            # §1091 bypass requires BOTH asset_class == "crypto" AND ticker
+            # membership in the validated spot-pair allowlist below — the
+            # asset_class switch alone is never sufficient. Absent ⇒
+            # us_equity ⇒ identical equity behavior.
+            asset_class       = resolve_asset_class(config),
+            validated_crypto_spot_pairs = resolve_validated_crypto_spot_pairs(config),
         )
 
 

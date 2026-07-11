@@ -224,11 +224,13 @@ class CrossSectionalPanelExitTask(Task):
             trigger_kind = "xs+mu" if fires_xs and fires_strong \
                            else ("xs" if fires_xs else "strong_mu")
 
+            from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
             suppress, why = soft_exit_horizon_suppression(
                 panel_cfg=cfg,
                 regime=soft_exit_thesis_regime(hs, getattr(ctx, "regime", None)),
                 today=getattr(ctx, "today", None),
                 holding=hs,
+                asset_class=resolve_asset_class(getattr(ctx, "config", {}) or {}),
             )
             if suppress:
                 ctx.counters["xs_panel_exit_horizon_suppressed"] = (

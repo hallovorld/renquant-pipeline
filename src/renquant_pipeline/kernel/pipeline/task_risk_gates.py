@@ -63,6 +63,15 @@ class RealizedVolGateTask(Task):
             return True
         cap = float(cfg.get("max_annualized", 0.60))
         window = int(cfg.get("window_days", 60))
+        # Crypto RFC 2026-07-10 P4: annualize with 365 for the always-open
+        # market (√252 would understate a 7-day/week stream's vol). The cap
+        # itself is strategy policy — the crypto config sets its own
+        # max_annualized; only the annualization factor is keyed here.
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            annualization_days_for,
+            resolve_asset_class,
+        )
+        ann_days = annualization_days_for(resolve_asset_class(ctx.config or {}))
 
         candidates = list(getattr(ctx, "candidates", []) or [])
         if not candidates:
@@ -76,7 +85,7 @@ class RealizedVolGateTask(Task):
         for cand in candidates:
             tkr = getattr(cand, "ticker", None)
             df = (getattr(ctx, "ohlcv", None) or {}).get(tkr)
-            vol = self._realized_vol_annualized(df, window)
+            vol = self._realized_vol_annualized(df, window, annualization_days=ann_days)
             if vol is None:
                 # Insufficient history → permissive (don't drop unknown)
                 kept.append(cand)
@@ -104,7 +113,9 @@ class RealizedVolGateTask(Task):
         return True
 
     @staticmethod
-    def _realized_vol_annualized(df, window: int) -> float | None:
+    def _realized_vol_annualized(
+        df, window: int, *, annualization_days: float = 252.0
+    ) -> float | None:
         if df is None:
             return None
         try:
@@ -119,7 +130,7 @@ class RealizedVolGateTask(Task):
         std = float(rets.std())
         if not math.isfinite(std):
             return None
-        return std * math.sqrt(252.0)
+        return std * math.sqrt(float(annualization_days))
 
 
 class PositionConcentrationGateTask(Task):

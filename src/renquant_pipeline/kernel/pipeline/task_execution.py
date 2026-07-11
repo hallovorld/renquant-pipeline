@@ -212,11 +212,30 @@ class StampWashSaleTask(Task):
     Pins: only **full liquidates** stamp ``last_sell_dates`` (matches the
     2026-04-24 partial-trim wash-sale exemption); path-rule exits stamp
     ``last_stop_exit_dates`` regardless of partial-vs-full (G8 invariant).
+
+    Crypto RFC 2026-07-10 P5: for a VALIDATED crypto spot pair, a sell does
+    NOT stamp ``last_sell_dates`` at all — crypto is property, §1091 never
+    applies, so no wash-sale re-entry state may be created (the RFC strips
+    the wash-sale/re-entry knobs from the crypto config entirely). The G8
+    post-stop cooldown stamp is a RISK rail, not tax law, and still fires.
+    An ``asset_class="crypto"``-tagged ticker that is NOT an explicitly
+    validated spot pair (Codex hardening, pipeline#183) STILL gets its sell
+    date stamped — §1091 genuinely applies to it, and skipping the stamp
+    here would silently defeat the ticker-level fail-closed block in
+    ``wash_sale_applies_for_ticker`` (nothing to check the re-entry against).
     """
 
     def run(self, ctx) -> "bool | None":
         if not ctx.fills:
             return True
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            resolve_asset_class,
+            resolve_validated_crypto_spot_pairs,
+            wash_sale_applies_for_ticker,
+        )
+        config = getattr(ctx, "config", {}) or {}
+        asset_class = resolve_asset_class(config)
+        validated_crypto_pairs = resolve_validated_crypto_spot_pairs(config)
         today = pd.Timestamp(ctx.today).date()
         # Reconstruct which fills came from which ExitSignal by ticker.
         exit_lookup: dict[str, str] = {}
@@ -228,8 +247,9 @@ class StampWashSaleTask(Task):
                 continue
             t = fill.ticker
             held = ctx.execution_backend.get_position_quantity(t)
+            stamp_wash = wash_sale_applies_for_ticker(asset_class, t, validated_crypto_pairs)
             # Full liquidate: backend now reports 0 shares (post-fill).
-            if held <= 0:
+            if held <= 0 and stamp_wash:
                 ctx.last_sell_dates[t] = today
             # G8: path-rule exits stamp cooldown date regardless of partial
             et = exit_lookup.get(t, "")
