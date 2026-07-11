@@ -3,10 +3,13 @@
 The #484 forensics found 5 ZM "buy_pending" rows in the runs DB and 0 broker
 fills — nothing in the DB distinguished a canceled intent from a fill, so
 every consumer overcounted buys and basic facts required the broker API.
-These tests pin the contract: attempt rows are stamped ``submitted`` with the
-broker order id at write time; broker-confirmed outcomes are written back via
-``record_order_outcomes``; the schema change is additive (old DBs migrate,
-old rows read back with NULL = unknown).
+These tests pin the contract (round 2, post Codex review on #190): attempt
+rows are stamped ``submitted`` with the broker order id at write time;
+broker-confirmed outcomes are written back via ``record_order_outcomes``
+keyed by broker order identity ONLY, under monotonic transition rules that
+out-of-order/replayed broker events cannot rewind; unmatched outcomes become
+explicit audit entries, never guesses; the schema change is additive (old
+DBs migrate, old rows read back with NULL = never reconciled).
 """
 from __future__ import annotations
 
@@ -16,6 +19,7 @@ from renquant_pipeline.kernel.persistence import (
     FILL_STATUS_CANCELED,
     FILL_STATUS_FILLED,
     FILL_STATUS_SUBMITTED,
+    FILL_STATUS_UNKNOWN,
     ensure_schema,
     get_connection,
     normalize_fill_status,
@@ -52,9 +56,16 @@ def _fill_rows(conn, ticker):
     ).fetchall()
 
 
+def _unmatched_audits(conn):
+    return conn.execute(
+        "SELECT ticker, detail FROM reconciliation_actions"
+        " WHERE kind = 'ORDER_OUTCOME_UNMATCHED' ORDER BY action_id",
+    ).fetchall()
+
+
 # ── normalize_fill_status ─────────────────────────────────────────────────────
 
-def test_normalize_fill_status_canonical_aliases_and_passthrough():
+def test_normalize_fill_status_canonical_aliases_and_unknown():
     assert normalize_fill_status("filled") == "filled"
     assert normalize_fill_status("FILLED") == "filled"
     assert normalize_fill_status("cancelled") == "canceled"
@@ -62,8 +73,10 @@ def test_normalize_fill_status_canonical_aliases_and_passthrough():
     assert normalize_fill_status("new") == "submitted"
     assert normalize_fill_status("accepted") == "submitted"
     assert normalize_fill_status("partial_fill") == "partially_filled"
-    # unknown broker states stay visible verbatim (lowercased), not coerced
-    assert normalize_fill_status("done_for_day") == "done_for_day"
+    # Codex #190: unrecognized broker vocabulary maps to the EXPLICIT
+    # unknown state — never something interpretable as canceled/unfilled.
+    assert normalize_fill_status("done_for_day") == FILL_STATUS_UNKNOWN
+    assert normalize_fill_status("suspended") == FILL_STATUS_UNKNOWN
     assert normalize_fill_status(None) is None
     assert normalize_fill_status("  ") is None
 
@@ -112,6 +125,16 @@ class TestRecordTradesStamping:
         (row,) = _fill_rows(conn, "MU")
         assert row[1] is None and row[2] is None
 
+    def test_unrecognized_explicit_status_stored_as_unknown(self, tmp_path):
+        conn = _conn(tmp_path)
+        run_id = _run(conn)
+        record_trades(conn, run_id, [{
+            "ticker": "ZM", "action": "buy", "date": "2026-07-07",
+            "broker_order_id": "id-1", "fill_status": "done_for_day",
+        }])
+        (row,) = _fill_rows(conn, "ZM")
+        assert row[2] == FILL_STATUS_UNKNOWN
+
 
 # ── post-execution outcome write-back ─────────────────────────────────────────
 
@@ -123,13 +146,13 @@ class TestRecordOrderOutcomes:
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
             "shares": 2, "price": 85.68, "order_id": "alpaca-zm-0707",
         }])
-        n = record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "alpaca-zm-0707",
             "fill_status": "canceled",
             "filled_qty": 0,
             "fill_updated_at": "2026-07-07T22:56:00Z",
         }])
-        assert n == 1
+        assert counts["updated"] == 1 and counts["unmatched"] == 0
         (row,) = _fill_rows(conn, "ZM")
         assert row[2] == FILL_STATUS_CANCELED
         assert row[3] == 0.0
@@ -147,53 +170,66 @@ class TestRecordOrderOutcomes:
             "ticker": "NFLX", "action": "buy_pending", "date": "2026-06-24",
             "shares": 3, "price": 72.50, "broker_order_id": "alpaca-nflx-0624",
         }])
-        n = record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "alpaca-nflx-0624",
             "fill_status": "filled", "filled_qty": 3,
             "filled_avg_price": 72.62, "filled_at": "2026-06-24T13:30:00Z",
         }])
-        assert n == 1
+        assert counts["updated"] == 1
         (row,) = _fill_rows(conn, "NFLX")
         assert row[2] == FILL_STATUS_FILLED
         assert row[3] == 3.0 and row[4] == 72.62
         assert row[5] == "2026-06-24T13:30:00Z"
 
-    def test_fallback_match_by_ticker_and_date(self, tmp_path):
-        """Rows recorded before order-id stamping are still reconcilable."""
+    def test_no_ticker_date_guessing_unmatched_is_audited(self, tmp_path):
+        """Codex #190: outcome mutation is keyed by broker order identity
+        ONLY — no ticker+date fallback (two same-ticker attempts in one day
+        would be indistinguishable). Unmatched -> audit entry, row untouched."""
         conn = _conn(tmp_path)
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-06-23",
-            "shares": 2, "price": 86.44,
+            "shares": 2, "price": 86.44,  # legacy row: no order id
         }])
-        n = record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "ticker": "ZM", "trade_date": "2026-06-23",
             "action": "buy_pending", "fill_status": "canceled",
         }])
-        assert n == 1
+        assert counts["unmatched"] == 1 and counts["updated"] == 0
         (row,) = _fill_rows(conn, "ZM")
-        assert row[2] == FILL_STATUS_CANCELED
+        assert row[2] == FILL_STATUS_SUBMITTED  # untouched, never guessed
+        audits = _unmatched_audits(conn)
+        assert len(audits) == 1 and audits[0][0] == "ZM"
+        assert "no_broker_order_id" in audits[0][1]
 
-    def test_fail_soft_paths(self, tmp_path):
+    def test_unknown_order_id_is_audited(self, tmp_path):
+        conn = _conn(tmp_path)
+        _run(conn)
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "never-seen",
+            "fill_status": "canceled",
+        }])
+        assert counts["unmatched"] == 1
+        audits = _unmatched_audits(conn)
+        assert len(audits) == 1 and "no_matching_row" in audits[0][1]
+
+    def test_fail_soft_paths_are_counted_not_raised(self, tmp_path):
         conn = _conn(tmp_path)
         run_id = _run(conn)
         record_trades(conn, run_id, [{
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
-            "shares": 2, "price": 85.68, "broker_order_id": "known-id",
+            "broker_order_id": "known-id",
         }])
         # disabled persistence
-        assert record_order_outcomes(None, [{"broker_order_id": "x",
-                                             "fill_status": "canceled"}]) == 0
-        # unknown order id
-        assert record_order_outcomes(conn, [{"broker_order_id": "unknown",
-                                             "fill_status": "canceled"}]) == 0
-        # no match key / no status / garbage entries — skipped, never raise
-        assert record_order_outcomes(conn, [
-            {"fill_status": "canceled"},
-            {"broker_order_id": "known-id"},
+        counts = record_order_outcomes(None, [{"broker_order_id": "x",
+                                                "fill_status": "canceled"}])
+        assert counts == {"updated": 0, "stale": 0, "unmatched": 0, "skipped": 0}
+        # garbage entries: no status / non-dict -> skipped, never raise
+        counts = record_order_outcomes(conn, [
+            {"broker_order_id": "known-id"},   # no status
             "not-a-dict",
-        ]) == 0
-        # row untouched
+        ])
+        assert counts["skipped"] == 2 and counts["updated"] == 0
         (row,) = _fill_rows(conn, "ZM")
         assert row[2] == FILL_STATUS_SUBMITTED
 
@@ -206,10 +242,10 @@ class TestRecordOrderOutcomes:
                 "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
                 "shares": 2, "price": 85.68, "broker_order_id": "shared-id",
             }])
-        n = record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "shared-id", "fill_status": "canceled",
         }], run_id=r2)
-        assert n == 1
+        assert counts["updated"] == 1
         statuses = [r[2] for r in _fill_rows(conn, "ZM")]
         assert statuses == [FILL_STATUS_SUBMITTED, FILL_STATUS_CANCELED]
 
@@ -220,11 +256,145 @@ class TestRecordOrderOutcomes:
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
             "broker_order_id": "id-1",
         }])
-        assert record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "id-1", "fill_status": "canceled",
-        }]) == 1
+        }])
+        assert counts["updated"] == 1
         (row,) = _fill_rows(conn, "ZM")
         assert row[5]  # fill_updated_at defaulted to now-UTC ISO
+
+
+# ── monotonic transitions (out-of-order / replayed broker events) ─────────────
+
+class TestMonotonicTransitions:
+    def _seed(self, tmp_path, order_id="oid-1"):
+        conn = _conn(tmp_path)
+        run_id = _run(conn)
+        record_trades(conn, run_id, [{
+            "ticker": "NFLX", "action": "buy_pending", "date": "2026-06-24",
+            "shares": 3, "price": 72.50, "broker_order_id": order_id,
+        }])
+        return conn
+
+    def test_late_submitted_never_overwrites_filled(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3, "fill_price": 72.62,
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "accepted",  # late event
+        }])
+        assert counts["stale"] == 1 and counts["updated"] == 0
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_FILLED and row[3] == 3.0
+
+    def test_cancel_never_overwrites_filled(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3, "fill_price": 72.62,
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "canceled",
+        }])
+        assert counts["stale"] == 1
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_FILLED
+
+    def test_partial_then_cancel_retains_executed_qty_and_price(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "filled_qty": 2, "fill_price": 72.60,
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "canceled",
+        }])
+        assert counts["updated"] == 1
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_CANCELED
+        assert row[3] == 2.0 and row[4] == 72.60  # executed facts retained
+
+    def test_filled_qty_never_decreases(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "filled_qty": 2,
+        }])
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "partially_filled",
+            "filled_qty": 1,  # out-of-order smaller partial
+        }])
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[3] == 2.0
+
+    def test_late_fill_after_recorded_cancel_applies_broker_truth(self, tmp_path):
+        conn = self._seed(tmp_path)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "canceled",
+        }])
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3, "fill_price": 72.62,
+        }])
+        assert counts["updated"] == 1
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_FILLED
+
+    def test_replay_is_idempotent(self, tmp_path):
+        conn = self._seed(tmp_path)
+        event = {
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3, "filled_avg_price": 72.62,
+            "filled_at": "2026-06-24T13:30:00Z",
+        }
+        record_order_outcomes(conn, [event])
+        before = _fill_rows(conn, "NFLX")
+        counts = record_order_outcomes(conn, [dict(event)])  # exact replay
+        assert counts["updated"] == 1  # applied, but state identical
+        assert _fill_rows(conn, "NFLX") == before
+
+    def test_concurrent_replay_orderings_converge(self, tmp_path):
+        """Two interleavings of the same event set end in the same state."""
+        events = [
+            {"broker_order_id": "oid-1", "fill_status": "accepted"},
+            {"broker_order_id": "oid-1", "fill_status": "partially_filled",
+             "filled_qty": 2, "fill_price": 72.60},
+            {"broker_order_id": "oid-1", "fill_status": "filled",
+             "filled_qty": 3, "fill_price": 72.62,
+             "fill_updated_at": "2026-06-24T13:30:00Z"},
+        ]
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        conn_a = self._seed(dir_a)
+        record_order_outcomes(conn_a, events)
+        state_a = _fill_rows(conn_a, "NFLX")
+
+        conn_b = self._seed(dir_b)
+        record_order_outcomes(conn_b, list(reversed(events)))
+        state_b = _fill_rows(conn_b, "NFLX")
+
+        # both end filled with qty 3 @ 72.62 regardless of arrival order
+        assert state_a[0][2:5] == state_b[0][2:5] == ("filled", 3.0, 72.62)
+
+    def test_unknown_broker_state_recorded_as_explicit_unknown(self, tmp_path):
+        conn = self._seed(tmp_path)
+        counts = record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "done_for_day",
+        }])
+        assert counts["updated"] == 1
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_UNKNOWN
+        # and a later real outcome still applies (unknown is low-rank)
+        record_order_outcomes(conn, [{
+            "broker_order_id": "oid-1", "fill_status": "filled",
+            "filled_qty": 3,
+        }])
+        (row,) = _fill_rows(conn, "NFLX")
+        assert row[2] == FILL_STATUS_FILLED
 
 
 # ── backward compatibility (additive schema) ──────────────────────────────────
@@ -259,7 +429,7 @@ class TestBackwardCompatibleSchema:
             "SELECT fill_status, filled_qty, broker_order_id FROM trades"
             " WHERE run_id='legacy-run'"
         ).fetchone()
-        assert row == (None, None, None)  # unknown, never assumed filled
+        assert row == (None, None, None)  # never reconciled, never assumed filled
 
     def test_legacy_db_accepts_new_writes_after_migration(self, tmp_path):
         self._legacy_db(tmp_path)
@@ -269,9 +439,10 @@ class TestBackwardCompatibleSchema:
             "ticker": "ZM", "action": "buy_pending", "date": "2026-07-07",
             "broker_order_id": "id-1",
         }])
-        assert record_order_outcomes(conn, [{
+        counts = record_order_outcomes(conn, [{
             "broker_order_id": "id-1", "fill_status": "canceled",
-        }]) == 1
+        }])
+        assert counts["updated"] == 1
 
     def test_ensure_schema_idempotent(self, tmp_path):
         conn = _conn(tmp_path)

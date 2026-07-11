@@ -37,11 +37,35 @@ Population, two halves:
    keys, so the umbrella's `runner_trace` attempt rows get order ids with no
    umbrella change.
 2. **Post-execution** (`record_order_outcomes(conn, outcomes, run_id=None)`,
-   NEW): UPDATE by `broker_order_id` (fallback: explicit
-   `ticker`+`trade_date`[+`action`] for pre-contract rows); normalizes broker
-   vocabulary (`cancelled`→`canceled`, `new`/`accepted`→`submitted`, unknown
-   states kept verbatim lowercased); returns rows updated; fail-soft on
-   disabled persistence / unknown ids / malformed entries.
+   NEW — round 2 post Codex review on #190): outcome mutation is keyed by
+   **broker order identity ONLY** (`broker_order_id`/`order_id`; the
+   ticker+date fallback was dropped — it cannot distinguish multiple
+   same-ticker attempts/cancels in one day). Unmatched outcomes (no order id,
+   or no matching row) become explicit `ORDER_OUTCOME_UNMATCHED` rows in the
+   append-only `reconciliation_actions` audit table + a warning log — never a
+   guessed match. **Monotonic transitions** (rank submitted/unknown=1 <
+   partially_filled=2 < canceled/rejected/expired=3 < filled=4): a
+   lower-ranked out-of-order/late event is counted `stale` and ignored (late
+   `accepted` never overwrites a fill; a cancel never overwrites a full
+   fill); `filled_qty` never decreases; a partial fill followed by a cancel
+   retains the executed qty+price; a late fill after a recorded cancel is
+   broker truth and applies; exact replays are idempotent. Unrecognized
+   broker vocabulary maps to the EXPLICIT `unknown` state (logged) — never
+   interpretable as canceled/unfilled. Returns observable counts
+   `{updated, stale, unmatched, skipped}`; fail-soft throughout (disabled
+   persistence / malformed entries never raise, never silently vanish).
+
+### Review round (Codex #190 CHANGES_REQUESTED — all points taken)
+
+1. ticker+date[+action] fallback removed from mutation; broker_order_id
+   mandatory; legacy unmatched rows stay untouched (`fill_status` NULL =
+   never reconciled) with an `ORDER_OUTCOME_UNMATCHED` audit entry.
+2. Monotonic transition rules + out-of-order tests added (late submitted vs
+   filled; cancel vs filled; partial→cancel qty/price retention; qty
+   never-decrease; late-fill-after-cancel; idempotent replay; two
+   interleavings of the same event set converge to the same state).
+3. Unknown broker vocabulary → explicit `unknown` state (distinct from NULL
+   = pre-contract/never-reconciled); all fail-soft paths counted + logged.
 
 ## Landing note (consumer wiring — umbrella-owned, NOT in this PR)
 
@@ -62,14 +86,15 @@ ships here; the live path wires it with one line per site in
 
 ## Evidence
 
-- `tests/test_fill_truth_persistence.py` (16 tests): the ZM shape (pending →
+- `tests/test_fill_truth_persistence.py` (26 tests): the ZM shape (pending →
   canceled, 0 fills — the DB now answers "was ZM bought?" without the broker
   API); the NFLX fill shape (qty+price+timestamp write-back); write-time
-  `submitted` stamping with order-id lift; fallback matching; run-id scoping;
-  fail-soft paths; legacy-DB migration (today's schema minus the 5 columns →
-  migrates, old rows read NULL); `ensure_schema` idempotence; builder
-  passthrough.
-- Full suite: 1677 passed, 8 skipped.
+  `submitted` stamping with order-id lift; unmatched-outcome auditing (no
+  guessing); the 8 monotonic/out-of-order/replay/convergence cases; unknown-
+  vocabulary state; run-id scoping; fail-soft counted paths; legacy-DB
+  migration (today's schema minus the 5 columns → migrates, old rows read
+  NULL); `ensure_schema` idempotence; builder passthrough.
+- Full suite: 1687 passed, 8 skipped.
 - Backward compatibility: additive columns only; the new
   `idx_trades_broker_order` index is created AFTER column migrations in
   `ensure_schema` so legacy DBs migrate cleanly; no positional-column

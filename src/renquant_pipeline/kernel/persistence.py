@@ -40,9 +40,14 @@ _ECON_REL_TOL = 1e-6
 # ── Fill-truth vocabulary (orchestrator #484 §8 item 8, 2026-07-11) ──────────
 # The canonical order-outcome states. ``submitted`` = an intent that reached
 # the broker but has no confirmed outcome yet (the state every *_pending
-# attempt row starts in); the rest are broker-confirmed terminal/partial
-# outcomes. Pre-contract rows carry NULL (= unknown), never a guessed state.
+# attempt row starts in); ``unknown`` = a broker state this vocabulary does
+# not recognize (Codex #190: it must be an EXPLICIT state that can never be
+# read as canceled or unfilled — the raw value is logged, never guessed
+# into a bucket); the rest are broker-confirmed partial/terminal outcomes.
+# Pre-contract rows carry NULL (= never reconciled), distinct from
+# ``unknown`` (= reconciled to an unrecognized broker state).
 FILL_STATUS_SUBMITTED = "submitted"
+FILL_STATUS_UNKNOWN = "unknown"
 FILL_STATUS_PARTIALLY_FILLED = "partially_filled"
 FILL_STATUS_FILLED = "filled"
 FILL_STATUS_CANCELED = "canceled"
@@ -50,6 +55,7 @@ FILL_STATUS_REJECTED = "rejected"
 FILL_STATUS_EXPIRED = "expired"
 FILL_STATUSES = frozenset({
     FILL_STATUS_SUBMITTED,
+    FILL_STATUS_UNKNOWN,
     FILL_STATUS_PARTIALLY_FILLED,
     FILL_STATUS_FILLED,
     FILL_STATUS_CANCELED,
@@ -58,8 +64,6 @@ FILL_STATUSES = frozenset({
 })
 
 # Broker-vocabulary aliases (Alpaca order lifecycle states) → canonical.
-# Unknown values pass through lowercased — an unexpected broker state must
-# stay visible in the audit trail, not be coerced into a wrong bucket.
 _FILL_STATUS_ALIASES = {
     "new": FILL_STATUS_SUBMITTED,
     "accepted": FILL_STATUS_SUBMITTED,
@@ -74,13 +78,31 @@ _FILL_STATUS_ALIASES = {
     "canceled": FILL_STATUS_CANCELED,
 }
 
+# Monotonic transition ranks (Codex #190: out-of-order broker events must
+# not rewind truth). A LOWER-ranked event arriving after a higher-ranked
+# state is stale and ignored: a late submitted/accepted can never overwrite
+# partially_filled/filled; a cancel/reject can follow a partial fill (the
+# executed quantity/price are retained) but can never overwrite a full fill;
+# a confirmed fill outranks everything (a late fill event after a recorded
+# cancel is broker truth and applies).
+_FILL_STATUS_RANK = {
+    FILL_STATUS_SUBMITTED: 1,
+    FILL_STATUS_UNKNOWN: 1,
+    FILL_STATUS_PARTIALLY_FILLED: 2,
+    FILL_STATUS_CANCELED: 3,
+    FILL_STATUS_REJECTED: 3,
+    FILL_STATUS_EXPIRED: 3,
+    FILL_STATUS_FILLED: 4,
+}
+
 
 def normalize_fill_status(value: Any) -> str | None:
     """Broker/producer status text → canonical fill status (fail-soft).
 
     Canonical values pass through; known broker aliases map; anything else
-    is lowercased and kept verbatim (audit honesty beats a clean enum);
-    empty/None stays None."""
+    maps to the EXPLICIT ``unknown`` state (logged with the raw value —
+    Codex #190: an unrecognized broker state must never be interpretable as
+    canceled or unfilled, and must stay observable); empty/None stays None."""
     if value is None:
         return None
     text = str(value).strip().lower()
@@ -88,7 +110,10 @@ def normalize_fill_status(value: Any) -> str | None:
         return None
     if text in FILL_STATUSES:
         return text
-    return _FILL_STATUS_ALIASES.get(text, text)
+    if text in _FILL_STATUS_ALIASES:
+        return _FILL_STATUS_ALIASES[text]
+    log.warning("fill-truth: unrecognized broker order status %r -> 'unknown'", value)
+    return FILL_STATUS_UNKNOWN
 
 
 # ── Schema ────────────────────────────────────────────────────────────────────
@@ -1570,12 +1595,46 @@ def record_trades(
         )
 
 
+def _record_outcome_unmatched(
+    conn: sqlite3.Connection,
+    outcome: dict,
+    reason: str,
+    run_id: str | None,
+) -> None:
+    """Append an ORDER_OUTCOME_UNMATCHED audit row (never guess a match).
+
+    Codex #190: an outcome that cannot be bound to a row by broker order
+    identity is left as an explicit unreconciled record with an audit entry
+    — silent loss of reconciliation is the failure mode this contract
+    exists to remove. Rows land in the existing append-only
+    ``reconciliation_actions`` audit table."""
+    detail = {
+        "reason": reason,
+        "broker_order_id": outcome.get("broker_order_id") or outcome.get("order_id"),
+        "fill_status": outcome.get("fill_status") or outcome.get("status"),
+        "filled_qty": outcome.get("filled_qty"),
+        "trade_date": outcome.get("trade_date"),
+    }
+    log.warning("fill-truth: order outcome UNMATCHED (%s): %s", reason, detail)
+    conn.execute(
+        """INSERT INTO reconciliation_actions
+              (run_id, run_date, kind, ticker, detail)
+           VALUES (?, ?, 'ORDER_OUTCOME_UNMATCHED', ?, ?)""",
+        (
+            run_id,
+            datetime.date.today().isoformat(),
+            str(outcome.get("ticker") or "?"),
+            json.dumps(detail, sort_keys=True, default=str),
+        ),
+    )
+
+
 def record_order_outcomes(
     conn: sqlite3.Connection | None,
     outcomes: Iterable[dict],
     *,
     run_id: str | None = None,
-) -> int:
+) -> dict[str, int]:
     """Write broker-confirmed order outcomes back onto trades rows.
 
     The post-execution half of the fill-truth contract (orchestrator #484
@@ -1584,70 +1643,106 @@ def record_order_outcomes(
     live runner's broker sync / pre-open cancel gate, where the fill info
     already exists) calls this with one outcome dict per order:
 
-      ``broker_order_id`` — primary match key (preferred), OR
-      ``ticker`` + ``trade_date`` [+ ``action``] — explicit fallback for
-      rows recorded before order-id stamping;
-      ``fill_status`` — required; normalized via :func:`normalize_fill_status`;
-      ``filled_qty`` / ``fill_price`` — optional, kept when omitted;
-      ``fill_updated_at`` — optional ISO timestamp (default: now UTC).
+      ``broker_order_id`` (or ``order_id``) — MANDATORY match key; outcome
+      mutation is keyed by broker order identity ONLY (Codex #190: a
+      ticker+date fallback cannot distinguish multiple same-ticker
+      attempts/cancels in one day — exactly the case this contract must get
+      right). Outcomes without it, or matching no row, are recorded as
+      explicit ``ORDER_OUTCOME_UNMATCHED`` audit entries, never guessed.
+      ``fill_status`` — required; normalized via :func:`normalize_fill_status`
+      (unrecognized vocabulary becomes the explicit ``unknown`` state);
+      ``filled_qty`` / ``fill_price`` — optional; ``fill_updated_at`` —
+      optional ISO timestamp (default: now UTC).
 
-    Returns the number of trades rows updated. Fail-soft: disabled
-    persistence (``conn is None``), an unknown order id, or an outcome with
-    neither match key updates nothing and never raises — the monitor plane
-    must not dark the run it audits.
+    MONOTONIC transitions (out-of-order/replayed broker events cannot rewind
+    truth): a lower-ranked status arriving after a higher-ranked state is
+    counted ``stale`` and ignored (late submitted never overwrites
+    partially_filled/filled; cancel/reject never overwrites filled);
+    ``filled_qty`` never decreases; ``fill_price`` is retained when the
+    event omits it (a partial fill followed by a cancel keeps the executed
+    quantity and price). Replaying the identical event is idempotent.
+
+    Returns ``{"updated": n, "stale": n, "unmatched": n, "skipped": n}``.
+    Fail-soft: disabled persistence returns all-zero counts; nothing here
+    raises on malformed outcomes — but every non-applied outcome is
+    OBSERVABLE (counted, logged, and audited when unmatched).
     """
+    counts = {"updated": 0, "stale": 0, "unmatched": 0, "skipped": 0}
     if conn is None:
-        return 0
-    updated = 0
+        return counts
     for outcome in outcomes:
         if not isinstance(outcome, dict):
+            counts["skipped"] += 1
+            log.warning("fill-truth: non-dict order outcome skipped: %r", outcome)
             continue
-        status = normalize_fill_status(outcome.get("fill_status") or outcome.get("status"))
+        status = normalize_fill_status(
+            outcome.get("fill_status") or outcome.get("status")
+        )
         if status is None:
+            counts["skipped"] += 1
+            log.warning("fill-truth: outcome without a status skipped: %s", outcome)
             continue
-        stamped_at = (
+        broker_order_id = outcome.get("broker_order_id") or outcome.get("order_id")
+        if not broker_order_id:
+            counts["unmatched"] += 1
+            _record_outcome_unmatched(conn, outcome, "no_broker_order_id", run_id)
+            continue
+
+        where = "broker_order_id = ?"
+        params: list[Any] = [str(broker_order_id)]
+        if run_id is not None:
+            where += " AND run_id = ?"
+            params.append(run_id)
+        rows = conn.execute(
+            f"SELECT rowid, fill_status, filled_qty, fill_price FROM trades"
+            f" WHERE {where}",
+            params,
+        ).fetchall()
+        if not rows:
+            counts["unmatched"] += 1
+            _record_outcome_unmatched(conn, outcome, "no_matching_row", run_id)
+            continue
+
+        stamped_at = str(
             outcome.get("fill_updated_at")
             or outcome.get("filled_at")
             or datetime.datetime.now(datetime.timezone.utc).isoformat(
                 timespec="seconds"
             )
         )
-        filled_qty = _none_or_float(outcome.get("filled_qty"))
-        fill_price = _none_or_float(
+        event_qty = _none_or_float(outcome.get("filled_qty"))
+        event_price = _none_or_float(
             outcome.get("fill_price")
             if outcome.get("fill_price") is not None
             else outcome.get("filled_avg_price")
         )
-        set_sql = (
-            "SET fill_status = ?, "
-            "filled_qty = COALESCE(?, filled_qty), "
-            "fill_price = COALESCE(?, fill_price), "
-            "fill_updated_at = ?"
-        )
-        params: list[Any] = [status, filled_qty, fill_price, str(stamped_at)]
-        where: list[str] = []
-        broker_order_id = outcome.get("broker_order_id") or outcome.get("order_id")
-        if broker_order_id:
-            where.append("broker_order_id = ?")
-            params.append(str(broker_order_id))
-        elif outcome.get("ticker") and outcome.get("trade_date"):
-            where.append("ticker = ? AND trade_date = ?")
-            params.extend([str(outcome["ticker"]), str(outcome["trade_date"])])
-            if outcome.get("action"):
-                where.append("action = ?")
-                params.append(str(outcome["action"]))
-        else:
-            continue  # no match key — skip, never guess
-        if run_id is not None:
-            where.append("run_id = ?")
-            params.append(run_id)
-        cur = conn.execute(
-            f"UPDATE trades {set_sql} WHERE {' AND '.join(where)}", params,
-        )
-        updated += max(cur.rowcount, 0)
-    if updated:
-        conn.commit()
-    return updated
+        new_rank = _FILL_STATUS_RANK.get(status, 1)
+        for rowid, cur_status, cur_qty, cur_price in rows:
+            cur_rank = _FILL_STATUS_RANK.get(cur_status, 0)
+            if new_rank < cur_rank:
+                counts["stale"] += 1
+                log.info(
+                    "fill-truth: stale event %r ignored for order %s "
+                    "(row already %r)",
+                    status, broker_order_id, cur_status,
+                )
+                continue
+            # filled_qty never decreases; price retained when event omits it.
+            if event_qty is None:
+                new_qty = cur_qty
+            elif cur_qty is None:
+                new_qty = event_qty
+            else:
+                new_qty = max(cur_qty, event_qty)
+            new_price = event_price if event_price is not None else cur_price
+            conn.execute(
+                "UPDATE trades SET fill_status = ?, filled_qty = ?, "
+                "fill_price = ?, fill_updated_at = ? WHERE rowid = ?",
+                (status, new_qty, new_price, stamped_at, rowid),
+            )
+            counts["updated"] += 1
+    conn.commit()
+    return counts
 
 
 def _field(obj: Any, *names: str) -> Any:
@@ -2604,6 +2699,7 @@ __all__ = [
     "normalize_fill_status",
     "FILL_STATUSES",
     "FILL_STATUS_SUBMITTED",
+    "FILL_STATUS_UNKNOWN",
     "FILL_STATUS_PARTIALLY_FILLED",
     "FILL_STATUS_FILLED",
     "FILL_STATUS_CANCELED",
