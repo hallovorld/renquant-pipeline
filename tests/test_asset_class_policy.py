@@ -117,37 +117,67 @@ class TestP1FreshnessCalendar:
         assert last_completed_always_open_session(self.REF) == SAT
         assert last_completed_always_open_session(SUN) == SAT
 
-    def test_utc_contract_near_midnight_boundary(self):
-        """UTC-contract pins (Codex review of renquant-common #27): the
-        pipeline-side UTC-day math — BOTH the local fallback and the common
-        consume path — must (a) treat NAIVE instants as UTC, never local/ET,
-        and (b) normalize AWARE instants to UTC before date extraction."""
-        from renquant_pipeline.kernel.asset_class import _utc_date_of
+    def test_delegates_to_shared_calendar_around_utc_midnight(self):
+        """Integration pin (Codex re-review of #183): the pipeline result
+        EQUALS the canonical shared-calendar primitive for naive-UTC and
+        aware-offset instants around UTC midnight — there is no local
+        re-implementation that could fork from it."""
+        from renquant_common import market_calendar as mc
 
-        # (b) Aware instant straddling UTC midnight: 2026-06-28T20:30-04:00
-        # == 2026-06-29 00:30 UTC → UTC date is the 29th (wall date 28th),
-        # so the last completed always-open session is the 28th.
-        straddle = pd.Timestamp("2026-06-28T20:30:00-04:00")
-        assert _utc_date_of(straddle) == dt.date(2026, 6, 29)
-        assert last_completed_always_open_session(straddle) == SUN
-        aware = dt.datetime(
-            2026, 6, 28, 20, 30,
-            tzinfo=dt.timezone(dt.timedelta(hours=-4)),
-        )
-        assert _utc_date_of(aware) == dt.date(2026, 6, 29)
-        assert last_completed_always_open_session(aware) == SUN
-
-        # (a) Naive instants near UTC midnight are UTC, not ET: a naive
-        # 23:00 on the 28th stays on the 28th (ET reading would spill into
-        # the 29th UTC day and wrongly report the 28th as completed).
-        for hh in (20, 21, 22, 23):
-            naive = dt.datetime(2026, 6, 28, hh, 59)
-            assert _utc_date_of(naive) == SUN, hh
-            assert last_completed_always_open_session(naive) == SAT, hh
-        # Naive pandas Timestamp too (the DataFreshness ref-ts shape).
+        probes = [
+            # Aware straddle: 2026-06-28T20:30-04:00 == 00:30 UTC June 29.
+            pd.Timestamp("2026-06-28T20:30:00-04:00"),
+            dt.datetime(2026, 6, 28, 20, 30,
+                        tzinfo=dt.timezone(dt.timedelta(hours=-4))),
+            # Aware UTC just after midnight.
+            pd.Timestamp("2026-06-29 00:00:01", tz="UTC"),
+            # Naive instants near UTC midnight (naive == UTC by convention).
+            dt.datetime(2026, 6, 28, 20, 59),
+            dt.datetime(2026, 6, 28, 21, 59),
+            dt.datetime(2026, 6, 28, 22, 59),
+            dt.datetime(2026, 6, 28, 23, 59),
+            pd.Timestamp("2026-06-28 23:59:00"),
+            SUN,
+        ]
+        for ref in probes:
+            assert last_completed_always_open_session(ref) == \
+                mc.last_completed_session(ref, calendar_name="ALWAYS_OPEN"), ref
+        # Spot-check absolute values so the equality above cannot be
+        # trivially satisfied by a shared wrong answer.
         assert last_completed_always_open_session(
-            pd.Timestamp("2026-06-28 23:59:00")
-        ) == SAT
+            pd.Timestamp("2026-06-28T20:30:00-04:00")
+        ) == SUN  # 00:30 UTC June 29 → June 28 completed
+        assert last_completed_always_open_session(
+            dt.datetime(2026, 6, 28, 23, 59)
+        ) == SAT  # naive == UTC: still June 28 → June 27 completed
+
+    def test_fails_closed_when_common_lacks_always_open_mode(self, monkeypatch):
+        """No-local-fork pin (Codex re-review of #183): with the common
+        capability masked (a pre-0.11.0 renquant-common), the crypto
+        calendar path raises a clear error instead of degrading onto a
+        forked local clock — and the freshness gate consuming it fails
+        closed too. Merge order: common #27 first, then this PR."""
+        from renquant_common import market_calendar as mc
+        from renquant_pipeline.kernel.pipeline.task_data_freshness import (
+            DataFreshnessGateTask,
+        )
+
+        # raising=False: on a genuinely old common the attribute is absent —
+        # setting it to None models the same missing capability either way.
+        monkeypatch.setattr(mc, "ALWAYS_OPEN_CALENDAR_NAME", None, raising=False)
+        with pytest.raises(RuntimeError, match="renquant-common >= 0.11.0"):
+            last_completed_always_open_session(self.REF)
+        # The consuming gate propagates the fail-closed error (no silent
+        # tolerance-path degradation) even with FRESH data present.
+        cfg = {
+            "asset_class": "crypto",
+            "data_freshness": {"require_expected_symbols": False},
+        }
+        with pytest.raises(RuntimeError, match="ALWAYS_OPEN"):
+            DataFreshnessGateTask().run(self._gate_ctx(cfg, SAT))
+        # Equity path is untouched by the mask.
+        eq_cfg = {"data_freshness": {"require_expected_symbols": False}}
+        assert DataFreshnessGateTask().run(self._gate_ctx(eq_cfg, FRI)) is True
 
     def test_local_store_crypto_requires_saturday_bar_on_sunday(self, tmp_path):
         from renquant_pipeline.kernel.data import LocalStore

@@ -24,9 +24,13 @@ versa.
 Calendar note (P1): the canonical always-open session calendar lives in
 ``renquant_common.market_calendar`` (``ALWAYS_OPEN`` mode — common owns
 calendars, crypto RFC gap M2). :func:`last_completed_always_open_session`
-consumes it when the installed renquant-common ships the mode and otherwise
-degrades to the identical local UTC-day arithmetic, keeping the self-contained
-kernel modules importable without common (their long-standing constraint).
+delegates to that primitive UNCONDITIONALLY and **fails closed** with a
+clear error when the installed renquant-common predates the mode
+(< 0.11.0, common PR #27). There is deliberately NO local
+re-implementation — a pipeline-side fallback would fork the shared
+calendar, the exact hazard the canonical module exists to prevent (Codex
+re-review of pipeline #183). Merge order: common #27 first, then this
+repo's crypto policy.
 """
 from __future__ import annotations
 
@@ -138,6 +142,36 @@ def sigma_clip_bounds_for(asset_class: str) -> tuple[float, float]:
 
 # ── P1/P2 calendar arithmetic (always-open mode) ────────────────────────────
 
+def _require_always_open_calendar() -> Any:
+    """The canonical shared calendar module, or a fail-closed error.
+
+    Common owns calendars (crypto RFC gap M2). NO local re-implementation
+    exists here by design — a pipeline-side fallback would fork the shared
+    ALWAYS_OPEN primitive, the exact hazard the canonical module exists to
+    prevent (Codex re-review of pipeline #183). If the installed
+    renquant-common predates the mode, crypto decisions must STOP with a
+    clear error, not silently degrade onto a divergent local clock.
+    """
+    try:
+        from renquant_common import market_calendar as _mc  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - common is a hard dep
+        raise RuntimeError(
+            "renquant_common.market_calendar is unavailable — the crypto "
+            "asset-class policy requires the canonical shared calendar "
+            "(fail-closed; renquant-common is a declared dependency of "
+            "renquant-pipeline)."
+        ) from exc
+    if not getattr(_mc, "ALWAYS_OPEN_CALENDAR_NAME", None):
+        raise RuntimeError(
+            "renquant_common.market_calendar has no ALWAYS_OPEN mode — the "
+            "crypto asset-class policy requires renquant-common >= 0.11.0 "
+            "(common PR #27; merge order: common #27 first, then pipeline "
+            "#183). Refusing to fork the shared calendar with a local "
+            "fallback (fail-closed)."
+        )
+    return _mc
+
+
 def last_completed_always_open_session(ref: Any) -> datetime.date:
     """Last COMPLETED UTC calendar-day session as of ``ref`` (P1, crypto).
 
@@ -146,39 +180,17 @@ def last_completed_always_open_session(ref: Any) -> datetime.date:
     completed session is ``X - 1`` (at exactly midnight the just-ended day
     counts, mirroring the NYSE ``now >= close`` rule).
 
-    Prefers the canonical ``renquant_common.market_calendar`` ALWAYS_OPEN
-    mode when the installed common ships it (>= 0.11.0); otherwise computes
-    the identical result locally so kernel modules stay importable without
-    common. ``ref`` may be an aware/naive datetime-like or a date; naive
-    values are interpreted as UTC (the always-open convention).
+    Delegates UNCONDITIONALLY to the canonical
+    ``renquant_common.market_calendar`` ALWAYS_OPEN primitive (>= 0.11.0)
+    and fails closed when it is absent — see
+    :func:`_require_always_open_calendar`. ``ref`` may be an aware/naive
+    datetime-like or a date; naive values are interpreted as UTC (the
+    always-open convention, enforced by the shared primitive).
     """
-    try:
-        from renquant_common import market_calendar as _mc  # noqa: PLC0415
-    except ImportError:
-        _mc = None
-    if _mc is not None and getattr(_mc, "ALWAYS_OPEN_CALENDAR_NAME", None):
-        return _mc.last_completed_session(
-            ref, calendar_name=_mc.ALWAYS_OPEN_CALENDAR_NAME
-        )
-    return _utc_date_of(ref) - datetime.timedelta(days=1)
-
-
-def _utc_date_of(ref: Any) -> datetime.date:
-    """UTC calendar date of ``ref`` (naive ⇒ already UTC by convention)."""
-    if ref is None:
-        return datetime.datetime.now(datetime.timezone.utc).date()
-    tzinfo = getattr(ref, "tzinfo", None)
-    astimezone = getattr(ref, "astimezone", None)
-    if tzinfo is not None and callable(astimezone):
-        return astimezone(datetime.timezone.utc).date()
-    if isinstance(ref, datetime.datetime):
-        return ref.date()
-    if isinstance(ref, datetime.date):
-        return ref
-    date_fn = getattr(ref, "date", None)  # tz-naive pandas Timestamp
-    if callable(date_fn):
-        return date_fn()
-    raise TypeError(f"cannot interpret {ref!r} as a date/datetime")
+    _mc = _require_always_open_calendar()
+    return _mc.last_completed_session(
+        ref, calendar_name=_mc.ALWAYS_OPEN_CALENDAR_NAME
+    )
 
 
 __all__ = [

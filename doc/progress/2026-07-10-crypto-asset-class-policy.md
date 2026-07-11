@@ -29,10 +29,14 @@ New single source of truth: `kernel/asset_class.py`
   (`kernel/data.py`), `DataFreshnessGateTask`
   (`kernel/pipeline/task_data_freshness.py`), `TypedDataFreshnessGate`
   (`kernel/typed_past/typed_data_freshness.py`). The canonical ALWAYS_OPEN
-  calendar lives in renquant-common (companion PR, common owns calendars —
-  RFC M2); the pipeline soft-consumes it when installed common ≥ 0.11.0 and
-  otherwise computes the identical UTC-day arithmetic locally, so this PR
-  does not hard-depend on the common PR's merge order.
+  calendar lives in renquant-common (companion PR #27, common owns calendars
+  — RFC M2); the pipeline delegates to it UNCONDITIONALLY and **fails
+  closed** with a clear error when the installed common predates the mode
+  (< 0.11.0). There is deliberately NO local re-implementation — a
+  pipeline-side fallback would fork the shared calendar, the exact hazard
+  the canonical module exists to prevent (Codex re-review). Structural
+  dependency bumped to `renquant-common>=0.11.0`; **merge order: common #27
+  FIRST, then this PR.**
 - **P2 (hold/streak clocks)**: `kernel/exits.py` gains asset-class-aware
   `is_trading_day` / `trading_days_between` (crypto: every day trades,
   clocks count calendar days); `check_model_sell` / `compute_exits` take
@@ -92,12 +96,18 @@ legacy behavior exactly). Full suite: 1532 passed / 8 skipped / 1
 pre-existing environment failure (`test_xgboost_scorer_contract.py::
 test_panel_scoring_loads_real_xgboost_artifact_without_explicit_scores`
 fails identically on clean origin/main in this environment — xgboost
-artifact/env issue, unrelated). New tests verified BOTH against common
-main (fallback path) and against the companion common branch (ALWAYS_OPEN
-consume path).
+artifact/env issue, unrelated). Suite verified against the companion
+common #27 branch state (which this PR structurally requires); the
+fail-closed path is tested with the common capability explicitly masked
+(`test_fails_closed_when_common_lacks_always_open_mode`), and an
+integration test pins pipeline == shared-calendar for naive-UTC and
+aware-offset instants around UTC midnight
+(`test_delegates_to_shared_calendar_around_utc_midnight`).
 
 ## Cross-repo
 
 Companion PR in renquant-common: `feat(calendar): ALWAYS_OPEN session mode
-for 24/7 asset classes` (0.10.0 → 0.11.0) — canonical calendar mode; this
-PR degrades gracefully without it (no pin bump required).
+for 24/7 asset classes` (#27, 0.10.0 → 0.11.0) — the canonical calendar
+mode this PR consumes unconditionally (fail-closed below 0.11.0; dependency
+pin bumped). **MERGE ORDER: common #27 first, then this PR** — until then
+the crypto P1 tests fail closed by design against a pre-#27 common.

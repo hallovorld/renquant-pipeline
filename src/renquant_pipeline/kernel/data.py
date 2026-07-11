@@ -1,8 +1,9 @@
 """OHLCV data fetching with local Parquet cache.
 
-Self-contained — no hard common/ imports (kernel.asset_class soft-consumes
-renquant_common's canonical ALWAYS_OPEN calendar mode when present and
-degrades to identical local UTC-day arithmetic otherwise).
+Self-contained for the equity path — no common/ imports. The crypto
+freshness branch (asset_class="crypto") delegates to renquant_common's
+canonical ALWAYS_OPEN calendar via kernel.asset_class and FAILS CLOSED when
+the installed common predates the mode (< 0.11.0) — no local calendar fork.
 """
 from __future__ import annotations
 
@@ -41,18 +42,19 @@ def _last_completed_session(ref_ts: pd.Timestamp, asset_class: str):
     ``renquant_common.market_calendar``), so weekend bars are REQUIRED and
     the freshness clock is the last completed UTC day, not the last NYSE
     close. Equity keeps the NYSE session clock byte-identically.
+
+    The crypto branch delegates to the shared calendar and FAILS CLOSED
+    (raises) when the installed renquant-common lacks the ALWAYS_OPEN mode
+    (< 0.11.0, common PR #27) — it must NOT degrade to the equity branch's
+    ``None``/tolerance path, which would silently loosen a crypto freshness
+    gate onto a forked local clock (Codex re-review of pipeline #183).
     """
     from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
         is_crypto,
         last_completed_always_open_session,
     )
     if is_crypto(asset_class):
-        try:
-            return last_completed_always_open_session(ref_ts)
-        except Exception:
-            # Mirror the equity branch's degraded-path contract (None ⇒
-            # caller applies its conservative fallback).
-            return None
+        return last_completed_always_open_session(ref_ts)
     return _last_completed_nyse_session(ref_ts)
 
 
