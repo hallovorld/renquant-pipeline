@@ -149,6 +149,15 @@ def build_buy_trade_event(
         "qp_delta_w": _decision_field(inputs, "delta_w"),
         "qp_target_w": _decision_field(inputs, "target_w"),
         "qp_status": _decision_field(inputs, "solver_status"),
+        # Fill-truth contract (orchestrator #484 §8 item 8): carry the broker
+        # order identity + any already-known fill facts through to the DB
+        # writer so intents and fills are distinguishable without the broker
+        # API. All optional — absent keys persist as NULL (unknown).
+        "broker_order_id": order.get("broker_order_id") or order.get("order_id"),
+        "fill_status": order.get("fill_status"),
+        "filled_qty": order.get("filled_qty"),
+        "fill_price": order.get("fill_price") or order.get("filled_avg_price"),
+        "fill_updated_at": order.get("fill_updated_at") or order.get("filled_at"),
     }
 
 
@@ -407,6 +416,17 @@ def build_sell_trade_event(
         "qp_delta_w": sig_inputs.get("delta_w"),
         "qp_target_w": sig_inputs.get("target_w"),
         "qp_status": sig_inputs.get("solver_status"),
+        # Fill-truth contract (orchestrator #484 §8 item 8): optional
+        # passthrough; absent values persist as NULL (unknown).
+        "broker_order_id": (
+            getattr(sig, "broker_order_id", None)
+            or getattr(sig, "order_id", None)
+            or sig_inputs.get("order_id")
+        ),
+        "fill_status": getattr(sig, "fill_status", None),
+        "filled_qty": getattr(sig, "filled_qty", None),
+        "fill_price": getattr(sig, "fill_price", None),
+        "fill_updated_at": getattr(sig, "fill_updated_at", None),
         "score_snapshot": {
             "rank_score": getattr(holding, "rank_score", None),
             "panel_score": getattr(holding, "panel_score", None),

@@ -37,6 +37,60 @@ _ECON_ABS_TOL = 1e-6
 _ECON_REL_TOL = 1e-6
 
 
+# ── Fill-truth vocabulary (orchestrator #484 §8 item 8, 2026-07-11) ──────────
+# The canonical order-outcome states. ``submitted`` = an intent that reached
+# the broker but has no confirmed outcome yet (the state every *_pending
+# attempt row starts in); the rest are broker-confirmed terminal/partial
+# outcomes. Pre-contract rows carry NULL (= unknown), never a guessed state.
+FILL_STATUS_SUBMITTED = "submitted"
+FILL_STATUS_PARTIALLY_FILLED = "partially_filled"
+FILL_STATUS_FILLED = "filled"
+FILL_STATUS_CANCELED = "canceled"
+FILL_STATUS_REJECTED = "rejected"
+FILL_STATUS_EXPIRED = "expired"
+FILL_STATUSES = frozenset({
+    FILL_STATUS_SUBMITTED,
+    FILL_STATUS_PARTIALLY_FILLED,
+    FILL_STATUS_FILLED,
+    FILL_STATUS_CANCELED,
+    FILL_STATUS_REJECTED,
+    FILL_STATUS_EXPIRED,
+})
+
+# Broker-vocabulary aliases (Alpaca order lifecycle states) → canonical.
+# Unknown values pass through lowercased — an unexpected broker state must
+# stay visible in the audit trail, not be coerced into a wrong bucket.
+_FILL_STATUS_ALIASES = {
+    "new": FILL_STATUS_SUBMITTED,
+    "accepted": FILL_STATUS_SUBMITTED,
+    "pending_new": FILL_STATUS_SUBMITTED,
+    "accepted_for_bidding": FILL_STATUS_SUBMITTED,
+    "held": FILL_STATUS_SUBMITTED,
+    "partial_fill": FILL_STATUS_PARTIALLY_FILLED,
+    "partially_filled": FILL_STATUS_PARTIALLY_FILLED,
+    "fill": FILL_STATUS_FILLED,
+    "cancelled": FILL_STATUS_CANCELED,
+    "pending_cancel": FILL_STATUS_CANCELED,
+    "canceled": FILL_STATUS_CANCELED,
+}
+
+
+def normalize_fill_status(value: Any) -> str | None:
+    """Broker/producer status text → canonical fill status (fail-soft).
+
+    Canonical values pass through; known broker aliases map; anything else
+    is lowercased and kept verbatim (audit honesty beats a clean enum);
+    empty/None stays None."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in FILL_STATUSES:
+        return text
+    return _FILL_STATUS_ALIASES.get(text, text)
+
+
 # ── Schema ────────────────────────────────────────────────────────────────────
 
 _SCHEMA_SQL = """
@@ -145,6 +199,19 @@ CREATE TABLE IF NOT EXISTS trades (
     attribution_version TEXT,
     score_snapshot_json  TEXT,
     decision_inputs_json TEXT,
+    -- Fill-truth contract (orchestrator #484 §7.3 / §8 item 8, 2026-07-11).
+    -- The trades table records ORDER INTENTS (buy_pending / sell_pending
+    -- attempt rows) alongside executed rows, but pre-contract NOTHING
+    -- distinguished a canceled intent from a broker fill: the #484 forensics
+    -- found 5 ZM "buy_pending" rows and 0 broker fills — every DB consumer
+    -- systematically overcounted buys and basic facts required the broker
+    -- API. Additive columns; pre-contract rows read back with NULLs
+    -- (= outcome unknown, not "filled").
+    broker_order_id TEXT,        -- broker-assigned order id (Alpaca uuid)
+    fill_status     TEXT,        -- submitted|partially_filled|filled|canceled|rejected|expired
+    filled_qty      REAL,        -- broker-confirmed filled quantity
+    fill_price      REAL,        -- broker-confirmed average fill price
+    fill_updated_at TEXT,        -- ISO-8601 UTC of the last outcome update
     FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
@@ -663,6 +730,14 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
         ("qp_status",             "TEXT"),
         ("regime",                "TEXT"),
         ("confidence",            "REAL"),
+        # Fill-truth contract (orchestrator #484 §8 item 8, 2026-07-11):
+        # additive — pre-existing DBs gain the columns; old rows stay
+        # readable with NULLs (= outcome unknown, never assumed filled).
+        ("broker_order_id",       "TEXT"),
+        ("fill_status",           "TEXT"),
+        ("filled_qty",            "REAL"),
+        ("fill_price",            "REAL"),
+        ("fill_updated_at",       "TEXT"),
     ],
     "ticker_forward_returns": [
         ("fwd_60d",               "REAL"),
@@ -952,6 +1027,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     # list; re-apply (idempotent) so later-added columns exist again.
     _apply_column_migrations(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date)")
+    # After _apply_column_migrations — a legacy trades table only gains
+    # broker_order_id via the migration, so the index must come second.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_broker_order "
+        "ON trades(broker_order_id)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_run ON ticker_daily_state(run_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_run ON score_distribution(run_id)")
     conn.commit()
@@ -1327,6 +1408,15 @@ def record_trades(
       blocked_by, qp_delta_w, qp_target_w, qp_status, regime, confidence,
       order_type/source/source_job/source_task/
       order_source/attribution_version, score_snapshot, decision_inputs.
+
+    Fill-truth fields (orchestrator #484 §8 item 8): ``broker_order_id``
+    (fallbacks: event ``order_id``, then ``decision_inputs.order_id`` — the
+    key live attempt rows already carry), ``fill_status`` (normalized via
+    :func:`normalize_fill_status`; when absent, ``*_pending`` actions are
+    stamped ``submitted`` because that is what a pending attempt row IS),
+    ``filled_qty``, ``fill_price`` (fallback ``filled_avg_price``), and
+    ``fill_updated_at`` (fallback ``filled_at``). Confirmed outcomes are
+    written post-execution via :func:`record_order_outcomes`.
     """
     if conn is None or run_id is None:
         return
@@ -1384,6 +1474,23 @@ def record_trades(
             return fallback
         return None
 
+    def _broker_order_id(t: dict) -> str | None:
+        value = t.get("broker_order_id") or t.get("order_id")
+        if not value:
+            inputs = t.get("decision_inputs")
+            if isinstance(inputs, dict):
+                value = inputs.get("order_id")
+        return str(value) if value else None
+
+    def _fill_status(t: dict) -> str | None:
+        explicit = normalize_fill_status(t.get("fill_status"))
+        if explicit is not None:
+            return explicit
+        action = str(t.get("action") or "")
+        if action.endswith("_pending"):
+            return FILL_STATUS_SUBMITTED
+        return None
+
     rows = []
     for t in trade_events:
         rows.append((
@@ -1434,6 +1541,11 @@ def record_trades(
             t.get("attribution_version"),
             _json_or_none(_score_snapshot_or_none(t)),
             _json_or_none(_decision_inputs_or_none(t)),
+            _broker_order_id(t),
+            _fill_status(t),
+            _none_or_float(t.get("filled_qty")),
+            _none_or_float(t.get("fill_price") or t.get("filled_avg_price")),
+            t.get("fill_updated_at") or t.get("filled_at"),
         ))
     if rows:
         conn.executemany(
@@ -1450,10 +1562,92 @@ def record_trades(
                    qp_delta_w, qp_target_w, qp_status,
                    regime, confidence,
                    order_type, source, source_job, source_task, order_source,
-                   attribution_version, score_snapshot_json, decision_inputs_json)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   attribution_version, score_snapshot_json, decision_inputs_json,
+                   broker_order_id, fill_status, filled_qty, fill_price,
+                   fill_updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
+
+
+def record_order_outcomes(
+    conn: sqlite3.Connection | None,
+    outcomes: Iterable[dict],
+    *,
+    run_id: str | None = None,
+) -> int:
+    """Write broker-confirmed order outcomes back onto trades rows.
+
+    The post-execution half of the fill-truth contract (orchestrator #484
+    §8 item 8): attempt rows are recorded at submission time with
+    ``fill_status='submitted'``; whoever observes the broker outcome (the
+    live runner's broker sync / pre-open cancel gate, where the fill info
+    already exists) calls this with one outcome dict per order:
+
+      ``broker_order_id`` — primary match key (preferred), OR
+      ``ticker`` + ``trade_date`` [+ ``action``] — explicit fallback for
+      rows recorded before order-id stamping;
+      ``fill_status`` — required; normalized via :func:`normalize_fill_status`;
+      ``filled_qty`` / ``fill_price`` — optional, kept when omitted;
+      ``fill_updated_at`` — optional ISO timestamp (default: now UTC).
+
+    Returns the number of trades rows updated. Fail-soft: disabled
+    persistence (``conn is None``), an unknown order id, or an outcome with
+    neither match key updates nothing and never raises — the monitor plane
+    must not dark the run it audits.
+    """
+    if conn is None:
+        return 0
+    updated = 0
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            continue
+        status = normalize_fill_status(outcome.get("fill_status") or outcome.get("status"))
+        if status is None:
+            continue
+        stamped_at = (
+            outcome.get("fill_updated_at")
+            or outcome.get("filled_at")
+            or datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        )
+        filled_qty = _none_or_float(outcome.get("filled_qty"))
+        fill_price = _none_or_float(
+            outcome.get("fill_price")
+            if outcome.get("fill_price") is not None
+            else outcome.get("filled_avg_price")
+        )
+        set_sql = (
+            "SET fill_status = ?, "
+            "filled_qty = COALESCE(?, filled_qty), "
+            "fill_price = COALESCE(?, fill_price), "
+            "fill_updated_at = ?"
+        )
+        params: list[Any] = [status, filled_qty, fill_price, str(stamped_at)]
+        where: list[str] = []
+        broker_order_id = outcome.get("broker_order_id") or outcome.get("order_id")
+        if broker_order_id:
+            where.append("broker_order_id = ?")
+            params.append(str(broker_order_id))
+        elif outcome.get("ticker") and outcome.get("trade_date"):
+            where.append("ticker = ? AND trade_date = ?")
+            params.extend([str(outcome["ticker"]), str(outcome["trade_date"])])
+            if outcome.get("action"):
+                where.append("action = ?")
+                params.append(str(outcome["action"]))
+        else:
+            continue  # no match key — skip, never guess
+        if run_id is not None:
+            where.append("run_id = ?")
+            params.append(run_id)
+        cur = conn.execute(
+            f"UPDATE trades {set_sql} WHERE {' AND '.join(where)}", params,
+        )
+        updated += max(cur.rowcount, 0)
+    if updated:
+        conn.commit()
+    return updated
 
 
 def _field(obj: Any, *names: str) -> Any:
@@ -2406,6 +2600,15 @@ __all__ = [
     "record_pipeline_run",
     "record_candidate_scores",
     "record_trades",
+    "record_order_outcomes",
+    "normalize_fill_status",
+    "FILL_STATUSES",
+    "FILL_STATUS_SUBMITTED",
+    "FILL_STATUS_PARTIALLY_FILLED",
+    "FILL_STATUS_FILLED",
+    "FILL_STATUS_CANCELED",
+    "FILL_STATUS_REJECTED",
+    "FILL_STATUS_EXPIRED",
     "record_training_run",
     "record_forward_returns",
     "record_live_state_snapshot",
