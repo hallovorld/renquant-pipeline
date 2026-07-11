@@ -5,7 +5,9 @@
 — the run-record contract the umbrella runner writes through)
 **Status:** contract + write-time stamping + emit-ready outcome writer merged-
 pending-review (round 3: canonical account+order identity + DB-level atomicity
-landed); live-path outcome wiring is a one-line umbrella landing (below)
+landed). This is an **INACTIVE, pipeline-owned persistence contract**:
+activation is a separate renquant-execution integration (ownership/cutover
+contract below); **no umbrella runtime landing** (round 4 correction)
 
 ## Why
 
@@ -40,9 +42,10 @@ Population, two halves:
    `build_sell_trade_event`) forward the order-id keys today; **follow-up
    needed**: neither builder emits `broker_account_id` yet (no upstream
    broker-account concept exists in this single-account system), so a future
-   broker-sync caller supplying a real account id will get `no_matching_row`
-   against rows written before that plumbing lands — tracked as a landing
-   prerequisite, not implemented here (broker-adapter/execution territory).
+   caller supplying a real account id will get `no_matching_row` against rows
+   written before that plumbing lands. That plumbing is prerequisite (a) of
+   the renquant-execution integration named in the ownership/cutover contract
+   below — execution-owned, intentionally NOT implemented here.
 2. **Post-execution** (`record_order_outcomes(conn, outcomes, run_id=None)`):
    outcome mutation is keyed by the **canonical identity
    `(broker_account_id, broker_order_id)`** (round 3 — round 2 had made
@@ -168,26 +171,54 @@ whenever a caller supplies it, but no upstream builder currently does (see
 the "follow-up needed" note above) — a documented gap, not silently
 papered over.
 
-## Landing note (consumer wiring — umbrella-owned, NOT in this PR)
+## Ownership / cutover contract (activation — NOT in this PR)
 
-Per the R-PIN/audit doctrine (no new umbrella ownership) the emit-ready seam
-ships here; the live path wires it with one line per site in
-`RenQuant/backtesting/renquant_104/adapters/runner.py` after sync:
+Round 4 correction (Codex review): earlier drafts of this section proposed
+one-line wiring in `RenQuant/backtesting/renquant_104/adapters/runner.py` and
+called it an "umbrella landing" — **withdrawn**. The umbrella is not an
+accepted production target; **no new umbrella runtime landing is permitted**
+(R-PIN/audit doctrine).
 
-- **Fills** — where broker execution results are reconciled (post
-  `broker_order_execution` / morning broker sync):
-  `record_order_outcomes(self._db, [{"broker_account_id": o.account_id, "broker_order_id": o.id, "fill_status": o.status, "filled_qty": o.filled_qty, "filled_avg_price": o.filled_avg_price, "filled_at": o.filled_at} for o in synced_orders])`
-  — note round 3 makes `broker_account_id` mandatory; the umbrella landing
-  must also start emitting it from `build_buy_trade_event`/intent recording,
-  or matching will find `no_matching_row` against rows written before that
-  lands (see the write-time follow-up note above).
-- **Pre-open cancels** — the runner already reads
-  `logs/alerts/preopen_cancel_ledger.jsonl` (`_preopen_cancel_symbols`,
-  runner.py:90-108); the ledger rows carry `order_id`:
-  `record_order_outcomes(self._db, [{"broker_account_id": r["account_id"], "broker_order_id": r["order_id"], "fill_status": "canceled"} for r in ledger_rows_today])`
-- Optional wording fix from #484 §8 item 8: ntfy buy notices should read
-  "submitted (fills at next open pending pre-open re-check)" — owned by the
-  notification producer, not this contract.
+The standing contract:
+
+- **This PR is, and remains, a pipeline-owned, INACTIVE persistence
+  contract.** It ships the schema, the write-time stamping, and the
+  emit-ready `record_order_outcomes()` API; nothing in production calls the
+  outcome writer until the execution-owned integration below lands.
+- **Activation prerequisite — a separate renquant-execution integration**
+  (repo: `renquant-execution`, the broker execution and order-audit plane),
+  with two parts:
+  - **(a) intent-time identity emission:** the execution-owned order plane
+    emits `broker_account_id` — sourced from
+    `renquant_execution.broker.BaseBroker.get_account_id()` (implemented by
+    `AlpacaBroker.get_account_id()`, Alpaca `account_number`) — alongside
+    `broker_order_id` on every order intent it reports, so intent rows carry
+    the full canonical identity `(broker_account_id, broker_order_id)` at
+    write time. The natural emission point is the order-lifecycle event API
+    (`renquant_execution.order_lifecycle.build_order_lifecycle_event` /
+    `lifecycle_event_from_confirmation`).
+  - **(b) canonical outcome submission after broker reconciliation:** the
+    same renquant-execution integration submits outcome dicts (status / qty /
+    price / broker event timestamp, keyed by the canonical identity) to
+    `record_order_outcomes()` after its broker reconciliation pass — the
+    plane that already owns the order lifecycle, the order state machine,
+    and the pre-open cancel ledger.
+- **Rows without account identity intentionally remain unreconciled.** A row
+  written before prerequisite (a) lands (no `broker_account_id`) can never be
+  matched by an outcome; any attempted outcome against it is recorded as an
+  explicit `ORDER_OUTCOME_UNMATCHED` audit entry and the row keeps
+  `fill_status` NULL/`submitted`. This is the fail-closed design, not a
+  defect: a row that cannot be bound to a canonical broker identity is never
+  guessed into an outcome.
+- **Orchestrator may consume the resulting run facts** (read-only runs-DB
+  queries for monitors/forensics, e.g. the #485 model-identity/outage
+  monitor plane) — it does not write them.
+- **No broker adapter code ships in this pipeline PR** (and none did): the
+  boundary between the persistence contract (here) and the broker/order
+  plane (renquant-execution) stays intact.
+- Non-blocking, notification-producer-owned: the #484 §8 item 8 ntfy wording
+  fix ("submitted (fills at next open pending pre-open re-check)") belongs
+  to whoever owns the notices, not to this contract.
 
 ## Evidence
 
@@ -224,6 +255,7 @@ ships here; the live path wires it with one line per site in
 
 ## Boundaries
 
-No broker calls, no umbrella edits, no execution-repo edits (the pre-open
-cancel gate stays decoupled — its ledger is the wiring surface). Fix C of the
-same forensics (model-identity tripwire) is orchestrator-owned: PR #485.
+No broker calls, no umbrella edits, no execution-repo edits, no broker
+adapter code — this PR is the persistence contract only, INACTIVE until the
+renquant-execution integration named above lands. Fix C of the same
+forensics (model-identity tripwire) is orchestrator-owned: PR #485.
