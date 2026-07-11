@@ -46,7 +46,10 @@ class WashSaleFilterTask(Task):
     """
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
-        from renquant_pipeline.kernel.asset_class import resolve_asset_class  # noqa: PLC0415
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            resolve_asset_class,
+            resolve_validated_crypto_spot_pairs,
+        )
         from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
         wash_days = int(tc.config.get("wash_sale_days", 0))
         tax_rate = float(tc.config.get("wash_sale_tax_rate", 0.30))
@@ -63,6 +66,7 @@ class WashSaleFilterTask(Task):
             estimated_hold_years=hold_yrs,
             expected_dollar_return=None,   # μ̂ not yet known at this stage
             asset_class=resolve_asset_class(tc.config or {}),
+            validated_crypto_pairs=resolve_validated_crypto_spot_pairs(tc.config or {}),
         )
         if blocked:
             tc.blocked_by = f"wash_sale:{reason}"

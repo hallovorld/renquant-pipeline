@@ -111,3 +111,82 @@ for 24/7 asset classes` (#27, 0.10.0 → 0.11.0) — the canonical calendar
 mode this PR consumes unconditionally (fail-closed below 0.11.0; dependency
 pin bumped). **MERGE ORDER: common #27 first, then this PR** — until then
 the crypto P1 tests fail closed by design against a pre-#27 common.
+
+## Update 2026-07-10: P5 ticker-scoped hardening (Codex re-review)
+
+Codex flagged a blocking gap in the P5 §1091 bypass as originally shipped:
+it was keyed off the blanket `asset_class == "crypto"` config switch alone,
+with no per-symbol validation. A tokenized security or any ambiguous
+instrument mis-tagged `asset_class="crypto"` would have silently inherited
+the wash-sale exemption it is not legally entitled to.
+
+**Fix**: the bypass now requires BOTH `asset_class == "crypto"` AND the
+ticker being an explicitly validated non-security spot pair.
+
+- No existing cross-repo "genuine crypto spot pair" registry was found to
+  reuse (`renquant-execution`'s `CryptoAssetSpec` is order-grid metadata,
+  not a security-classification source, and lives in the wrong repo for
+  this kernel-level tax gate). Introduced a new operator-curated strategy
+  config key, `crypto_spot_pairs` (a list), as the fail-closed source of
+  truth — absent/empty ⇒ nobody is validated ⇒ §1091 still applies to
+  every ticker, the safe default.
+- New `kernel/asset_class.py` primitives: `resolve_validated_crypto_spot_pairs`
+  (reads + normalizes the config list via the newly-available
+  `renquant_common.pair_slug.as_pair`, dropping malformed entries rather
+  than mis-parsing them into a false match), `is_validated_crypto_spot_pair`,
+  and `wash_sale_applies_for_ticker(asset_class, ticker,
+  validated_crypto_pairs)` — the new ticker-scoped decision function.
+  `wash_sale_applies(asset_class)` is kept unchanged (still correct for the
+  handful of gaps that are genuinely asset-class-only) but its docstring
+  now warns it is insufficient alone for the §1091 bypass specifically.
+- Threaded through every P5 consumer: `is_wash_sale_blocked` /
+  `is_wash_sale_blocked_with_cost` (`kernel/selection.py`, both gained a
+  `validated_crypto_pairs` kwarg), `SelectionContext` (new
+  `validated_crypto_spot_pairs` field), `WashSaleFilterTask`
+  (`task_candidates.py`), `_compute_qp_wash_mask` / `ComputeWashSaleMaskTask`
+  (`portfolio_qp/tasks.py`, new `_ctx_validated_crypto_pairs` helper).
+- Self-identified second hole while implementing the above:
+  `StampWashSaleTask` (`task_execution.py`) computed its stamp-or-not
+  decision ONCE per run at the asset-class level, before the per-fill loop
+  — an unvalidated "crypto"-tagged ticker would skip stamping its sell date
+  entirely, leaving nothing for the (now correctly fail-closed) block check
+  to compare a re-entry against. Moved the decision inside the per-fill
+  loop using `wash_sale_applies_for_ticker`, so an unvalidated ticker still
+  gets its `last_sell_dates` stamped like an equity would.
+- Out of scope, observed but unchanged: `task_joint_actions.py` and
+  `task_rotation.py` call `is_wash_sale_blocked_with_cost` without ever
+  threading `asset_class` (implicit `"us_equity"` default) — pre-existing
+  equity-only gaps, unaffected by this bug or its fix either way.
+
+**Tests** (`tests/test_asset_class_policy.py::TestP5WashSaleBypass`, 7
+methods, +2 net new): every method now proves BOTH branches — a genuine
+validated spot pair (`"BTC/USD"`, declared via `crypto_spot_pairs`) gets the
+bypass, while an `asset_class="crypto"`-tagged but unvalidated ticker
+(`"XYZ-TOKEN"`, modeling a tokenized-security-style instrument routed
+through the crypto asset class) still gets blocked at every consumer.
+New standalone method `test_asset_class_crypto_alone_is_not_sufficient_fail_closed`
+pins the core regression directly at the `kernel/asset_class.py` level,
+including the historical call shape with no `validated_crypto_pairs`
+argument at all (`wash_sale_applies_for_ticker("crypto", "BTC/USD", None)
+is True`). `TestP6TaxPropertyMode`'s existing test updated to pass
+`validated_crypto_pairs` explicitly (no behavior change, just the new
+required parameter for its already-validated fixture ticker).
+
+Verified meaningful via stash-revert: stashing only the 6 source files
+(keeping the new test file) makes the module fail to even import
+(`ImportError: cannot import name 'is_validated_crypto_spot_pair'`),
+confirming the tests are load-bearing on the fix. Full suite re-run with
+the fix restored: identical 66 pre-existing failures / 36 collection errors
+before and after (all missing-optional-dependency environment gaps —
+`xgboost`, `cvxpy` — confirmed pre-existing on unmodified `origin/main` too,
+unrelated to this change); 1086 passed after vs. 1084 before (the 2 net-new
+methods).
+
+Rebase/CI-currency check: `HEAD` (`834027a`) already sits exactly on
+`origin/main` tip (`8775fec`, 0 commits behind) and already carries the
+`renquant-common>=0.11.0` pin from the prior commit. CI's workflow
+(`.github/workflows/ci.yml`) checks out `renquant-common` at its default
+branch with no pinned `ref:`, so it always installs common's current main
+fresh — pushing this fix's commit triggers exactly the fresh CI run needed
+to pick up common#27 (now merged at 0.11.0); no separate merge/rebase of
+this branch was needed.

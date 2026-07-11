@@ -675,9 +675,11 @@ class ComputeWashSaleMaskTask(Task):
             held_tickers=held_tickers,
             calibrator_saturated=bool(getattr(ctx, "_calibrator_saturated", False)),
             # Crypto RFC 2026-07-10 P5: §1091 leg of the mask is bypassed for
-            # asset_class=crypto (property); anti-churn + saturation-abstain
-            # legs are NOT §1091 and stay asset-class-agnostic.
+            # asset_class=crypto (property) AND a ticker-level validated
+            # spot-pair check (Codex hardening, pipeline#183); anti-churn +
+            # saturation-abstain legs are NOT §1091 and stay asset-class-agnostic.
             asset_class=_ctx_asset_class(ctx),
+            validated_crypto_pairs=_ctx_validated_crypto_pairs(ctx),
         )
         ctx._qp_wash_mask = mask  # noqa: SLF001
         if n_wash or n_churn or n_sat:
@@ -3501,6 +3503,15 @@ def _ctx_asset_class(ctx) -> str:
     return resolve_asset_class(getattr(ctx, "config", {}) or {})
 
 
+def _ctx_validated_crypto_pairs(ctx) -> "frozenset[str]":
+    """P5 hardening (Codex review, pipeline#183): the explicitly-declared
+    validated non-security spot-pair allowlist — required alongside
+    ``asset_class == "crypto"`` for the §1091 bypass, see
+    ``wash_sale_applies_for_ticker``."""
+    from renquant_pipeline.kernel.asset_class import resolve_validated_crypto_spot_pairs  # noqa: PLC0415
+    return resolve_validated_crypto_spot_pairs(getattr(ctx, "config", {}) or {})
+
+
 def _qp_cfg(ctx) -> dict:
     base = dict((ctx.config.get("rotation", {}).get("joint_actions", {})) or {})
     regime = getattr(ctx, "regime", None)
@@ -3605,6 +3616,7 @@ def _compute_qp_wash_mask(
     held_tickers: set[str],
     calibrator_saturated: bool,
     asset_class: str = "us_equity",
+    validated_crypto_pairs: "frozenset[str] | None" = None,
 ) -> tuple[np.ndarray, int, int, int]:
     """Build QP block mask for wash-sale, anti-churn, and saturation abstain.
 
@@ -3625,6 +3637,7 @@ def _compute_qp_wash_mask(
                 last_sell_pls=last_sell_pls,
                 wash_sale_days=wash_days,
                 asset_class=asset_class,
+                validated_crypto_pairs=validated_crypto_pairs,
             )
             if blocked:
                 mask[i] = True

@@ -45,6 +45,7 @@ def is_wash_sale_blocked(
     wash_sale_days: int,
     *,
     asset_class: str = "us_equity",
+    validated_crypto_pairs: "frozenset[str] | None" = None,
 ) -> bool:
     """Return True if ticker sold within wash_sale_days of today.
 
@@ -61,8 +62,8 @@ def is_wash_sale_blocked(
     The bypass is keyed per asset class, never a global disable; the default
     keeps the equity path byte-identical.
     """
-    from renquant_pipeline.kernel.asset_class import wash_sale_applies  # noqa: PLC0415
-    if not wash_sale_applies(asset_class):
+    from renquant_pipeline.kernel.asset_class import wash_sale_applies_for_ticker  # noqa: PLC0415
+    if not wash_sale_applies_for_ticker(asset_class, ticker, validated_crypto_pairs):
         return False
     if wash_sale_days <= 0:
         return False
@@ -120,6 +121,7 @@ def is_wash_sale_blocked_with_cost(
     expected_dollar_return: float | None = None,
     safety_margin: float = 1.5,
     asset_class: str = "us_equity",
+    validated_crypto_pairs: "frozenset[str] | None" = None,
 ) -> tuple[bool, str, float]:
     """Cost-aware wash-sale decision per IRC §1091.
 
@@ -147,9 +149,9 @@ def is_wash_sale_blocked_with_cost(
     have μ̂ (e.g. the post-NGB economic gate) should pass
     expected_dollar_return.
     """
-    from renquant_pipeline.kernel.asset_class import wash_sale_applies  # noqa: PLC0415
-    if not wash_sale_applies(asset_class):
-        return (False, "asset_class=crypto: §1091 N/A (property, not a security)", 0.0)
+    from renquant_pipeline.kernel.asset_class import wash_sale_applies_for_ticker  # noqa: PLC0415
+    if not wash_sale_applies_for_ticker(asset_class, ticker, validated_crypto_pairs):
+        return (False, "validated crypto spot pair: §1091 N/A (property, not a security)", 0.0)
     if wash_sale_days <= 0:
         return (False, "wash_sale_days=0 (disabled)", 0.0)
     last = last_sell_dates.get(ticker)
@@ -391,6 +393,10 @@ class SelectionContext:
     # bypasses the §1091 wash-sale guard (property, rule N/A); the default
     # keeps equity selection byte-identical.
     asset_class:        str = "us_equity"
+    # P5 hardening (Codex review, pipeline#183): the explicitly-validated
+    # non-security spot-pair allowlist -- asset_class="crypto" alone is not
+    # sufficient for the wash-sale bypass, see wash_sale_applies_for_ticker.
+    validated_crypto_spot_pairs: "frozenset[str]" = field(default_factory=frozenset)
 
 
 def run_selection_loop(
@@ -463,6 +469,7 @@ def run_selection_loop(
             last_sell_pls=ctx.last_sell_pls,
             wash_sale_days=ctx.wash_sale_days,
             asset_class=ctx.asset_class,
+            validated_crypto_pairs=ctx.validated_crypto_spot_pairs,
         )
         if ws_blocked:
             _reject(c.ticker, "wash_sale")

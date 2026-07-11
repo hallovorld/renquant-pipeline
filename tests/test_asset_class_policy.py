@@ -23,11 +23,14 @@ from renquant_pipeline.kernel.asset_class import (
     ASSET_CLASS_US_EQUITY,
     annualization_days_for,
     is_crypto,
+    is_validated_crypto_spot_pair,
     last_completed_always_open_session,
     resolve_asset_class,
+    resolve_validated_crypto_spot_pairs,
     settlement_days_for,
     sigma_clip_bounds_for,
     wash_sale_applies,
+    wash_sale_applies_for_ticker,
 )
 
 FRI = dt.date(2026, 6, 26)
@@ -390,8 +393,18 @@ class TestP4Annualization:
 # ─── P5: wash-sale bypass (crypto = property, §1091 N/A) ────────────────────
 
 class TestP5WashSaleBypass:
-    LOSS_SALE = {"AAPL": dt.date(2026, 6, 25)}   # 3 days before SUN
-    LOSS_PLS = {"AAPL": -50.0}
+    """The §1091 bypass requires BOTH asset_class="crypto" AND the ticker
+    being an explicitly validated non-security spot pair (Codex hardening,
+    pipeline#183) — "AAPL" is used for the equity-pin cases (unaffected by
+    any of this); "BTC/USD" (validated) and "XYZ-TOKEN" (asset_class=crypto
+    but NEVER in the validated set — modeling a tokenized-security-style
+    instrument wrongly routed through the crypto asset class) cover the two
+    required branches for every consumer."""
+
+    LOSS_SALE = {"AAPL": dt.date(2026, 6, 25), "BTC/USD": dt.date(2026, 6, 25),
+                 "XYZ-TOKEN": dt.date(2026, 6, 25)}   # 3 days before SUN
+    LOSS_PLS = {"AAPL": -50.0, "BTC/USD": -50.0, "XYZ-TOKEN": -50.0}
+    VALIDATED = frozenset({"BTC/USD"})
 
     def test_gate_blocks_equity_never_crypto(self):
         from renquant_pipeline.kernel.selection import (
@@ -403,87 +416,173 @@ class TestP5WashSaleBypass:
         )
         assert blocked  # equity pin: recent loss sale blocks
         blocked, reason, cost = is_wash_sale_blocked_with_cost(
-            "AAPL", SUN, self.LOSS_SALE, self.LOSS_PLS, 30, asset_class="crypto",
+            "BTC/USD", SUN, self.LOSS_SALE, self.LOSS_PLS, 30,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
         )
         assert not blocked and "1091" in reason and cost == 0.0
-        # Unknown-P/L conservative branch also bypassed for crypto only.
+        # Unknown-P/L conservative branch also bypassed for VALIDATED crypto.
         assert is_wash_sale_blocked_with_cost(
             "AAPL", SUN, self.LOSS_SALE, None, 30,
         )[0] is True
         assert is_wash_sale_blocked_with_cost(
-            "AAPL", SUN, self.LOSS_SALE, None, 30, asset_class="crypto",
+            "BTC/USD", SUN, self.LOSS_SALE, None, 30,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
         )[0] is False
         # Legacy binary helper too.
         assert is_wash_sale_blocked("AAPL", SUN, self.LOSS_SALE, 30) is True
         assert is_wash_sale_blocked(
-            "AAPL", SUN, self.LOSS_SALE, 30, asset_class="crypto"
+            "BTC/USD", SUN, self.LOSS_SALE, 30,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
         ) is False
+
+    def test_asset_class_crypto_alone_is_not_sufficient_fail_closed(self):
+        """The finding this round fixes: asset_class="crypto" tagging a
+        ticker is NOT itself sufficient for the §1091 bypass — an unknown/
+        unvalidated/tokenized-security-shaped ticker must fail closed (rule
+        STILL applies), never silently inherit the crypto exemption."""
+        from renquant_pipeline.kernel.asset_class import (
+            is_validated_crypto_spot_pair,
+            wash_sale_applies_for_ticker,
+        )
+        from renquant_pipeline.kernel.selection import (
+            is_wash_sale_blocked,
+            is_wash_sale_blocked_with_cost,
+        )
+        assert not is_validated_crypto_spot_pair("XYZ-TOKEN", self.VALIDATED)
+        assert wash_sale_applies_for_ticker("crypto", "XYZ-TOKEN", self.VALIDATED) is True
+        # No validated_crypto_pairs supplied at all (the historical call
+        # shape) -> nobody is validated -> §1091 still applies, even to a
+        # plausible-looking pair.
+        assert wash_sale_applies_for_ticker("crypto", "BTC/USD", None) is True
+        blocked, reason, cost = is_wash_sale_blocked_with_cost(
+            "XYZ-TOKEN", SUN, self.LOSS_SALE, self.LOSS_PLS, 30,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
+        )
+        assert blocked and "1091" not in reason
+        assert is_wash_sale_blocked(
+            "XYZ-TOKEN", SUN, self.LOSS_SALE, 30,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
+        ) is True
+
+    def test_resolve_validated_crypto_spot_pairs_from_config(self):
+        from renquant_pipeline.kernel.asset_class import (
+            resolve_validated_crypto_spot_pairs,
+        )
+        assert resolve_validated_crypto_spot_pairs({}) == frozenset()
+        assert resolve_validated_crypto_spot_pairs(None) == frozenset()
+        assert resolve_validated_crypto_spot_pairs(
+            {"crypto_spot_pairs": ["BTC/USD", "eth-usd"]}
+        ) == frozenset({"BTC/USD", "ETH/USD"})
+        # Malformed entries drop rather than raise or false-match.
+        assert resolve_validated_crypto_spot_pairs(
+            {"crypto_spot_pairs": ["BTC/USD", "not-a-pair-form!!"]}
+        ) == frozenset({"BTC/USD"})
 
     def test_candidate_filter_task(self):
         from renquant_pipeline.kernel.pipeline.task_candidates import (
             WashSaleFilterTask,
         )
-        def _tc(cfg):
+        def _tc(ticker, cfg):
             return SimpleNamespace(
-                ticker="AAPL", today=SUN, config=cfg,
+                ticker=ticker, today=SUN, config=cfg,
                 last_sell_dates=dict(self.LOSS_SALE),
                 last_sell_pls=dict(self.LOSS_PLS),
                 blocked_by=None,
             )
-        tc = _tc({"wash_sale_days": 30})
+        tc = _tc("AAPL", {"wash_sale_days": 30})
         assert WashSaleFilterTask().run(tc) is False  # equity pin: blocked
         assert str(tc.blocked_by).startswith("wash_sale")
-        tc = _tc({"wash_sale_days": 30, "asset_class": "crypto"})
-        assert WashSaleFilterTask().run(tc) is None   # crypto: passes
+        crypto_cfg = {
+            "wash_sale_days": 30, "asset_class": "crypto",
+            "crypto_spot_pairs": ["BTC/USD"],
+        }
+        tc = _tc("BTC/USD", crypto_cfg)
+        assert WashSaleFilterTask().run(tc) is None   # validated crypto: passes
         assert tc.blocked_by is None
+        # asset_class=crypto but NOT in the validated set -> still blocked.
+        tc = _tc("XYZ-TOKEN", crypto_cfg)
+        assert WashSaleFilterTask().run(tc) is False
+        assert str(tc.blocked_by).startswith("wash_sale")
 
-    def test_qp_mask_wash_leg_bypassed_for_crypto_only(self):
+    def test_qp_mask_wash_leg_bypassed_for_validated_crypto_only(self):
         from renquant_pipeline.kernel.portfolio_qp.tasks import (
             _compute_qp_wash_mask,
         )
         kwargs = dict(
+            tickers=["BTC/USD"], today=SUN,
+            last_sell_dates=dict(self.LOSS_SALE),
+            last_sell_pls=dict(self.LOSS_PLS),
+            wash_days=30, min_reentry=0,
+            held_tickers=set(), calibrator_saturated=False,
+        )
+        mask, n_wash, _, _ = _compute_qp_wash_mask(
             tickers=["AAPL"], today=SUN,
             last_sell_dates=dict(self.LOSS_SALE),
             last_sell_pls=dict(self.LOSS_PLS),
             wash_days=30, min_reentry=0,
             held_tickers=set(), calibrator_saturated=False,
         )
-        mask, n_wash, _, _ = _compute_qp_wash_mask(**kwargs)
         assert mask[0] and n_wash == 1  # equity pin
-        mask, n_wash, _, _ = _compute_qp_wash_mask(**kwargs, asset_class="crypto")
+        mask, n_wash, _, _ = _compute_qp_wash_mask(
+            **kwargs, asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
+        )
         assert not mask[0] and n_wash == 0
-        # Anti-churn leg is NOT §1091 — still applies to crypto when set.
+        # asset_class=crypto but NOT validated -> still blocked.
+        mask, n_wash, _, _ = _compute_qp_wash_mask(
+            tickers=["XYZ-TOKEN"], today=SUN,
+            last_sell_dates=dict(self.LOSS_SALE),
+            last_sell_pls=dict(self.LOSS_PLS),
+            wash_days=30, min_reentry=0,
+            held_tickers=set(), calibrator_saturated=False,
+            asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
+        )
+        assert mask[0] and n_wash == 1
+        # Anti-churn leg is NOT §1091 — still applies to validated crypto.
         kwargs["min_reentry"] = 10
         mask, n_wash, n_churn, _ = _compute_qp_wash_mask(
-            **kwargs, asset_class="crypto"
+            **kwargs, asset_class="crypto", validated_crypto_pairs=self.VALIDATED,
         )
         assert mask[0] and n_wash == 0 and n_churn == 1
 
-    def test_selection_loop_bypasses_wash_for_crypto(self):
+    def test_selection_loop_bypasses_wash_for_validated_crypto_only(self):
         from renquant_pipeline.kernel.selection import (
             CandidateResult,
             SelectionContext,
             run_selection_loop,
         )
-        def _ctx(asset_class):
+        def _ctx(ticker, asset_class, validated=frozenset()):
             return SelectionContext(
                 today=SUN, held_tickers=[],
                 last_sell_dates=dict(self.LOSS_SALE),
                 last_sell_pls=dict(self.LOSS_PLS),
-                earnings_calendar={}, corr_matrix={}, sector_map={"AAPL": "IT"},
+                earnings_calendar={}, corr_matrix={}, sector_map={ticker: "IT"},
                 defensive_set=set(), wash_sale_days=30, earnings_buffer=0,
                 corr_threshold=0.99, max_per_sector=0, tiered_thresholds=[],
                 open_slots=1, asset_class=asset_class,
+                validated_crypto_spot_pairs=validated,
             )
-        cand = [CandidateResult("AAPL", 1.0, 1.0, 0.0)]
-        selected, blocks = run_selection_loop(cand, _ctx("us_equity"))
+        equity_cand = [CandidateResult("AAPL", 1.0, 1.0, 0.0)]
+        selected, blocks = run_selection_loop(equity_cand, _ctx("AAPL", "us_equity"))
         assert selected == [] and blocks["wash_sale"] == 1  # equity pin
-        selected, blocks = run_selection_loop(cand, _ctx("crypto"))
-        assert selected == ["AAPL"] and blocks["wash_sale"] == 0
+        crypto_cand = [CandidateResult("BTC/USD", 1.0, 1.0, 0.0)]
+        selected, blocks = run_selection_loop(
+            crypto_cand, _ctx("BTC/USD", "crypto", self.VALIDATED)
+        )
+        assert selected == ["BTC/USD"] and blocks["wash_sale"] == 0
+        # asset_class=crypto but the ticker is NOT in the validated set.
+        unvalidated_cand = [CandidateResult("XYZ-TOKEN", 1.0, 1.0, 0.0)]
+        selected, blocks = run_selection_loop(
+            unvalidated_cand, _ctx("XYZ-TOKEN", "crypto", self.VALIDATED)
+        )
+        assert selected == [] and blocks["wash_sale"] == 1
 
     def test_crypto_sell_does_not_stamp_reentry_state(self):
-        """THE RFC-required pin: a crypto sell must not stamp/block re-entry
-        while an equity one still does (StampWashSaleTask → gate)."""
+        """THE RFC-required pin: a sell of a VALIDATED crypto spot pair must
+        not stamp/block re-entry while an equity one still does
+        (StampWashSaleTask → gate). An asset_class=crypto sell of an
+        UNVALIDATED ticker must still stamp (Codex hardening, pipeline#183)
+        — otherwise the ticker-level fail-closed block has nothing to
+        check the re-entry against."""
         from renquant_pipeline.kernel.execution.types import Fill, OrderSide
         from renquant_pipeline.kernel.pipeline.task_execution import (
             StampWashSaleTask,
@@ -492,15 +591,15 @@ class TestP5WashSaleBypass:
             is_wash_sale_blocked_with_cost,
         )
 
-        def _sell_ctx(config):
+        def _sell_ctx(ticker, config):
             fill = Fill(
-                ticker="XYZ", side=OrderSide.SELL, shares=5.0, price=10.0,
+                ticker=ticker, side=OrderSide.SELL, shares=5.0, price=10.0,
                 fees=0.0, today=pd.Timestamp(FRI),
             )
             backend = SimpleNamespace(get_position_quantity=lambda t: 0.0)
             return SimpleNamespace(
                 fills=[fill],
-                exits=[("XYZ", SimpleNamespace(exit_type="stop_loss"))],
+                exits=[(ticker, SimpleNamespace(exit_type="stop_loss"))],
                 last_sell_dates={}, last_stop_exit_dates={},
                 today=pd.Timestamp(FRI), config=config,
                 execution_backend=backend,
@@ -508,7 +607,7 @@ class TestP5WashSaleBypass:
 
         # Equity pin: full-liquidate sell stamps the wash-sale date and the
         # gate then blocks a re-entry inside the window.
-        ctx = _sell_ctx({})
+        ctx = _sell_ctx("XYZ", {})
         StampWashSaleTask().run(ctx)
         assert ctx.last_sell_dates == {"XYZ": FRI}
         assert ctx.last_stop_exit_dates == {"XYZ": FRI}
@@ -517,19 +616,34 @@ class TestP5WashSaleBypass:
         )
         assert blocked
 
-        # Crypto: the SAME sell stamps NOTHING into wash-sale state (§1091
-        # N/A — no re-entry state may exist), while the G8 post-stop
-        # cooldown stamp (a risk rail, not tax law) still fires.
-        ctx = _sell_ctx({"asset_class": "crypto"})
+        # Validated crypto: the SAME sell stamps NOTHING into wash-sale
+        # state (§1091 N/A — no re-entry state may exist), while the G8
+        # post-stop cooldown stamp (a risk rail, not tax law) still fires.
+        crypto_cfg = {"asset_class": "crypto", "crypto_spot_pairs": ["BTC/USD"]}
+        ctx = _sell_ctx("BTC/USD", crypto_cfg)
         StampWashSaleTask().run(ctx)
         assert ctx.last_sell_dates == {}
-        assert ctx.last_stop_exit_dates == {"XYZ": FRI}
+        assert ctx.last_stop_exit_dates == {"BTC/USD": FRI}
         # Belt-and-suspenders: even a (stale/foreign) stamped date cannot
-        # block a crypto re-entry — the gate is bypassed by asset class.
+        # block a validated-crypto re-entry — the gate is bypassed.
         blocked, _, _ = is_wash_sale_blocked_with_cost(
-            "XYZ", SUN, {"XYZ": FRI}, None, 30, asset_class="crypto",
+            "BTC/USD", SUN, {"BTC/USD": FRI}, None, 30,
+            asset_class="crypto", validated_crypto_pairs=frozenset({"BTC/USD"}),
         )
         assert not blocked
+
+        # asset_class=crypto but the ticker is NOT validated: §1091
+        # genuinely applies, so the sell date MUST still be stamped, or the
+        # (correctly fail-closed) block below would have nothing to block
+        # against on a re-entry attempt.
+        ctx = _sell_ctx("XYZ-TOKEN", crypto_cfg)
+        StampWashSaleTask().run(ctx)
+        assert ctx.last_sell_dates == {"XYZ-TOKEN": FRI}
+        blocked, _, _ = is_wash_sale_blocked_with_cost(
+            "XYZ-TOKEN", SUN, ctx.last_sell_dates, None, 30,
+            asset_class="crypto", validated_crypto_pairs=frozenset({"BTC/USD"}),
+        )
+        assert blocked
 
 
 # ─── P6: tax property-mode (verify-only — no code change) ───────────────────
@@ -546,6 +660,7 @@ class TestP6TaxPropertyMode:
         blocked, reason, cost = is_wash_sale_blocked_with_cost(
             "BTC/USD", SUN, {"BTC/USD": SAT}, {"BTC/USD": -500.0},
             30, asset_class="crypto",
+            validated_crypto_pairs=frozenset({"BTC/USD"}),
         )
         assert (blocked, cost) == (False, 0.0)
         # The LT threshold machinery is untouched: 365-day property

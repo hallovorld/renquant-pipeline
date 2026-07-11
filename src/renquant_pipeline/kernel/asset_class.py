@@ -127,10 +127,87 @@ def wash_sale_applies(asset_class: str) -> bool:
     Crypto is treated as PROPERTY for federal tax purposes (IRS Notice
     2014-21); §1091 covers "shares of stock or securities" and therefore does
     NOT apply. The bypass is keyed here — never a global disable.
+
+    NOTE: this is the ASSET-CLASS-level check only. A blanket
+    ``asset_class == "crypto"`` bypass is NOT sufficient to grant the §1091
+    exemption to a specific ticker — see :func:`wash_sale_applies_for_ticker`,
+    which additionally requires the ticker to be an explicitly validated
+    non-security spot pair (Codex review, pipeline#183: an
+    asset_class=crypto-tagged tokenized security or ambiguous instrument
+    must NOT silently inherit the crypto exemption). Callers making a
+    per-ticker wash-sale decision MUST use
+    :func:`wash_sale_applies_for_ticker`, never this function alone.
     """
     if asset_class not in KNOWN_ASSET_CLASSES:
         raise ValueError(f"unknown asset_class {asset_class!r} (fail-closed)")
     return asset_class != ASSET_CLASS_CRYPTO
+
+
+def resolve_validated_crypto_spot_pairs(config: Any) -> frozenset[str]:
+    """The EXPLICITLY DECLARED set of validated non-security crypto spot
+    pairs (Codex review, pipeline#183 P5 hardening).
+
+    Read from the top-level strategy config's ``crypto_spot_pairs`` list —
+    an operator-curated allowlist of pairs actually confirmed to be genuine
+    spot crypto (IRS property, IRC §1091 N/A), never derivatives, never
+    tokenized securities, never anything ambiguous. Absent/empty ⇒ EMPTY
+    SET (fail closed: no ticker is validated, so the §1091 bypass applies
+    to nobody, until an operator explicitly declares the universe). Entries
+    are normalized through :func:`renquant_common.pair_slug.as_pair` so
+    ``"BTC/USD"`` and ``"BTC-USD"`` compare equal; a malformed entry is
+    dropped (never silently mis-parsed into a false match).
+    """
+    raw = None
+    if config is not None:
+        getter = getattr(config, "get", None)
+        raw = getter("crypto_spot_pairs") if callable(getter) else None
+    if not raw:
+        return frozenset()
+    from renquant_common.pair_slug import as_pair  # noqa: PLC0415
+    validated: set[str] = set()
+    for entry in raw:
+        try:
+            validated.add(as_pair(entry))
+        except ValueError:
+            continue
+    return frozenset(validated)
+
+
+def is_validated_crypto_spot_pair(
+    ticker: str, validated_crypto_pairs: "frozenset[str] | None"
+) -> bool:
+    """True only when ``ticker`` is in the EXPLICITLY DECLARED validated-spot-
+    pair set. Being tagged ``asset_class=crypto`` is NOT itself sufficient —
+    an unknown, unclassified, or ambiguous ticker (e.g. a tokenized security
+    mistakenly routed through the crypto asset class) is never validated by
+    default; this is the fail-closed half of the P5 hardening."""
+    if not validated_crypto_pairs:
+        return False
+    from renquant_common.pair_slug import as_pair  # noqa: PLC0415
+    try:
+        normalized = as_pair(ticker)
+    except ValueError:
+        return False
+    return normalized in validated_crypto_pairs
+
+
+def wash_sale_applies_for_ticker(
+    asset_class: str,
+    ticker: str,
+    validated_crypto_pairs: "frozenset[str] | None" = None,
+) -> bool:
+    """P5, TICKER-SCOPED (Codex review, pipeline#183): the §1091 bypass
+    requires BOTH ``asset_class == "crypto"`` AND ``ticker`` being an
+    explicitly validated non-security spot pair — never a blanket
+    asset-class-only bypass. An ``asset_class="crypto"`` ticker that is NOT
+    in the validated set fails closed: the wash-sale rule STILL applies,
+    the same safe default an equity ticker gets. This is the function every
+    per-ticker wash-sale call site must use; :func:`wash_sale_applies` alone
+    is asset-class-level only and insufficient for a real bypass decision.
+    """
+    if wash_sale_applies(asset_class):
+        return True  # us_equity (or any non-crypto class): unchanged
+    return not is_validated_crypto_spot_pair(ticker, validated_crypto_pairs)
 
 
 def sigma_clip_bounds_for(asset_class: str) -> tuple[float, float]:
@@ -202,9 +279,12 @@ __all__ = [
     "SIGMA_CLIP_BOUNDS",
     "annualization_days_for",
     "is_crypto",
+    "is_validated_crypto_spot_pair",
     "last_completed_always_open_session",
     "resolve_asset_class",
     "settlement_days_for",
+    "resolve_validated_crypto_spot_pairs",
     "sigma_clip_bounds_for",
     "wash_sale_applies",
+    "wash_sale_applies_for_ticker",
 ]
