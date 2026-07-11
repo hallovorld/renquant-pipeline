@@ -685,6 +685,72 @@ class TestFailPolicy:
         assert task.enforce_buy_block(ctx) is True
         assert ctx.buy_blocked is True
 
+    def test_enforce_buy_block_goes_through_the_gate_registry_choke_point(
+            self, tmp_path):
+        """Codex review (PR #189): enforce_buy_block must NOT write
+        ctx.buy_blocked itself — it submits to the GateRegistry and applies
+        the aggregate via job_gates.apply_gate_registry_verdict, the SAME
+        single choke point BuyGatesJob.run() uses. Proves the submission
+        actually lands (not just that the flag ends up True some other
+        way) and that the applied value traces back to this gate's row."""
+        from renquant_pipeline.kernel.gate_registry import ctx_registry
+
+        ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
+            "path": str(tmp_path / "gone.parquet"),
+            "policy": "fail_closed"}}))
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True
+        assert task.enforce_buy_block(ctx) is True
+
+        registry = ctx_registry(ctx)
+        agg = registry.aggregate("book")
+        assert agg.verdict == "block"
+        assert any(v.gate == "data_availability" for v in agg.contributing)
+        submitted = next(v for v in agg.contributing if v.gate == "data_availability")
+        assert submitted.scope == "book"
+        assert "fundamentals_serving_axis" in submitted.reason
+        assert ctx.buy_blocked is True
+
+    def test_enforce_buy_block_submits_nothing_on_clean_pass(self):
+        """No registry submission at all when nothing fired — a clean pass
+        must not leave a phantom 'block' row in the decision ledger."""
+        from renquant_pipeline.kernel.gate_registry import ctx_registry
+
+        ctx = _ctx()
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True
+        assert task.enforce_buy_block(ctx) is True
+        assert ctx.buy_blocked is False
+        assert ctx_registry(ctx).aggregate("book").verdict == "allow"
+
+    def test_enforce_buy_block_composes_with_an_earlier_buy_gates_job_pass(
+            self, tmp_path):
+        """Re-entrant application (Codex review, PR #189): BuyGatesJob.run()
+        runs EARLY in the pipeline and applies whatever the registry knows
+        at that point; enforce_buy_block runs LATER and re-applies the
+        (now larger) aggregate via the exact same function. Simulates both
+        choke points firing in the real pipeline order on one shared ctx —
+        an early pass with nothing to block, then this gate's post-sell
+        submission, must still end up blocked."""
+        from renquant_pipeline.kernel.pipeline.job_gates import (
+            apply_gate_registry_verdict,
+        )
+
+        ctx = _ctx(config_extra=_contract({"fundamentals_serving_axis": {
+            "path": str(tmp_path / "gone.parquet"),
+            "policy": "fail_closed"}}))
+        task = DataAvailabilityGateTask()
+        assert task.run(ctx) is True   # record-only, early in the pipeline
+
+        # Simulates BuyGatesJob.run()'s own application call, which in the
+        # real pipeline happens BEFORE this gate has anything to submit.
+        apply_gate_registry_verdict(ctx)
+        assert ctx.buy_blocked is False
+
+        # Later, post-sell: this gate submits and re-applies.
+        assert task.enforce_buy_block(ctx) is True
+        assert ctx.buy_blocked is True
+
     def test_mixed_policies_buy_block_names_only_fail_closed_axes(
             self, tmp_path, caplog):
         ctx = _ctx(
@@ -1071,3 +1137,34 @@ class TestFailClosedNeverSuppressesSells:
         assert ticker == self.HELD
         assert signal.should_exit is True
         assert signal.exit_type == "stop_loss"
+
+
+# ── Census retirement (Codex review, PR #189) ────────────────────────────────
+
+class TestCensusRetirement:
+    """Zero direct buy_blocked writers in task_data_availability.py — the
+    same local AST pin test_gate_writers_migration.py uses for
+    task_gates.py. enforce_buy_block's registry-owned path must not
+    reintroduce a 4th direct-writer file (the orchestrator cross-repo
+    census ratchet must stay at 3)."""
+
+    def test_direct_writers_zero(self):
+        import ast
+        from pathlib import Path
+
+        src = (Path(__file__).resolve().parent.parent /
+               "src/renquant_pipeline/kernel/pipeline/task_data_availability.py")
+        tree = ast.parse(src.read_text())
+        count = 0
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(t, ast.Attribute) and t.attr == "buy_blocked"
+                            for t in node.targets)
+                    and isinstance(node.value, ast.Constant)
+                    and node.value.value is True):
+                count += 1
+        assert count == 0, (
+            f"task_data_availability.py direct buy_blocked writers = {count}, "
+            f"expected 0 — enforce_buy_block must submit to the GateRegistry "
+            f"and apply via job_gates.apply_gate_registry_verdict, never "
+            f"write ctx.buy_blocked itself")

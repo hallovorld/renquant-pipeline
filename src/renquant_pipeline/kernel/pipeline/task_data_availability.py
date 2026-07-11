@@ -953,10 +953,14 @@ class DataAvailabilityGateTask:
         counters, logs loudly. NEVER raises. NEVER touches
         ``ctx.buy_blocked``.
       * :meth:`enforce_buy_block` — called AFTER the sell/exit pass has
-        already executed for this bar. Applies the buy-side block a
-        fail_closed axis violation recorded, via the same errata-C
-        ``ctx.buy_blocked`` choke point every other buy gate uses. NEVER
-        raises. Cannot touch sells/exits — they already ran.
+        already executed for this bar. Submits a fail_closed axis
+        violation to the ``GateRegistry`` and applies the aggregate via
+        ``job_gates.apply_gate_registry_verdict`` — the SAME single
+        choke point ``BuyGatesJob.run()`` already uses (Codex review, PR
+        #189: no direct ``ctx.buy_blocked = True`` write lives in this
+        module; that would be a 4th direct-writer file and fail the
+        cross-repo gate-writer census). NEVER raises. Cannot touch
+        sells/exits — they already ran.
 
     This split is the whole point of the fix: input-availability may gate
     NEW BUYS ONLY, and must never be able to suppress a risk-reducing
@@ -1021,20 +1025,26 @@ class DataAvailabilityGateTask:
         return True
 
     def enforce_buy_block(self, ctx: Any) -> bool:
-        """Apply the buy-side block recorded by :meth:`run`.
+        """Submit the block recorded by :meth:`run` to the GateRegistry and
+        apply it — this method never writes ``ctx.buy_blocked`` itself.
 
         MUST be called AFTER the sell/exit pass has already executed for
         this bar (see ``pp_inference.InferencePipeline.run()`` wiring — right
         after the ``TickerSellJob`` loop and its downstream exit-refinement
         tasks, before Phase 2b's buy candidate scan). Reads back
         ``ctx.data_availability["blocked"]`` (set only by :meth:`run`, never
-        by this method) and, only when true, sets ``ctx.buy_blocked = True``
-        — the same errata-C choke point every other buy gate honours
-        (``job_gates.BuyGatesJob``, ``task_gates`` macro gates,
-        ``panel_scoring.PanelScoringJob``). This can NEVER suppress a sell or
-        exit: those are computed strictly before this method is ever
-        invoked, and this method never reads or writes ``ctx.exits`` /
-        ``ctx.holdings``. Never raises.
+        by this method); when true, submits a ``"block"`` verdict to the
+        ``GateRegistry`` (``ctx_registry(ctx).submit(...)``, the same
+        dual-write EVERY gate makes — see ``task_gates.py``) and applies the
+        aggregate via :func:`job_gates.apply_gate_registry_verdict` — the
+        SAME single choke point ``BuyGatesJob.run()`` already uses, called
+        here a second time now that this run's registry has a new
+        submission. There is no direct ``ctx.buy_blocked = True`` anywhere
+        in this module: this is NOT a new direct-writer file (Codex review,
+        PR #189 — the census ratchet must stay at 3, not grow to 4). This
+        can NEVER suppress a sell or exit: those are computed strictly
+        before this method is ever invoked, and this method never reads or
+        writes ``ctx.exits`` / ``ctx.holdings``. Never raises.
         """
         block = getattr(ctx, CTX_ATTR, None)
         if not isinstance(block, dict) or not block.get("blocked"):
@@ -1061,10 +1071,22 @@ class DataAvailabilityGateTask:
             "for this bar already executed above and are unaffected.",
             names, reasons,
         )
-        ctx.buy_blocked = True
+
+        from renquant_pipeline.kernel.gate_registry import ctx_registry  # noqa: PLC0415
+        from renquant_pipeline.kernel.pipeline.job_gates import (  # noqa: PLC0415
+            apply_gate_registry_verdict,
+        )
+
+        ctx_registry(ctx).submit(
+            gate="data_availability", scope="book", verdict="block",
+            reason=f"fail-closed axis(es) violated: {names}",
+            inputs={"fired": block.get("fired"), "axes": names},
+        )
+        apply_gate_registry_verdict(ctx)
+
         counters = getattr(ctx, "counters", None)
         if isinstance(counters, dict):
-            counters["data_availability_buy_blocked"] = 1
+            counters["data_availability_buy_blocked"] = int(bool(ctx.buy_blocked))
         return True
 
     # Internal ---------------------------------------------------------------
