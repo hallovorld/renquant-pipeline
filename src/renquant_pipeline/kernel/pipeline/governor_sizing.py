@@ -297,6 +297,7 @@ def run_governor_sizing(ctx: Any, gov_cfg: dict) -> bool:
     from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
         resolve_asset_class,
         resolve_validated_crypto_spot_pairs,
+        wash_sale_applies_for_ticker,
     )
     from renquant_pipeline.kernel.selection import is_wash_sale_blocked  # noqa: PLC0415
     gov_asset_class = resolve_asset_class(config)
@@ -313,11 +314,15 @@ def run_governor_sizing(ctx: Any, gov_cfg: dict) -> bool:
             no_sell.add(ticker)
             continue
         # §1091 no-sell guard: selling a LOSS lot bought inside the
-        # wash-sale window would realize a disallowed loss.
+        # wash-sale window would realize a disallowed loss. Ticker-scoped
+        # (P5 hardening, pipeline#183): a validated crypto spot pair is
+        # never subject to §1091, so this guard must not fire for it.
         price = _finite(prices.get(ticker)) or 0.0
         entry_price = _entry_price(hs)
         if (entry_price is not None and price < entry_price
-                and days_held is not None and days_held < wash_days):
+                and days_held is not None and days_held < wash_days
+                and wash_sale_applies_for_ticker(gov_asset_class, ticker,
+                                                  gov_validated_crypto_pairs)):
             no_sell.add(ticker)
 
     alloc = allocate_down_only(
