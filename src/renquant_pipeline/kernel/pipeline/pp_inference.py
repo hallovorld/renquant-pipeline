@@ -343,6 +343,28 @@ class InferencePipeline:
         from .task_data_verification import DataVerificationTask  # noqa: PLC0415
         DataVerificationTask().run(ctx)
 
+        # 2026-07-11 DATA-AVAILABILITY (operator mandate — the META / 07-08
+        # investigations exposed FRAGMENTED input-integrity checking: OHLCV
+        # fail-closes here, admission staleness fail-closes per ticker but its
+        # collapse went out quiet, P-FUND-FRESHNESS was structurally
+        # unsatisfiable for ~88d unnoticed, P-MODEL-STALENESS was a soft-skip,
+        # and whole-dataset absence had NO check at all): verify every
+        # declared INPUT AXIS (presence + as-of vintage vs its data_contracts
+        # budget + universe coverage) BEFORE any scoring or decision logic.
+        # INPUT-side complement of FunnelIntegrityTask (which judges the
+        # OUTPUT funnel at the END of the run) — no overlap in responsibility.
+        # Per-axis policy: fail_closed aborts loudly (DataFreshnessGate
+        # pattern); degrade_with_alarm — the day-one default for EVERY axis —
+        # proceeds with the alarm in ctx.data_availability + counters (run
+        # bundle + ntfy fields via notification_fields, the #463
+        # universe_health stamping pattern). Kill switch:
+        # data_availability.enabled = false. Deliberately NOT in
+        # SellOnlyPipeline: buy-input verification must never block the
+        # risk-exit path (same reasoning as the P-FUND-FRESHNESS sell-only
+        # exemption).
+        from .task_data_availability import DataAvailabilityGateTask  # noqa: PLC0415
+        DataAvailabilityGateTask().run(ctx)
+
         RegimeJob().run(ctx)
         DrawdownJob().run(ctx)
         BuyGatesJob().run(ctx)
