@@ -1,4 +1,8 @@
-"""ParkingSleeveShadowTask — S7 lane-B parking sleeve (β-budgeted SPY/SGOV), shadow mode.
+"""ParkingSleeveShadowTask — S7 lane-B parking sleeve (β-budgeted SPY/SGOV).
+
+Class name retained from the original shadow-only change (#157) for wiring
+and audit continuity; since this change the task carries BOTH modes
+(``shadow`` default, ``live`` = SGOV-floor order emission — see below).
 
 Design contract (both merged on renquant-orchestrator main):
   * doc/research/2026-07-02-rs1-parking-sleeve.md (RS-1, r2)
@@ -23,19 +27,54 @@ Rollout state (THIS module)
 * **Default OFF.** The task is a no-op unless ``config["sleeve"]["enabled"]``
   is truthy — with the flag absent it reads nothing else, writes nothing,
   and mutates no ctx field (pinned by tests/test_parking_sleeve.py).
-* **Shadow only.** In ``sleeve.mode = "shadow"`` the task computes the
+* **Shadow default.** In ``sleeve.mode = "shadow"`` the task computes the
   intended sweep/fund orders and appends them to a dedicated JSONL under
   ``logs/`` — schema ``{date, action, symbol, qty, notional, reason,
   book_state}`` — placing NOTHING (never touches ``ctx.orders`` /
-  ``ctx.exits``; runtime-asserted). ``sleeve.mode = "live"`` is deliberately
-  NOT implemented in this change: RS-1 §4 requires a pre-registered
-  cash-vs-SGOV-vs-SPY comparison plus an explicit capital-authorization
-  decision before real exposure; until then live mode falls back to shadow
-  logging with a warning + counter.
+  ``ctx.exits``; runtime-asserted). Shadow behavior is byte-identical to
+  the original #157 implementation (pinned by regression tests): it still
+  models the RS-1 β-budgeted SPY/SGOV split and does NOT apply the
+  ``max_sleeve_pct`` cap, so the shadow corpus feeding the RS-1 §4
+  pre-registered comparison is not silently changed mid-collection.
+* **Live = SGOV floor only.** ``sleeve.mode = "live"`` emits REAL order
+  intents, restricted to the RS-1 §2/§4 "floor variant": SGOV buys of idle
+  cash above the reserves, SGOV sells whenever cash is needed (sells always
+  win — free-before-need). The SPY arm stays DARK in live mode by
+  construction (never a SPY order, buy or sell): RS-1 §4 requires the SPY
+  arm's own pre-registered comparison + a recorded capital authorization,
+  mirroring strategy-104's ``spy_arm_gate_cleared`` structural guard
+  (strategy-104 #44). Enabling live SPY exposure is a separate, gated
+  change — there is deliberately no config knob for it here.
+  Live-mode invariants:
+    - liquidity: a sleeve buy only uses cash above
+      ``reserve_pv_pct``·PV + pending admitted buys + the regime reserve,
+      so the sleeve can never starve a main-strategy buy; when cash falls
+      short of those reserves the sleeve SELLS first (exits are executed
+      before buys — pp_execution's ExitsJob→BuysJob ordering invariant).
+    - ``max_sleeve_pct`` (default 0.50, strategy-104 #44 semantics) caps
+      CUMULATIVE cross-session sleeve exposure against the REAL broker
+      SGOV holding, and additionally rebalances an over-cap sleeve back
+      down (subject to the dust threshold).
+    - fail-closed on missing SGOV price: no buy is ever emitted without a
+      positive SGOV price (the umbrella daily price fetch does not cover
+      SGOV yet — umbrella/base-data follow-up); if cash is needed while
+      the price is missing, the FULL position is liquidated (a full exit
+      needs no price) so the liquidity invariant still holds.
+    - SGOV buys pass through the existing cost-aware §1091 wash-sale
+      engine (``is_wash_sale_blocked_with_cost``): a recent SGOV loss
+      sale blocks the re-buy; ETF-at-gain sales pass. Sells are never
+      wash-sale blocked.
+    - live sleeve buys respect the book-level buy gates
+      (``buy_blocked`` / ``skip_buys`` / ``bear_only``); sells ignore
+      them (exits-always-allowed).
 * The shadow sleeve book persists across sessions inside the JSONL itself
   (the last ``record_type == "summary"`` row carries ``shadow_state``), so
   the 10-session shadow AC exercises the incremental sweep / sell-to-fund
-  round-trip, not a fresh full sweep every day.
+  round-trip, not a fresh full sweep every day. Live mode does NOT use the
+  JSONL book — the broker holdings are the cross-session truth; the JSONL
+  keeps being written (same schema, ``book_state.mode = "live"``) for
+  monitoring and the summary row's ``shadow_state`` mirrors the REAL
+  post-trade book so a later mode flip never inherits a stale shadow book.
 
 Monitoring rule (RS-1 §4/§5) — metric emission only
 ---------------------------------------------------
@@ -76,12 +115,27 @@ except ImportError:  # pragma: no cover - non-POSIX platform
     fcntl = None  # type: ignore[assignment]
 
 from .context import InferenceContext
+from .order_attribution import stamp_order_attribution
 from .pipeline import Task
-from .task_benchmark_sleeve import _finite_float, _pending_buy_invest
+from .task_benchmark_sleeve import (
+    _buy_cost_multiplier,
+    _existing_buy_tickers,
+    _existing_exit_tickers,
+    _finite_float,
+    _pending_buy_invest,
+    _sell_proceeds_multiplier,
+)
 
 log = logging.getLogger("kernel.pipeline.parking_sleeve")
 
 DEFAULT_LOG_PATH = "logs/parking_sleeve_shadow.jsonl"
+
+# Live mode caps CUMULATIVE cross-session sleeve exposure at
+# max_sleeve_pct · PV against the REAL broker SGOV holding — the same
+# semantics strategy-104 #44 pinned for its ParkingSleeveConfig (default
+# 0.50). Shadow mode deliberately does NOT cap (byte-identical #157
+# behavior; see module docstring).
+DEFAULT_MAX_SLEEVE_PCT_LIVE = 0.50
 
 # SGOV is tracked at COST, not marked to market: the shadow book only moves
 # the SGOV leg's value via BUY/SELL notional (see module docstring — T-bill
@@ -92,6 +146,13 @@ DEFAULT_LOG_PATH = "logs/parking_sleeve_shadow.jsonl"
 # treated symmetrically and this makes that asymmetry explicit rather than
 # implicit in the arithmetic.
 SGOV_VALUATION_MODE = "cost_no_carry"
+
+# Live mode marks the REAL broker SGOV holding to market (entry_price cost
+# basis vs current price) — the opposite convention from the shadow book.
+# Stamped so mixed shadow/live logs are self-describing; the operational
+# scorecard's sgov_valuation_mode_consistent flag flipping to False after a
+# mode change is correct and intentional signal, not noise.
+SGOV_VALUATION_MODE_LIVE = "mark_to_market"
 
 # ── Operational vs economic field split (see build_operational_scorecard /
 # build_economic_scorecard below) — a clean operational log (idempotent,
@@ -148,6 +209,8 @@ def compute_parking_sleeve_plan(
     beta_max: float = 0.6,
     beta_pos: float = 1.0,
     min_trade_notional: float = 50.0,
+    max_sleeve_pct: float = 1.0,
+    sgov_only: bool = False,
     spy_symbol: str = "SPY",
     sgov_symbol: str = "SGOV",
 ) -> dict[str, Any]:
@@ -157,6 +220,16 @@ def compute_parking_sleeve_plan(
     and every intermediate quantity needed for the shadow log's
     ``book_state``. Monetary inputs are dollars; ``sgov_value`` is the
     current SGOV leg at cost.
+
+    ``max_sleeve_pct`` caps the TARGET total sleeve at that fraction of PV
+    (strategy-104 #44 cumulative cross-session semantics: the current leg
+    values count against the cap, and an over-cap sleeve rebalances back
+    down). The default 1.0 never binds — shadow callers stay byte-identical
+    to #157; the live path passes the configured cap.
+
+    ``sgov_only=True`` forces ``sleeve_spy_frac = 0`` (the RS-1 §2 SGOV
+    floor variant) — the live path uses this so the un-authorized SPY arm
+    can never receive capital.
     """
     pv = _finite_float(pv, 0.0)
     if pv <= 0:
@@ -174,6 +247,7 @@ def compute_parking_sleeve_plan(
     beta_max = max(_finite_float(beta_max, 0.6), 0.0)
     beta_pos = max(_finite_float(beta_pos, 1.0), 0.0)
     min_trade = max(_finite_float(min_trade_notional, 50.0), 0.0)
+    max_sleeve_pct = min(max(_finite_float(max_sleeve_pct, 1.0), 0.0), 1.0)
 
     spy_value = spy_qty * spy_price if spy_price > 0 else 0.0
     sleeve_value = spy_value + sgov_value
@@ -183,9 +257,17 @@ def compute_parking_sleeve_plan(
     deployable = max(0.0, cash + sleeve_value - reserve_operational - reserve_regime)
     funding_shortfall = max(0.0, reserve_operational + reserve_regime - cash)
 
+    # strategy-104 #44 cumulative cap: the TARGET total sleeve never exceeds
+    # max_sleeve_pct·PV. Because ``deployable`` is the target and the current
+    # legs count inside it, this enforces the cap across sessions and also
+    # rebalances an over-cap sleeve back down (dust threshold still applies).
+    max_sleeve_value = max_sleeve_pct * pv
+    cap_bound = deployable > max_sleeve_value
+    deployable = min(deployable, max_sleeve_value)
+
     w_pos = positions_value / pv
     w_sleeve = deployable / pv
-    if w_sleeve <= 0.0:
+    if sgov_only or w_sleeve <= 0.0:
         sleeve_spy_frac = 0.0
     else:
         sleeve_spy_frac = min(max((beta_max - w_pos * beta_pos) / w_sleeve, 0.0), 1.0)
@@ -201,6 +283,8 @@ def compute_parking_sleeve_plan(
         reason = "reserve_shortfall_scale_down"
     elif rr > 0.0:
         reason = "regime_reserve_scaled_sweep"
+    elif cap_bound:
+        reason = "max_sleeve_cap_enforced"
     elif sleeve_value <= 0.0:
         reason = "sweep_idle_cash"
     else:
@@ -280,6 +364,10 @@ def compute_parking_sleeve_plan(
         "sleeve_value": sleeve_value,
         "spy_value": spy_value,
         "sgov_value": sgov_value,
+        "max_sleeve_pct": max_sleeve_pct,
+        "max_sleeve_value_cap": max_sleeve_value,
+        "sleeve_cap_bound": cap_bound,
+        "sgov_only": bool(sgov_only),
     }
 
 
@@ -410,7 +498,16 @@ def build_economic_scorecard(rows: list[dict]) -> dict[str, Any]:
 
 
 class ParkingSleeveShadowTask(Task):
-    """Compute + log the intended parking-sleeve orders. Places NOTHING."""
+    """Compute the parking-sleeve sweep; log it (shadow) or emit it (live).
+
+    Class name kept from #157 for wiring/audit continuity. In the default
+    ``sleeve.mode="shadow"`` this places NOTHING (runtime-asserted). In
+    ``sleeve.mode="live"`` it emits SGOV-floor order intents only — the SPY
+    arm stays dark pending its RS-1 §4 pre-registered gate. Either way the
+    task is fail-isolated: an internal error is swallowed + counted, never
+    breaking the main pipeline (order/exit appends happen atomically at the
+    end of the live path, so a mid-computation failure emits nothing).
+    """
 
     name = "ParkingSleeveShadowTask"
 
@@ -420,8 +517,8 @@ class ParkingSleeveShadowTask(Task):
             return None  # fully inert — no reads, no writes, no counters
         try:
             self._run(ctx, sleeve_cfg)
-        except Exception:  # noqa: BLE001 — a shadow logger must never break the pipeline
-            log.exception("ParkingSleeveShadowTask failed (shadow only — no orders affected)")
+        except Exception:  # noqa: BLE001 — the sleeve must never break the pipeline
+            log.exception("ParkingSleeveShadowTask failed (fail-isolated)")
             ctx.counters["parking_sleeve_error"] = (
                 ctx.counters.get("parking_sleeve_error", 0) + 1
             )
@@ -435,18 +532,7 @@ class ParkingSleeveShadowTask(Task):
         date_str = date_str.isoformat() if date_str is not None else None
 
         mode = str(sleeve_cfg.get("mode", "shadow")).strip().lower()
-        if mode == "live":
-            # RS-1 §4: live enablement requires the pre-registered
-            # cash/SGOV/SPY comparison + a recorded capital authorization.
-            # The order-placing path intentionally does not exist yet.
-            log.warning(
-                "ParkingSleeveShadowTask: sleeve.mode='live' is NOT implemented "
-                "(RS-1 §4 authorization bar) — falling back to shadow logging",
-            )
-            ctx.counters["parking_sleeve_live_mode_unimplemented"] = (
-                ctx.counters.get("parking_sleeve_live_mode_unimplemented", 0) + 1
-            )
-        elif mode != "shadow":
+        if mode not in ("shadow", "live"):
             log.warning(
                 "ParkingSleeveShadowTask: unknown sleeve.mode=%r — treating as shadow",
                 mode,
@@ -454,6 +540,7 @@ class ParkingSleeveShadowTask(Task):
             ctx.counters["parking_sleeve_bad_mode"] = (
                 ctx.counters.get("parking_sleeve_bad_mode", 0) + 1
             )
+            mode = "shadow"
 
         pv_real = _finite_float(getattr(ctx, "portfolio_value", 0.0), 0.0)
         cash_real = _finite_float(getattr(ctx, "cash", 0.0), 0.0)
@@ -479,6 +566,9 @@ class ParkingSleeveShadowTask(Task):
                 # Idempotency guard, checked INSIDE the lock so a retry or a
                 # concurrent run racing on the same host cannot both pass the
                 # check before either has appended — see _has_logged_date.
+                # Applies to live too: a same-date retry must not re-emit the
+                # sweep (the retry replans from CURRENT broker state on the
+                # next session; a skipped session is the conservative outcome).
                 if _has_logged_date(path, date_str):
                     log.warning(
                         "ParkingSleeveShadowTask: date %s already logged in %s — "
@@ -489,13 +579,21 @@ class ParkingSleeveShadowTask(Task):
                         ctx.counters.get("parking_sleeve_duplicate_date_skipped", 0) + 1
                     )
                     return
-                self._compute_and_log(
-                    ctx, sleeve_cfg, path=path, date_str=date_str, mode=mode,
-                    pv_real=pv_real, cash_real=cash_real,
-                    spy_symbol=spy_symbol, sgov_symbol=sgov_symbol,
-                    spy_price=spy_price, sgov_price=sgov_price,
-                    orders_before=orders_before, exits_before=exits_before,
-                )
+                if mode == "live":
+                    self._compute_and_emit_live(
+                        ctx, sleeve_cfg, path=path, date_str=date_str,
+                        pv_real=pv_real, cash_real=cash_real,
+                        spy_symbol=spy_symbol, sgov_symbol=sgov_symbol,
+                        sgov_price=sgov_price,
+                    )
+                else:
+                    self._compute_and_log(
+                        ctx, sleeve_cfg, path=path, date_str=date_str, mode=mode,
+                        pv_real=pv_real, cash_real=cash_real,
+                        spy_symbol=spy_symbol, sgov_symbol=sgov_symbol,
+                        spy_price=spy_price, sgov_price=sgov_price,
+                        orders_before=orders_before, exits_before=exits_before,
+                    )
             finally:
                 if fcntl is not None:
                     fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -671,6 +769,513 @@ class ParkingSleeveShadowTask(Task):
             "parking sleeve shadow mutated ctx.orders"
         assert len(getattr(ctx, "exits", []) or []) == exits_before, \
             "parking sleeve shadow mutated ctx.exits"
+
+    # ── live (SGOV floor) path ────────────────────────────────────────────
+
+    def _compute_and_emit_live(
+        self, ctx: InferenceContext, sleeve_cfg: dict, *, path: Path,
+        date_str: str | None, pv_real: float, cash_real: float,
+        spy_symbol: str, sgov_symbol: str, sgov_price: float,
+    ) -> None:
+        """Plan against REAL broker state and emit SGOV-floor order intents.
+
+        Must only be called while ``path``'s ``.lock`` sibling is held (see
+        ``_run``). The SPY arm is structurally dark here: the planner runs
+        with ``sgov_only=True`` and ``spy_qty=0``, and a defensive guard
+        drops any non-SGOV action — live SPY exposure requires the RS-1 §4
+        pre-registered gate and is a separate change by design.
+
+        Intents are built first and appended to ``ctx.exits``/``ctx.orders``
+        in one block at the end, so a failure mid-computation emits nothing.
+        """
+        cfg = getattr(ctx, "config", None) or {}
+        pending = _pending_buy_invest(ctx)
+        regime = getattr(ctx, "regime", None)
+        regime_params = cfg.get("regime_params", {}) if isinstance(cfg, dict) else {}
+        regime_p = regime_params.get(regime, {}) if isinstance(regime_params, dict) else {}
+        # RAW reserve — deliberately NOT confidence-scaled (module docstring).
+        rr = min(max(_finite_float(
+            regime_p.get("cash_reserve_pct", 0.0) if isinstance(regime_p, dict) else 0.0,
+            0.0,
+        ), 0.0), 1.0)
+        reserve_pv_pct = min(max(
+            _finite_float(sleeve_cfg.get("reserve_pv_pct"), 0.05), 0.0), 1.0)
+        max_sleeve_pct = _finite_float(
+            sleeve_cfg.get("max_sleeve_pct"), DEFAULT_MAX_SLEEVE_PCT_LIVE)
+
+        # REAL broker SGOV book — the cumulative cross-session truth.
+        holdings = getattr(ctx, "holdings", None) or {}
+        hs = holdings.get(sgov_symbol)
+        sgov_shares = max(
+            _finite_float(getattr(hs, "shares", 0.0), 0.0) if hs is not None else 0.0,
+            0.0,
+        )
+        entry_price = (
+            _finite_float(getattr(hs, "entry_price", 0.0), 0.0) if hs is not None else 0.0
+        )
+        basis_before = entry_price * sgov_shares if entry_price > 0 else (
+            sgov_shares * sgov_price if sgov_price > 0 else 0.0
+        )
+
+        blocked: list[str] = []
+        live_exits: list[tuple[str, Any]] = []
+        live_orders: list[dict[str, Any]] = []
+
+        # Another emitter already touched the sleeve symbol this bar —
+        # never stack a second intent on it (mirrors BenchmarkSleeveTask).
+        if sgov_symbol in _existing_buy_tickers(ctx) or (
+            sgov_symbol in _existing_exit_tickers(ctx)
+        ):
+            blocked.append("live_symbol_already_touched")
+            ctx.counters["parking_sleeve_live_symbol_already_touched"] = (
+                ctx.counters.get("parking_sleeve_live_symbol_already_touched", 0) + 1
+            )
+            log.warning(
+                "ParkingSleeveShadowTask[live]: %s already has an order/exit "
+                "this bar — sleeve stands down", sgov_symbol,
+            )
+            self._write_live_records(
+                ctx, sleeve_cfg, path=path, date_str=date_str, plan=None,
+                pv_real=pv_real, cash_real=cash_real, pending=pending, rr=rr,
+                regime=regime, sgov_symbol=sgov_symbol, sgov_price=sgov_price,
+                sgov_shares=sgov_shares, basis_before=basis_before,
+                live_exits=[], live_orders=[], blocked=blocked,
+                reason="live_symbol_already_touched",
+            )
+            return
+
+        reserve_operational = reserve_pv_pct * pv_real + pending
+        reserve_regime = rr * pv_real
+        funding_shortfall = max(0.0, reserve_operational + reserve_regime - cash_real)
+
+        if sgov_price <= 0:
+            # FAIL-CLOSED: the umbrella daily price fetch does not cover SGOV
+            # yet (verified 2026-07-10: no SGOV bars in either OHLCV store).
+            # No buy is ever emitted without a positive price. If cash is
+            # actually needed (reserve/pending shortfall, or a BEAR full
+            # sweep-off) the FULL position is liquidated — a full exit needs
+            # no price, and freeing cash outranks keeping the sleeve parked.
+            blocked.append("sgov_price_missing_live_fail_closed")
+            ctx.counters["parking_sleeve_live_missing_sgov_price"] = (
+                ctx.counters.get("parking_sleeve_live_missing_sgov_price", 0) + 1
+            )
+            log.error(
+                "ParkingSleeveShadowTask[live]: no price for %s — FAIL-CLOSED "
+                "(no sleeve buys; umbrella daily price fetch must add %s bars "
+                "before live parking can deploy). shortfall=$%.2f held=%s",
+                sgov_symbol, sgov_symbol, funding_shortfall, sgov_shares,
+            )
+            fail_closed_plan = {
+                "reserve_operational": reserve_operational,
+                "reserve_regime": reserve_regime,
+                "funding_shortfall": funding_shortfall,
+                "deployable": 0.0,
+                "max_sleeve_pct": min(max(max_sleeve_pct, 0.0), 1.0),
+                "max_sleeve_value_cap": min(max(max_sleeve_pct, 0.0), 1.0) * pv_real,
+            }
+            reason = "sgov_price_missing_fail_closed"
+            if sgov_shares >= 1 and (funding_shortfall > 0.0 or rr >= 1.0):
+                from renquant_pipeline.kernel.exits import ExitSignal  # noqa: PLC0415
+                sig = ExitSignal(
+                    should_exit=True,
+                    reason=(
+                        "parking sleeve fail-closed liquidation: "
+                        f"{sgov_symbol} price missing while "
+                        f"${funding_shortfall:.2f} cash shortfall / regime "
+                        f"reserve {rr:.2f} demands cash — full exit"
+                    ),
+                    exit_type="parking_sleeve_sweep",
+                    quantity=None,  # FULL exit — needs no price
+                )
+                self._stamp_exit_source(sig)
+                live_exits.append((sgov_symbol, sig))
+                reason = "sgov_price_missing_fail_closed_full_exit"
+            for item in live_exits:
+                ctx.exits.append(item)
+            ctx.counters["parking_sleeve_live_exits"] = (
+                ctx.counters.get("parking_sleeve_live_exits", 0) + len(live_exits)
+            )
+            self._write_live_records(
+                ctx, sleeve_cfg, path=path, date_str=date_str,
+                plan=fail_closed_plan,
+                pv_real=pv_real, cash_real=cash_real, pending=pending, rr=rr,
+                regime=regime, sgov_symbol=sgov_symbol, sgov_price=0.0,
+                sgov_shares=sgov_shares, basis_before=basis_before,
+                live_exits=live_exits, live_orders=[], blocked=blocked,
+                reason=reason,
+            )
+            return
+
+        sgov_value = sgov_shares * sgov_price
+        # The sleeve is NOT an alpha position — exclude it from w_pos so the
+        # β budget sees only real single-name exposure (RS-1 §3 narrow
+        # exclusion; SGOV itself is the near-zero-beta leg).
+        positions_value = max(pv_real - cash_real - sgov_value, 0.0)
+
+        plan = compute_parking_sleeve_plan(
+            pv=pv_real,
+            cash=cash_real,
+            positions_value=positions_value,
+            spy_qty=0.0,                       # SPY arm is DARK in live mode
+            spy_price=None,
+            sgov_value=sgov_value,
+            sgov_price=sgov_price,
+            pending_buy_notional=pending,
+            regime_cash_reserve_pct=rr,
+            reserve_pv_pct=reserve_pv_pct,
+            beta_max=_finite_float(sleeve_cfg.get("beta_max"), 0.6),
+            beta_pos=_finite_float(sleeve_cfg.get("beta_pos"), 1.0),
+            min_trade_notional=_finite_float(sleeve_cfg.get("min_trade_notional"), 50.0),
+            max_sleeve_pct=max_sleeve_pct,
+            sgov_only=True,
+            spy_symbol=spy_symbol,
+            sgov_symbol=sgov_symbol,
+        )
+        blocked.extend(plan.get("blocked") or [])
+
+        buy_gated = (
+            bool(getattr(ctx, "buy_blocked", False))
+            or bool(getattr(ctx, "skip_buys", False))
+            or bool(getattr(ctx, "bear_only", False))
+        )
+        wash_days = 30
+        if isinstance(cfg, dict):
+            wash_days = int(_finite_float(cfg.get("wash_sale_days"), 30.0))
+
+        for action in plan["actions"]:
+            symbol = str(action.get("symbol") or "")
+            if symbol != sgov_symbol:
+                # Structural SPY-dark guard — must be unreachable with
+                # sgov_only=True + spy_qty=0; never emit and say so loudly.
+                blocked.append(f"live_non_sgov_action_dropped:{symbol}")
+                ctx.counters["parking_sleeve_live_non_sgov_dropped"] = (
+                    ctx.counters.get("parking_sleeve_live_non_sgov_dropped", 0) + 1
+                )
+                log.error(
+                    "ParkingSleeveShadowTask[live]: dropped non-SGOV action %r "
+                    "(SPY arm is not authorized for live exposure)", action,
+                )
+                continue
+            if action["action"] == "SELL":
+                sig = self._build_live_sell(
+                    ctx, action, sgov_symbol=sgov_symbol,
+                    sgov_price=sgov_price, sgov_shares=sgov_shares,
+                )
+                if sig is not None:
+                    live_exits.append((sgov_symbol, sig))
+                continue
+            # BUY — gates first (sells above are never gated).
+            if buy_gated:
+                blocked.append("live_buy_gates_blocked")
+                ctx.counters["parking_sleeve_live_buy_gated"] = (
+                    ctx.counters.get("parking_sleeve_live_buy_gated", 0) + 1
+                )
+                continue
+            from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+                is_wash_sale_blocked_with_cost,
+            )
+            ws_blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
+                sgov_symbol, ctx.today,
+                getattr(ctx, "last_sell_dates", None) or {},
+                getattr(ctx, "last_sell_pls", None) or {},
+                wash_days,
+            )
+            if ws_blocked:
+                # A recent SGOV LOSS sale would wash under §1091 — same
+                # engine, same verdict as any single-name buy. Gain sales
+                # and stale sales pass through the engine unblocked.
+                blocked.append("sgov_wash_sale_blocked")
+                ctx.counters["parking_sleeve_live_wash_sale_blocked"] = (
+                    ctx.counters.get("parking_sleeve_live_wash_sale_blocked", 0) + 1
+                )
+                log.warning(
+                    "ParkingSleeveShadowTask[live]: SGOV buy wash-sale "
+                    "blocked — %s", ws_reason,
+                )
+                continue
+            order = self._build_live_buy(
+                ctx, action, plan=plan, sgov_symbol=sgov_symbol,
+                sgov_price=sgov_price, sgov_value=sgov_value,
+                pv_real=pv_real, cash_real=cash_real,
+            )
+            if order is not None:
+                live_orders.append(order)
+
+        # Atomic append — nothing above mutated ctx.
+        for item in live_exits:
+            ctx.exits.append(item)
+        for order in live_orders:
+            ctx.orders.append(order)
+        ctx.counters["parking_sleeve_live_exits"] = (
+            ctx.counters.get("parking_sleeve_live_exits", 0) + len(live_exits)
+        )
+        ctx.counters["parking_sleeve_live_orders"] = (
+            ctx.counters.get("parking_sleeve_live_orders", 0) + len(live_orders)
+        )
+        log.info(
+            "ParkingSleeveShadowTask[live]: emitted %d sell(s) + %d buy(s) "
+            "reason=%s deployable=$%.0f shortfall=$%.0f (SGOV floor, SPY dark)",
+            len(live_exits), len(live_orders), plan.get("reason"),
+            _finite_float(plan.get("deployable"), 0.0),
+            _finite_float(plan.get("funding_shortfall"), 0.0),
+        )
+        self._write_live_records(
+            ctx, sleeve_cfg, path=path, date_str=date_str, plan=plan,
+            pv_real=pv_real, cash_real=cash_real, pending=pending, rr=rr,
+            regime=regime, sgov_symbol=sgov_symbol, sgov_price=sgov_price,
+            sgov_shares=sgov_shares, basis_before=basis_before,
+            live_exits=live_exits, live_orders=live_orders, blocked=blocked,
+            reason=str(plan.get("reason")),
+        )
+
+    @staticmethod
+    def _stamp_exit_source(sig: Any) -> None:
+        sig.source_job = "ParkingSleeveJob"
+        sig.source_task = "ParkingSleeveShadowTask"
+        sig.order_source = "ParkingSleeveJob.ParkingSleeveShadowTask"
+        sig.source = sig.order_source
+
+    def _build_live_sell(
+        self, ctx: InferenceContext, action: dict, *, sgov_symbol: str,
+        sgov_price: float, sgov_shares: float,
+    ) -> Any | None:
+        """Translate a planned SGOV SELL into an ExitSignal.
+
+        Shares are sized with the sell-proceeds cost multiplier so the cash
+        actually freed (net of spread/fees) still covers the planned
+        notional — the free-before-need invariant survives friction.
+        """
+        if sgov_shares < 1:
+            return None
+        notional = _finite_float(action.get("notional"), 0.0)
+        if notional <= 0:
+            return None
+        unit_proceeds = sgov_price * _sell_proceeds_multiplier(
+            getattr(ctx, "config", None) or {})
+        if unit_proceeds <= 0:
+            qty = int(sgov_shares)
+        else:
+            qty = min(int(math.ceil(notional / unit_proceeds)), int(sgov_shares))
+        if qty < 1:
+            return None
+        from renquant_pipeline.kernel.exits import ExitSignal  # noqa: PLC0415
+        full = qty >= int(sgov_shares)
+        sig = ExitSignal(
+            should_exit=True,
+            reason=f"parking sleeve: {action.get('reason')}",
+            exit_type="parking_sleeve_sweep",
+            quantity=None if full else float(qty),
+        )
+        self._stamp_exit_source(sig)
+        return sig
+
+    def _build_live_buy(
+        self, ctx: InferenceContext, action: dict, *, plan: dict,
+        sgov_symbol: str, sgov_price: float, sgov_value: float,
+        pv_real: float, cash_real: float,
+    ) -> dict | None:
+        """Translate a planned SGOV BUY into an attributed order dict.
+
+        Whole shares, priced with the buy-cost multiplier, and re-clamped so
+        the invest can never dig into the operational/regime reserves or the
+        pending main-strategy buys (belt-and-suspenders on top of the
+        planner's ``deployable`` arithmetic — the liquidity invariant is
+        enforced twice).
+        """
+        notional = _finite_float(action.get("notional"), 0.0)
+        invest_cap = max(
+            0.0,
+            cash_real
+            - _finite_float(plan.get("reserve_operational"), 0.0)
+            - _finite_float(plan.get("reserve_regime"), 0.0),
+        )
+        buy_value = min(notional, invest_cap)
+        unit_cost = sgov_price * _buy_cost_multiplier(getattr(ctx, "config", None) or {})
+        qty = int(buy_value // unit_cost) if unit_cost > 0 else 0
+        if qty < 1:
+            ctx.counters["parking_sleeve_live_buy_dust_skipped"] = (
+                ctx.counters.get("parking_sleeve_live_buy_dust_skipped", 0) + 1
+            )
+            return None
+        invest = qty * sgov_price
+        target_pct = (sgov_value + invest) / pv_real if pv_real > 0 else 0.0
+        return stamp_order_attribution({
+            "ticker": sgov_symbol,
+            "shares": float(qty),
+            "price": sgov_price,
+            "invest": invest,
+            "target_pct": target_pct,
+            "regime": getattr(ctx, "regime", None),
+            "confidence": getattr(ctx, "confidence", None),
+            "conviction": 1.0,
+            "sigma_mult": 1.0,
+            "rank_score": None,
+            "rs_score": 0.0,
+            "panel_score": None,
+            "sigma": None,
+            "mu": None,
+            "kelly_target_pct": None,
+            "detail": "parking_sleeve_sgov_floor",
+            "order_type": "PARKING_SLEEVE_BUY",
+        }, ctx=ctx, source_job="ParkingSleeveJob",
+            source_task="ParkingSleeveShadowTask",
+            acceptance_reason="idle_cash_to_sgov_parking_floor",
+            decision_inputs={
+                "reason": plan.get("reason"),
+                "deployable": _finite_float(plan.get("deployable"), 0.0),
+                "reserve_operational": _finite_float(plan.get("reserve_operational"), 0.0),
+                "reserve_regime": _finite_float(plan.get("reserve_regime"), 0.0),
+                "max_sleeve_pct": _finite_float(plan.get("max_sleeve_pct"), 0.0),
+                "max_sleeve_value_cap": _finite_float(plan.get("max_sleeve_value_cap"), 0.0),
+                "invest_cap": invest_cap,
+                "sgov_value_before": sgov_value,
+            })
+
+    def _write_live_records(
+        self, ctx: InferenceContext, sleeve_cfg: dict, *, path: Path,
+        date_str: str | None, plan: dict | None, pv_real: float,
+        cash_real: float, pending: float, rr: float, regime: Any,
+        sgov_symbol: str, sgov_price: float, sgov_shares: float,
+        basis_before: float, live_exits: list, live_orders: list,
+        blocked: list[str], reason: str,
+    ) -> None:
+        """Append the live session's rows to the JSONL (same schema as shadow).
+
+        ``shadow_state`` mirrors the REAL post-trade book (SGOV at cost
+        basis, SPY always 0) so a later flip back to shadow never inherits a
+        stale shadow book. The running ``max_dd_budget_consumption_pct`` is
+        carried across sessions through the same field as shadow mode.
+        """
+        prior = load_last_shadow_state(path)
+
+        sold_qty = 0.0
+        for _ticker, sig in live_exits:
+            q = getattr(sig, "quantity", None)
+            sold_qty += sgov_shares if q is None else min(float(q), sgov_shares)
+        bought_qty = sum(_finite_float(o.get("shares"), 0.0) for o in live_orders)
+        buy_invest = sum(_finite_float(o.get("invest"), 0.0) for o in live_orders)
+
+        shares_after = max(sgov_shares - sold_qty, 0.0) + bought_qty
+        basis_per_share = basis_before / sgov_shares if sgov_shares > 0 else 0.0
+        basis_after = max(basis_before - sold_qty * basis_per_share, 0.0) + buy_invest
+        value_after = shares_after * sgov_price if sgov_price > 0 else basis_after
+
+        # Mark-to-market contribution of the REAL pre-trade holding
+        # (trading at the current price does not change it).
+        contribution_abs = (
+            sgov_shares * sgov_price - basis_before if sgov_price > 0 else 0.0
+        )
+        contribution_pct = contribution_abs / pv_real if pv_real > 0 else 0.0
+        hwm = _finite_float(getattr(ctx, "hwm", 0.0), 0.0)
+        drawdown_pct = max(0.0, 1.0 - pv_real / hwm) if hwm > 0 else 0.0
+        dd_budget_pct = _finite_float(sleeve_cfg.get("dd_budget_pct"), 0.15)
+        dd_consumption = drawdown_pct / dd_budget_pct if dd_budget_pct > 0 else 0.0
+        max_dd = max(
+            _finite_float(prior.get("max_dd_budget_consumption_pct"), 0.0),
+            dd_consumption,
+        )
+
+        plan = plan or {}
+        book_state = {
+            "mode": "live",
+            "live_orders_placed": bool(live_exits or live_orders),
+            "pv": round(pv_real, 2),
+            "shadow_pv": round(pv_real, 2),      # no shadow book in live mode
+            "cash": round(cash_real, 2),
+            "shadow_cash": round(cash_real, 2),  # no shadow book in live mode
+            "positions_value": round(max(pv_real - cash_real, 0.0), 2),
+            "pending_buy_notional": round(pending, 2),
+            "regime": regime,
+            "regime_cash_reserve_pct": rr,
+            "reserve_operational": round(_finite_float(plan.get("reserve_operational"), 0.0), 2),
+            "reserve_regime": round(_finite_float(plan.get("reserve_regime"), 0.0), 2),
+            "deployable": round(_finite_float(plan.get("deployable"), 0.0), 2),
+            "funding_shortfall": round(_finite_float(plan.get("funding_shortfall"), 0.0), 2),
+            "w_pos": round(_finite_float(plan.get("w_pos"), 0.0), 6),
+            "w_sleeve": round(_finite_float(plan.get("w_sleeve"), 0.0), 6),
+            "sleeve_spy_frac": 0.0,               # SPY arm dark in live mode
+            "target_spy_value": 0.0,
+            "target_sgov_value": round(_finite_float(plan.get("target_sgov_value"), 0.0), 2),
+            "spy_price": None,
+            "sgov_price": sgov_price if sgov_price > 0 else None,
+            "shadow_spy_qty": 0.0,
+            "shadow_sgov_value": round(basis_after, 2),
+            "net_invested": round(basis_after, 2),
+            "sleeve_value": round(value_after, 2),
+            "sleeve_contribution_abs": round(contribution_abs, 2),
+            "sleeve_contribution_pct": round(contribution_pct, 6),
+            "drawdown_pct": round(drawdown_pct, 6),
+            "dd_budget_pct": dd_budget_pct,
+            "dd_budget_consumption_pct": round(dd_consumption, 6),
+            "max_dd_budget_consumption_pct": round(max_dd, 6),
+            "sgov_valuation_mode": SGOV_VALUATION_MODE_LIVE,
+            "blocked": list(blocked),
+            # live-only telemetry
+            "live_sgov_shares_before": sgov_shares,
+            "live_sgov_shares_after": shares_after,
+            "max_sleeve_pct": _finite_float(plan.get("max_sleeve_pct"), None),
+            "max_sleeve_value_cap": _finite_float(plan.get("max_sleeve_value_cap"), 0.0),
+            "sleeve_cap_bound": bool(plan.get("sleeve_cap_bound", False)),
+        }
+
+        records: list[dict[str, Any]] = []
+        for _ticker, sig in live_exits:
+            q = getattr(sig, "quantity", None)
+            qty = int(sgov_shares) if q is None else int(q)
+            records.append({
+                "record_type": "action",
+                "date": date_str,
+                "action": "SELL",
+                "symbol": sgov_symbol,
+                "qty": qty,
+                "notional": round(qty * sgov_price, 2) if sgov_price > 0 else None,
+                "reason": getattr(sig, "reason", reason),
+                "book_state": book_state,
+            })
+        for order in live_orders:
+            records.append({
+                "record_type": "action",
+                "date": date_str,
+                "action": "BUY",
+                "symbol": order.get("ticker"),
+                "qty": int(_finite_float(order.get("shares"), 0.0)),
+                "notional": round(_finite_float(order.get("invest"), 0.0), 2),
+                "reason": reason,
+                "book_state": book_state,
+            })
+        new_state = {
+            "spy_qty": 0.0,
+            "sgov_value": basis_after,
+            "net_invested": basis_after,
+            "last_spy_price": 0.0,
+            "max_dd_budget_consumption_pct": max_dd,
+        }
+        records.append({
+            "record_type": "summary",
+            "date": date_str,
+            "action": "hold" if not (live_exits or live_orders) else "summary",
+            "symbol": None,
+            "qty": None,
+            "notional": 0.0,
+            "reason": reason,
+            "book_state": book_state,
+            "shadow_state": {k: round(float(v), 6) for k, v in new_state.items()},
+        })
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            for row in records:
+                fh.write(json.dumps(row, default=str, sort_keys=True) + "\n")
+
+        ctx._parking_sleeve_last = records[-1]  # noqa: SLF001
+        ctx._parking_sleeve_log_path = str(path)  # noqa: SLF001
+        ctx.counters["parking_sleeve_live_rows"] = (
+            ctx.counters.get("parking_sleeve_live_rows", 0) + len(records)
+        )
+        ctx.counters["parking_sleeve_intended_actions"] = (
+            ctx.counters.get("parking_sleeve_intended_actions", 0)
+            + len(live_exits) + len(live_orders)
+        )
 
     @staticmethod
     def _resolve_path(ctx: InferenceContext, sleeve_cfg: dict) -> Path:

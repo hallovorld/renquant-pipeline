@@ -577,10 +577,15 @@ class InferencePipeline:
 
         # S7 lane-B parking sleeve (renquant-orchestrator RS-1 + capability
         # program §1.3): β-budgeted SPY/SGOV sweep of idle cash above the
-        # reserve. Default OFF (`sleeve.enabled`); shadow mode only — logs the
-        # intended sweep/fund orders to a JSONL and places NOTHING. Runs after
-        # every selection/top-up/trim decision so it can never compete with or
-        # block single-name admission.
+        # reserve. Default OFF (`sleeve.enabled`). `sleeve.mode="shadow"`
+        # (default) logs the intended sweep/fund orders to a JSONL and places
+        # NOTHING; `sleeve.mode="live"` emits real SGOV-floor intents only
+        # (SGOV buys above the reserves, SGOV sells first when cash is
+        # needed — the SPY arm stays dark pending its RS-1 §4 gate). Runs
+        # after every selection/top-up/trim decision so it can never compete
+        # with or block single-name admission; its sells land in ctx.exits,
+        # which pp_execution's ExitsJob executes BEFORE BuysJob (free cash
+        # before it is needed).
         from .task_parking_sleeve import ParkingSleeveShadowTask  # noqa: PLC0415
         ParkingSleeveShadowTask().run(ctx)
 
