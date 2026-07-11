@@ -65,20 +65,41 @@ OUTPUT CONTRACT (``ctx.funnel_integrity``, schema ``funnel_integrity.v1``):
   n_candidates_final, n_ranked, n_rotations, n_buy_orders, n_exits,
   buy_blocked, bear_only, skip_buys}, error``
 
-Downstream persistence stamps this block into the run bundle verbatim under
-the key ``funnel_integrity``; the umbrella ntfy path titles the run via
-``notification_headline(getattr(ctx, "funnel_integrity", None))`` →
-``{"outage": bool, "title_tag": "OUTAGE"|"DEGRADED"|"NO-TRADE"|"TRADE"|
-"UNKNOWN", "line": str}``. Integer mirrors land on ``ctx.counters``
-(``funnel_integrity_structural`` / ``funnel_integrity_fired`` /
-``funnel_integrity_errors``) so the existing counters_json persistence
-carries the headline even before any consumer reads the block.
+This module emits ONLY the versioned structured verdict above — it is
+owner-neutral serialization, not a notification/paging contract. Integer
+mirrors land on ``ctx.counters`` (``funnel_integrity_structural`` /
+``funnel_integrity_fired`` / ``funnel_integrity_errors``) so the existing
+counters_json / run-bundle persistence carries the verdict even before any
+consumer reads ``ctx.funnel_integrity`` directly. Rendering this block into
+an operator-facing page/title (e.g. OUTAGE-vs-no-trade ntfy framing) is a
+downstream concern for whichever repo owns notification delivery —
+renquant-orchestrator's monitor, per the multi-repo boundary already
+enforced by RenQuant#462/#463 (broker-capability and universe-collapse
+alerting both belong to their owning repo, not the umbrella or this
+detector module). That consumer is out of scope here and should arrive as
+a separate renquant-orchestrator PR that reads this schema.
 
 CONTRACT (hard, same isolation pattern as AdmissionShadowLoggerTask):
 
-  * OBSERVE-ONLY / ZERO behavior change — no signal, decision, sizing or
-    order state is mutated. The task only reads funnel state and writes its
-    own block + counters + its rolling history slice of ``ctx.monitor_state``.
+  * DECISION-INVARIANT, not zero-mutation — this task never reads-then-
+    changes any decision/order state (``candidates``, ``orders``, ``exits``,
+    ``buy_blocked``, ``skip_buys``, ``models``, ranking/rotation/selection
+    outputs, …); the buy/sell decision a session already made is identical
+    whether or not this task runs. It DOES mutate ``ctx``: it stamps
+    ``ctx.funnel_integrity`` (this run's verdict block), two new
+    ``ctx.counters`` keys (``funnel_integrity_fired`` / ``_structural``,
+    plus ``_errors`` on failure), and appends one compact record per
+    trading day to ``ctx.monitor_state`` history (see ``_update_history``).
+    These are additive observability state, never modifications of
+    existing decision fields.
+  * PERSISTENCE / RETRY — a same-date re-run REPLACES that day's history
+    record rather than appending a duplicate (``_update_history``), so
+    intraday re-runs cannot inflate history or duplicate ledger rows. Must
+    be wired strictly after the final buy/rotation/exit emission (so the
+    funnel counts reported are final) and strictly before any task that
+    persists this run's ``ctx.counters`` / a decision-ledger record (so
+    that consumer can already see this block) — see
+    ``test_wired_before_decision_ledger_write``.
   * FAIL-ISOLATED — any exception inside the task is swallowed, logged and
     counted; a crash here must NEVER dark a run. When the crash happens
     after partial assembly the published block carries ``error`` so the
@@ -751,7 +772,7 @@ DEFAULT_INVARIANTS: tuple[Any, ...] = (
 )
 
 
-# ── Verdict + notification contract ──────────────────────────────────────────
+# ── Verdict classification ────────────────────────────────────────────────────
 
 def classify_verdict(
     view: FunnelView, findings: list[InvariantFinding],
@@ -781,49 +802,25 @@ def classify_verdict(
     )
 
 
-def notification_headline(block: dict | None) -> dict[str, Any]:
-    """Notification-contract adapter for the umbrella ntfy path.
-
-    Consumes ``getattr(ctx, "funnel_integrity", None)`` and returns
-    ``{"outage": bool, "title_tag": str, "line": str}``:
-
-      * ``outage``    — True iff verdict == STRUCTURAL_BLOCK: the run must be
-        titled an OUTAGE (engineering block), never a quiet no-trade.
-      * ``title_tag`` — OUTAGE | DEGRADED | NO-TRADE | TRADE | UNKNOWN.
-      * ``line``      — one-line body segment (verdict + fired invariants).
-    """
-    if not isinstance(block, dict) or not block.get("verdict"):
-        return {
-            "outage": False,
-            "title_tag": "UNKNOWN",
-            "line": "funnel integrity: not evaluated",
-        }
-    verdict = str(block["verdict"])
-    tag = {
-        VERDICT_STRUCTURAL_BLOCK: "OUTAGE",
-        VERDICT_DEGRADED: "DEGRADED",
-        VERDICT_ECONOMIC_NO_TRADE: "NO-TRADE",
-        VERDICT_ECONOMIC_TRADE: "TRADE",
-    }.get(verdict, "UNKNOWN")
-    fired = block.get("fired") or []
-    fired_names = ", ".join(
-        str(f.get("invariant", "?")) for f in fired if isinstance(f, dict)
-    )
-    line = f"funnel integrity: {verdict}"
-    if fired_names:
-        line += f" [{fired_names}]"
-    error = block.get("error")
-    if error:
-        line += f" (integrity-task error: {error})"
-    return {"outage": tag == "OUTAGE", "title_tag": tag, "line": line}
+# Notification/paging rendering (page title, OUTAGE-vs-no-trade framing, ntfy
+# body text) is deliberately NOT implemented here. This module's contract ends
+# at the versioned structured verdict (``ctx.funnel_integrity``, schema
+# ``funnel_integrity.v1``) — pipeline emits owner-neutral serialization only.
+# Rendering it into an operator-facing alert belongs to whichever repo owns
+# notification delivery (renquant-orchestrator's monitor), as a separate PR
+# that reads this schema. See module docstring and RenQuant#462/#463 (both
+# closed for placing owning-repo-specific logic in the deprecated umbrella).
 
 
 # ── The task ──────────────────────────────────────────────────────────────────
 
 class FunnelIntegrityTask:
-    """Observe-only, fail-isolated buy-funnel integrity verdict (see module
-    docstring). The two hard invariants are ZERO behavior change and NEVER
-    raising out of ``run`` — a crash here must never dark the run it audits."""
+    """Decision-invariant, fail-isolated buy-funnel integrity verdict (see
+    module docstring). The two hard invariants are DECISION-INVARIANCE (it
+    mutates ``ctx.funnel_integrity`` / ``ctx.counters`` / ``ctx.monitor_state``
+    as new observability state, but never reads-then-changes any existing
+    decision/order field) and NEVER raising out of ``run`` — a crash here
+    must never dark the run it audits."""
 
     def __init__(self, invariants: tuple[Any, ...] | None = None) -> None:
         self._invariants = tuple(invariants or DEFAULT_INVARIANTS)

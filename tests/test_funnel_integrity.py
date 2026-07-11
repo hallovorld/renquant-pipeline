@@ -20,12 +20,18 @@ class"):
 * partial suppression classifies DEGRADED;
 * fail isolation: a detector exception, and a whole-task exception, never
   fail the run — the integrity block carries the error;
-* ZERO behavior change to decision state (regression pin);
+* decision-invariant to decision state (regression pin) while still
+  mutating ctx.funnel_integrity / ctx.counters / ctx.monitor_state;
 * the kill switch (funnel_integrity.enabled=false);
-* rolling history maintenance on ctx.monitor_state;
-* the notification contract (OUTAGE vs no-trade title fields);
-* the pp_inference wiring (end of InferencePipeline only, never
-  SellOnlyPipeline).
+* rolling history maintenance on ctx.monitor_state (persistence/retry —
+  same-date re-run replaces, not duplicates);
+* the pp_inference wiring: FunnelIntegrityTask runs after the final
+  buy/rotation/exit emission but BEFORE DecisionLedgerWriteTask (so any
+  ledger/run-bundle consumer of this run's ctx can already see the block),
+  and only in InferencePipeline, never SellOnlyPipeline. Notification/
+  paging rendering is intentionally NOT this module's concern — see
+  task_funnel_integrity.py's module docstring; that consumer belongs in a
+  separate renquant-orchestrator PR.
 """
 from __future__ import annotations
 
@@ -52,7 +58,6 @@ from renquant_pipeline.kernel.pipeline.task_funnel_integrity import (
     InvariantFinding,
     build_funnel_view,
     gate_family,
-    notification_headline,
 )
 
 TODAY = datetime.date(2026, 7, 8)
@@ -117,10 +122,10 @@ def test_universe_admission_collapse_fires_on_0708_signature():
     assert finding["evidence"]["n_staleness_rejections"] == 133
     assert finding["evidence"]["admitted_below_floor"] is True
     assert finding["evidence"]["staleness_above_threshold"] is True
-    # The headline must title this an OUTAGE, never a no-trade.
-    headline = notification_headline(block)
-    assert headline["outage"] is True
-    assert headline["title_tag"] == "OUTAGE"
+    # A downstream consumer must be able to title this an OUTAGE, never a
+    # no-trade: structural + zero buys is exactly STRUCTURAL_BLOCK.
+    assert block["structural"] is True
+    assert block["verdict"] == VERDICT_STRUCTURAL_BLOCK
     # Counter mirrors for counters_json persistence.
     assert ctx.counters["funnel_integrity_structural"] == 1
     assert ctx.counters["funnel_integrity_fired"] >= 1
@@ -225,7 +230,6 @@ def test_threshold_scale_mismatch_warn_when_floor_above_positive_max():
     assert finding["severity"] == SEVERITY_WARN
     # warn-only + zero buys = DEGRADED (partial), not a full OUTAGE.
     assert block["verdict"] == VERDICT_DEGRADED
-    assert notification_headline(block)["title_tag"] == "DEGRADED"
 
 
 def test_threshold_scale_mismatch_quiet_when_floor_reachable():
@@ -483,9 +487,6 @@ def test_clean_no_trade_session_is_economic_no_trade():
     assert block["fired"] == []
     assert block["structural"] is False
     assert block["verdict"] == VERDICT_ECONOMIC_NO_TRADE
-    headline = notification_headline(block)
-    assert headline["outage"] is False
-    assert headline["title_tag"] == "NO-TRADE"
     assert block["funnel"]["n_candidates_final"] == 1
     assert block["gate_kill_counts"] == {"conviction": 1, "veto": 1}
 
@@ -497,7 +498,6 @@ def test_clean_traded_session_is_economic_trade():
     block = _block(ctx)
     assert block["fired"] == []
     assert block["verdict"] == VERDICT_ECONOMIC_TRADE
-    assert notification_headline(block)["title_tag"] == "TRADE"
 
 
 def test_structural_finding_with_buys_is_degraded():
@@ -558,10 +558,15 @@ def test_whole_task_exception_never_raises_and_stamps_error(monkeypatch):
     block = getattr(ctx, CTX_ATTR)
     assert block["verdict"] is None
     assert "total collapse" in block["error"]
-    assert notification_headline(block)["title_tag"] == "UNKNOWN"
 
 
-def test_zero_behavior_change_regression_pin():
+def test_decision_invariant_regression_pin():
+    """The task is decision-invariant, NOT zero-mutation: it never touches an
+    existing decision/order field, but it DOES stamp ctx.funnel_integrity,
+    mirror counters onto ctx.counters, and append to ctx.monitor_state
+    history. Pin both halves of that contract so a future change cannot
+    silently start mutating a decision field, nor silently stop publishing
+    the block/mirrors/history that downstream consumers rely on."""
     ctx = _clean_ctx()
     ctx.orders = [{"ticker": "AAA", "shares": 3, "price": 100.0}]
     before = {
@@ -575,9 +580,11 @@ def test_zero_behavior_change_regression_pin():
         "skip_buys": ctx.skip_buys,
         "models": set(ctx.models),
     }
+    assert getattr(ctx, CTX_ATTR, None) is None   # not yet published
 
     FunnelIntegrityTask().run(ctx)
 
+    # Decision/order state: byte-for-byte unchanged.
     assert [(c.ticker, c.expected_return) for c in ctx.candidates] \
         == before["candidates"]
     assert ctx.orders == before["orders"]
@@ -586,6 +593,16 @@ def test_zero_behavior_change_regression_pin():
     assert ctx.buy_blocked == before["buy_blocked"]
     assert ctx.skip_buys == before["skip_buys"]
     assert set(ctx.models) == before["models"]
+
+    # Observability state: the task DOES mutate ctx — this is the intended,
+    # documented side effect (decision-invariant, not zero-mutation).
+    block = _block(ctx)
+    assert block["verdict"] == VERDICT_ECONOMIC_TRADE
+    assert ctx.counters["funnel_integrity_fired"] == 0
+    assert ctx.counters["funnel_integrity_structural"] == 0
+    hist = ctx.monitor_state[HISTORY_STATE_KEY]
+    assert hist[-1]["date"] == TODAY.isoformat()
+    assert hist[-1]["verdict"] == VERDICT_ECONOMIC_TRADE
 
 
 # ── Kill switches ─────────────────────────────────────────────────────────────
@@ -686,24 +703,6 @@ def test_build_funnel_view_merges_both_blocked_maps():
     assert view.gate_kill_counts == {"wash_sale": 1, "earnings_blackout": 1}
 
 
-def test_notification_headline_contract():
-    assert notification_headline(None) == {
-        "outage": False,
-        "title_tag": "UNKNOWN",
-        "line": "funnel integrity: not evaluated",
-    }
-    block = {
-        "schema": SCHEMA_VERSION,
-        "verdict": VERDICT_STRUCTURAL_BLOCK,
-        "fired": [{"invariant": "universe_admission_collapse"}],
-        "error": None,
-    }
-    headline = notification_headline(block)
-    assert headline["outage"] is True
-    assert headline["title_tag"] == "OUTAGE"
-    assert "universe_admission_collapse" in headline["line"]
-
-
 def test_finding_as_dict_roundtrip():
     finding = InvariantFinding(
         invariant="x", severity=SEVERITY_WARN, reason="r", evidence={"k": 1},
@@ -716,14 +715,87 @@ def test_finding_as_dict_roundtrip():
 
 # ── pp_inference wiring ──────────────────────────────────────────────────────
 
-def test_wired_at_end_of_inference_pipeline_only():
+def test_wired_before_decision_ledger_write():
+    """Source-order guard on the actual InferencePipeline assembly.
+
+    FunnelIntegrityTask must run after the final buy/rotation/exit emission
+    (so its funnel counts are final) but strictly BEFORE
+    DecisionLedgerWriteTask (S5) — so any current or future consumer of
+    that persisted ledger/run record can already see ctx.funnel_integrity
+    and its counter mirrors. Getting this backwards was the exact bug this
+    test pins: FunnelIntegrityTask published its block only after S5 had
+    already read/persisted ctx for this run.
+    """
     from renquant_pipeline.kernel.pipeline import pp_inference
 
     full = inspect.getsource(pp_inference.InferencePipeline.run)
     sell_only = inspect.getsource(pp_inference.SellOnlyPipeline.run)
     assert "FunnelIntegrityTask().run(ctx)" in full
-    # Must run at the very END: after the decision-ledger write.
+    assert "DecisionLedgerWriteTask" in full
     assert full.index("FunnelIntegrityTask().run(ctx)") \
-        > full.index("DecisionLedgerWriteTask")
+        < full.index("DecisionLedgerWriteTask")
+    # It must also run after the tail of decision emission (monitor/topup/
+    # trim/parking-sleeve are the last decision-affecting steps).
+    assert full.index("MonitorIdleStreakTask") \
+        < full.index("FunnelIntegrityTask().run(ctx)")
     # The exit-only variant has no buy funnel to judge.
     assert "FunnelIntegrityTask" not in sell_only
+
+
+def test_decision_ledger_task_can_see_funnel_integrity_in_correct_order():
+    """Integration proof for the ordering fix (not just source-text order).
+
+    Exercises the REAL FunnelIntegrityTask followed by the REAL
+    DecisionLedgerWriteTask, in the order pp_inference.py now wires them,
+    against a single shared ctx. Proves that by DecisionLedgerWriteTask's
+    call site, ctx.funnel_integrity and its counter mirrors already exist
+    and survive the ledger task running (a currently-disabled-by-default,
+    fail-open task in this ctx) untouched — the exact contract Codex's
+    review demanded.
+
+    A full end-to-end InferencePipeline().run(ctx) cannot be exercised
+    here: kernel.meta_label.task_meta_label_veto / job_meta_label_log are
+    still umbrella/renquant-backtesting-only (see
+    renquant_pipeline/kernel/meta_label/__init__.py's own docstring) and
+    are unconditionally imported inside InferencePipeline.run, so that
+    entry point is not yet callable from this repo alone — same
+    constraint documented in test_lift_pp_inference.py for the xgboost
+    boundary.
+    """
+    from renquant_pipeline.kernel.pipeline.task_decision_ledger import (
+        DecisionLedgerWriteTask,
+    )
+
+    watchlist = [f"T{i:03d}" for i in range(145)]
+    admitted = watchlist[:12]
+    ctx = _ctx(config_extra={
+        "watchlist": watchlist,
+        "_universe_rejections": {
+            t: "stale_76d_limit_60:live_train_end" for t in watchlist[12:]
+        },
+    })
+    ctx.models = {t: {"_metadata": {}} for t in admitted}
+
+    FunnelIntegrityTask().run(ctx)
+
+    block_before = copy.deepcopy(getattr(ctx, CTX_ATTR))
+    counters_before = dict(ctx.counters)
+    assert block_before["verdict"] == VERDICT_STRUCTURAL_BLOCK
+    assert block_before["structural"] is True
+    assert counters_before["funnel_integrity_structural"] == 1
+
+    # decision_ledger.enabled defaults False in this ctx's config (opt-in,
+    # matches production default) — DecisionLedgerWriteTask.run returns
+    # False without touching a DB, but this still proves the real S5 call
+    # site can observe (and does not clobber) the funnel_integrity state
+    # FunnelIntegrityTask already published, in the corrected order.
+    result = DecisionLedgerWriteTask().run(ctx)
+
+    assert result is False
+    assert getattr(ctx, CTX_ATTR) == block_before
+    assert ctx.counters["funnel_integrity_structural"] == (
+        counters_before["funnel_integrity_structural"]
+    )
+    assert ctx.counters["funnel_integrity_fired"] == (
+        counters_before["funnel_integrity_fired"]
+    )

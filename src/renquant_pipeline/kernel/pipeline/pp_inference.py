@@ -603,32 +603,39 @@ class InferencePipeline:
         if not _ml_job.should_skip(ctx):
             _ml_job.run(ctx)
 
+        # 2026-07-11 FUNNEL-INTEGRITY (operator mandate after the 07-08/09
+        # admission outage — two sessions of zero buy capability reported as
+        # a normal "no trade"): classify this session's buy-funnel outcome
+        # into a first-class verdict (ECONOMIC_TRADE / ECONOMIC_NO_TRADE /
+        # DEGRADED / STRUCTURAL_BLOCK) and publish ctx.funnel_integrity plus
+        # its ctx.counters mirrors. Runs after the final buy/rotation/exit
+        # emission (post-selection, post-rotation, post-monitor) so the
+        # funnel counts it reports are final, and BEFORE the decision-ledger
+        # persistence point below so any current or future ledger/run-bundle
+        # consumer of this run's ctx.counters/ctx state can already see the
+        # block — see tests/test_funnel_integrity.py::
+        # test_wired_before_decision_ledger_write. OBSERVE-ONLY + fail-
+        # isolated (its own crash never darks the run) — same isolation
+        # contract as AdmissionShadowLoggerTask. Kill switch:
+        # funnel_integrity.enabled. Deliberately NOT in SellOnlyPipeline: the
+        # exit-only variant has no buy funnel to judge and runs ~every 12 min
+        # intraday (a misleading per-tick verdict would be false-OUTAGE
+        # spam, not observability).
+        from .task_funnel_integrity import FunnelIntegrityTask  # noqa: PLC0415
+        FunnelIntegrityTask().run(ctx)
+
         # S5: persist gate verdicts to the decision ledger DB. Per-ticker
         # decisions are formatted and logged for observability only, not
         # persisted (would reintroduce the outcome-observer poisoning bug
         # at (as_of, scope, gate) grain — see task_decision_ledger.py).
-        # Fail-open — never blocks the daily run.
+        # Fail-open — never blocks the daily run. Runs AFTER
+        # FunnelIntegrityTask (above) so ctx already carries this run's
+        # funnel_integrity verdict + counters mirrors.
         from .task_decision_ledger import DecisionLedgerWriteTask  # noqa: PLC0415
         try:
             DecisionLedgerWriteTask().run(ctx)
         except Exception:
             log.exception("S5 DecisionLedgerWriteTask raised (fail-open)")
-
-        # 2026-07-11 FUNNEL-INTEGRITY (operator mandate after the 07-08/09
-        # admission outage — two sessions of zero buy capability reported as
-        # a normal "no trade"): classify this session's buy-funnel outcome
-        # into a first-class verdict (ECONOMIC_TRADE / ECONOMIC_NO_TRADE /
-        # DEGRADED / STRUCTURAL_BLOCK) and publish ctx.funnel_integrity for
-        # run-bundle persistence + the umbrella ntfy OUTAGE-vs-no-trade
-        # title. Runs LAST so it sees the final funnel state (post-selection,
-        # post-rotation, post-ledger). OBSERVE-ONLY + fail-isolated (its own
-        # crash never darks the run) — same isolation contract as
-        # AdmissionShadowLoggerTask. Kill switch: funnel_integrity.enabled.
-        # Deliberately NOT in SellOnlyPipeline: the exit-only variant has no
-        # buy funnel to judge and runs ~every 12 min intraday (a misleading
-        # per-tick verdict would be false-OUTAGE spam, not observability).
-        from .task_funnel_integrity import FunnelIntegrityTask  # noqa: PLC0415
-        FunnelIntegrityTask().run(ctx)
 
         # Audit fix ROT-COUNTER (Bug L, 2026-04-25): pre-fix this logged
         # `len(ctx.rotations)` which is "pairs CONSIDERED by find_rotation_pairs",
