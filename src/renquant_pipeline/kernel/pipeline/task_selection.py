@@ -89,8 +89,11 @@ class PrepareSelectionTask(Task):
             tiered_thresholds = tiered,
             open_slots        = open_slots,
             bear_only         = bool(ctx.bear_only),
-            # Crypto RFC 2026-07-10 P5: §1091 bypass keyed off the ONE
-            # top-level asset_class switch (absent ⇒ us_equity ⇒ identical).
+            # Crypto RFC 2026-07-10 P5 (ticker-scoped hardening, pipeline#183):
+            # §1091 bypass requires BOTH asset_class == "crypto" AND ticker
+            # membership in the validated spot-pair allowlist below — the
+            # asset_class switch alone is never sufficient. Absent ⇒
+            # us_equity ⇒ identical equity behavior.
             asset_class       = resolve_asset_class(config),
             validated_crypto_spot_pairs = resolve_validated_crypto_spot_pairs(config),
         )

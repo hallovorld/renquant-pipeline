@@ -234,6 +234,12 @@ class JointActionTask(Task):
             ctx.config.get("max_concurrent_positions", 8),
         ))
         wash_days      = int(ctx.config.get("wash_sale_days", 0))
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            resolve_asset_class,
+            resolve_validated_crypto_spot_pairs,
+        )
+        joint_asset_class = resolve_asset_class(ctx.config)
+        joint_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(ctx.config)
         corr_threshold = float(regime_cfg.get("correlation_guard_threshold", 0.70))
         max_per_sector = int(ctx.config.get("max_positions_per_sector", 0))
         sector_map     = ctx.config.get("sector_map", {})
@@ -711,6 +717,8 @@ class JointActionTask(Task):
             blocked, _, _ = is_wash_sale_blocked_with_cost(
                 a.cand_ticker, ctx.today, ctx.last_sell_dates,
                 getattr(ctx, "last_sell_pls", None) or {}, wash_days,
+                asset_class=joint_asset_class,
+                validated_crypto_pairs=joint_validated_crypto_pairs,
             )
             if blocked:
                 ctx.counters["joint_blocked_wash"] = (

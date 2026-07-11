@@ -658,11 +658,19 @@ class ValidatePairsTask(Task):
         defensive_set  = set(cfg.get("defensive_tickers", []))
 
         validated = []
+        from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+            resolve_asset_class,
+            resolve_validated_crypto_spot_pairs,
+        )
         from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+        rotation_asset_class = resolve_asset_class(cfg)
+        rotation_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(cfg)
         for pair in ctx.rotations:
             blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
                 pair.buy_ticker, ctx.today, ctx.last_sell_dates or {},
                 getattr(ctx, "last_sell_pls", None) or {}, wash_days,
+                asset_class=rotation_asset_class,
+                validated_crypto_pairs=rotation_validated_crypto_pairs,
             )
             if blocked:
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=wash_sale (%s)",

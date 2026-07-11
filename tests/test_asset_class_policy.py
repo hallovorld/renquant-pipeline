@@ -645,6 +645,185 @@ class TestP5WashSaleBypass:
         )
         assert blocked
 
+    def test_governor_sizing_no_buy_mask_bypassed_for_validated_crypto_only(self):
+        """Codex re-review of #183 (7aa82cf5): run_governor_sizing's no-buy
+        wash-sale mask called is_wash_sale_blocked with no asset_class/
+        validated_crypto_pairs kwargs, so it always evaluated under the
+        us_equity default — a validated crypto pair recently sold at a loss
+        was wrongly blocked from a top-up. An asset_class="crypto"-tagged
+        but unvalidated ticker must still be blocked (fail closed); an
+        equity ticker is unaffected."""
+        from renquant_pipeline.context import InferenceContext
+        from renquant_pipeline.kernel.exits import HoldingState
+        from renquant_pipeline.kernel.pipeline.task_selection import SizeAndEmitTask
+
+        gov_cfg = {
+            "enabled": True,
+            "e_ceil_by_regime": {"BULL_CALM": 0.95},
+            "hysteresis_band": 0.0,
+            "kelly_fraction": 0.3,
+            "mu_shrinkage": 0.0,
+            "top_k": 8,
+            "max_step_per_session": 1.0,
+        }
+
+        def _held():
+            return HoldingState(
+                entry_price=100.0, entry_date=SUN - dt.timedelta(days=100),
+                high_watermark=100.0, shares=5, mu=0.04, sigma=0.2,
+            )
+
+        def _cfg(**top):
+            cfg = {
+                "regime_params": {"BULL_CALM": {
+                    "max_position_pct": 0.12, "cash_reserve_pct": 0.0,
+                    "max_concurrent_positions": 8,
+                }},
+                "ranking": {"panel_scoring": {
+                    "enabled": True,
+                    "sizing": {"enabled": True, "floor": 0.0, "ceiling": 1.0,
+                               "min_mult": 0.5},
+                    "sigma_sizing": {},
+                }, "kelly_sizing": {"enabled": False}},
+                "regime": {}, "wash_sale_days": 30, "min_hold_days": 0,
+                "deployment_governor": gov_cfg,
+            }
+            cfg.update(top)
+            return cfg
+
+        def _orders(ticker, cfg, last_sell_dates):
+            ctx = InferenceContext(
+                config=cfg, today=SUN, regime="BULL_CALM", confidence=1.0,
+                bear_only=False, portfolio_value=10_000.0, cash=5_000.0,
+                prices={ticker: 100.0}, ranked=[], models={},
+                holdings={ticker: _held()},
+                last_sell_dates=last_sell_dates,
+            )
+            ctx._selected = []  # noqa: SLF001
+            SizeAndEmitTask().run(ctx)
+            return {o["ticker"] for o in ctx.orders}
+
+        assert "BTC/USD" in _orders(
+            "BTC/USD",
+            _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+            {"BTC/USD": SUN - dt.timedelta(days=5)},
+        )
+        assert "XYZ-TOKEN" not in _orders(
+            "XYZ-TOKEN",
+            _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+            {"XYZ-TOKEN": SUN - dt.timedelta(days=5)},
+        )
+        assert "AAPL" not in _orders(
+            "AAPL", _cfg(), {"AAPL": SUN - dt.timedelta(days=5)},
+        )
+
+    def test_joint_action_wash_check_bypassed_for_validated_crypto_only(self):
+        """Codex re-review of #183 (7aa82cf5): JointActionTask's buy-leg
+        wash-sale check called is_wash_sale_blocked_with_cost with no
+        asset_class/validated_crypto_pairs kwargs. Prove the joint_blocked_wash
+        counter — and the actual buy — reflect the ticker-scoped policy."""
+        from renquant_pipeline.context import InferenceContext
+        from renquant_pipeline.kernel.selection import CandidateResult
+        from renquant_pipeline.kernel.pipeline.task_joint_actions import JointActionTask
+
+        def _cand(ticker):
+            return CandidateResult(
+                ticker=ticker, raw_score=0.5, rank_score=0.6, rs_score=0.0,
+                detail="", expected_return=0.04, expected_return_horizon_days=60,
+                panel_score=0.5, mu=0.04, mu_horizon_days=60, sigma=0.2,
+            )
+
+        def _cfg(**top):
+            cfg = {
+                "regime_params": {"BULL_CALM": {
+                    "max_position_pct": 0.10, "cash_reserve_pct": 0.0,
+                    "max_concurrent_positions": 8,
+                }},
+                "ranking": {"panel_scoring": {"enabled": True, "sizing": {},
+                                              "sigma_sizing": {}},
+                            "kelly_sizing": {"enabled": False}},
+                "regime": {},
+                "rotation": {"joint_actions": {"enabled": True, "solver": "greedy"}},
+                "max_positions_per_sector": 0,
+                "wash_sale_days": 30,
+            }
+            cfg.update(top)
+            return cfg
+
+        def _run(ticker, cfg, last_sell_dates):
+            ctx = InferenceContext(
+                config=cfg, today=SUN, regime="BULL_CALM", confidence=1.0,
+                bear_only=False, portfolio_value=10_000.0, cash=10_000.0,
+                prices={ticker: 100.0}, ranked=[_cand(ticker)], models={},
+                holdings={}, last_sell_dates=last_sell_dates,
+                last_sell_pls={t: -50.0 for t in last_sell_dates},
+            )
+            ctx._selected = []  # noqa: SLF001
+            JointActionTask().run(ctx)
+            return ctx
+
+        ctx = _run(
+            "BTC/USD",
+            _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+            {"BTC/USD": SUN - dt.timedelta(days=5)},
+        )
+        assert ctx.counters.get("joint_blocked_wash", 0) == 0
+        assert any(o["ticker"] == "BTC/USD" for o in ctx.orders)
+
+        ctx = _run(
+            "XYZ-TOKEN",
+            _cfg(asset_class="crypto", crypto_spot_pairs=["BTC/USD"]),
+            {"XYZ-TOKEN": SUN - dt.timedelta(days=5)},
+        )
+        assert ctx.counters.get("joint_blocked_wash", 0) == 1
+        assert not any(o["ticker"] == "XYZ-TOKEN" for o in ctx.orders)
+
+        ctx = _run("AAPL", _cfg(), {"AAPL": SUN - dt.timedelta(days=5)})
+        assert ctx.counters.get("joint_blocked_wash", 0) == 1  # equity pin
+
+    def test_validate_pairs_task_wash_mask_bypassed_for_validated_crypto_only(self):
+        """Codex re-review of #183 (7aa82cf5): ValidatePairsTask's rotation
+        wash-sale check called is_wash_sale_blocked_with_cost with no
+        asset_class/validated_crypto_pairs kwargs. A validated crypto pair
+        must survive the rotation guard; an asset_class="crypto"-tagged but
+        unvalidated buy ticker must still be dropped."""
+        from renquant_pipeline.kernel.rotation import RotationPair
+        from renquant_pipeline.kernel.pipeline.task_rotation import ValidatePairsTask
+
+        def _pair(sell_ticker, buy_ticker):
+            return RotationPair(
+                sell_ticker=sell_ticker, buy_ticker=buy_ticker,
+                sell_score=0.3, buy_score=0.6, sell_er=0.0, buy_er=0.05,
+                horizon_days=20, raw_advantage=0.05, tax_drag=0.0,
+                transaction_cost=0.001, net_advantage=0.049,
+                threshold=0.02, margin_realized=0.029,
+            )
+
+        def _run(sell_ticker, buy_ticker, cfg, last_sell_dates):
+            ctx = SimpleNamespace(
+                config=cfg, today=SUN, holdings={}, corr_matrix={},
+                last_sell_dates=last_sell_dates,
+                last_sell_pls={t: -50.0 for t in last_sell_dates},
+                rotations=[_pair(sell_ticker, buy_ticker)],
+            )
+            ValidatePairsTask().run(ctx)
+            return ctx.rotations
+
+        cfg = {"wash_sale_days": 30, "asset_class": "crypto",
+               "crypto_spot_pairs": ["BTC/USD"]}
+        survived = _run("OLD", "BTC/USD", cfg,
+                         {"BTC/USD": SUN - dt.timedelta(days=5)})
+        assert [p.buy_ticker for p in survived] == ["BTC/USD"]
+
+        survived = _run("OLD", "XYZ-TOKEN", cfg,
+                         {"XYZ-TOKEN": SUN - dt.timedelta(days=5)})
+        assert survived == []
+
+        equity_cfg = {"wash_sale_days": 30}
+        survived = _run("OLD", "AAPL", equity_cfg,
+                         {"AAPL": SUN - dt.timedelta(days=5)})
+        assert survived == []  # equity pin
+
 
 # ─── P6: tax property-mode (verify-only — no code change) ───────────────────
 

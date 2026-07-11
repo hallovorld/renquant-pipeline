@@ -36,9 +36,14 @@ class WashSaleFilterTask(Task):
       - sales OUTSIDE window pass (rule doesn't apply)
 
     Config:
-      asset_class          : str — "crypto" bypasses §1091 entirely (crypto
-                             is PROPERTY; RFC 2026-07-10 P5). Absent ⇒
-                             "us_equity" ⇒ byte-identical equity behavior.
+      asset_class          : str — "crypto" is PROPERTY (RFC 2026-07-10 P5),
+                             but §1091 is bypassed only when the ticker is
+                             ALSO an explicitly validated non-security spot
+                             pair (see resolve_validated_crypto_spot_pairs /
+                             wash_sale_applies_for_ticker, pipeline#183 P5
+                             hardening) — asset_class alone is insufficient.
+                             Absent ⇒ "us_equity" ⇒ byte-identical equity
+                             behavior.
       wash_sale_days       : int — window in days (default 30)
       wash_sale_tax_rate   : float — combined federal+state rate (0.30)
       wash_sale_discount_rate : float — for NPV (0.05)
