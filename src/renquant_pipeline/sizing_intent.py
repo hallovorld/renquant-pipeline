@@ -50,6 +50,26 @@ def _finite_nonnegative(name: str, value: float) -> float:
     return result
 
 
+def _nonnegative_int(name: str, value: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SizingIntentContractError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _admission_gate_outcomes(value: Mapping[str, Any]) -> dict[str, bool]:
+    if not isinstance(value, Mapping) or not value:
+        raise SizingIntentContractError("admission_gate_outcomes must be a non-empty mapping")
+    outcomes: dict[str, bool] = {}
+    for gate, passed in value.items():
+        normalized_gate = _required_text("admission gate name", gate)
+        if not isinstance(passed, bool):
+            raise SizingIntentContractError(
+                "admission_gate_outcomes values must be bool"
+            )
+        outcomes[normalized_gate] = passed
+    return dict(sorted(outcomes.items()))
+
+
 @dataclass(frozen=True)
 class SizingIntentRecord:
     """One post-admission, pre-execution sizing decision.
@@ -67,8 +87,10 @@ class SizingIntentRecord:
     config_sha256: str
     source: str
     ticker: str
+    candidate_id: str
     candidate_rank: int
     admission_passed: bool
+    admission_gate_outcomes: Mapping[str, bool]
     target_notional: float
     unrounded_quantity: float
     planned_quantity: float
@@ -78,6 +100,9 @@ class SizingIntentRecord:
     cash_reserve_notional: float
     available_cash_before: float
     normal_buy_reservation_notional: float
+    cumulative_exposure_before_notional: float
+    cumulative_exposure_after_notional: float
+    ordinary_buy_displacement_count: int
     outcome: str
     reason: str | None = None
 
@@ -94,6 +119,7 @@ class SizingIntentRecord:
         object.__setattr__(self, "source", _required_text("source", self.source))
         ticker = _required_text("ticker", self.ticker).upper()
         object.__setattr__(self, "ticker", ticker)
+        object.__setattr__(self, "candidate_id", _required_text("candidate_id", self.candidate_id))
         if (
             isinstance(self.candidate_rank, bool)
             or not isinstance(self.candidate_rank, int)
@@ -102,6 +128,12 @@ class SizingIntentRecord:
             raise SizingIntentContractError("candidate_rank must be a nonnegative integer")
         if not isinstance(self.admission_passed, bool):
             raise SizingIntentContractError("admission_passed must be bool")
+        gate_outcomes = _admission_gate_outcomes(self.admission_gate_outcomes)
+        object.__setattr__(self, "admission_gate_outcomes", gate_outcomes)
+        if self.admission_passed != all(gate_outcomes.values()):
+            raise SizingIntentContractError(
+                "admission_passed must equal the conjunction of admission_gate_outcomes"
+            )
         for name in (
             "target_notional",
             "unrounded_quantity",
@@ -110,8 +142,17 @@ class SizingIntentRecord:
             "cash_reserve_notional",
             "available_cash_before",
             "normal_buy_reservation_notional",
+            "cumulative_exposure_before_notional",
+            "cumulative_exposure_after_notional",
         ):
             object.__setattr__(self, name, _finite_nonnegative(name, getattr(self, name)))
+        object.__setattr__(
+            self,
+            "ordinary_buy_displacement_count",
+            _nonnegative_int(
+                "ordinary_buy_displacement_count", self.ordinary_buy_displacement_count
+            ),
+        )
         price = _finite_nonnegative("reference_price", self.reference_price)
         if price <= 0:
             raise SizingIntentContractError("reference_price must be > 0")
@@ -148,6 +189,16 @@ class SizingIntentRecord:
             raise SizingIntentContractError(
                 "planned notional exceeds cash remaining after reserve and ordinary-buy reservation"
             )
+        expected_exposure_after = self.cumulative_exposure_before_notional + planned_notional
+        if not math.isclose(
+            self.cumulative_exposure_after_notional,
+            expected_exposure_after,
+            rel_tol=1e-9,
+            abs_tol=1e-8,
+        ):
+            raise SizingIntentContractError(
+                "cumulative_exposure_after_notional must equal cumulative exposure before plus planned notional"
+            )
         if self.outcome == "emitted" and self.planned_quantity <= 0:
             raise SizingIntentContractError("emitted record requires planned_quantity > 0")
         if self.outcome != "emitted" and self.planned_quantity != 0:
@@ -157,10 +208,12 @@ class SizingIntentRecord:
 
     def to_dict(self) -> dict[str, Any]:
         """Return the schema-stamped JSON-safe representation."""
+        record = asdict(self)
+        record["admission_gate_outcomes"] = dict(self.admission_gate_outcomes)
         return {
             "schema_version": SIZING_INTENT_SCHEMA_VERSION,
             "kind": SIZING_INTENT_KIND,
-            **asdict(self),
+            **record,
         }
 
 
@@ -172,6 +225,12 @@ def parse_sizing_intent_record(payload: Mapping[str, Any]) -> SizingIntentRecord
         raise SizingIntentContractError("unsupported sizing intent schema_version")
     if payload.get("kind") != SIZING_INTENT_KIND:
         raise SizingIntentContractError("unsupported sizing intent kind")
+    expected_fields = {"schema_version", "kind", *SizingIntentRecord.__dataclass_fields__}
+    unknown_fields = sorted(set(payload) - expected_fields)
+    if unknown_fields:
+        raise SizingIntentContractError(
+            f"sizing intent payload carries unknown fields: {unknown_fields}"
+        )
     fields = {
         name: payload.get(name)
         for name in SizingIntentRecord.__dataclass_fields__

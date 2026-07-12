@@ -24,8 +24,14 @@ def _record(**overrides) -> SizingIntentRecord:
         "config_sha256": _SHA,
         "source": "pipeline.selection.greedy",
         "ticker": "BLK",
+        "candidate_id": "2026-07-12:BLK:2",
         "candidate_rank": 2,
         "admission_passed": True,
+        "admission_gate_outcomes": {
+            "data_available": True,
+            "rank_eligible": True,
+            "risk_eligible": True,
+        },
         "target_notional": 400.0,
         "unrounded_quantity": 0.4,
         "planned_quantity": 0.0,
@@ -35,6 +41,9 @@ def _record(**overrides) -> SizingIntentRecord:
         "cash_reserve_notional": 0.0,
         "available_cash_before": 5000.0,
         "normal_buy_reservation_notional": 0.0,
+        "cumulative_exposure_before_notional": 18000.0,
+        "cumulative_exposure_after_notional": 18000.0,
+        "ordinary_buy_displacement_count": 0,
         "outcome": "zero_quantity_after_whole_share_floor",
         "reason": "zero_quantity_after_whole_share_floor",
     }
@@ -54,11 +63,27 @@ def test_floor_rescue_may_exceed_target_but_not_hard_cap_or_cash() -> None:
     record = _record(
         arm_id="floor-on",
         planned_quantity=1.0,
+        cumulative_exposure_after_notional=19000.0,
         outcome="emitted",
         reason=None,
     )
     assert record.planned_quantity == 1.0
     assert record.planned_quantity * record.reference_price > record.target_notional
+    assert record.ordinary_buy_displacement_count == 0
+
+
+def test_gate_level_admission_evidence_must_match_summary() -> None:
+    with pytest.raises(SizingIntentContractError, match="conjunction"):
+        _record(admission_gate_outcomes={"data_available": False})
+
+
+def test_exposure_after_must_include_the_planned_notional() -> None:
+    with pytest.raises(SizingIntentContractError, match="cumulative_exposure_after"):
+        _record(
+            planned_quantity=1.0,
+            outcome="emitted",
+            reason=None,
+        )
 
 
 @pytest.mark.parametrize(
@@ -66,7 +91,10 @@ def test_floor_rescue_may_exceed_target_but_not_hard_cap_or_cash() -> None:
     [
         ({"input_manifest_sha256": "not-a-hash"}, "sha256"),
         ({"run_id": None}, "run_id"),
+        ({"candidate_id": ""}, "candidate_id"),
         ({"candidate_rank": True}, "candidate_rank"),
+        ({"admission_gate_outcomes": {"rank_eligible": "yes"}}, "values"),
+        ({"ordinary_buy_displacement_count": -1}, "displacement"),
         ({"target_notional": 401.0}, "unrounded_quantity"),
         ({"planned_quantity": 2.0, "outcome": "emitted", "reason": None}, "cap"),
         ({"planned_quantity": 1.0, "available_cash_before": 900.0,
@@ -83,4 +111,11 @@ def test_unknown_schema_fails_closed() -> None:
     payload = _record().to_dict()
     payload["schema_version"] = "future-schema"
     with pytest.raises(SizingIntentContractError, match="schema_version"):
+        parse_sizing_intent_record(payload)
+
+
+def test_unknown_record_field_fails_closed() -> None:
+    payload = _record().to_dict()
+    payload["unreviewed_extension"] = True
+    with pytest.raises(SizingIntentContractError, match="unknown fields"):
         parse_sizing_intent_record(payload)
