@@ -53,8 +53,10 @@ from renquant_pipeline.software_stops import (
     DEFAULT_MAX_STALENESS_MINUTES,
     SoftwareStopRegistry,
     SoftwareStopRegistryCorrupt,
+    _validate_snapshot,
     compute_staleness,
     registry_path_for,
+    validate_software_stop_snapshot,
 )
 
 FRACTIONAL_QTY = 0.435578
@@ -457,3 +459,106 @@ class TestStalenessWatchdog:
         state = reg.staleness_state(now=NOW)
         assert state["stale"] is False
         assert state["age_minutes"] == pytest.approx(0.0, abs=1e-6)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Public schema contract (software-stops-v1) — Codex review on
+# renquant-execution#30 / renquant-orchestrator#481 (2026-07-12T11:57:53Z):
+# the cross-repo consumer (renquant-execution's software_stops_liveness
+# checker) must depend on an EXPLICIT public pipeline name, not the private
+# ``_validate_snapshot``. These tests exercise ``validate_software_stop_snapshot``
+# directly and prove it is a genuine thin wrapper (not a divergent
+# reimplementation) by comparing its behavior against ``_validate_snapshot``
+# for both a valid and an invalid input.
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestPublicValidateSoftwareStopSnapshot:
+    def _valid_one_stop(self):
+        return {
+            "version": 1,
+            "stops": {
+                "BLK": {
+                    "symbol": "BLK",
+                    "qty": 0.435578,
+                    "stop_price": 760.0,
+                    "source": "z9",
+                },
+            },
+        }
+
+    def test_valid_empty_registry(self):
+        raw = {"version": 1, "stops": {}}
+        assert validate_software_stop_snapshot(raw) == raw
+
+    def test_valid_one_stop_entry(self):
+        raw = self._valid_one_stop()
+        assert validate_software_stop_snapshot(raw) == raw
+
+    def test_thin_wrapper_identity_valid_case(self):
+        # Same object back, same result as the private implementation --
+        # proves this is a wrapper, not a divergent reimplementation.
+        raw = self._valid_one_stop()
+        assert validate_software_stop_snapshot(raw) == _validate_snapshot(raw)
+        assert validate_software_stop_snapshot(raw) is raw
+
+    def test_thin_wrapper_identity_invalid_case(self):
+        bad = {"version": 999, "stops": {}}
+        with pytest.raises(ValueError):
+            validate_software_stop_snapshot(bad)
+        with pytest.raises(ValueError):
+            _validate_snapshot(bad)
+
+    def test_root_not_a_dict(self):
+        with pytest.raises(ValueError, match="registry root must be an object"):
+            validate_software_stop_snapshot(["not", "a", "dict"])
+
+    def test_wrong_version(self):
+        raw = {"version": 2, "stops": {}}
+        with pytest.raises(ValueError, match="unsupported registry version"):
+            validate_software_stop_snapshot(raw)
+
+    def test_stops_not_a_dict(self):
+        raw = {"version": 1, "stops": "not-a-dict"}
+        with pytest.raises(ValueError, match="registry 'stops' must be an object"):
+            validate_software_stop_snapshot(raw)
+
+    def test_symbol_mismatch(self):
+        raw = {
+            "version": 1,
+            "stops": {"BLK": {"symbol": "WRONG", "qty": 1.0,
+                               "stop_price": 80.0, "source": "z9"}},
+        }
+        with pytest.raises(ValueError, match="symbol mismatch"):
+            validate_software_stop_snapshot(raw)
+
+    def test_invalid_qty(self):
+        raw = {
+            "version": 1,
+            "stops": {"BLK": {"symbol": "BLK", "qty": -1,
+                               "stop_price": 80.0, "source": "z9"}},
+        }
+        with pytest.raises(ValueError, match="qty invalid"):
+            validate_software_stop_snapshot(raw)
+
+    def test_invalid_stop_price(self):
+        raw = {
+            "version": 1,
+            "stops": {"BLK": {"symbol": "BLK", "qty": 1.0,
+                               "stop_price": 0.0, "source": "z9"}},
+        }
+        with pytest.raises(ValueError, match="stop_price invalid"):
+            validate_software_stop_snapshot(raw)
+
+    def test_invalid_source(self):
+        raw = {
+            "version": 1,
+            "stops": {"BLK": {"symbol": "BLK", "qty": 1.0,
+                               "stop_price": 80.0, "source": "not-a-source"}},
+        }
+        with pytest.raises(ValueError, match="source invalid"):
+            validate_software_stop_snapshot(raw)
+
+    def test_invalid_max_staleness_minutes(self):
+        raw = {"version": 1, "stops": {}, "max_staleness_minutes": -5.0}
+        with pytest.raises(ValueError, match="max_staleness_minutes invalid"):
+            validate_software_stop_snapshot(raw)
