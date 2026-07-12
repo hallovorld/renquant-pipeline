@@ -203,6 +203,39 @@ def _validate_snapshot(raw: Any) -> dict:
     return raw
 
 
+def validate_software_stop_snapshot(raw: Any) -> dict:
+    """PUBLIC, versioned contract (software-stops-v1): schema-validate a
+    software-stop registry snapshot.
+
+    This is the explicit external-consumption boundary for this module's
+    registry schema — the ownership fix requested by Codex on
+    renquant-orchestrator#481 / renquant-execution#30 (2026-07-12): a
+    cross-repo consumer (renquant-execution's software_stops_liveness
+    checker, which renquant-orchestrator's install-time arming guard
+    depends on transitively) must depend on THIS name, never on
+    ``_validate_snapshot`` directly — that stays this module's private
+    implementation, free to change shape internally as long as this
+    wrapper's contract holds.
+
+    Compatibility contract (software-stops-v1, REGISTRY_VERSION=1):
+      - Raises ``ValueError`` on any schema violation (root not an
+        object; ``version`` != 1; ``stops`` not an object; any stop
+        entry missing/mismatching ``symbol``, non-finite-positive
+        ``qty``/``stop_price``, or an invalid ``source``;
+        non-finite-positive ``max_staleness_minutes`` if present).
+      - Returns the validated dict UNCHANGED (no normalization,
+        no defaulting) on success.
+      - A future incompatible schema change bumps ``REGISTRY_VERSION``
+        and this function's behavior for the new version is documented
+        here at that time; this docstring is the source of truth for
+        v1, not README prose.
+
+    Thin wrapper around ``_validate_snapshot`` today — no behavior
+    difference, only a stable public name and documented contract.
+    """
+    return _validate_snapshot(raw)
+
+
 def compute_staleness(
     snapshot: "dict | None",
     *,
