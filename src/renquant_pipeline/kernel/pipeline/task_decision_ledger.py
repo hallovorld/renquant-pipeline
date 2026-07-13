@@ -44,7 +44,7 @@ class DecisionLedgerWriteTask(Task):
       ctx.config["decision_ledger"]["enabled"]  — default False (opt-in)
 
     Writes:
-      ~/renquant-data/decision_ledger.db via orchestrator modules (verdicts only)
+      ~/renquant-data/decision_ledger.db via renquant_common.decision_ledger (verdicts only)
     """
 
     def run(self, ctx: InferenceContext) -> bool | None:
