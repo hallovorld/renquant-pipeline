@@ -1,32 +1,52 @@
-"""Public re-export surface for cross-repo consumers.
+"""Narrow public surface for cross-repo consumers (V-005 remediation).
 
-V-005 remediation: orchestrator (and potentially other sibling repos) need
-a handful of types and functions from kernel internals.  Rather than
-importing from ``renquant_pipeline.kernel.*`` directly (fragile coupling
-to internal module layout), consumers import from this stable surface.
+Only types that a sibling repo demonstrably needs belong here.  Each
+import is LAZY (loaded on first attribute access) so that importing this
+module does not eagerly pull in unrelated kernel subsystems.
 
-Add symbols here only when a sibling repo has a demonstrated need.
+Current consumers (orchestrator ``native_context_hydration.py``):
+  - ``LocalStore``   — kernel.data
+  - ``HoldingState``  — kernel.exits
+  - ``RegimeState``   — kernel.regime
+
+Symbols NOT exported here (codex review on this PR):
+  - ``LoadUniverseJob`` / ``UniverseContext`` — pipeline execution
+    internals; orchestrator should not construct pipeline job objects.
+  - ``record_training_run`` — training/model-run persistence; its
+    consumer (``train_gbdt.py``) is itself model-training logic that
+    belongs in renquant-model, not orchestrator.
+  - ``_last_completed_nyse_session`` — use
+    ``renquant_common.market_calendar`` instead.
 """
 from __future__ import annotations
 
-from renquant_pipeline.kernel.data import (
-    LocalStore,
-    _last_completed_nyse_session as last_completed_nyse_session,
-)
-from renquant_pipeline.kernel.exits import HoldingState
-from renquant_pipeline.kernel.regime import RegimeState
-from renquant_pipeline.kernel.pipeline.job_universe import (
-    LoadUniverseJob,
-    UniverseContext,
-)
-from renquant_pipeline.kernel.persistence import record_training_run
+import importlib
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from renquant_pipeline.kernel.data import LocalStore as _LocalStore
+    from renquant_pipeline.kernel.exits import HoldingState as _HoldingState
+    from renquant_pipeline.kernel.regime import RegimeState as _RegimeState
 
 __all__ = [
-    "HoldingState",
-    "last_completed_nyse_session",
-    "LoadUniverseJob",
     "LocalStore",
-    "record_training_run",
+    "HoldingState",
     "RegimeState",
-    "UniverseContext",
 ]
+
+_LAZY_MAP: dict[str, tuple[str, str]] = {
+    "LocalStore": ("renquant_pipeline.kernel.data", "LocalStore"),
+    "HoldingState": ("renquant_pipeline.kernel.exits", "HoldingState"),
+    "RegimeState": ("renquant_pipeline.kernel.regime", "RegimeState"),
+}
+
+
+def __getattr__(name: str):
+    entry = _LAZY_MAP.get(name)
+    if entry is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_path, attr = entry
+    mod = importlib.import_module(module_path)
+    obj = getattr(mod, attr)
+    globals()[name] = obj
+    return obj
