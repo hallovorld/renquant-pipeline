@@ -1,10 +1,14 @@
 """Import-surface tests for renquant_pipeline.public (V-005 remediation).
 
 Proves that importing the public module does NOT eagerly load kernel
-subsystems — each symbol is lazy-loaded on first access only.
+subsystems — each symbol is lazy-loaded on first access only, and the
+``load_universe`` OPERATION's kernel import is function-scoped (loaded only
+when called, not when referenced or imported).
 
-All checks run in a fresh subprocess so parent-process module cache
-cannot mask real violations (codex review on this PR).
+The import-isolation checks run in a fresh subprocess so parent-process
+module cache cannot mask real violations (codex review on this PR).
+``load_universe``'s functional-correctness tests run in-process (tmp_path
+fixtures) — they are consumer-contract tests, not import-surface proofs.
 """
 from __future__ import annotations
 
@@ -12,8 +16,6 @@ import json
 import os
 import subprocess
 import sys
-
-import pytest
 
 
 def _run_script(script: str) -> dict:
@@ -141,3 +143,118 @@ print(json.dumps(results))
 """)
     for name, ok in data.items():
         assert ok, f"public.__all__ lists {name!r} but it resolved to None"
+
+
+def test_load_universe_import_is_lazy_until_called():
+    """``load_universe``'s kernel import is function-scoped: importing
+    ``renquant_pipeline.public`` or merely referencing the ``load_universe``
+    function object must NOT load ``kernel.pipeline.job_universe``; only
+    CALLING it may. Calling it against a strategy_dir with no ``models/``
+    directory exercises the real chain (LoadArtifactsTask short-circuits)
+    without needing artifact fixtures inside the subprocess."""
+    data = _run_script("""
+import json, sys, tempfile
+import renquant_pipeline
+import renquant_pipeline.public as public
+
+before_import = set(sys.modules)
+_ = public.load_universe  # referencing the function object only
+after_ref = set(sys.modules) - before_import
+
+tmp_dir = tempfile.mkdtemp()
+before_call = set(sys.modules)
+result = public.load_universe(config={}, strategy_dir=tmp_dir)
+after_call = set(sys.modules) - before_call
+
+print(json.dumps({
+    "after_ref": sorted(n for n in after_ref if "kernel" in n),
+    "after_call": sorted(n for n in after_call if "kernel" in n),
+    "models": result.models,
+    "rejections": result.rejections,
+}))
+""")
+    assert data["after_ref"] == [], (
+        f"merely referencing load_universe loaded kernel modules "
+        f"(should be function-scoped): {data['after_ref']}"
+    )
+    assert any("kernel.pipeline.job_universe" in m for m in data["after_call"]), (
+        f"calling load_universe did not load kernel.pipeline.job_universe: "
+        f"{data['after_call']}"
+    )
+    assert data["models"] == {}
+    assert data["rejections"] == []
+
+
+def test_load_universe_admits_valid_artifact_and_reports_rejection(tmp_path):
+    """Consumer-contract test: ``load_universe`` runs the real
+    ``LoadUniverseJob`` chain and returns a ``UniverseLoadResult`` with the
+    admitted model plus the rejection reason for a ticker with no artifact —
+    faithful to what ``native_context_hydration.py`` did by constructing
+    ``LoadUniverseJob``/``UniverseContext`` directly (pipeline#197 round 1,
+    point 2 / orchestrator#513)."""
+    from renquant_pipeline.public import UniverseLoadResult, load_universe
+
+    models_dir = tmp_path / "models"
+    aaa_dir = models_dir / "AAA"
+    aaa_dir.mkdir(parents=True)
+    (aaa_dir / "AAA-policy-metadata.json").write_text(json.dumps({
+        "policy_type": "manual",
+        "feature_columns": [],
+    }))
+    (aaa_dir / "AAA-manual-rules.json").write_text(json.dumps({
+        "score_rules": [],
+        "buy_threshold": 0.1,
+        "sell_threshold": -0.1,
+    }))
+    # BBB has a directory but no policy-metadata file -> load_artifact
+    # returns None -> LoadArtifactsTask records a "no_artifact" rejection.
+    (models_dir / "BBB").mkdir(parents=True)
+
+    result = load_universe(
+        config={"watchlist": ["AAA", "BBB"]},
+        strategy_dir=tmp_path,
+    )
+
+    assert isinstance(result, UniverseLoadResult)
+    assert "AAA" in result.models
+    assert result.models["AAA"]["policy_type"] == "manual"
+    assert ("BBB", "no_artifact") in result.rejections
+
+
+def test_load_universe_held_tickers_is_authoritative_over_state_file(tmp_path):
+    """``held_tickers``, when given (even an empty set), is AUTHORITATIVE —
+    it wins over state-file-derived holdings rather than being treated as
+    "unset" (matching ``UniverseContext``'s own held/``None`` distinction).
+    A ticker with a sub-floor quality metric is exempted from the
+    universe-floor filter when passed as held, and dropped when it is not
+    (empty held set) — proving the set value, not just its truthiness, is
+    threaded through."""
+    from renquant_pipeline.public import load_universe
+
+    aaa_dir = tmp_path / "models" / "AAA"
+    aaa_dir.mkdir(parents=True)
+    (aaa_dir / "AAA-policy-metadata.json").write_text(json.dumps({
+        "policy_type": "manual",
+        "sharpe": 0.1,  # below the floor threshold configured below
+    }))
+    (aaa_dir / "AAA-manual-rules.json").write_text(json.dumps({
+        "score_rules": [],
+        "buy_threshold": 0.1,
+        "sell_threshold": -0.1,
+    }))
+    config = {
+        "watchlist": ["AAA"],
+        "ranking": {"universe_floor": {"type": "sharpe", "threshold": 1.0}},
+    }
+
+    not_held = load_universe(
+        config=config, strategy_dir=tmp_path, held_tickers=set(),
+    )
+    assert "AAA" not in not_held.models
+    assert any(ticker == "AAA" for ticker, _reason in not_held.rejections)
+
+    held = load_universe(
+        config=config, strategy_dir=tmp_path, held_tickers={"AAA"},
+    )
+    assert "AAA" in held.models
+    assert held.rejections == []
