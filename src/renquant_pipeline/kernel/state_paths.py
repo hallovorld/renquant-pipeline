@@ -23,19 +23,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-# VAL-1 (2026-04-28 self-audit): allowlist of broker tags. Centralised here
-# so a typo / malicious caller cannot path-traverse via broker_name. Add
-# new brokers here when wiring them through live/runner.py.
-ALLOWED_BROKERS: frozenset[str] = frozenset({
-    "paper", "alpaca", "alpaca-paper",
-    "alpaca_paper",     # post-replace form (allow both)
-    "alpaca-shorts",
-    "alpaca_shorts",
-    "alpaca_shadow",    # 2026-05-19 full-e2e shadow via ReadOnlyBrokerWrapper
-    "alpaca_shadow_a",  # D6-§2a two-arm admission experiment, arm S-0.5
-    "alpaca_shadow_b",  # D6-§2a two-arm admission experiment, arm S-1.0 (control)
-    "ibkr",
-})
+from renquant_pipeline.state_paths import ALLOWED_BROKERS  # noqa: F401 — single source (V-006 fix)
 
 
 def _safe_broker(broker_name: str | None) -> str:
