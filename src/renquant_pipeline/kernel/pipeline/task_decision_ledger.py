@@ -1,6 +1,6 @@
-"""S5 decision-ledger write task — persist gate verdicts to the orchestrator DB.
+"""S5 decision-ledger write task — persist gate verdicts to the decision DB.
 
-Fail-open: if orchestrator modules are not importable (version skew, dependency
+Fail-open: if common modules are not importable (version skew, dependency
 missing), logs a WARNING and continues the daily run. S5 is a measurement
 substrate, not a trading gate — a missing write degrades analytics but does not
 affect trade safety.
@@ -74,10 +74,10 @@ class DecisionLedgerWriteTask(Task):
         decisions = format_ticker_decisions(ctx, ctx.config, run_id, date_iso)
 
         try:
-            from renquant_orchestrator.decision_ledger import connect, write_verdicts
+            from renquant_common.decision_ledger import connect, write_verdicts
         except ImportError:
             log.warning(
-                "renquant_orchestrator.decision_ledger not importable; "
+                "renquant_common.decision_ledger not importable; "
                 "S5 verdicts formatted (%d) but not persisted (fail-open)",
                 len(verdicts),
             )
