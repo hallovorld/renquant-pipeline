@@ -30,10 +30,13 @@ def _run_script(script: str) -> dict:
         [sys.executable, "-c", script],
         capture_output=True, text=True, env=env, timeout=60,
     )
+    assert result.returncode == 0, (
+        f"subprocess exited {result.returncode}:\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
     lines = [line for line in result.stdout.splitlines() if line.strip()]
     assert lines, (
-        f"subprocess produced no JSON output "
-        f"(exit={result.returncode}):\nstderr: {result.stderr}"
+        f"subprocess produced no JSON output:\nstderr: {result.stderr}"
     )
     return json.loads(lines[-1])
 
