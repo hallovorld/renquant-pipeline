@@ -143,3 +143,10 @@ failures are the same pre-existing ones documented in round 1-3 above
 (`test_replay_d6_conventions.py` x2, `test_xgboost_scorer_contract.py` x1) —
 reproduced identically with this round's diff stashed out on the same
 worktree, confirming they predate and are unrelated to this change.
+
+### PR note
+
+Round 1-3 (`NON_OWNED_KERNEL_STEMS`) merged as PR #198 before this round's
+commit landed on the branch (a push/merge race against the same branch).
+Round 4 (`OWNED_KERNEL_STEMS`, this section) is a fresh PR on the same
+branch: https://github.com/hallovorld/renquant-pipeline/pull/199.
