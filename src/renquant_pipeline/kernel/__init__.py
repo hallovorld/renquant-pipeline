@@ -88,10 +88,21 @@ to paper over an accidental umbrella-only module landing in this directory
 by name coincidence — the contract is keyed off this frozenset, a
 structural declaration owned by *this* package, never off the failing
 stem's name matching something a consumer happens to expect.
+
+``OWNED_KERNEL_STEMS`` is the companion, positive declaration: every stem
+this package guarantees to ship in this directory (i.e. every stem NOT in
+``NON_OWNED_KERNEL_STEMS``). A consumer walking a pinned checkout of this
+package uses it as a path-identity / sanity check on the directory it
+discovered — e.g. renquant-orchestrator's ``live_bridge.bootstrap_multirepo``
+verifies the stems it actually found cover everything declared here, to
+catch a wrong or incomplete pipeline checkout (PR #514 round 4; this
+replaced an earlier arbitrary orchestrator-local minimum-module-count
+heuristic Codex flagged as stale-prone and not tied to the real pinned
+contract).
 """
 from __future__ import annotations
 
-__all__: list[str] = ["NON_OWNED_KERNEL_STEMS"]
+__all__: list[str] = ["NON_OWNED_KERNEL_STEMS", "OWNED_KERNEL_STEMS"]
 
 # Stems that physically exist in this directory but are NOT part of the
 # guaranteed, importable contract above. A consumer bootstrapping against
@@ -109,4 +120,79 @@ __all__: list[str] = ["NON_OWNED_KERNEL_STEMS"]
 #   ``live_bridge.bootstrap_multirepo`` / PR #514.
 NON_OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
     "meta_label",
+})
+
+# The companion, positive side of the same contract: every stem that
+# physically exists in this directory and IS part of the guaranteed,
+# importable contract above (i.e. every stem NOT in NON_OWNED_KERNEL_STEMS).
+# Maintained the same way as NON_OWNED_KERNEL_STEMS -- an explicit, reviewed
+# frozenset literal, not something computed at import time by re-listing
+# this same directory. A consumer that walks a PINNED CHECKOUT of this
+# package (e.g. renquant-orchestrator's ``live_bridge.bootstrap_multirepo``)
+# uses this declaration as the actual pinned-package contract to verify its
+# discovered directory against -- if OWNED_KERNEL_STEMS is not a real,
+# static "here is what should be here" declaration, but instead just infers
+# itself from whatever the directory happens to contain, an empty or wrong
+# directory would trivially "satisfy" it too, defeating the point (this is
+# exactly the gap Codex flagged with the old orchestrator-local
+# ``_MIN_PIPELINE_KERNEL_MODULES = 10`` heuristic: "bind the discovered
+# module inventory to the pinned package contract instead" -- a "contract"
+# that just re-derives itself from disk isn't a contract).
+#
+# ``tests/test_kernel_ownership_contract.py`` enforces that this set, union
+# NON_OWNED_KERNEL_STEMS, always equals exactly what is physically present
+# in this directory -- so an added/removed/renamed kernel module without a
+# matching update to one of these two declarations fails CI here, in
+# pipeline, rather than surfacing later as an orchestrator bootstrap error
+# with no clear cause.
+OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
+    "alert_lifecycle",
+    "artifact_resolver",
+    "asset_class",
+    "broker_reconciliation",
+    "config",
+    "config_schema",
+    "data",
+    "data_cache",
+    "data_coverage",
+    "decision_trace",
+    "deployment_allocator",
+    "deployment_governor",
+    "execution",
+    "exit_types",
+    "exits",
+    "gate_registry",
+    "indicators",
+    "intraday",
+    "intraday_wash",
+    "kelly",
+    "live_state_v2",
+    "market_gates",
+    "model_protection",
+    "models",
+    "net_safety",
+    "panel_pipeline",
+    "persistence",
+    "pipeline",
+    "pit_reader",
+    "portfolio",
+    "portfolio_qp",
+    "preflight",
+    "preflight_pipeline",
+    "realized_pnl",
+    "regime",
+    "regime_hmm",
+    "regime_resolver",
+    "rotation",
+    "rotation_convex",
+    "score_audit",
+    "score_drift",
+    "scoring",
+    "selection",
+    "sizing",
+    "state_paths",
+    "trade_events",
+    "typed_past",
+    "vol_target",
+    "walk_forward",
 })

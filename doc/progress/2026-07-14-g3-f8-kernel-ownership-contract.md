@@ -57,7 +57,7 @@ downstream consumer.
   causes the orchestrator to fail closed — it will not proceed without a
   verified ownership contract from the pinned pipeline.
 
-## Verification
+## Verification (round 1-3)
 
 - New `tests/test_kernel_ownership_contract.py`:
   - `NON_OWNED_KERNEL_STEMS` is a frozenset.
@@ -74,3 +74,72 @@ downstream consumer.
   `test_xgboost_scorer_contract.py::test_panel_scoring_loads_real_xgboost_artifact_without_explicit_scores`
   — reproduced identically on a clean `origin/main` checkout with none of
   this PR's changes, so unrelated to this change).
+
+## Round 4: the companion `OWNED_KERNEL_STEMS` declaration
+
+Codex's round-2 review on the orchestrator side (#514) raised a second,
+independent concern in the same review comment as the `NON_OWNED_KERNEL_STEMS`
+consistency issue above:
+
+> Also do not use the arbitrary `_MIN_PIPELINE_KERNEL_MODULES = 10` as a
+> path-identity control. It permits any wrong directory with ten importable
+> files and will become stale when the package layout changes. Bind the
+> discovered module inventory to the pinned package contract instead.
+
+Orchestrator's `_MIN_PIPELINE_KERNEL_MODULES = 10` check existed to catch an
+empty/wrong pipeline kernel directory silently producing zero (or
+suspiciously few) aliases — e.g. a misconfigured checkout path pointing
+somewhere that happens to contain a handful of unrelated importable files.
+The number `10` was an orchestrator-local guess with no relationship to
+what this package actually ships, and would both (a) miss a wrong directory
+that happened to contain ten-plus unrelated files, and (b) go stale/require
+manual bumping every time a real kernel module is added or removed here.
+
+### Change
+
+Added `renquant_pipeline.kernel.OWNED_KERNEL_STEMS` — the positive-side
+companion to `NON_OWNED_KERNEL_STEMS`, built the same way (an explicit,
+reviewed frozenset literal, not something computed at import time by
+re-listing this same directory — a "contract" that just re-derives itself
+from whatever is on disk would trivially "pass" against an empty or wrong
+directory too, defeating the point). It lists all 49 stems currently in
+`kernel/` that are NOT in `NON_OWNED_KERNEL_STEMS`.
+
+Orchestrator's `bootstrap_multirepo` (PR #514 round 4) now reads this
+declaration and verifies the stems it actually discovered in a pinned
+checkout are a superset of everything declared here — this is the real,
+pinned-contract-bound replacement for the old minimum-count heuristic.
+
+### Tests (round 4)
+
+Added to `tests/test_kernel_ownership_contract.py`:
+- `test_owned_kernel_stems_is_frozen`
+- `test_owned_kernel_stems_still_exist` (mirrors the existing
+  `test_non_owned_kernel_stems_still_exist` for the positive side)
+- `test_owned_and_non_owned_kernel_stems_are_disjoint`
+- `test_declared_kernel_stems_match_directory_contents`: the real
+  structural guarantee — `OWNED_KERNEL_STEMS | NON_OWNED_KERNEL_STEMS` must
+  equal exactly what `kernel/` physically contains. This is what makes
+  `OWNED_KERNEL_STEMS` an enforced, always-in-sync inventory rather than a
+  hand-maintained list that silently drifts: adding, removing, or renaming
+  a kernel module without updating one of these two declarations fails this
+  test, in this repo's own CI, rather than surfacing later as an opaque
+  orchestrator bootstrap error in a downstream repo.
+
+### Cross-repo pairing verification
+
+Confirmed against orchestrator PR #514's real worktree (both src roots on
+`sys.path`, no mocks): orchestrator's real `bootstrap_multirepo` check
+passes cleanly against this package's real `OWNED_KERNEL_STEMS` (49 stems)
+and real `kernel/` directory contents (50 entries incl. `meta_label`), and
+correctly fails closed — citing the exact stem name — when the declared
+inventory is tampered with to include a stem absent from disk.
+
+### Full suite verification (round 4)
+
+Run with this package's own `.venv` (Python 3.11, matching its `Makefile`'s
+standalone-interpreter resolution): 1729 passed, 8 skipped, 3 failed. The 3
+failures are the same pre-existing ones documented in round 1-3 above
+(`test_replay_d6_conventions.py` x2, `test_xgboost_scorer_contract.py` x1) —
+reproduced identically with this round's diff stashed out on the same
+worktree, confirming they predate and are unrelated to this change.
