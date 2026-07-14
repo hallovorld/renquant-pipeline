@@ -150,3 +150,8 @@ Round 1-3 (`NON_OWNED_KERNEL_STEMS`) merged as PR #198 before this round's
 commit landed on the branch (a push/merge race against the same branch).
 Round 4 (`OWNED_KERNEL_STEMS`, this section) is a fresh PR on the same
 branch: https://github.com/hallovorld/renquant-pipeline/pull/199.
+
+Codex review (round 4) confirms: "the PR is rebased on current main, CI is
+green, and OWNED_KERNEL_STEMS plus NON_OWNED_KERNEL_STEMS are enforced as a
+disjoint, exact partition of the physical kernel inventory." Awaiting formal
+APPROVE to unblock the #514 deployment chain.
