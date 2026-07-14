@@ -46,17 +46,16 @@ downstream consumer.
 
 - The declaration lives in the pinned, versioned pipeline package, not in
   orchestrator. Consumers read it via the already-imported `kernel` module
-  object (`getattr(pipeline_kernel, "NON_OWNED_KERNEL_STEMS", frozenset())`
-  — see orchestrator PR #514), so it travels with whatever pipeline commit is
-  pinned.
+  object (see orchestrator PR #514 r3), so it travels with whatever pipeline
+  commit is pinned.
 - The exemption set is deliberately tiny (one entry, with a documented
   reason) rather than a broad name list — a future stem sharing a name with
   a classic "umbrella-only" module (e.g. a `fundamentals.py` landing in this
   directory by mistake) is NOT exempt unless pipeline itself explicitly adds
   it here with a reviewed reason. Import failure for it is a hard error.
 - Missing the declaration entirely (an older pin without this attribute)
-  defaults to an EMPTY exempt set on the consumer side — the safe direction:
-  nothing is silently tolerated, not everything.
+  causes the orchestrator to fail closed — it will not proceed without a
+  verified ownership contract from the pinned pipeline.
 
 ## Verification
 
