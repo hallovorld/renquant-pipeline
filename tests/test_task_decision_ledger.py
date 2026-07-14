@@ -31,27 +31,67 @@ def _make_task():
 
 
 @pytest.fixture(autouse=True)
-def _mock_orchestrator_module():
-    """Pre-register a fake renquant_orchestrator.decision_ledger so
-    unittest.mock.patch can target it without the real package installed."""
-    orch_mod = ModuleType("renquant_orchestrator")
-    dl_mod = ModuleType("renquant_orchestrator.decision_ledger")
+def _mock_common_module():
+    """Pre-register a fake renquant_common.decision_ledger so
+    unittest.mock.patch can target it without the real package installed.
+
+    task_decision_ledger.py does ``from renquant_common.decision_ledger import
+    connect, write_verdicts`` as a function-local import (V-003: moved off of
+    renquant_orchestrator.decision_ledger onto renquant_common.decision_ledger,
+    see renquant-common#30). The fake submodule mirrors that module's real
+    shape (connect, write_verdicts, DDL, DEFAULT_DB, _VALID_VERDICTS) so
+    patches here target the same names the production import resolves at
+    call time.
+
+    Unlike the old renquant_orchestrator fake, ``renquant_common`` is a REAL
+    dependency renquant_pipeline already imports from elsewhere (Job,
+    Pipeline, Task, ... in renquant_pipeline/__init__.py -> inference.py).
+    Blindly replacing ``sys.modules["renquant_common"]`` wholesale — as the
+    pre-V-003 fixture safely did for the (unrelated to pipeline) orchestrator
+    package — shadows those real exports and breaks any test whose first
+    ``import renquant_pipeline`` happens while the fixture is active, with
+    ``ImportError: cannot import name 'Job' from 'renquant_common'``. So this
+    fixture reuses the real ``renquant_common`` module object when it's
+    importable (as it is in this environment, sibling-checkout on
+    PYTHONPATH/pytest `pythonpath` ini) and only swaps in the fake
+    ``decision_ledger`` submodule/attribute, restoring both on teardown.
+    """
+    try:
+        import renquant_common as common_mod
+        created_common = False
+    except ImportError:
+        common_mod = ModuleType("renquant_common")
+        created_common = True
+        sys.modules["renquant_common"] = common_mod
+
+    dl_mod = ModuleType("renquant_common.decision_ledger")
     dl_mod.connect = MagicMock()
     dl_mod.write_verdicts = MagicMock()
-    orch_mod.decision_ledger = dl_mod
+    dl_mod.DDL = ""
+    dl_mod.DEFAULT_DB = None
+    dl_mod._VALID_VERDICTS = ("allow", "halve", "block")
 
-    originals = {}
-    for name in ("renquant_orchestrator", "renquant_orchestrator.decision_ledger"):
-        originals[name] = sys.modules.get(name)
+    original_submodule = sys.modules.get("renquant_common.decision_ledger")
+    had_attr = hasattr(common_mod, "decision_ledger")
+    original_attr = getattr(common_mod, "decision_ledger", None)
 
-    sys.modules["renquant_orchestrator"] = orch_mod
-    sys.modules["renquant_orchestrator.decision_ledger"] = dl_mod
+    common_mod.decision_ledger = dl_mod
+    sys.modules["renquant_common.decision_ledger"] = dl_mod
+
     yield
-    for name, orig in originals.items():
-        if orig is None:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = orig
+
+    if original_submodule is None:
+        sys.modules.pop("renquant_common.decision_ledger", None)
+    else:
+        sys.modules["renquant_common.decision_ledger"] = original_submodule
+
+    if had_attr:
+        common_mod.decision_ledger = original_attr
+    elif hasattr(common_mod, "decision_ledger"):
+        delattr(common_mod, "decision_ledger")
+
+    if created_common:
+        sys.modules.pop("renquant_common", None)
 
 
 class TestDecisionLedgerWriteTask:
@@ -85,9 +125,9 @@ class TestDecisionLedgerWriteTask:
             "renquant_pipeline.decision_ledger.format_ticker_decisions",
             return_value=mock_decisions,
         ) as fmt_d, patch(
-            "renquant_orchestrator.decision_ledger.connect",
+            "renquant_common.decision_ledger.connect",
         ) as mock_connect, patch(
-            "renquant_orchestrator.decision_ledger.write_verdicts",
+            "renquant_common.decision_ledger.write_verdicts",
         ) as mock_write:
             mock_conn = MagicMock()
             mock_connect.return_value = mock_conn
@@ -131,9 +171,9 @@ class TestDecisionLedgerWriteTask:
             "renquant_pipeline.decision_ledger.format_ticker_decisions",
             return_value=mock_decisions,
         ), patch(
-            "renquant_orchestrator.decision_ledger.connect",
+            "renquant_common.decision_ledger.connect",
         ) as mock_connect, patch(
-            "renquant_orchestrator.decision_ledger.write_verdicts",
+            "renquant_common.decision_ledger.write_verdicts",
         ), patch.dict(
             "sys.modules",
             {"renquant_orchestrator.ledger_attribution": ledger_attribution_mod},
@@ -146,7 +186,12 @@ class TestDecisionLedgerWriteTask:
             ledger_attribution_mod.write_outcomes.assert_not_called()
             ledger_attribution_mod.connect_attribution.assert_not_called()
 
-    def test_failopen_on_orchestrator_import_error(self):
+    def test_failopen_on_common_import_error(self):
+        """Simulates version skew where renquant_common is installed but
+        does not yet provide decision_ledger (e.g. common#30 not merged
+        yet). Only the submodule is nulled in sys.modules — nulling the
+        top-level renquant_common too would also break the real Job/
+        Pipeline/Task exports renquant_pipeline itself depends on."""
         ctx = _FakeCtx(config={"decision_ledger": {"enabled": True}})
         task = _make_task()
 
@@ -159,8 +204,7 @@ class TestDecisionLedgerWriteTask:
             return_value=[],
         ), patch.dict(
             "sys.modules",
-            {"renquant_orchestrator": None,
-             "renquant_orchestrator.decision_ledger": None},
+            {"renquant_common.decision_ledger": None},
         ):
             result = task.run(ctx)
             assert result is False
@@ -178,7 +222,7 @@ class TestDecisionLedgerWriteTask:
             "renquant_pipeline.decision_ledger.format_ticker_decisions",
             return_value=[],
         ), patch(
-            "renquant_orchestrator.decision_ledger.connect",
+            "renquant_common.decision_ledger.connect",
             side_effect=RuntimeError("DB locked"),
         ):
             result = task.run(ctx)
@@ -198,9 +242,9 @@ class TestDecisionLedgerWriteTask:
             "renquant_pipeline.decision_ledger.format_ticker_decisions",
             return_value=[],
         ), patch(
-            "renquant_orchestrator.decision_ledger.connect",
+            "renquant_common.decision_ledger.connect",
         ) as mock_connect, patch(
-            "renquant_orchestrator.decision_ledger.write_verdicts",
+            "renquant_common.decision_ledger.write_verdicts",
         ):
             mock_connect.return_value = MagicMock()
             task.run(ctx)
@@ -226,9 +270,9 @@ class TestDecisionLedgerWriteTask:
             "renquant_pipeline.decision_ledger.format_ticker_decisions",
             return_value=[],
         ), patch(
-            "renquant_orchestrator.decision_ledger.connect",
+            "renquant_common.decision_ledger.connect",
         ) as mock_connect, patch(
-            "renquant_orchestrator.decision_ledger.write_verdicts",
+            "renquant_common.decision_ledger.write_verdicts",
         ) as mock_write:
             mock_connect.return_value = MagicMock()
             task.run(ctx)

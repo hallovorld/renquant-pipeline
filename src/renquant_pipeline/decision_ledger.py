@@ -1,14 +1,15 @@
 """S5 decision-ledger formatter — extract per-ticker decision records from ctx.
 
-The orchestrator owns the ledger DB (``decision_ledger.py`` for gate verdicts,
-``ledger_attribution.py`` for per-ticker outcomes). This module lives in the
+renquant-common owns the gate-verdict ledger DB (``decision_ledger.py``, moved
+from renquant-orchestrator per V-003); renquant-orchestrator still owns
+``ledger_attribution.py`` for per-ticker outcomes. This module lives in the
 *pipeline* because only the pipeline has access to the runtime context (``ctx``)
 with candidates, exits, rotations, regime, and scores.
 
 Two entry points:
 
 * ``format_gate_verdicts(ctx, config, run_id, run_date)`` → list of gate-verdict
-  dicts compatible with ``renquant_orchestrator.decision_ledger.write_verdicts``.
+  dicts compatible with ``renquant_common.decision_ledger.write_verdicts``.
 * ``format_ticker_decisions(ctx, config, run_id, run_date)`` → list of per-ticker
   decision dicts compatible with ``renquant_orchestrator.ledger_attribution.write_outcomes``
   (minus forward-return columns, which are filled later by the outcome observer).
@@ -46,7 +47,7 @@ def format_gate_verdicts(
 
     Each dict has: scope, gate, verdict ("allow" | "halve" | "block"),
     reason, inputs.  Compatible with
-    ``renquant_orchestrator.decision_ledger.write_verdicts``.
+    ``renquant_common.decision_ledger.write_verdicts``.
     """
     scope = _run_scope(config)
     verdicts: list[dict[str, Any]] = []
