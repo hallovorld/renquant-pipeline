@@ -82,6 +82,7 @@ class WfGateMetadataTask(PreflightTask):
         passed = wf.get("passed")
         details = {
             "passed": passed,
+            "diagnostic_only": wf.get("diagnostic_only"),
             "run_mode": ctx.run_mode,
             "wf_3cut_sharpe_mean": wf.get("wf_3cut_sharpe_mean"),
             "wf_3cut_apy_mean": wf.get("wf_3cut_apy_mean"),
@@ -93,6 +94,15 @@ class WfGateMetadataTask(PreflightTask):
         if passed is False:
             return self._fail_with_evidence(wf, details, ctx.run_mode)
         if passed is True:
+            if wf.get("diagnostic_only") is True:
+                return _soft_for_sell_only(
+                    self.check_name,
+                    "WF gate evidence is explicitly diagnostic-only; full/buy "
+                    "runs require a non-diagnostic validation verdict. "
+                    "Sell-only risk exits remain allowed.",
+                    run_mode=ctx.run_mode,
+                    details=details,
+                )
             return self._validate_passed(wf, details, ctx)
         return _soft_for_sell_only(
             self.check_name,

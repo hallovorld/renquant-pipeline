@@ -1856,6 +1856,27 @@ def _regime_stats_map(raw: object) -> dict[str, dict]:
     return {}
 
 
+def _diagnostic_only_admission(metadata: dict) -> tuple[bool, str, dict]:
+    """Refuse live-buy admission for scorers explicitly marked diagnostic-only.
+
+    A diagnostic-only walk-forward result is research evidence, not a trading
+    authorization.  This check deliberately lives before the optional regime
+    admission configuration: no configuration toggle may turn a diagnostic
+    artifact into a buy-capable production artifact.  The normal blocked-path
+    below preserves sell/risk handling by making existing holdings exit-only.
+    """
+    wf = metadata.get("wf_gate_metadata") if isinstance(metadata, dict) else {}
+    if isinstance(wf, dict) and wf.get("diagnostic_only") is True:
+        return False, "regime_admission:diagnostic_only_wf_evidence", {
+            "wf_gate_metadata": {
+                "diagnostic_only": True,
+                "passed": wf.get("passed"),
+                "reason": wf.get("reason"),
+            }
+        }
+    return True, "ok", {}
+
+
 def _trade_monotonicity_admission(metadata: dict, regime: str) -> tuple[bool, str, dict]:
     wf = metadata.get("wf_gate_metadata") if isinstance(metadata, dict) else {}
     tm = wf.get("trade_monotonicity") if isinstance(wf, dict) else {}
@@ -2118,13 +2139,15 @@ class RegimeModelAdmissionTask(Task):
             return None
         panel_cfg = ctx.config.get("ranking", {}).get("panel_scoring", {})
         cfg = panel_cfg.get("regime_admission", {}) or {}
-        if cfg.get("enabled", True) is False:
-            return None
         scorer = getattr(ctx, "_panel_scorer", None)
         metadata = getattr(scorer, "metadata", {}) or {}
         regime = str(getattr(ctx, "regime", "") or "UNKNOWN")
 
-        ok, reason, details = _trade_monotonicity_admission(metadata, regime)
+        ok, reason, details = _diagnostic_only_admission(metadata)
+        if ok and cfg.get("enabled", True) is False:
+            return None
+        if ok:
+            ok, reason, details = _trade_monotonicity_admission(metadata, regime)
         if ok and bool(cfg.get("require_sanity_regime_ic", True)):
             ok, reason, details = _sanity_regime_admission(
                 metadata,
