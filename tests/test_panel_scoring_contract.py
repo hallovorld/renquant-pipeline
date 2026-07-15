@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from renquant_pipeline import (
     stamp_order_attribution,
     validate_order_attribution,
 )
+from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import RegimeModelAdmissionTask
 
 
 def _ctx(*, feature_frame=None, panel_scores=None, artifact_extra=None) -> InferenceContext:
@@ -130,6 +132,36 @@ def test_model_admission_rejection_is_recorded_in_runtime_trace() -> None:
     assert latest["blocked_by"] == "model_spy_relative_sharpe_below_floor"
     assert latest["model_admission_ok"] is False
     assert latest["model_admission_reason"] == "model_spy_relative_sharpe_below_floor"
+
+
+def test_diagnostic_only_wf_evidence_blocks_buys_even_when_regime_admission_is_disabled() -> None:
+    candidate = SimpleNamespace(ticker="AAPL")
+    ctx = SimpleNamespace(
+        candidates=[candidate],
+        holdings={"MSFT": {"quantity": 2}},
+        config={"ranking": {"panel_scoring": {"regime_admission": {"enabled": False}}}},
+        _panel_scorer=SimpleNamespace(
+            metadata={
+                "wf_gate_metadata": {
+                    "passed": True,
+                    "diagnostic_only": True,
+                    "reason": "research_only",
+                }
+            }
+        ),
+        regime="BULL_CALM",
+        counters={},
+    )
+
+    RegimeModelAdmissionTask().run(ctx)
+
+    assert ctx.candidates == []
+    assert ctx._blocked_by_ticker == {
+        "AAPL": "regime_admission:diagnostic_only_wf_evidence",
+        "MSFT": "regime_admission:diagnostic_only_wf_evidence",
+    }
+    assert ctx._qp_exit_only_tickers == {"MSFT"}
+    assert ctx._regime_model_admission["reason"] == "regime_admission:diagnostic_only_wf_evidence"
 
 
 def test_runtime_regime_admission_is_recorded_in_decision_trace() -> None:
