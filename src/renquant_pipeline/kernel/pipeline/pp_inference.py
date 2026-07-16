@@ -184,6 +184,29 @@ def _make_cand_tctx(ctx: InferenceContext, ticker: str) -> TickerInferenceContex
     )
 
 
+def _panel_watchlist_candidate_mode(ctx: InferenceContext) -> bool:
+    """Whether a panel scorer may source candidates from the full watchlist.
+
+    The legacy path deliberately starts from ``ctx.models``: each candidate
+    needs a per-ticker tournament model.  A cross-sectional panel scorer is a
+    different contract.  It can score names without a tournament model, but
+    that broader entry point must be explicit so an ordinary panel-score
+    rollout cannot silently change live breadth.
+
+    ``candidate_universe=watchlist`` is therefore valid only alongside the
+    existing explicit tournament-bypass flag.  Any other value preserves the
+    legacy model-backed universe.
+    """
+    panel_cfg = (
+        (ctx.config.get("ranking", {}) or {}).get("panel_scoring", {}) or {}
+    )
+    return (
+        bool(panel_cfg.get("enabled", False))
+        and bool(panel_cfg.get("bypass_ticker_gate", False))
+        and panel_cfg.get("candidate_universe") == "watchlist"
+    )
+
+
 def _buy_universe(ctx: InferenceContext) -> list[str]:
     held = set(ctx.holdings.keys())
     from .task_benchmark_sleeve import (  # noqa: PLC0415
@@ -210,8 +233,15 @@ def _buy_universe(ctx: InferenceContext) -> list[str]:
                 if t in ctx.models and t not in held
                 and t != sleeve_ticker
                 and t not in pending_at_broker and t in ctx.ohlcv]
-    return [t for t in ctx.models if t not in held
+    source = (
+        ctx.config.get("watchlist", [])
+        if _panel_watchlist_candidate_mode(ctx)
+        else ctx.models
+    )
+    benchmark = str(ctx.config.get("benchmark", "SPY"))
+    return [t for t in source if t not in held
             and t != sleeve_ticker
+            and t != benchmark
             and t not in pending_at_broker and t in ctx.ohlcv]
 
 
