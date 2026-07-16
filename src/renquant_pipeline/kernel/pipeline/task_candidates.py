@@ -9,6 +9,24 @@ from .pipeline import Task
 log = logging.getLogger("kernel.pipeline.candidates")
 
 
+def _panel_watchlist_candidate_mode(tc: TickerInferenceContext) -> bool:
+    """True when this candidate is intentionally panel-only.
+
+    This is paired with ``pp_inference._panel_watchlist_candidate_mode``.  A
+    panel-only candidate has no tournament artifact by design; it remains
+    subject to every pre-panel risk/metadata gate and receives its scores from
+    ``PanelScoringJob`` later in the same inference run.
+    """
+    panel_cfg = (
+        (tc.config.get("ranking", {}) or {}).get("panel_scoring", {}) or {}
+    )
+    return (
+        bool(panel_cfg.get("enabled", False))
+        and bool(panel_cfg.get("bypass_ticker_gate", False))
+        and panel_cfg.get("candidate_universe") == "watchlist"
+    )
+
+
 class EarningsFilterTask(Task):
     def run(self, tc: TickerInferenceContext) -> bool | None:
         from renquant_pipeline.kernel.selection import is_earnings_blocked  # noqa: PLC0415
@@ -141,11 +159,12 @@ class BuildFeaturesTask(Task):
         from renquant_pipeline.kernel.indicators import build_feature_frame  # noqa: PLC0415
         stock_df = tc.ohlcv.get(tc.ticker)
         spy_df   = tc.ohlcv.get("SPY")
-        if stock_df is None or tc.model is None or spy_df is None:
+        panel_only = _panel_watchlist_candidate_mode(tc) and tc.model is None
+        if stock_df is None or (tc.model is None and not panel_only) or spy_df is None:
             missing = []
             if stock_df is None:
                 missing.append("stock_ohlcv")
-            if tc.model is None:
+            if tc.model is None and not panel_only:
                 missing.append("model")
             if spy_df is None:
                 missing.append("spy_ohlcv")
@@ -155,6 +174,13 @@ class BuildFeaturesTask(Task):
                      tc.ticker, stock_df is not None,
                      tc.model is not None, spy_df is not None)
             return False
+        # Panel-only candidates are scored from the full panel feature frames
+        # later in PanelScoringJob.  Building the legacy per-ticker feature
+        # frame here is both unnecessary and impossible without a tournament
+        # model contract.
+        if panel_only:
+            return None
+
         spec    = tc.config.get("indicator_spec", {})
         vol_win = int(tc.config.get("regime", {}).get("vol_realized_window", 20))
         tc.features = build_feature_frame(stock_df, spy_df, spec, vol_win)
@@ -181,6 +207,16 @@ class ScoreBuyTask(Task):
     """
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
+        if tc.model is None and _panel_watchlist_candidate_mode(tc):
+            # PanelScoringJob overwrites these placeholders with the active
+            # panel model's raw score, calibrated rank and expected return.
+            tc.model_action = "panel_pending"
+            tc._raw_score = 0.0  # noqa: SLF001
+            tc._rank_score = 0.0  # noqa: SLF001
+            tc._expected_return = 0.0  # noqa: SLF001
+            tc._expected_return_horizon_days = None  # noqa: SLF001
+            return None
+
         from renquant_pipeline.kernel.models import score_artifact  # noqa: PLC0415
         rotation_horizon = int(tc.config.get("rotation", {}).get("target_horizon_days", 20))
         sr = score_artifact(
