@@ -1856,24 +1856,54 @@ def _regime_stats_map(raw: object) -> dict[str, dict]:
     return {}
 
 
-def _diagnostic_only_admission(metadata: dict) -> tuple[bool, str, dict]:
+def _diagnostic_only_admission(
+    metadata: dict,
+    config: dict | None = None,
+    *,
+    today: datetime.date | None = None,
+) -> tuple[bool, str, dict]:
     """Refuse live-buy admission for scorers explicitly marked diagnostic-only.
 
     A diagnostic-only walk-forward result is research evidence, not a trading
     authorization.  This check deliberately lives before the optional regime
-    admission configuration: no configuration toggle may turn a diagnostic
-    artifact into a buy-capable production artifact.  The normal blocked-path
-    below preserves sell/risk handling by making existing holdings exit-only.
+    admission configuration: no ORDINARY configuration toggle may turn a
+    diagnostic artifact into a buy-capable production artifact.  The ONLY
+    sanctioned exception is the governed operator authorization validated by
+    :mod:`renquant_pipeline.kernel.diagnostic_only_override` — explicit,
+    expiring, bound to this exact scorer's schema-v1 content hash, and fully
+    audited (the provenance is surfaced in the admission details).  The
+    normal blocked-path below preserves sell/risk handling by making
+    existing holdings exit-only.
     """
     wf = metadata.get("wf_gate_metadata") if isinstance(metadata, dict) else {}
     if isinstance(wf, dict) and wf.get("diagnostic_only") is True:
-        return False, "regime_admission:diagnostic_only_wf_evidence", {
+        from renquant_pipeline.kernel.diagnostic_only_override import (  # noqa: PLC0415
+            evaluate_diagnostic_only_override,
+        )
+        verdict = evaluate_diagnostic_only_override(
+            config,
+            scorer_v1_fingerprint=(
+                metadata.get("model_content_fingerprint_v1_recompute")
+                if isinstance(metadata, dict) else None
+            ),
+            today=today,
+        )
+        if verdict.authorized:
+            return True, "ok:diagnostic_only_operator_override", {
+                "diagnostic_only_override": verdict.provenance,
+            }
+        details = {
             "wf_gate_metadata": {
                 "diagnostic_only": True,
                 "passed": wf.get("passed"),
                 "reason": wf.get("reason"),
             }
         }
+        if verdict.reason != "absent":
+            details["diagnostic_only_override_rejected"] = {
+                "reason": verdict.reason, **verdict.provenance,
+            }
+        return False, "regime_admission:diagnostic_only_wf_evidence", details
     return True, "ok", {}
 
 
@@ -2143,8 +2173,17 @@ class RegimeModelAdmissionTask(Task):
         metadata = getattr(scorer, "metadata", {}) or {}
         regime = str(getattr(ctx, "regime", "") or "UNKNOWN")
 
-        ok, reason, details = _diagnostic_only_admission(metadata)
+        ok, reason, details = _diagnostic_only_admission(
+            metadata, ctx.config, today=getattr(ctx, "today", None),
+        )
+        # The governed-override provenance must survive into the admission
+        # record even when later admission stages overwrite reason/details.
+        override_provenance = details.get("diagnostic_only_override")
         if ok and cfg.get("enabled", True) is False:
+            if override_provenance:
+                ctx._regime_model_admission = {  # noqa: SLF001
+                    "ok": True, "reason": reason, "regime": regime, **details,
+                }
             return None
         if ok:
             ok, reason, details = _trade_monotonicity_admission(metadata, regime)
@@ -2157,6 +2196,8 @@ class RegimeModelAdmissionTask(Task):
             )
         ctx._regime_model_admission = {  # noqa: SLF001
             "ok": bool(ok), "reason": reason, "regime": regime, **details,
+            **({"diagnostic_only_override": override_provenance}
+               if override_provenance else {}),
         }
         if ok:
             return None

@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import json
 
+from renquant_pipeline.kernel.diagnostic_only_override import (
+    evaluate_diagnostic_only_override,
+)
 from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
@@ -36,6 +39,11 @@ class WfGateMetadataTask(PreflightTask):
       - sidecar unreadable → soft|hard per run_mode (P-PANEL-CONTRACT handles)
       - wf metadata absent → soft|hard per run_mode (full/buy strict)
       - passed=False → HARD fail (sell-only soft pass with warning)
+      - passed=True + diagnostic_only=True → sell-only, UNLESS a valid
+        ``wf_gate.diagnostic_only_buy_admission`` operator authorization
+        (explicit, expiring, bound to this exact scorer's schema-v1 content
+        hash — see ``kernel.diagnostic_only_override``) admits buys; the
+        authorization provenance is attached to the check details
       - passed=True with missing sanity / missing required numerics → soft|hard
         per run_mode (with config-controlled wf_gate.sanity_regime_ic_required
         relaxation, default True = strict)
@@ -76,9 +84,10 @@ class WfGateMetadataTask(PreflightTask):
                 "Sharpe and SPY comparison evidence",
                 run_mode=ctx.run_mode,
             )
-        return self._evaluate_wf(wf, ctx)
+        return self._evaluate_wf(wf, ctx, payload=payload)
 
-    def _evaluate_wf(self, wf: dict, ctx: PreflightContext) -> PreflightCheck:
+    def _evaluate_wf(self, wf: dict, ctx: PreflightContext,
+                     payload: dict | None = None) -> PreflightCheck:
         passed = wf.get("passed")
         details = {
             "passed": passed,
@@ -95,11 +104,38 @@ class WfGateMetadataTask(PreflightTask):
             return self._fail_with_evidence(wf, details, ctx.run_mode)
         if passed is True:
             if wf.get("diagnostic_only") is True:
-                return _soft_for_sell_only(
-                    self.check_name,
+                verdict = evaluate_diagnostic_only_override(
+                    ctx.config, scorer_payload=payload,
+                )
+                if verdict.authorized:
+                    details["diagnostic_only_override"] = verdict.provenance
+                    prov = verdict.provenance
+                    return PreflightCheck(
+                        self.check_name, "hard", True,
+                        "WF gate evidence is diagnostic-only; buys admitted "
+                        "under a governed operator authorization "
+                        f"(operator={prov['operator']}, "
+                        f"authorized_at={prov['authorized_at']}, "
+                        f"expires={prov['expires']}, scorer-bound "
+                        f"{prov['scorer_model_content_sha256']})",
+                        details=details,
+                    )
+                blocked_msg = (
                     "WF gate evidence is explicitly diagnostic-only; full/buy "
                     "runs require a non-diagnostic validation verdict. "
-                    "Sell-only risk exits remain allowed.",
+                    "Sell-only risk exits remain allowed."
+                )
+                if verdict.reason != "absent":
+                    details["diagnostic_only_override_rejected"] = {
+                        "reason": verdict.reason, **verdict.provenance,
+                    }
+                    blocked_msg += (
+                        " (an operator authorization was present but "
+                        f"rejected: {verdict.reason})"
+                    )
+                return _soft_for_sell_only(
+                    self.check_name,
+                    blocked_msg,
                     run_mode=ctx.run_mode,
                     details=details,
                 )

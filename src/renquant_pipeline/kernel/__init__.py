@@ -147,6 +147,7 @@ NON_OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
 # with no clear cause.
 OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
     "alert_lifecycle",
+    "diagnostic_only_override",
     "artifact_resolver",
     "asset_class",
     "broker_reconciliation",
