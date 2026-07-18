@@ -8,7 +8,9 @@ Scorer Protocol").
 """
 from __future__ import annotations
 
+import logging
 import math
+import statistics
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +29,8 @@ from .model_admission import evaluate_model_admission
 from .order_attribution import stamp_order_attribution
 from .kernel.gate_registry import ctx_registry
 from .runtime_features import build_runtime_feature_frame
+
+log = logging.getLogger(__name__)
 
 
 def _legacy_dict_to_manifest(legacy: dict[str, Any]) -> ArtifactManifest | None:
@@ -259,11 +263,25 @@ class RegimeModelAdmissionTask(Task):
 
 
 class VetoWeakBuysTask(Task):
-    """Convert panel scores into buy-eligible candidates without sizing them."""
+    """Convert panel scores into buy-eligible candidates without sizing them.
+
+    Floor semantics are kept in LOCKSTEP with the kernel twin
+    (``kernel/panel_pipeline/job_panel_scoring.VetoWeakBuysTask``): the three
+    adaptive modes (``adaptive_mean_std``, ``adaptive_mean_std_cap``,
+    ``adaptive_quantile``) and the RFC 2026-07-17 (pipeline #204) small-n
+    relax-only guard are honored here exactly as in the kernel — see
+    :func:`_buy_floor_info`.
+    """
 
     def run(self, ctx: Any) -> bool | None:
-        floor = _buy_floor(ctx)
+        floor, floor_label = _buy_floor_info(ctx)
+        # Audit/detection surface, mirroring the kernel twin: expose the
+        # exact floor + label so replay harnesses and tests can assert
+        # bit-identity without parsing logs.
+        setattr(ctx, "_panel_buy_floor", floor)
+        setattr(ctx, "_panel_buy_floor_label", floor_label)
         accepted: list[dict[str, Any]] = []
+        dropped = 0
         scores = getattr(ctx, "panel_scores", {}) or {}
         for ticker in _watchlist(ctx):
             score = scores.get(ticker)
@@ -272,6 +290,7 @@ class VetoWeakBuysTask(Task):
                 continue
             if float(score) < floor:
                 _block(ctx, ticker, "panel_score_below_buy_floor")
+                dropped += 1
                 continue
             accepted.append(
                 {
@@ -284,6 +303,11 @@ class VetoWeakBuysTask(Task):
                 }
             )
 
+        if dropped:
+            log.info(
+                "VetoWeakBuysTask: dropped %d candidate(s) below "
+                "rank_score floor=%s", dropped, floor_label,
+            )
         setattr(ctx, "accepted_candidates", accepted)
         _trace(ctx, selected=[row["ticker"] for row in accepted])
         return True
@@ -620,11 +644,191 @@ def _model_type(ctx: Any) -> str | None:
     return None
 
 
-def _buy_floor(ctx: Any) -> float:
+_ADAPTIVE_FLOOR_MODES = {
+    "adaptive_mean_std",
+    "adaptive_mean_std_cap",
+    "adaptive_quantile",
+}
+
+
+def _smalln_guard_params(panel_cfg: dict) -> tuple[int, float] | None:
+    """Validate the small-n guard config (RFC 2026-07-17 §2.2 matrix).
+
+    LOCKSTEP: mirrored verbatim from
+    ``kernel/panel_pipeline/job_panel_scoring._smalln_guard_params`` —
+    change BOTH or neither.
+
+    Returns ``(buy_floor_min_n, buy_floor_absolute_smalln)`` only when BOTH
+    optional keys are present and valid:
+
+    - ``buy_floor_min_n``: integer in [2, 30] (bool rejected);
+    - ``buy_floor_absolute_smalln``: finite number in (0, 1) exclusive.
+
+    Any other combination — half-configured (one key present, the other
+    absent) or out-of-bounds/invalid values — is REJECTED loudly (ERROR log
+    naming the offending key and value) and returns ``None`` so the caller
+    falls back to the status-quo floor formula, which fails toward no-entry.
+    Both keys absent → ``None`` silently (guard fully off, bit-identical
+    status quo).
+    """
+    if "buy_floor_min_n" not in panel_cfg and "buy_floor_absolute_smalln" not in panel_cfg:
+        return None
+    raw_min_n = panel_cfg.get("buy_floor_min_n")
+    raw_abs = panel_cfg.get("buy_floor_absolute_smalln")
+    ok = True
+    if (
+        not isinstance(raw_min_n, int)
+        or isinstance(raw_min_n, bool)
+        or not (2 <= raw_min_n <= 30)
+    ):
+        log.error(
+            "VetoWeakBuysTask: small-n guard config REJECTED — "
+            "buy_floor_min_n=%r invalid (must be an integer in [2, 30]); "
+            "status-quo floor applies",
+            raw_min_n,
+        )
+        ok = False
+    abs_val: float | None = None
+    if isinstance(raw_abs, (int, float)) and not isinstance(raw_abs, bool):
+        abs_val = float(raw_abs)
+    if abs_val is None or not math.isfinite(abs_val) or not (0.0 < abs_val < 1.0):
+        log.error(
+            "VetoWeakBuysTask: small-n guard config REJECTED — "
+            "buy_floor_absolute_smalln=%r invalid (must be finite in (0, 1)); "
+            "status-quo floor applies",
+            raw_abs,
+        )
+        ok = False
+    if not ok:
+        return None
+    assert abs_val is not None  # narrowed above; keeps type-checkers honest
+    return int(raw_min_n), abs_val
+
+
+def _apply_smalln_guard(
+    floor: float,
+    floor_label: str,
+    *,
+    n_finite: int,
+    min_fl: float,
+    guard: tuple[int, float] | None,
+) -> tuple[float, str]:
+    """Apply the RELAX-ONLY small-n branch (RFC 2026-07-17 §2.1).
+
+    LOCKSTEP: mirrored verbatim from
+    ``kernel/panel_pipeline/job_panel_scoring._apply_smalln_guard`` —
+    change BOTH or neither.
+
+    ``floor`` is F_mode — the EXACT status-quo output of the adaptive mode
+    formula (including its own min/cap clamps). When the guard is configured
+    and the finite-score count ``n_finite`` is below ``buy_floor_min_n``:
+
+        floor_smalln = max(min_fl, min(F_mode, buy_floor_absolute_smalln))
+
+    hardened with an unconditional one-sidedness clamp ``min(F_mode, ·)``
+    (design-review approval note): under the pre-existing pathological
+    misconfig ``buy_floor_adaptive_cap < buy_floor_min`` in
+    ``adaptive_mean_std_cap``, F_mode (= cap) sits BELOW ``min_fl`` and the
+    unclamped formula would RAISE the floor to ``min_fl``. The clamp makes
+    the branch relax-only by construction — it can only lower the floor
+    (widen admission) relative to the status quo, never raise it; in that
+    pathological case it degrades to exactly the status-quo floor.
+    """
+    if guard is None:
+        return floor, floor_label
+    min_n, abs_smalln = guard
+    if n_finite >= min_n:
+        return floor, floor_label
+    relaxed = min(floor, max(min_fl, min(floor, abs_smalln)))
+    label = (
+        f"smalln-relax(n={n_finite} < N0, min(mode={floor:.3f}, "
+        f"abs={abs_smalln:.2f})) = {relaxed:.3f}"
+    )
+    return relaxed, label
+
+
+def _buy_floor_info(ctx: Any) -> tuple[float, str]:
+    """Resolve the buy floor + audit label, in LOCKSTEP with the kernel twin.
+
+    Mirrors the floor computation of
+    ``kernel/panel_pipeline/job_panel_scoring.VetoWeakBuysTask`` (three
+    adaptive modes + RFC 2026-07-17 small-n relax-only guard). Non-adaptive
+    values keep this module's historical lenient parse: numeric → absolute
+    floor; unset/unparseable → 0.0.
+    """
     cfg = _panel_cfg(ctx)
-    value = cfg.get("buy_floor", cfg.get("floor", 0.0))
-    parsed = _finite_float(value)
-    return float(parsed or 0.0)
+    raw = cfg.get("buy_floor", cfg.get("floor", 0.0))
+    if isinstance(raw, str) and raw in _ADAPTIVE_FLOOR_MODES:
+        scores_map = getattr(ctx, "panel_scores", {}) or {}
+        scores: list[float] = []
+        for ticker in _watchlist(ctx):
+            value = _finite_float(scores_map.get(ticker))
+            if value is not None:
+                scores.append(value)
+        floor: float
+        floor_label: str
+        if raw == "adaptive_quantile":
+            q      = float(cfg.get("buy_floor_quantile", 0.80))
+            min_fl = float(cfg.get("buy_floor_min",      0.20))
+            if len(scores) >= 2:
+                qclamped = min(max(q, 0.0), 1.0)
+                scores_sorted = sorted(scores)
+                pos = qclamped * (len(scores_sorted) - 1)
+                lo = math.floor(pos)
+                hi = math.ceil(pos)
+                if lo == hi:
+                    qval = scores_sorted[lo]
+                else:
+                    weight = pos - lo
+                    qval = (
+                        scores_sorted[lo] * (1.0 - weight)
+                        + scores_sorted[hi] * weight
+                    )
+                floor = max(min_fl, qval)
+                floor_label = (
+                    f"max(min={min_fl:.2f}, q{qclamped:.2f}={qval:.3f}) = "
+                    f"{floor:.3f}  (n={len(scores)})"
+                )
+            else:
+                floor = min_fl
+                floor_label = f"{floor:.3f} (fallback; n<2 for stats)"
+        else:
+            cap      = float(cfg.get("buy_floor_adaptive_cap", 0.30))
+            min_fl   = float(cfg.get("buy_floor_min",          0.20))
+            std_mult = float(cfg.get("buy_floor_std_mult",      1.0))
+            if len(scores) >= 2:
+                mean_s = statistics.fmean(scores)
+                std_s  = statistics.stdev(scores)
+                adaptive = mean_s + std_mult * std_s
+                if raw == "adaptive_mean_std":
+                    floor = max(min_fl, adaptive)
+                    floor_label = (
+                        f"max(min={min_fl:.2f}, mean+{std_mult:.2f}*std="
+                        f"{adaptive:.3f}) = {floor:.3f}  (n={len(scores)})"
+                    )
+                else:
+                    floor = min(max(min_fl, adaptive), cap)
+                    floor_label = (
+                        f"min(max(min={min_fl:.2f}, mean+std={adaptive:.3f}), "
+                        f"cap={cap:.2f}) = {floor:.3f}  (n={len(scores)})"
+                    )
+            else:
+                floor = min_fl if raw == "adaptive_mean_std" else cap
+                floor_label = f"{floor:.3f} (fallback; n<2 for stats)"
+        return _apply_smalln_guard(
+            floor,
+            floor_label,
+            n_finite=len(scores),
+            min_fl=min_fl,
+            guard=_smalln_guard_params(cfg),
+        )
+    parsed = _finite_float(raw)
+    value = float(parsed or 0.0)
+    return value, f"{value:.3f} (absolute)"
+
+
+def _buy_floor(ctx: Any) -> float:
+    return _buy_floor_info(ctx)[0]
 
 
 def _finite_float(value: Any) -> float | None:

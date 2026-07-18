@@ -1620,6 +1620,100 @@ class ApplyScoresTask(Task):
                  n_held_scored, len(ctx.holdings))
 
 
+def _smalln_guard_params(panel_cfg: dict) -> tuple[int, float] | None:
+    """Validate the small-n guard config (RFC 2026-07-17 §2.2 matrix).
+
+    LOCKSTEP: mirrored verbatim in ``renquant_pipeline.panel_scoring``
+    (the twin) — change BOTH or neither.
+
+    Returns ``(buy_floor_min_n, buy_floor_absolute_smalln)`` only when BOTH
+    optional keys are present and valid:
+
+    - ``buy_floor_min_n``: integer in [2, 30] (bool rejected);
+    - ``buy_floor_absolute_smalln``: finite number in (0, 1) exclusive.
+
+    Any other combination — half-configured (one key present, the other
+    absent) or out-of-bounds/invalid values — is REJECTED loudly (ERROR log
+    naming the offending key and value) and returns ``None`` so the caller
+    falls back to the status-quo floor formula, which fails toward no-entry.
+    Both keys absent → ``None`` silently (guard fully off, bit-identical
+    status quo).
+    """
+    if "buy_floor_min_n" not in panel_cfg and "buy_floor_absolute_smalln" not in panel_cfg:
+        return None
+    raw_min_n = panel_cfg.get("buy_floor_min_n")
+    raw_abs = panel_cfg.get("buy_floor_absolute_smalln")
+    ok = True
+    if (
+        not isinstance(raw_min_n, int)
+        or isinstance(raw_min_n, bool)
+        or not (2 <= raw_min_n <= 30)
+    ):
+        log.error(
+            "VetoWeakBuysTask: small-n guard config REJECTED — "
+            "buy_floor_min_n=%r invalid (must be an integer in [2, 30]); "
+            "status-quo floor applies",
+            raw_min_n,
+        )
+        ok = False
+    abs_val: float | None = None
+    if isinstance(raw_abs, (int, float)) and not isinstance(raw_abs, bool):
+        abs_val = float(raw_abs)
+    if abs_val is None or not math.isfinite(abs_val) or not (0.0 < abs_val < 1.0):
+        log.error(
+            "VetoWeakBuysTask: small-n guard config REJECTED — "
+            "buy_floor_absolute_smalln=%r invalid (must be finite in (0, 1)); "
+            "status-quo floor applies",
+            raw_abs,
+        )
+        ok = False
+    if not ok:
+        return None
+    assert abs_val is not None  # narrowed above; keeps type-checkers honest
+    return int(raw_min_n), abs_val
+
+
+def _apply_smalln_guard(
+    floor: float,
+    floor_label: str,
+    *,
+    n_finite: int,
+    min_fl: float,
+    guard: tuple[int, float] | None,
+) -> tuple[float, str]:
+    """Apply the RELAX-ONLY small-n branch (RFC 2026-07-17 §2.1).
+
+    LOCKSTEP: mirrored verbatim in ``renquant_pipeline.panel_scoring``
+    (the twin) — change BOTH or neither.
+
+    ``floor`` is F_mode — the EXACT status-quo output of the adaptive mode
+    formula (including its own min/cap clamps). When the guard is configured
+    and the finite-score count ``n_finite`` is below ``buy_floor_min_n``:
+
+        floor_smalln = max(min_fl, min(F_mode, buy_floor_absolute_smalln))
+
+    hardened with an unconditional one-sidedness clamp ``min(F_mode, ·)``
+    (design-review approval note): under the pre-existing pathological
+    misconfig ``buy_floor_adaptive_cap < buy_floor_min`` in
+    ``adaptive_mean_std_cap``, F_mode (= cap) sits BELOW ``min_fl`` and the
+    unclamped formula would RAISE the floor to ``min_fl``. The clamp makes
+    the branch relax-only by construction — it can only lower the floor
+    (widen admission) relative to the status quo, never raise it; in that
+    pathological case it degrades to exactly the status-quo floor.
+    """
+    if guard is None:
+        return floor, floor_label
+    min_n, abs_smalln = guard
+    if n_finite >= min_n:
+        return floor, floor_label
+    relaxed = min(floor, max(min_fl, min(floor, abs_smalln)))
+    label = (
+        f"smalln-relax(n={n_finite} < N0, min(mode={floor:.3f}, "
+        f"abs={abs_smalln:.2f})) = {relaxed:.3f}"
+    )
+    return relaxed, label
+
+
 class VetoWeakBuysTask(Task):
     """Drop candidates whose CALIBRATED rank_score is below `buy_floor`.
 
@@ -1718,6 +1812,11 @@ class VetoWeakBuysTask(Task):
         # mean+std happens to land low.
         floor: float
         floor_label: str
+        # Small-n guard scope (RFC 2026-07-17 §2.1): populated by the three
+        # ADAPTIVE branches only — (finite-score count, buy_floor_min).
+        # Absolute numeric floors have no self-referential statistic, so the
+        # guard does not apply (and its config keys are not consulted) there.
+        _smalln_scope: tuple[int, float] | None = None
         if isinstance(raw_floor, str) and raw_floor == "adaptive_quantile":
             # 2026-06-11 false-BEAR audit P2: explicit breadth control.
             # mean+kσ on a Platt-compressed calibrator (rank_score IQR ~0.04)
@@ -1739,6 +1838,7 @@ class VetoWeakBuysTask(Task):
                     continue
                 if math.isfinite(f):
                     scores.append(f)
+            _smalln_scope = (len(scores), min_fl)
             if len(scores) >= 2:
                 qclamped = min(max(q, 0.0), 1.0)
                 scores_sorted = sorted(scores)
@@ -1774,6 +1874,7 @@ class VetoWeakBuysTask(Task):
                     continue
                 if math.isfinite(f):
                     scores.append(f)
+            _smalln_scope = (len(scores), min_fl)
             if len(scores) >= 2:
                 import statistics as _stats  # noqa: PLC0415
                 mean_s = _stats.fmean(scores)
@@ -1806,6 +1907,26 @@ class VetoWeakBuysTask(Task):
         else:
             floor = float(raw_floor)
             floor_label = f"{floor:.3f} (absolute)"
+
+        # RFC 2026-07-17 (pipeline #204) small-n guard: RELAX-ONLY branch on
+        # the three adaptive modes when the finite-score count is below
+        # buy_floor_min_n. Config absent → bit-identical status quo; config
+        # half-set/invalid → loud ERROR inside _smalln_guard_params and
+        # status quo (fails toward no-entry). Validation is per-run and runs
+        # whenever an adaptive mode is active, independent of n.
+        if _smalln_scope is not None:
+            floor, floor_label = _apply_smalln_guard(
+                floor,
+                floor_label,
+                n_finite=_smalln_scope[0],
+                min_fl=_smalln_scope[1],
+                guard=_smalln_guard_params(panel_cfg),
+            )
+
+        # Audit/detection surface: expose the exact floor + label so replay
+        # harnesses and tests can assert bit-identity without parsing logs.
+        ctx._panel_buy_floor = floor                           # noqa: SLF001
+        ctx._panel_buy_floor_label = floor_label               # noqa: SLF001
 
         kept: list = []
         dropped = 0
