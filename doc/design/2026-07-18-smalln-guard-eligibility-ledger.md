@@ -27,9 +27,12 @@ residue — the exact case where relaxing admission must not happen.
 
 ## 2. Eligibility partition — the clean-scan precondition
 
-At VetoWeakBuysTask entry, build the partition for the current scan
-from surfaces that already exist in the funnel (no new upstream
-instrumentation is required for v1):
+At VetoWeakBuysTask entry, build the partition for the current scan.
+Most fields come from surfaces that already exist in the funnel; TWO
+require new instrumentation (r2): the generation-stage
+`expected_universe` counter and the promoted feed-staleness marker —
+both named in §2's CLEAN definition and part of the implementation
+scope:
 
 | field | source |
 |---|---|
@@ -41,14 +44,40 @@ instrumentation is required for v1):
 | `pre_floor_exclusions` | per-reason counts from `ctx._blocked_by_ticker` upstream of the floor (wash-sale, vol-gate, override-ineligible, etc.) |
 | `finite_n` | the n the guard sees |
 
-**CLEAN means:** `score_missing == 0` AND `nonfinite == 0` AND every
-`pre_floor_exclusions` reason belongs to the APPROVED-NORMAL class
-(wash-sale, realized-vol gate, governed-override eligibility, corporate
-action, membership rules — an explicit allowlist frozen in config) AND
-no scorer/calibrator/feature/manifest/coverage failure marker is present
-on the context (contract-mismatch flags, fingerprint-dispatch errors,
-feed-staleness markers — enumerated at implementation from the existing
-failure surfaces).
+**CLEAN means ALL of (r2 — review round 1 P1s incorporated):**
+
+1. **Mass balance (P1-1).** `entered_scan + Σ(recorded pre-scan
+   exclusion counts) == expected_universe`, where `expected_universe`
+   is a counter EMITTED BY THE CANDIDATE-GENERATION STAGE at run time
+   (watchlist ∩ session eligibility, recorded before any drop). Any
+   unaccounted shortfall — the signature of generation-starving
+   failures that leave no per-name records (bars-feed outage, the June
+   per-ticker staleness shape) — is NOT CLEAN. If the counter is
+   absent (older pipeline), expected_universe is UNKNOWN → NOT CLEAN.
+   This REVISES the r1 claim that no new upstream instrumentation is
+   needed: the generation-stage counter is required implementation.
+2. **Funnel integrity:** `score_missing == 0` AND `nonfinite == 0`.
+3. **Approved-normal reasons WITH share bounds (P1-2).** Every
+   `pre_floor_exclusions` reason belongs to the explicit allowlist
+   frozen in config, AND each INTEGRITY-classed reason's count share of
+   `expected_universe` is within its config-frozen bound (proposed
+   defaults: wash-sale ≤ 20%, realized-vol gate ≤ 50%, corporate
+   action ≤ 10%) — a mass of bogus tags under an approved class (the
+   RenQuant#428 STATE-EXT-SELL wash-sale precedent) breaches its bound
+   → NOT CLEAN. POLICY-classed narrowing (governed-override
+   eligibility, membership rules) is exempt from share bounds because
+   the narrowing is itself declared in reviewed, pinned config — but
+   it must still be the EXACT reason string the config declares.
+4. **No failure markers:** no scorer/calibrator/feature/manifest/
+   coverage failure marker on the context. v1 detectable set (all
+   existing surfaces): `_panel_scoring_contract_failed`,
+   `panel_score_missing` counters, `veto:rank_score_nan`,
+   fingerprint-dispatch errors. Feed-staleness currently logs a
+   warning with NO machine surface (r2 honest scope): implementation
+   PROMOTES that warning to a context marker
+   (`_feed_staleness_flagged`), and until that marker exists the
+   staleness class is covered indirectly by (1)+(3) only — stated
+   plainly rather than claimed.
 
 - CLEAN and `finite_n < N0` → the relax-only branch MAY act (§2.1 of the
   base RFC, unchanged).
@@ -56,7 +85,11 @@ failure surfaces).
   fails toward no-entry), and the run is tagged
   `smalln_guard_suppressed(reason=<first failing class>)` — LOUD in the
   sentinel (a suppression on a small-n day is exactly a day a human
-  should look at).
+  should look at). **Named deliverable (r2):** a separate orchestrator
+  PR extends the deployed #545 sentinel with a
+  `smalln_guard_suppressed` LOUD pattern — the current rule fires only
+  on all-veto∧small-n and would miss a suppressed-but-partially-
+  admitting day.
 - The partition is computed REGARDLESS of whether the branch fires, so
   normal-n days build the same record (baseline data for §4).
 
@@ -95,8 +128,13 @@ explicit (`smalln_ledger: absent`).
   affected shadow/replay sessions: (i) zero suppression-logic errors
   (no session where manual audit finds the partition mislabeled); (ii)
   every delta name traceable through downstream gates with no risk-gate
-  bypass; (iii) the guard admits ≥1 name on ≥70% of affected sessions
-  (it does what it exists to do); (iv) no new alarm class fires.
+  bypass; (iii) the guard admits ≥1 name on ≥70% of OPERATIVE affected
+  sessions — operative = the absolute bound sits BELOW the status-quo
+  floor, i.e. relaxation can change the outcome; compressed-scale
+  sessions where the relax-only `min()` degrades to status quo are
+  EXCLUDED from this denominator (r2 — they are one-sidedness
+  correctness evidence, and counting them would NO-GO the guard for
+  behaving correctly); (iv) no new alarm class fires.
   **NO-GO if:** any partition mislabel (a failure-residue day classified
   CLEAN — the P0's core hazard) OR any delta name bypasses a downstream
   gate OR the sentinel small-n rule fails to fire on a suppressed day.
@@ -117,7 +155,14 @@ explicit (`smalln_ledger: absent`).
 - AC-C: the partition block appears in the run bundle + decision ledger
   on EVERY session (normal-n included), schema-versioned.
 - AC-D: suppression reasons enumerate every failure surface named in §2;
-  an unknown/unclassifiable exclusion reason → NOT CLEAN (fail-closed
-  default, no allowlist-by-omission).
+  an unknown/unclassifiable exclusion reason → NOT CLEAN, and an ABSENT
+  expected_universe counter → NOT CLEAN (fail-closed on missing records,
+  not just recorded-unknown ones).
 - AC-E: the shadow verdict artifact contains the frozen corpus digests,
   all four GO criteria evaluated, and the NO-GO triggers checked.
+- AC-F (mass balance): a synthetic generation-starved day (expected 145,
+  entered 5, zero recorded exclusions) → NOT CLEAN, suppressed, LOUD —
+  even though every within-funnel record looks healthy.
+- AC-G (share bound): a synthetic mass-wash-sale day (wash-sale share >
+  bound at small n) → NOT CLEAN, suppressed; the same day under the
+  bound → CLEAN.
