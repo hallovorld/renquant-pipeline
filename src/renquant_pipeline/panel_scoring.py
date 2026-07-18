@@ -747,12 +747,100 @@ def _apply_smalln_guard(
     return relaxed, label
 
 
+def _guarded_smalln_floor(
+    ctx: Any,
+    cfg: dict[str, Any],
+    *,
+    floor: float,
+    floor_label: str,
+    n_finite: int,
+    min_fl: float,
+) -> tuple[float, str]:
+    """CLEAN-gated small-n branch (amendment #207 §2), twin side.
+
+    The eligibility partition + CLEAN predicate are SINGLE-SOURCE in
+    ``kernel.panel_pipeline.smalln_eligibility`` (imported here — the
+    verbatim-lockstep contract applies to the FLOOR helpers above, not to
+    the eligibility logic, precisely so the predicate cannot drift between
+    the twins). This module's simplified contract normally carries NO
+    generation-stage ``expected_universe`` counter, so with the guard
+    configured at small n the branch SUPPRESSES fail-closed (AC-D: absent
+    counter → NOT CLEAN) unless the driving harness emits the counter via
+    :func:`~renquant_pipeline.kernel.panel_pipeline.smalln_eligibility.emit_expected_universe`.
+
+    Evaluated ONLY when the guard is validly configured and n < N0 — on
+    every other path (guard off/invalid, normal n) behavior and log output
+    are bit-identical to stage 1 (#205).
+    """
+    guard = _smalln_guard_params(cfg)
+    if guard is None or n_finite >= guard[0]:
+        return _apply_smalln_guard(
+            floor,
+            floor_label,
+            n_finite=n_finite,
+            min_fl=min_fl,
+            guard=guard,
+        )
+    from .kernel import smalln_eligibility as _elig  # noqa: PLC0415
+
+    partition, blocked = _elig.twin_partition(ctx)
+    clean, reason = _elig.evaluate_clean(
+        partition,
+        watchlist=_watchlist(ctx),
+        blocked=blocked,
+        config=_elig.eligibility_config(cfg),
+    )
+    if not clean:
+        _elig.log_suppression(reason, n_finite=n_finite, min_n=guard[0])
+        _elig.finalize_ledger_block(
+            ctx,
+            partition=partition,
+            clean=clean,
+            clean_reason=reason,
+            branch_action=f"suppressed:{reason}",
+            n0=guard[0],
+            original_floor=floor,
+            relaxed_floor=floor,
+            candidate_delta=[],
+            submit_registry=False,
+        )
+        return floor, floor_label
+    relaxed, label = _apply_smalln_guard(
+        floor,
+        floor_label,
+        n_finite=n_finite,
+        min_fl=min_fl,
+        guard=guard,
+    )
+    scores_map = getattr(ctx, "panel_scores", {}) or {}
+    delta = sorted(
+        ticker
+        for ticker in _watchlist(ctx)
+        if (value := _finite_float(scores_map.get(ticker))) is not None
+        and relaxed <= value < floor
+    )
+    _elig.finalize_ledger_block(
+        ctx,
+        partition=partition,
+        clean=clean,
+        clean_reason=reason,
+        branch_action=_elig.BRANCH_ACTED,
+        n0=guard[0],
+        original_floor=floor,
+        relaxed_floor=relaxed,
+        candidate_delta=delta,
+        submit_registry=False,
+    )
+    return relaxed, label
+
+
 def _buy_floor_info(ctx: Any) -> tuple[float, str]:
     """Resolve the buy floor + audit label, in LOCKSTEP with the kernel twin.
 
     Mirrors the floor computation of
     ``kernel/panel_pipeline/job_panel_scoring.VetoWeakBuysTask`` (three
-    adaptive modes + RFC 2026-07-17 small-n relax-only guard). Non-adaptive
+    adaptive modes + RFC 2026-07-17 small-n relax-only guard, CLEAN-gated
+    per amendment #207 — see :func:`_guarded_smalln_floor`). Non-adaptive
     values keep this module's historical lenient parse: numeric → absolute
     floor; unset/unparseable → 0.0.
     """
@@ -815,12 +903,13 @@ def _buy_floor_info(ctx: Any) -> tuple[float, str]:
             else:
                 floor = min_fl if raw == "adaptive_mean_std" else cap
                 floor_label = f"{floor:.3f} (fallback; n<2 for stats)"
-        return _apply_smalln_guard(
-            floor,
-            floor_label,
+        return _guarded_smalln_floor(
+            ctx,
+            cfg,
+            floor=floor,
+            floor_label=floor_label,
             n_finite=len(scores),
             min_fl=min_fl,
-            guard=_smalln_guard_params(cfg),
         )
     parsed = _finite_float(raw)
     value = float(parsed or 0.0)

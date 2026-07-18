@@ -22,6 +22,15 @@ Covers RFC §3.2 (a)-(f) plus the design-review approval note:
 
 Also pins kernel/twin LOCKSTEP: the ``renquant_pipeline.panel_scoring`` twin
 computes bit-identical floors for every mode/config/score-set combination.
+
+Amendment 2026-07-18 (pipeline #207, r2): the relax branch acts ONLY on a
+CLEAN eligibility partition. The fixtures below therefore emit the
+generation-stage ``expected_universe`` counter + ticker list for exactly
+the scanned candidates (mass balance trivially satisfied → CLEAN), which
+replays the 07-16/07-17 motivating shape: universe == scanned == 5,
+governed-override narrowing upstream of generation, zero score_missing.
+Suppression behavior itself is pinned in
+``tests/test_smalln_eligibility_ledger.py``.
 """
 from __future__ import annotations
 
@@ -86,14 +95,18 @@ def _pairs(scores):
 
 
 def _kernel_ctx(scores, raw_floor="adaptive_mean_std", **panel_cfg):
-    cands = [
-        SimpleNamespace(ticker=t, rank_score=s) for t, s in _pairs(scores)
-    ]
+    pairs = _pairs(scores)
+    cands = [SimpleNamespace(ticker=t, rank_score=s) for t, s in pairs]
     cfg = {"buy_floor": raw_floor, **panel_cfg}
+    tickers = sorted({t for t, _ in pairs})
     return SimpleNamespace(
         candidates=cands,
         config={"ranking": {"panel_scoring": cfg}},
-        counters={},
+        # Amendment #207: CLEAN partition seed — the generation stage
+        # recorded exactly the scanned names (mass balance trivially
+        # holds, the 07-16/07-17 motivating shape).
+        counters={"expected_universe": len(tickers)},
+        _smalln_expected_universe_tickers=tickers,
     )
 
 
@@ -117,6 +130,10 @@ def _twin_ctx(scores, raw_floor="adaptive_mean_std", **panel_cfg):
         market_snapshot={},
     )
     setattr(ctx, "panel_scores", {t: s for t, s in pairs})
+    # Amendment #207: CLEAN partition seed (see _kernel_ctx).
+    tickers = sorted({t for t, _ in pairs})
+    setattr(ctx, "counters", {"expected_universe": len(tickers)})
+    setattr(ctx, "_smalln_expected_universe_tickers", tickers)
     return ctx
 
 
@@ -274,8 +291,12 @@ def test_rejection_is_evaluated_even_at_normal_n(caplog) -> None:
 
 def test_nan_scores_excluded_from_guard_n() -> None:
     """12 finite + 3 NaN: finite n == 12 == N0 → guard INACTIVE even though
-    len(candidates)=15. Dropping one finite score (11 finite + 3 NaN)
-    activates the small-n branch. NaN drop semantics unchanged throughout."""
+    len(candidates)=15. NaN drop semantics unchanged.
+
+    AMENDED (#207 §2 condition 2): at finite n=11 < N0 the 3 NaN scores are
+    funnel-integrity failure residue (`veto:rank_score_nan` class), so the
+    branch that stage 1 would have fired is now SUPPRESSED — status-quo
+    floor, loud tag — instead of relaxing admission on a dirty scan."""
     finite = [0.52 + 0.005 * i for i in range(12)]     # mean+σ > 0.50
     nans = [("NAN1", float("nan")), ("NAN2", float("nan")), ("NAN3", float("nan"))]
     rows12 = _pairs(finite) + nans
@@ -287,11 +308,19 @@ def test_nan_scores_excluded_from_guard_n() -> None:
         ctx._blocked_by_ticker[t] == "veto:rank_score_nan"
         for t in ("NAN1", "NAN2", "NAN3")
     )
+    assert ctx._smalln_eligibility["branch_action"] == "not_small_n"
 
-    rows11 = _pairs(finite[:11]) + nans   # finite n=11 < 12 → guard active
+    rows11 = _pairs(finite[:11]) + nans   # finite n=11 < 12: small-n, dirty
+    _, floor11_base, label11_base, _ = _run_kernel(
+        _pairs(finite[:11]) + nans, buy_floor_min=0.20
+    )
     ctx, floor, label, _ = _run_kernel(rows11, buy_floor_min=0.20, **GUARD)
-    assert label.startswith("smalln-relax(n=11 < N0")
-    assert floor == 0.50
+    assert floor == floor11_base          # suppressed → status quo, not 0.50
+    assert label == label11_base
+    assert ctx._smalln_eligibility["branch_action"].startswith(
+        "suppressed:funnel_integrity:rank_score_nan"
+    )
+    assert ctx._smalln_eligibility["finite_n"] == 11  # NaN still excluded from n
     assert ctx._blocked_by_ticker["NAN1"] == "veto:rank_score_nan"
 
 
