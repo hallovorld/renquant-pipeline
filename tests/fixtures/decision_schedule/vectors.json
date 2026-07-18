@@ -1,0 +1,863 @@
+{
+  "contract": "renquant_pipeline.decision_schedule.validate_session_records",
+  "contract_version": 1,
+  "design": "renquant-model#61 DESIGN_AMENDMENT_v4 \u00a72 (implementation step 1, \u00a75)",
+  "session": "2026-07-16",
+  "session_window": {
+    "close": "2026-07-16T20:00:00+00:00",
+    "next_open": "2026-07-17T13:30:00+00:00",
+    "next_open_session": "2026-07-17"
+  },
+  "calendar_id": "nyse/2026.06",
+  "price_source_id": "alpaca-iex/v1",
+  "cases": [
+    {
+      "name": "valid_pair",
+      "description": "both arms qualify: watermark == recomputed max event-time <= close(T), orders for open(T+1), deterministic job identity, bundle timestamp inside (close(T), open(T+1))",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": true,
+        "reason_codes": [],
+        "failure_class": null,
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "valid_retry_byte_identical",
+      "description": "champion retried with byte-identical decision/input digests (only the run-bundle timestamp differs) \u2014 retry is admissible",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T23:40:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": true,
+        "reason_codes": [],
+        "failure_class": null,
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "late_watermark",
+      "description": "l1 declares an input watermark after the official close of T \u2014 watermark violation, admission failure for that arm (B_idio class)",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T20:00:05+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T20:00:05+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": false,
+        "reason_codes": [
+          "watermark_after_close"
+        ],
+        "failure_class": "idiosyncratic",
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [
+            "watermark_after_close"
+          ],
+          "failure_class": "idiosyncratic",
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "divergent_retry",
+      "description": "champion has two records under ONE canonical job identity with different decision digests \u2014 integrity failure, never resolved by selecting the latest commit (B_idio class)",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-16T23:40:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 5
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:863f33307efdeb9ca4da3d69c4b8ce2d17bd9f7ae4598f5dfdf0c7e8e64f9be8",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": false,
+        "reason_codes": [
+          "divergent_retry"
+        ],
+        "failure_class": "idiosyncratic",
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [
+            "divergent_retry"
+          ],
+          "failure_class": "idiosyncratic",
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "missing_arm",
+      "description": "champion produced no record for the session \u2014 integrity failure (B_idio class)",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": false,
+        "reason_codes": [
+          "missing_arm"
+        ],
+        "failure_class": "idiosyncratic",
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "shared_price_source_failure",
+      "description": "both arms declare the same price-source failure \u2014 symmetric shared outage invalidates both arms (B_shared class)",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "failure": {
+            "kind": "price_source",
+            "detail": "primary price feed returned no prints"
+          }
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "failure": {
+            "kind": "price_source",
+            "detail": "primary price feed returned no prints"
+          }
+        }
+      ],
+      "expected": {
+        "ok": false,
+        "reason_codes": [
+          "shared_price_source_failure"
+        ],
+        "failure_class": "shared",
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [
+            "arm_declared_failure"
+          ],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [
+            "arm_declared_failure"
+          ],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "asymmetric_valuation_failure",
+      "description": "champion alone declares a valuation failure \u2014 asymmetric, classified to the B_idio budget",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "failure": {
+            "kind": "valuation",
+            "detail": "mark-to-market failed for one holding"
+          }
+        }
+      ],
+      "expected": {
+        "ok": false,
+        "reason_codes": [
+          "asymmetric_arm_failure"
+        ],
+        "failure_class": "idiosyncratic",
+        "evidence_flags": []
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [
+            "arm_declared_failure"
+          ],
+          "failure_class": null,
+          "evidence_flags": []
+        }
+      }
+    },
+    {
+      "name": "timestamp_outside_window",
+      "description": "champion's run-bundle timestamp falls after open(T+1) \u2014 EVIDENCE flag only, the record still qualifies (v4 \u00a72: timestamp is evidence, never the information-set proof)",
+      "session_window": {
+        "close": "2026-07-16T20:00:00+00:00",
+        "next_open": "2026-07-17T13:30:00+00:00",
+        "next_open_session": "2026-07-17"
+      },
+      "expected_calendar_id": "nyse/2026.06",
+      "expected_price_source_id": "alpaca-iex/v1",
+      "records": [
+        {
+          "schema_version": 1,
+          "arm": "l1",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "ensemble": "sha256:5c3b8d9d58a95c4f706a3a8b6f439e72cf724fc2eff1f92e2da28f22987f41c0"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:56a2366af6784cb3f7e7a83496de784e28342709e267239a4ed67608ca9667e6",
+          "run_bundle_timestamp": "2026-07-16T22:15:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 2
+            },
+            {
+              "ticker": "NVDA",
+              "side": "buy",
+              "quantity": 1
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:598fcb79bda543a502721124bde5fe6a0b2275cd60ab397303327f575bd330ca",
+          "failure": null
+        },
+        {
+          "schema_version": 1,
+          "arm": "champion",
+          "decision_session": "2026-07-16",
+          "declared_input_watermark": "2026-07-16T19:59:57+00:00",
+          "input_manifest": {
+            "prices_daily": {
+              "digest": "sha256:a5dd0c645c84a4602bf031d30c7696d86764fb4a9ed6086b54af0fa7e834dcef",
+              "max_event_time": "2026-07-16T19:59:57+00:00"
+            },
+            "fundamentals": {
+              "digest": "sha256:44637871cb7f2252cd2d7535f8236c685a224b0f19e05a2daedb76d6fd40a3b4",
+              "max_event_time": "2026-07-16T11:00:00+00:00"
+            }
+          },
+          "artifact_digests": {
+            "scorer": "sha256:6d6f9c6236c06430f59df0bce0ef8dc67f1edbae30280f06cd08707216b61717",
+            "calibrator": "sha256:556a0bcdba582b23452984236d3ced0ce3ee778c4381a825b4ac61af2611ebeb"
+          },
+          "config_digest": "sha256:a1c2c48f1ee1ebffac5c4e3a7c62797969351435f06cab89c74046f1171116a6",
+          "job_id": "sha256:072ec2ceee48fee0e2715b6c85cdd59733d512c9c9a9cc776f6f935cb50abad7",
+          "run_bundle_timestamp": "2026-07-17T14:05:00+00:00",
+          "calendar_id": "nyse/2026.06",
+          "price_source_id": "alpaca-iex/v1",
+          "orders": [
+            {
+              "ticker": "AAPL",
+              "side": "buy",
+              "quantity": 3
+            },
+            {
+              "ticker": "MSFT",
+              "side": "buy",
+              "quantity": 2
+            }
+          ],
+          "orders_scheduled_for": "2026-07-17",
+          "decision_digest": "sha256:aa2f3ea75bb3d2dc44e7662b2adfe3bc5755f05b3b07132c76e899f183714474",
+          "failure": null
+        }
+      ],
+      "expected": {
+        "ok": true,
+        "reason_codes": [],
+        "failure_class": null,
+        "evidence_flags": [
+          "champion:run_bundle_timestamp_outside_window"
+        ]
+      },
+      "expected_arm_verdicts": {
+        "l1": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": []
+        },
+        "champion": {
+          "reason_codes": [],
+          "failure_class": null,
+          "evidence_flags": [
+            "run_bundle_timestamp_outside_window"
+          ]
+        }
+      }
+    }
+  ]
+}
