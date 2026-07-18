@@ -58,8 +58,34 @@ def format_gate_verdicts(
     verdicts.append(_vol_gate_verdict(ctx, config, scope))
     verdicts.append(_wash_sale_verdict(ctx, scope))
     verdicts.append(_rotation_verdict(ctx, scope))
+    verdicts.append(_smalln_eligibility_verdict(ctx, scope))
 
     return [v for v in verdicts if v is not None]
+
+
+def _smalln_eligibility_verdict(ctx: Any, scope: str) -> dict[str, Any] | None:
+    """§3 persistence (amendment pipeline #207): the eligibility-ledger
+    block, decision-ledger side.
+
+    ``VetoWeakBuysTask`` attaches the schema-versioned partition block to
+    ``ctx._smalln_eligibility`` on EVERY session (AC-C); this formatter
+    forwards it verbatim through the adapter's existing write path. The
+    verdict is always ``allow`` — the block is observability (suppression
+    keeps the STATUS-QUO floor; it never blocks the book) and an allow can
+    never raise the ledger's verdict lattice. Absent attribute (older
+    pipeline / non-funnel contexts) → no row, which downstream readers must
+    treat as the explicit ``smalln_ledger: absent`` state.
+    """
+    block = getattr(ctx, "_smalln_eligibility", None)
+    if not isinstance(block, dict):
+        return None
+    return {
+        "scope": scope,
+        "gate": "smalln_eligibility",
+        "verdict": "allow",
+        "reason": str(block.get("branch_action", "unknown")),
+        "inputs": dict(block),
+    }
 
 
 def _run_scope(config: dict[str, Any]) -> str:

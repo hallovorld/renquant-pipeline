@@ -473,6 +473,18 @@ class InferencePipeline:
                     "for decision audit, order-emission remains gated"
                 )
             universe   = _buy_universe(ctx)
+            # Eligibility-ledger amendment (pipeline #207 §2 condition 1):
+            # expected_universe is EMITTED BY THE CANDIDATE-GENERATION
+            # STAGE at run time — watchlist ∩ session eligibility, recorded
+            # BEFORE any drop. VetoWeakBuysTask's mass-balance check
+            # reconciles every one of these names against survivors +
+            # per-name recorded exclusions; an absent counter (older
+            # pipeline) is NOT CLEAN by definition, so this emission is
+            # required instrumentation, not telemetry.
+            from renquant_pipeline.kernel.smalln_eligibility import (  # noqa: PLC0415
+                emit_expected_universe,
+            )
+            emit_expected_universe(ctx, universe)
             cand_tctxs = [_make_cand_tctx(ctx, t) for t in universe]
             run_parallel(cand_tctxs, TickerCandidateJob())
             blocked_map = getattr(ctx, "_blocked_by_ticker", None)

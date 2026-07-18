@@ -191,6 +191,7 @@ OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
     "scoring",
     "selection",
     "sizing",
+    "smalln_eligibility",
     "state_paths",
     "trade_events",
     "typed_past",

@@ -48,6 +48,7 @@ from .feature_matrix import build_inference_matrix
 # binding checks — this site and walk_forward/loader.py). Re-bound under
 # their historical private names for in-repo back-compat; the legacy-route
 # semantics are byte-for-byte the pre-dispatch behavior.
+from .. import smalln_eligibility as _elig
 from .fingerprint_dispatch import (
     accept_legacy_stamps as _accept_legacy_stamps,
     any_fingerprints_match as _any_fingerprints_match,
@@ -223,6 +224,8 @@ def _apply_fund_features(
     today: Any,
     context_tickers: list[str],
     fund_cols: list[str],
+    *,
+    ctx: Any | None = None,
 ) -> tuple[int, int, dict[str, float]]:
     today_ts = pd.Timestamp(today)
     panel = fund_panel.copy()
@@ -236,6 +239,12 @@ def _apply_fund_features(
     # training each day). Training hard-fails on this misalignment; live had no
     # guard. We warn loudly rather than fail closed (the fresh alpha158 block
     # still carries the bulk of the signal).
+    #
+    # Eligibility-ledger amendment (#207 §2 condition 4): the warning is
+    # PROMOTED to a machine surface — ``ctx._feed_staleness_flagged`` — so
+    # the small-n guard's CLEAN predicate can see a stale feed instead of
+    # covering the class indirectly. Behavior otherwise unchanged (still
+    # warn-only, never fail-closed here).
     if not panel.empty:
         max_date = panel["date"].max()
         stale_days = (today_ts - max_date).days
@@ -247,6 +256,12 @@ def _apply_fund_features(
                 max_date.date().isoformat(), stale_days,
                 today_ts.date().isoformat(), len(fund_cols),
             )
+            if ctx is not None:
+                ctx._feed_staleness_flagged = {  # noqa: SLF001
+                    "max_date": max_date.date().isoformat(),
+                    "stale_days": int(stale_days),
+                    "as_of": today_ts.date().isoformat(),
+                }
 
     # HIGH fix (2026-06-11 R2 audit): use the last VALID (finite) value per
     # (ticker, column) as-of today, NOT the last-DATED row even when its value
@@ -668,7 +683,8 @@ def _build_live_panel_history(
                     ctx, ("sec_fundamentals_daily", str(fp)), fp)
                 if fund_panel is not None and not fund_panel.empty:
                     _apply_fund_features(
-                        rows, fund_panel, today, context_tickers, fund_cols)
+                        rows, fund_panel, today, context_tickers, fund_cols,
+                        ctx=ctx)
 
         pead_cols = [c for c in ("days_since_earnings", "pead_signal",
                                   "pead_quintile_rank") if c in extra_cols]
@@ -1300,6 +1316,7 @@ class ApplyScoresTask(Task):
                     )
                     n_real, n_imputed, _medians = _apply_fund_features(
                         rows, fund_panel, today, context_tickers, fund_cols,
+                        ctx=ctx,
                     )
                     log.info(
                         "ApplyScoresTask[panel_ltr_xgboost]: merged 5 fund features "
@@ -1743,11 +1760,62 @@ class VetoWeakBuysTask(Task):
     """
 
     def run(self, ctx: InferenceContext) -> bool | None:
+        panel_cfg = ctx.config.get("ranking", {}).get("panel_scoring", {})
+
+        # Eligibility ledger (amendment #207, approved): build the §2
+        # partition at TASK ENTRY on EVERY session — normal-n days build
+        # the same record (baseline data for the §4 shadow contract,
+        # AC-C). Pure reads; candidate list is not touched here. The
+        # CLEAN verdict gates ONLY the small-n relax branch below; with
+        # the guard keys absent the floors stay bit-identical and the
+        # block is purely additive observability.
+        guard = _smalln_guard_params(panel_cfg)
+        partition, _elig_blocked = _elig.kernel_partition(ctx)
+        clean, clean_reason = _elig.evaluate_clean(
+            partition,
+            watchlist=[str(t) for t in (ctx.config.get("watchlist") or [])],
+            blocked=_elig_blocked,
+            config=_elig.eligibility_config(panel_cfg),
+        )
+
+        def _finalize_no_floor() -> None:
+            """§3 block for paths where no floor is computed this run.
+
+            When the guard is validly configured, the scan is small, and
+            the partition is NOT CLEAN, the suppression is still recorded
+            LOUD (AC-F's limiting shape: a generation-starved run with no
+            floor to relax is exactly a day a human should look at).
+            """
+            branch = _elig.BRANCH_DECONFIGURED
+            if (
+                guard is not None
+                and partition["finite_n"] < guard[0]
+                and not clean
+            ):
+                branch = f"suppressed:{clean_reason}"
+                _elig.log_suppression(
+                    clean_reason,
+                    n_finite=partition["finite_n"],
+                    min_n=guard[0],
+                )
+            _elig.finalize_ledger_block(
+                ctx,
+                partition=partition,
+                clean=clean,
+                clean_reason=clean_reason,
+                branch_action=branch,
+                n0=guard[0] if guard else None,
+                original_floor=None,
+                relaxed_floor=None,
+                candidate_delta=[],
+            )
+
         # Audit fix VETO-EMPTY-CANDS (Round 2 deep audit, 2026-04-25):
         # pre-fix returned False when ctx.candidates was empty, which
         # short-circuits the rest of PanelScoringJob's chain. Empty
         # candidates is now a continue (None), not a stop.
         if not ctx.candidates:
+            _finalize_no_floor()
             return None
 
         # 2026-05-04 user mandate ("rank_score need to be collected
@@ -1764,9 +1832,9 @@ class VetoWeakBuysTask(Task):
         # offline analysis needs the data either way.
         ctx._full_candidate_snapshot = list(ctx.candidates)    # noqa: SLF001
 
-        panel_cfg = ctx.config.get("ranking", {}).get("panel_scoring", {})
         raw_floor = panel_cfg.get("buy_floor")
         if raw_floor is None:
+            _finalize_no_floor()
             return
 
         # 2026-05-30 — escape hatch for distribution-fair model comparison.
@@ -1791,6 +1859,7 @@ class VetoWeakBuysTask(Task):
                     "(distribution-fair sim mode); raw_floor=%r ignored",
                     raw_floor,
                 )
+                _finalize_no_floor()
                 return
             log.warning(
                 "VetoWeakBuysTask: RQ_SIM_BYPASS_BUY_FLOOR=1 ignored outside "
@@ -1818,7 +1887,10 @@ class VetoWeakBuysTask(Task):
         # Small-n guard scope (RFC 2026-07-17 §2.1): populated by the three
         # ADAPTIVE branches only — (finite-score count, buy_floor_min).
         # Absolute numeric floors have no self-referential statistic, so the
-        # guard does not apply (and its config keys are not consulted) there.
+        # guard does not apply there (config VALIDATION is per-run at task
+        # entry since amendment #207 — the §3 block records n0/deconfigured
+        # regardless of floor mode; the relax branch itself remains
+        # adaptive-only).
         _smalln_scope: tuple[int, float] | None = None
         if isinstance(raw_floor, str) and raw_floor == "adaptive_quantile":
             # 2026-06-11 false-BEAR audit P2: explicit breadth control.
@@ -1915,16 +1987,60 @@ class VetoWeakBuysTask(Task):
         # the three adaptive modes when the finite-score count is below
         # buy_floor_min_n. Config absent → bit-identical status quo; config
         # half-set/invalid → loud ERROR inside _smalln_guard_params and
-        # status quo (fails toward no-entry). Validation is per-run and runs
-        # whenever an adaptive mode is active, independent of n.
-        if _smalln_scope is not None:
-            floor, floor_label = _apply_smalln_guard(
-                floor,
-                floor_label,
-                n_finite=_smalln_scope[0],
-                min_fl=_smalln_scope[1],
-                guard=_smalln_guard_params(panel_cfg),
-            )
+        # status quo (fails toward no-entry). Validation is per-run,
+        # independent of n.
+        #
+        # Amendment #207 §2 (r2): the branch may act ONLY on a CLEAN
+        # eligibility partition. NOT CLEAN at small n → the branch MUST NOT
+        # act: status-quo floor stands (fails toward no-entry) and the run
+        # is tagged smalln_guard_suppressed(reason=<first failing class>)
+        # at ERROR — the orchestrator degradation sentinel alarms on the
+        # tag.
+        original_floor = floor
+        branch_action = _elig.BRANCH_DECONFIGURED
+        if _smalln_scope is not None and guard is not None:
+            n_finite, min_fl = _smalln_scope
+            if n_finite >= guard[0]:
+                branch_action = _elig.BRANCH_NOT_SMALL_N
+            elif clean:
+                floor, floor_label = _apply_smalln_guard(
+                    floor,
+                    floor_label,
+                    n_finite=n_finite,
+                    min_fl=min_fl,
+                    guard=guard,
+                )
+                branch_action = _elig.BRANCH_ACTED
+            else:
+                branch_action = f"suppressed:{clean_reason}"
+                _elig.log_suppression(
+                    clean_reason, n_finite=n_finite, min_n=guard[0],
+                )
+
+        # §3 candidate_delta: tickers admitted by relaxation that the
+        # status-quo floor would have vetoed (empty unless the branch acted
+        # and actually lowered the floor).
+        candidate_delta: list[str] = []
+        if branch_action == _elig.BRANCH_ACTED and floor < original_floor:
+            for cand in ctx.candidates:
+                s = getattr(cand, "rank_score", None)
+                try:
+                    f = float(s)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(f) and floor <= f < original_floor:
+                    candidate_delta.append(str(cand.ticker))
+        _elig.finalize_ledger_block(
+            ctx,
+            partition=partition,
+            clean=clean,
+            clean_reason=clean_reason,
+            branch_action=branch_action,
+            n0=guard[0] if guard else None,
+            original_floor=original_floor,
+            relaxed_floor=floor,
+            candidate_delta=sorted(candidate_delta),
+        )
 
         # Audit/detection surface: expose the exact floor + label so replay
         # harnesses and tests can assert bit-identity without parsing logs.
