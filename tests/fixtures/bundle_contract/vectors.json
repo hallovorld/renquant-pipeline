@@ -1,0 +1,404 @@
+{
+  "contract": "renquant_pipeline.bundle_contract.validate_pair",
+  "contract_version": 1,
+  "rfc": "RenQuant#492 \u00a72.5 (GOAL-5 AC4 phase 2)",
+  "member_serialization": "json.dumps(payload, sort_keys=True, indent=2) + '\\n' (utf-8)",
+  "scorer_member": "panel-ltr.alpha158_fund.json",
+  "calibrator_member": "panel-rank-calibration.json",
+  "cases": [
+    {
+      "name": "matching_pair_legacy_schema",
+      "description": "versionless scorer stamp == versionless calibrator declaration (legacy shim equality route)",
+      "accept_legacy_stamps": true,
+      "scorer_payload": {
+        "kind": "panel_ltr_xgboost",
+        "version": 3,
+        "feature_cols": [
+          "a",
+          "b",
+          "c"
+        ],
+        "params": {
+          "objective": "rank:pairwise",
+          "max_depth": 4
+        },
+        "booster_raw_json": "{\"fake\": \"booster\"}",
+        "label_col": "fwd_60d_excess",
+        "trained_date": "2026-06-01",
+        "metadata": {
+          "note": "bundle-contract fixture"
+        },
+        "model_content_fingerprint": "sha256:a64b282442ceeb767846f29251305467dd727a91344a30e74cb0cb8ba4a87322"
+      },
+      "calibrator_payload": {
+        "kind": "global_panel_calibration",
+        "trained_date": "2026-06-02",
+        "probability": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        },
+        "expected_return": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            -0.05,
+            0.0,
+            0.05
+          ]
+        },
+        "metadata": {
+          "scorer_model_content_fingerprint": "sha256:a64b282442ceeb767846f29251305467dd727a91344a30e74cb0cb8ba4a87322"
+        }
+      },
+      "manifest": {
+        "schema_version": 1,
+        "members": {
+          "panel-ltr.alpha158_fund.json": {
+            "sha256": "12c02db293c4668a7d1f8b821abab513cc73a5e6ab6ec50822441327cb2e607f",
+            "bytes": 452
+          },
+          "panel-rank-calibration.json": {
+            "sha256": "a74b04b54bf5b2e78365264e0cf49f8818987a65f961ee8c79c1e040d812f82b",
+            "bytes": 463
+          }
+        },
+        "bindings": {
+          "phase3": "bindings content pinned by the phase-3 binding step"
+        }
+      },
+      "expected": {
+        "ok": true,
+        "matched_schema": "legacy",
+        "reason_codes": []
+      }
+    },
+    {
+      "name": "matching_pair_v1_schema",
+      "description": "v1-stamped scorer == v1-declared calibrator (exact digest route)",
+      "accept_legacy_stamps": true,
+      "scorer_payload": {
+        "kind": "panel_ltr_xgboost",
+        "version": 3,
+        "feature_cols": [
+          "a",
+          "b",
+          "c"
+        ],
+        "params": {
+          "objective": "rank:pairwise",
+          "max_depth": 4
+        },
+        "booster_raw_json": "{\"fake\": \"booster\"}",
+        "label_col": "fwd_60d_excess",
+        "trained_date": "2026-06-01",
+        "metadata": {
+          "note": "bundle-contract fixture"
+        },
+        "model_content_fingerprint": "sha256:0f6dc00a4e14906032451d614c662870a3f16beae252104839529826ca1ed7e3",
+        "fingerprint_schema_version": 1
+      },
+      "calibrator_payload": {
+        "kind": "global_panel_calibration",
+        "trained_date": "2026-06-02",
+        "probability": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        },
+        "expected_return": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            -0.05,
+            0.0,
+            0.05
+          ]
+        },
+        "metadata": {
+          "scorer_fingerprint_schema_version": 1,
+          "scorer_model_content_fingerprint": "sha256:0f6dc00a4e14906032451d614c662870a3f16beae252104839529826ca1ed7e3"
+        }
+      },
+      "manifest": {
+        "schema_version": 1,
+        "members": {
+          "panel-ltr.alpha158_fund.json": {
+            "sha256": "190f694a01ba6268771f30bab9b333d2f2051d323bd5dd52ad1ecf2b774842c1",
+            "bytes": 487
+          },
+          "panel-rank-calibration.json": {
+            "sha256": "23903d8aa5ffc5ed23c2d68c9656fcac108ef2a924289c00fbbd4a0302ff6d68",
+            "bytes": 507
+          }
+        },
+        "bindings": {
+          "phase3": "bindings content pinned by the phase-3 binding step"
+        }
+      },
+      "expected": {
+        "ok": true,
+        "matched_schema": "v1",
+        "reason_codes": []
+      }
+    },
+    {
+      "name": "mismatched_pair",
+      "description": "same (legacy) schema, foreign calibrator digest \u2014 the 2026-05-27/06-22/07-01/07-14 orphaned-binding incident shape",
+      "accept_legacy_stamps": true,
+      "scorer_payload": {
+        "kind": "panel_ltr_xgboost",
+        "version": 3,
+        "feature_cols": [
+          "a",
+          "b",
+          "c"
+        ],
+        "params": {
+          "objective": "rank:pairwise",
+          "max_depth": 4
+        },
+        "booster_raw_json": "{\"fake\": \"booster\"}",
+        "label_col": "fwd_60d_excess",
+        "trained_date": "2026-06-01",
+        "metadata": {
+          "note": "bundle-contract fixture"
+        },
+        "model_content_fingerprint": "sha256:a64b282442ceeb767846f29251305467dd727a91344a30e74cb0cb8ba4a87322"
+      },
+      "calibrator_payload": {
+        "kind": "global_panel_calibration",
+        "trained_date": "2026-06-02",
+        "probability": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        },
+        "expected_return": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            -0.05,
+            0.0,
+            0.05
+          ]
+        },
+        "metadata": {
+          "scorer_model_content_fingerprint": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      },
+      "manifest": {
+        "schema_version": 1,
+        "members": {
+          "panel-ltr.alpha158_fund.json": {
+            "sha256": "12c02db293c4668a7d1f8b821abab513cc73a5e6ab6ec50822441327cb2e607f",
+            "bytes": 452
+          },
+          "panel-rank-calibration.json": {
+            "sha256": "0aa7807b05467ffbfefc0bb07c964de279f9f1bba7eb50909fc8828f2471c34b",
+            "bytes": 456
+          }
+        },
+        "bindings": {
+          "phase3": "bindings content pinned by the phase-3 binding step"
+        }
+      },
+      "expected": {
+        "ok": false,
+        "matched_schema": null,
+        "reason_codes": [
+          "fingerprint_mismatch"
+        ]
+      }
+    },
+    {
+      "name": "missing_binding",
+      "description": "calibrator metadata carries no scorer identity at all",
+      "accept_legacy_stamps": true,
+      "scorer_payload": {
+        "kind": "panel_ltr_xgboost",
+        "version": 3,
+        "feature_cols": [
+          "a",
+          "b",
+          "c"
+        ],
+        "params": {
+          "objective": "rank:pairwise",
+          "max_depth": 4
+        },
+        "booster_raw_json": "{\"fake\": \"booster\"}",
+        "label_col": "fwd_60d_excess",
+        "trained_date": "2026-06-01",
+        "metadata": {
+          "note": "bundle-contract fixture"
+        },
+        "model_content_fingerprint": "sha256:a64b282442ceeb767846f29251305467dd727a91344a30e74cb0cb8ba4a87322"
+      },
+      "calibrator_payload": {
+        "kind": "global_panel_calibration",
+        "trained_date": "2026-06-02",
+        "probability": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        },
+        "expected_return": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            -0.05,
+            0.0,
+            0.05
+          ]
+        },
+        "metadata": {
+          "fit_date": "2026-06-02"
+        }
+      },
+      "manifest": {
+        "schema_version": 1,
+        "members": {
+          "panel-ltr.alpha158_fund.json": {
+            "sha256": "12c02db293c4668a7d1f8b821abab513cc73a5e6ab6ec50822441327cb2e607f",
+            "bytes": 452
+          },
+          "panel-rank-calibration.json": {
+            "sha256": "158113e2bfbea09cfecd0f1016f3ba757552e0f21a823d0ac87332528f1f5bd9",
+            "bytes": 378
+          }
+        },
+        "bindings": {
+          "phase3": "bindings content pinned by the phase-3 binding step"
+        }
+      },
+      "expected": {
+        "ok": false,
+        "matched_schema": null,
+        "reason_codes": [
+          "missing_binding"
+        ]
+      }
+    },
+    {
+      "name": "cross_schema_comparison_refused",
+      "description": "v1-stamped scorer vs versionless calibrator declaring the scorer's LEGACY hash \u2014 never compared across schemas (no-OR)",
+      "accept_legacy_stamps": true,
+      "scorer_payload": {
+        "kind": "panel_ltr_xgboost",
+        "version": 3,
+        "feature_cols": [
+          "a",
+          "b",
+          "c"
+        ],
+        "params": {
+          "objective": "rank:pairwise",
+          "max_depth": 4
+        },
+        "booster_raw_json": "{\"fake\": \"booster\"}",
+        "label_col": "fwd_60d_excess",
+        "trained_date": "2026-06-01",
+        "metadata": {
+          "note": "bundle-contract fixture"
+        },
+        "model_content_fingerprint": "sha256:0f6dc00a4e14906032451d614c662870a3f16beae252104839529826ca1ed7e3",
+        "fingerprint_schema_version": 1
+      },
+      "calibrator_payload": {
+        "kind": "global_panel_calibration",
+        "trained_date": "2026-06-02",
+        "probability": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            0.2,
+            0.5,
+            0.8
+          ]
+        },
+        "expected_return": {
+          "x": [
+            -1.0,
+            0.0,
+            1.0
+          ],
+          "y": [
+            -0.05,
+            0.0,
+            0.05
+          ]
+        },
+        "metadata": {
+          "scorer_model_content_fingerprint": "sha256:a64b282442ceeb767846f29251305467dd727a91344a30e74cb0cb8ba4a87322"
+        }
+      },
+      "manifest": {
+        "schema_version": 1,
+        "members": {
+          "panel-ltr.alpha158_fund.json": {
+            "sha256": "190f694a01ba6268771f30bab9b333d2f2051d323bd5dd52ad1ecf2b774842c1",
+            "bytes": 487
+          },
+          "panel-rank-calibration.json": {
+            "sha256": "a74b04b54bf5b2e78365264e0cf49f8818987a65f961ee8c79c1e040d812f82b",
+            "bytes": 463
+          }
+        },
+        "bindings": {
+          "phase3": "bindings content pinned by the phase-3 binding step"
+        }
+      },
+      "expected": {
+        "ok": false,
+        "matched_schema": null,
+        "reason_codes": [
+          "cross_schema_refused"
+        ]
+      }
+    }
+  ]
+}
