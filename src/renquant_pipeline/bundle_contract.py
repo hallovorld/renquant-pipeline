@@ -45,7 +45,6 @@ Scope notes (v1 of this contract):
 from __future__ import annotations
 
 import json
-import logging
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -64,8 +63,6 @@ from renquant_pipeline.kernel.panel_pipeline.fingerprint_dispatch import (
     resolve_scorer_stamp_metadata,
     scorer_claim_from_metadata,
 )
-
-log = logging.getLogger(__name__)
 
 #: Version of THIS validation contract (bump on any semantic change; the
 #: renquant-common contract fixtures pin verdict semantics per version).
