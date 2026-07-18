@@ -20,6 +20,19 @@ days, book frozen ~86% cash, with a ranking inversion (vetoed ATI 0.557
 vs held GRMN 0.549). Era-wide counterfactual at normal n is NULL, so the
 fix is surgical to the small-n branch only.
 
+## Round 2 (codex review, 3 P1s — all fixed with fresh evidence)
+
+- Small-n branch redesigned RELAX-ONLY: `max(min_fl, min(F_mode, abs))`
+  — one-sided by construction (verified 0 violations on 14 recorded
+  sessions + 2 synthetic compressed sets); r1's hard-switch would have
+  invented all-vetoes on shifted scales.
+- N0=12 justified by empirical-mixture MC (the iid≈mixture result also
+  corrects the memo's "essentially deterministic" overstatement).
+- "Calibrated better-than-even" claim WITHDRAWN; 0.50 reframed as a
+  distributional anchor with the adverse h=20 split reported honestly.
+- Complete config matrix with validation bounds; sentinel gets built-in
+  N0_sentinel=12 independent of guard config.
+
 ## Status
 
 RFC only — no implementation, no config change, no deployment. Rollout
