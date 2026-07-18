@@ -189,6 +189,107 @@ def build_claim(
 
 
 # ---------------------------------------------------------------------------
+# Metadata-side claim construction (the DAILY buy-path semantics)
+# ---------------------------------------------------------------------------
+#
+# GOAL-5 AC4 phase 2 (RFC RenQuant#492 §2.5): these helpers ARE the claim
+# construction of the runtime loader's binding check
+# (``job_panel_scoring._assert_calibrator_matches_scorer`` — the
+# 2026-05-27/06-22/07-01/07-14→16 incident site). They were moved here
+# verbatim so the public pair-validation API
+# (``renquant_pipeline.bundle_contract.validate_pair``) and the runtime
+# path consume ONE implementation instead of the public API re-implementing
+# a divergent copy. Do not fork; a semantic change here changes BOTH the
+# daily serve path and bundle publication validation, deliberately.
+#
+# NOTE the WF loader (``walk_forward/loader.py::_calibrator_claim``) keeps
+# its own, NARROWER calibrator legacy key set (scorer_* keys only) — that
+# divergence predates this refactor and is preserved as-is; the bundle
+# contract exports the DAILY path per the RFC.
+
+#: Metadata keys accepted as a scorer identity on the LEGACY route —
+#: byte-for-byte the historical ``_fingerprint_values`` list from
+#: ``job_panel_scoring``.
+METADATA_IDENTITY_KEYS: tuple[str, ...] = (
+    "model_content_fingerprint",
+    "scorer_model_content_fingerprint",
+    "artifact_fingerprint",
+    "scorer_artifact_fingerprint",
+    "model_fingerprint",
+    "artifact_sha256",
+    "scorer_artifact_sha256",
+    "fingerprint",
+)
+
+
+def fingerprint_values_from_metadata(
+    metadata: Mapping[str, Any] | None,
+) -> list[str]:
+    """Return scorer identities, never shared strategy config fingerprints.
+
+    New artifacts bind calibrators by ``model_content_fingerprint`` because
+    acceptance metadata is mutable. Legacy artifacts used full-file hashes,
+    so keep those as fallback identities until the old folds are re-stamped.
+
+    (Moved verbatim from ``job_panel_scoring._fingerprint_values`` — GOAL-5
+    AC4 phase 2; the historical private name remains bound there.)
+    """
+    if not metadata:
+        return []
+    out: list[str] = []
+    for key in METADATA_IDENTITY_KEYS:
+        value = metadata.get(key)
+        if value:
+            out.append(str(value))
+    return out
+
+
+def scorer_claim_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    source: str = "active_scorer",
+) -> IdentityClaim:
+    """The active scorer's identity claim from its in-memory metadata.
+
+    Exactly the scorer-side claim construction of
+    ``_assert_calibrator_matches_scorer`` (schema selector =
+    ``fingerprint_schema_version``, v1 value =
+    ``model_content_fingerprint``, legacy values = the
+    :data:`METADATA_IDENTITY_KEYS` collection).
+    """
+    meta = dict(metadata or {})
+    return build_claim(
+        schema_version=meta.get("fingerprint_schema_version"),
+        v1_value=meta.get("model_content_fingerprint"),
+        legacy_values=fingerprint_values_from_metadata(meta),
+        source=source,
+    )
+
+
+def calibrator_claim_from_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    source: str = "calibrator",
+) -> IdentityClaim:
+    """The calibrator's declared scorer identity from its metadata.
+
+    Exactly the calibrator-side claim construction of
+    ``_assert_calibrator_matches_scorer`` (schema selector =
+    ``scorer_fingerprint_schema_version``, v1 value =
+    ``scorer_model_content_fingerprint``, legacy values = the full
+    :data:`METADATA_IDENTITY_KEYS` collection — the DAILY path's set, wider
+    than the WF loader's scorer_*-only set, preserved byte-for-byte).
+    """
+    meta = dict(metadata or {})
+    return build_claim(
+        schema_version=meta.get("scorer_fingerprint_schema_version"),
+        v1_value=meta.get("scorer_model_content_fingerprint"),
+        legacy_values=fingerprint_values_from_metadata(meta),
+        source=source,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Matching (verbatim-preserved legacy helpers + the v1 exact route)
 # ---------------------------------------------------------------------------
 

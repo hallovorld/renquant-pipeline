@@ -52,10 +52,13 @@ from .fingerprint_dispatch import (
     accept_legacy_stamps as _accept_legacy_stamps,
     any_fingerprints_match as _any_fingerprints_match,
     build_claim as _build_fingerprint_claim,
+    calibrator_claim_from_metadata as _calibrator_claim_from_metadata,
+    fingerprint_values_from_metadata as _fingerprint_values,
     fingerprints_match as _fingerprints_match,
     log_verify_telemetry as _log_fingerprint_telemetry,
     match_claims as _match_fingerprint_claims,
     normalize_fingerprint as _normalize_fingerprint,
+    scorer_claim_from_metadata as _scorer_claim_from_metadata,
 )
 
 
@@ -2368,30 +2371,12 @@ class RegimeModelAdmissionTask(Task):
 
 # ── Global calibration (Item #2 — optional) ───────────────────────────────────
 
-def _fingerprint_values(metadata: dict | None) -> list[str]:
-    """Return scorer identities, never shared strategy config fingerprints.
-
-    New artifacts bind calibrators by ``model_content_fingerprint`` because
-    acceptance metadata is mutable. Legacy artifacts used full-file hashes, so
-    keep those as fallback identities until the old folds are re-stamped.
-    """
-    if not metadata:
-        return []
-    out: list[str] = []
-    for key in (
-        "model_content_fingerprint",
-        "scorer_model_content_fingerprint",
-        "artifact_fingerprint",
-        "scorer_artifact_fingerprint",
-        "model_fingerprint",
-        "artifact_sha256",
-        "scorer_artifact_sha256",
-        "fingerprint",
-    ):
-        value = metadata.get(key)
-        if value:
-            out.append(str(value))
-    return out
+# GOAL-5 AC4 phase 2 (RFC RenQuant#492 §2.5): the historical private
+# ``_fingerprint_values`` moved verbatim into
+# ``fingerprint_dispatch.fingerprint_values_from_metadata`` (re-bound above
+# under its old name) so the public pair-validation API
+# (``renquant_pipeline.bundle_contract``) shares ONE claim construction
+# with this runtime path instead of re-implementing a divergent copy.
 
 
 def _active_scorer_metadata(ctx: InferenceContext) -> dict:
@@ -2435,18 +2420,12 @@ def _assert_calibrator_matches_scorer(
         return
 
     cal_meta = dict(getattr(calibrator, "metadata", {}) or {})
-    scorer_claim = _build_fingerprint_claim(
-        schema_version=scorer_meta.get("fingerprint_schema_version"),
-        v1_value=scorer_meta.get("model_content_fingerprint"),
-        legacy_values=_fingerprint_values(scorer_meta),
-        source="active_scorer",
-    )
-    cal_claim = _build_fingerprint_claim(
-        schema_version=cal_meta.get("scorer_fingerprint_schema_version"),
-        v1_value=cal_meta.get("scorer_model_content_fingerprint"),
-        legacy_values=_fingerprint_values(cal_meta),
-        source="calibrator",
-    )
+    # AC4 phase 2: claim construction is the SHARED helper pair (identical
+    # inputs to the historical inline _build_fingerprint_claim calls — the
+    # sources "active_scorer"/"calibrator" and key selection are pinned
+    # there), consumed by this runtime path AND bundle_contract.
+    scorer_claim = _scorer_claim_from_metadata(scorer_meta)
+    cal_claim = _calibrator_claim_from_metadata(cal_meta)
     active_fps = list(scorer_claim.values)
     cal_fps = list(cal_claim.values)
     if not active_fps or not cal_fps:
