@@ -15,6 +15,21 @@ origin/main with my changes stashed — unrelated to this work). Addresses codex
 CHANGES_REQUESTED on #211 (artifact identity, expected-skip state, per-early-exit
 tests).
 
+**CR#2 FIX (single resolution):** the emitter previously resolved the artifact
+TWICE — `_resolve_shadow_artifact_path` produced the path handed to the scorer
+loader, while `content_digest(...)` + `resolve_artifact_identity(...).source`
+were computed separately for the record. The record could therefore certify one
+identity/source while the loader had loaded a DIFFERENT file. Fixed: `run()`
+resolves ONCE through `resolve_artifact_identity`; the loader is called with
+`identity.resolved_path` and the record's `content_sha256` / `artifact_source` /
+`artifact_resolved_path` are all stamped from that SAME result. An unresolved
+identity now takes the not-loaded FAULT path (no scorer load, no path-existence
+fall-through). `_resolve_shadow_artifact_path` is now a thin back-compat wrapper
+that delegates to `resolve_artifact_identity` (no second, independent resolution
+logic remains). Two regression tests added
+(`test_run_single_resolution_loader_and_record_agree`,
+`test_run_unresolved_identity_skips_loader`).
+
 ## WHAT
 
 `ApplyShadowScoringTask` emits ONE structured, machine-readable HEALTH RECORD
@@ -33,10 +48,14 @@ import so three consumers never drift.
   kill switch (never disables shadow scoring).
 
 - **Artifact IDENTITY, not path-existence** (codex point 1): `content_sha256`
-  is the IMMUTABLE `sha256:<16hex>` of the file scoring actually loaded (hashed
-  via the canonical `content_digest`, `(path,mtime,size)`-cached so sims don't
-  re-hash) — a swapped file changes the digest, so a stale-identity "healthy"
-  record is impossible. `config_fingerprint` is the training-config identity.
+  is the IMMUTABLE `sha256:<16hex>` of the file scoring actually loaded — it is
+  stamped from the single `resolve_artifact_identity` result (which reads the
+  resolved file's bytes directly via the canonical `kernel.artifact_resolver`,
+  NOT via the `(path,mtime,size)`-keyed `content_digest` cache), so the digest
+  the record certifies is the digest of the exact file passed to the loader. A
+  swapped file changes those bytes → the digest changes → a stale-identity
+  "healthy" record is impossible. `config_fingerprint` is the training-config
+  identity.
   Required identity absent (`missing_content_sha256` / `missing_config_fingerprint`)
   OR a mismatch against a config pin (`expected_content_sha256` /
   `expected_config_fingerprint` → `content_sha256_mismatch` /

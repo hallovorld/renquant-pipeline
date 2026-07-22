@@ -95,25 +95,21 @@ def _resolve_shadow_artifact_path(
     strategy_dir: str | Path | None,
     repo: Path | None = None,
 ) -> Path:
-    p = Path(artifact_path)
-    if p.is_absolute():
-        return p
+    """DEPRECATED thin wrapper — kept only for back-compat callers.
 
-    # 2026-06-11 shadow-dead fix: resolve like the PRIMARY scorer —
-    # strategy_dir first, repo data_root as back-compat fallback. Pre-fix this
-    # resolved only against data_root(), so the post-PatchTST-promotion shadow
-    # under <strategy_dir>/artifacts/prod failed to load on every run.
-    if strategy_dir:
-        sd = Path(strategy_dir) / p
-        if sd.exists():
-            return sd
-    # 2026-06-27: resolve data_root() LAZILY — only when the strategy_dir
-    # candidate misses and we actually need the umbrella repo fallback. A fully
-    # stubbed/cached call path (unit tests) then never requires a data root.
-    if repo is None:
-        from renquant_pipeline.kernel.panel_pipeline._data_root import data_root  # noqa: PLC0415
-        repo = data_root()
-    return repo / p
+    Artifact resolution now goes through the ONE authority
+    ``resolve_artifact_identity`` (see ``ApplyShadowScoringTask.run``); this
+    delegates to it so no second, independently-resolved path can diverge from
+    the identity the health record certifies (codex CR#2). It preserves the
+    established resolution order (absolute → strategy_dir → repo_root). Returns
+    the resolved file path when the ref resolves, else the best-effort located
+    candidate. New code should call ``resolve_artifact_identity`` directly.
+    """
+    identity = resolve_artifact_identity(
+        artifact_path, strategy_dir=strategy_dir, repo_root=repo)
+    if identity.resolved_path is not None:
+        return Path(identity.resolved_path)
+    return Path(artifact_path)
 
 
 def _is_degenerate_cross_section(
@@ -356,9 +352,11 @@ class ApplyShadowScoringTask(Task):
                 shadow_log_mlflow = False
 
         from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
-        # data_root() is resolved lazily inside _resolve_shadow_artifact_path —
-        # only when a path actually needs the umbrella repo fallback — so a fully
-        # stubbed/cached call path (e.g. unit tests) never requires a data root.
+        # Artifact resolution is delegated per-shadow to the canonical
+        # resolve_artifact_identity below — the ONE authority the #525 CI gate +
+        # #566 sentinel also consume — so the file scoring loads and the identity
+        # the record certifies never diverge (codex CR#2). The umbrella repo_root
+        # fallback is derived (from strategy_dir) lazily inside the resolver.
         health_records: list[dict[str, Any]] = []
 
         for sm in shadow_models:
@@ -378,27 +376,42 @@ class ApplyShadowScoringTask(Task):
                     log.warning("ApplyShadowScoringTask: shadow %s missing "
                                  "kind/artifact_path", name)
                     continue
-                p = _resolve_shadow_artifact_path(
-                    artifact_path,
-                    strategy_dir=strategy_dir,
-                )
-                health["artifact_resolved_path"] = str(p)
-                # ARTIFACT IDENTITY (not mere path-existence): stamp the IMMUTABLE
-                # content digest of the file scoring will actually load — if the
-                # file at this mutable path is swapped, the digest changes and the
-                # record stops reading "healthy". A missing digest == the artifact
-                # did not resolve to a real file (the ``../../`` class). Uses the
-                # SAME canonical recipe the CI gate (#525) / sentinel (#566) reuse.
-                if health_enabled:
-                    health["content_sha256"] = content_digest(p)
-                    health["artifact_resolved"] = health["content_sha256"] is not None
-                    try:
-                        health["artifact_source"] = resolve_artifact_identity(
-                            artifact_path, strategy_dir=strategy_dir).source
-                    except Exception:  # noqa: BLE001 — label only
-                        pass
-                else:
-                    health["artifact_resolved"] = p.exists()
+                # SINGLE canonical resolution + immutable identity. This is the
+                # ONE authority the shadow-artifact CI gate (#525) + health
+                # sentinel (#566) also consume: the file scoring LOADS, the digest
+                # the record certifies, the resolved path, and the source label
+                # ALL come from this one result. No second, independently-resolved
+                # path can diverge from the certified identity (codex CR#2 — the
+                # loader used a separately-resolved path while the record hashed
+                # another, so a record could certify one file while a DIFFERENT one
+                # was actually scored).
+                identity = resolve_artifact_identity(
+                    artifact_path, strategy_dir=strategy_dir)
+                health["artifact_resolved_path"] = identity.resolved_path
+                health["artifact_source"] = identity.source
+                # Immutable content identity of the file scoring will load: the
+                # sha256 of its bytes, read via the canonical resolver (NOT via the
+                # mtime/size-keyed content_digest cache) — if the artifact is
+                # swapped the digest changes and the record stops reading "healthy".
+                # None == the ref did not resolve to a real file (the ``../../``
+                # class).
+                health["content_sha256"] = identity.content_sha256
+                health["artifact_resolved"] = identity.resolved
+
+                # Unresolved / missing artifact → the record is a FAULT via the
+                # not-loaded finalize path. Do NOT fall through to path-existence
+                # or load a scorer against a path the identity did not certify.
+                if not identity.resolved:
+                    health["load_error"] = (
+                        f"artifact_path {artifact_path!r} did not resolve to an "
+                        f"existing file: {identity.error}")
+                    log.warning(
+                        "ApplyShadowScoringTask: shadow %s artifact unresolved: %s",
+                        name, identity.error)
+                    continue
+
+                # Load from the SAME path the identity certifies.
+                p = Path(identity.resolved_path)
                 try:
                     handler = registry.get(kind)
                 except ValueError as exc:
@@ -423,13 +436,10 @@ class ApplyShadowScoringTask(Task):
                     try:
                         scorer = handler.scorer_loader(p, shadow_cfg)
                     except Exception as exc:
-                        if not health["artifact_resolved"]:
-                            health["load_error"] = (
-                                f"artifact_path {artifact_path!r} does not "
-                                f"resolve to an existing file (resolved: {p}): "
-                                f"{exc}")
-                        else:
-                            health["load_error"] = str(exc)
+                        # The identity certified a real file (we only reach here
+                        # when identity.resolved), so a raise is a genuine load
+                        # failure → STATE_LOAD_FAILED via finalize.
+                        health["load_error"] = str(exc)
                         log.warning("ApplyShadowScoringTask: shadow %s (%s) load failed: %s",
                                      name, kind, exc)
                         continue

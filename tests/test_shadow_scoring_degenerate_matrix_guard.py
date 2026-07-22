@@ -15,7 +15,6 @@ primary.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
@@ -84,10 +83,20 @@ def _ctx(matrix: pd.DataFrame) -> SimpleNamespace:
 
 def _wire(monkeypatch, scorer):
     """Pre-seed the scorer cache + stub artifact/registry so run() reaches the
-    score step without touching the filesystem or model registry."""
+    score step without touching the filesystem or model registry.
+
+    Resolution goes through the single ``resolve_artifact_identity`` authority, so
+    force it to a RESOLVED identity for the ``dummy`` ref (resolved_path=``dummy``
+    → cache hit) — the run then bypasses real loading and exercises the degenerate
+    cross-section guard, which is what this test is about."""
     from renquant_pipeline.kernel.panel_pipeline.model_registry import registry
-    monkeypatch.setattr(shadow_scoring, "_resolve_shadow_artifact_path",
-                        lambda *a, **k: Path("dummy"))
+    from renquant_pipeline.kernel.panel_pipeline.shadow_health import ArtifactIdentity
+    monkeypatch.setattr(
+        shadow_scoring, "resolve_artifact_identity",
+        lambda *a, **k: ArtifactIdentity(
+            ref="dummy", resolved=True, resolved_path="dummy",
+            source="strategy_dir", content_sha256="sha256:deadbeefdeadbeef",
+            error=None))
     monkeypatch.setattr(registry, "get", lambda kind: object())
     shadow_scoring._SCORER_CACHE[("xgb", "dummy")] = scorer
 

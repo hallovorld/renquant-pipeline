@@ -482,3 +482,87 @@ def test_run_emits_one_record_per_shadow_model(monkeypatch, tmp_path):
     recs = _read_records(tmp_path)
     assert {r["shadow_name"] for r in recs} == {"shadow_a", "shadow_b"}
     assert len(recs) == 2
+
+
+# ── Single-resolution regression (codex CR#2) ──────────────────────────────────
+# The path passed to scorer_loader, the artifact_resolved_path / artifact_source
+# recorded, and the content_sha256 stamped MUST all come from ONE
+# resolve_artifact_identity result — a record can never certify one file while a
+# separately-resolved path is what actually gets loaded/scored.
+
+class _CapturingHandler:
+    """Records the exact path scorer_loader is called with."""
+
+    def __init__(self, scorer):
+        self._scorer = scorer
+        self.called_with: list = []
+
+    def scorer_loader(self, p, cfg):
+        self.called_with.append(p)
+        return self._scorer
+
+
+def test_run_single_resolution_loader_and_record_agree(monkeypatch, tmp_path):
+    """Loader path + record's resolved_path/source/content_sha256 ALL come from
+    the single resolve_artifact_identity result — proven by FORCING an identity
+    whose digest differs from a re-hash of the underlying file bytes."""
+    real = tmp_path / "certified" / "model.pt"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"certified-bytes")
+    known_digest = "sha256:1234567890abcdef"   # deliberately NOT content_digest(real)
+    known_source = "strategy_dir"
+    forced = sh.ArtifactIdentity(
+        ref="artifacts/prod/model.pt", resolved=True, resolved_path=str(real),
+        source=known_source, content_sha256=known_digest, error=None)
+    monkeypatch.setattr(shadow_scoring, "resolve_artifact_identity",
+                        lambda *a, **k: forced)
+    handler = _CapturingHandler(_RecordingXGB(dict(_FRESH_META), dict(_FULL_SCORES)))
+    from renquant_pipeline.kernel.panel_pipeline.model_registry import registry
+    monkeypatch.setattr(registry, "get", lambda kind: handler)
+
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, shadow_models=[{"name": "s", "kind": "hf_patchtst",
+                                  "artifact_path": "artifacts/prod/model.pt"}]))
+
+    # loader called EXACTLY once, with the identity's resolved_path
+    assert len(handler.called_with) == 1
+    assert str(handler.called_with[0]) == str(real)
+
+    (rec,) = _read_records(tmp_path)
+    assert rec["artifact_resolved_path"] == str(real)
+    assert rec["artifact_source"] == known_source
+    assert rec["content_sha256"] == known_digest
+    # PROOF the digest came from the identity, not a re-hash of the loaded file
+    assert rec["content_sha256"] != content_digest(real)
+    assert rec["loaded"] is True
+    assert rec["state"] == STATE_OK
+    assert rec["actionable"] is True
+
+
+def test_run_unresolved_identity_skips_loader(monkeypatch, tmp_path):
+    """When resolve_artifact_identity reports unresolved, the record is
+    not-actionable (FAULT) and the loader is NEVER called — no fall-through to
+    path-existence against an uncertified path."""
+    forced = sh.ArtifactIdentity(
+        ref="../../broken/model.pt", resolved=False, resolved_path=None,
+        source="unresolved", content_sha256=None,
+        error="artifact unresolvable (fail-closed): '../../broken/model.pt'")
+    monkeypatch.setattr(shadow_scoring, "resolve_artifact_identity",
+                        lambda *a, **k: forced)
+    handler = _CapturingHandler(_RecordingXGB(dict(_FRESH_META), dict(_FULL_SCORES)))
+    from renquant_pipeline.kernel.panel_pipeline.model_registry import registry
+    monkeypatch.setattr(registry, "get", lambda kind: handler)
+
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, shadow_models=[{"name": "s", "kind": "hf_patchtst",
+                                  "artifact_path": "../../broken/model.pt"}]))
+
+    assert handler.called_with == []   # loader NOT invoked for an uncertified path
+    (rec,) = _read_records(tmp_path)
+    assert rec["loaded"] is False
+    assert rec["artifact_resolved"] is False
+    assert rec["artifact_resolved_path"] is None
+    assert rec["content_sha256"] is None
+    assert rec["state"] == STATE_UNRESOLVED_ARTIFACT
+    assert rec["status"] == STATUS_FAULT
+    assert rec["actionable"] is False

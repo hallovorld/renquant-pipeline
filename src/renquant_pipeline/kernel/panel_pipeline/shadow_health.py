@@ -95,9 +95,14 @@ CONFIG_FINGERPRINT_FIELD = "config_fingerprint"
 
 CONTENT_SHA256_PREFIX = "sha256:"
 
-# Per-process content-digest cache keyed by (path, mtime_ns, size) so a 700-bar
-# sim does not re-hash a 100 MB checkpoint every bar. A swapped file changes its
-# mtime/size and busts the cache, so cross-run drift is still caught.
+# Per-process content-digest cache for the standalone ``content_digest`` helper,
+# keyed by (path, mtime_ns, size) so a 700-bar sim does not re-hash a 100 MB
+# checkpoint every bar. NOTE: the (path, mtime, size) key is a PERFORMANCE
+# heuristic, not an identity guarantee — a same-size, mtime-preserving swap would
+# reuse the cached digest. The AUTHORITATIVE identity the health record certifies
+# is stamped from ``resolve_artifact_identity`` (which reads the resolved file's
+# bytes directly via ``kernel.artifact_resolver``, NOT this cache), so do not rely
+# on this cache for swap detection.
 _DIGEST_CACHE: dict[tuple[str, int, int], str] = {}
 
 
