@@ -38,7 +38,6 @@ Tests in tests/test_shadow_scoring.py.
 """
 from __future__ import annotations
 import datetime
-import json
 import logging
 import math
 import os
@@ -50,6 +49,29 @@ import pandas as pd
 
 from renquant_pipeline.kernel.pipeline.context import InferenceContext
 from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
+# Canonical, pure shadow health + artifact-identity contract. Lives in its own
+# stdlib-only module so the three consumers that MUST NOT DRIFT — this task
+# (EMIT), the shadow-artifact CI gate (orchestrator #525), and the shadow-health
+# sentinel (orchestrator #566) — resolve the same ref to the same file, stamp
+# the same content digest, and compute the same expected-skip-vs-fault verdict.
+# Re-exported below for back-compat; shadow_health is the home.
+from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
+    DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS,
+    DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC,
+    SHADOW_HEALTH_SCHEMA,
+    STATE_DISABLED,
+    STATE_NO_CANDIDATES,
+    STATE_NO_SHADOW_MODELS,
+    append_shadow_health,
+    content_digest,
+    finalize_shadow_health,
+    mark_expected_skip,
+    new_shadow_health,
+    resolve_artifact_identity,
+    shadow_health_cfg,
+    shadow_health_log_path,
+    shadow_health_sink_defined,
+)
 
 log = logging.getLogger("kernel.panel_pipeline.shadow_scoring")
 
@@ -66,166 +88,6 @@ def _default_tracking_uri() -> str:
     return "file:" + str(data_root() / "mlruns")
 _DEFAULT_EXPERIMENT = "renquant_104_shadow"
 _SCORER_CACHE: dict[tuple[str, str], object] = {}
-
-# ── Shadow-scorer HEALTH RECORD (silent-failure sentinel feed) ─────────────────
-# The shadow scorer is fail-soft by design: a broken artifact_path (e.g. a
-# stray ``../../``) makes it load-fail and CONTINUE, so a G4-critical shadow
-# data feed can die for weeks with nothing but a per-run log.warning. This
-# emits ONE structured, machine-readable health record per configured shadow
-# model per run to an append-only JSONL sink so a downstream orchestrator
-# sentinel can alarm on silent degradation (unresolved artifact, stale train
-# cutoff, low coverage, missing provenance) WITHOUT the shadow ever becoming
-# fatal to the live decision pipeline.
-#
-# SINK (documented for the orchestrator sentinel):
-#   <config["_strategy_dir"]>/logs/shadow_scorer_health.jsonl
-#   override via config["shadow_health"]["path"]; one JSON object per line,
-#   schema tag "shadow_scorer_health.v1".
-SHADOW_HEALTH_SCHEMA = "shadow_scorer_health.v1"
-DEFAULT_SHADOW_HEALTH_RELPATH = Path("logs") / "shadow_scorer_health.jsonl"
-# Freshness bar mirrors the model-freshness governance policy ("NO model
-# > 28 days"); coverage bar mirrors the fundamentals min_coverage (0.80) used
-# by DataAvailabilityTask. Both operator-overridable under config.shadow_health.
-DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS = 28
-DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC = 0.80
-# Provenance stamps whose absence marks a shadow NOT ACTIONABLE (a comparison
-# with no known training cutoff / config fingerprint is unverifiable).
-_SHADOW_TRAIN_CUTOFF_FIELD = "effective_train_cutoff_date"
-_SHADOW_CONFIG_FP_FIELD = "config_fingerprint"
-
-
-def _shadow_health_cfg(config: dict) -> dict:
-    raw = (config or {}).get("shadow_health")
-    return raw if isinstance(raw, dict) else {}
-
-
-def shadow_health_log_path(config: dict) -> Path:
-    """Resolve the append-only JSONL sink for shadow-scorer health records.
-
-    Default: ``<config["_strategy_dir"]>/logs/shadow_scorer_health.jsonl``
-    (mirrors the AdmissionShadowLoggerTask sink convention). Overridable via
-    ``config["shadow_health"]["path"]``. Falls back to ``./logs/...`` when no
-    strategy_dir is set (sim/test)."""
-    override = _shadow_health_cfg(config).get("path")
-    if override:
-        return Path(str(override))
-    strategy_dir = (config or {}).get("_strategy_dir")
-    base = Path(str(strategy_dir)) if strategy_dir else Path(".")
-    return base / DEFAULT_SHADOW_HEALTH_RELPATH
-
-
-def _parse_cutoff_date(value: Any) -> datetime.date | None:
-    """Parse a ``YYYY-MM-DD`` cutoff stamp (leading 10 chars). None if
-    absent/unparseable — mirrors job_universe._axis_cutoff parsing."""
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        return datetime.datetime.strptime(text[:10], "%Y-%m-%d").date()
-    except ValueError:
-        return None
-
-
-def _new_shadow_health(
-    *, shadow_name: str, kind: Any, artifact_path: Any,
-    run_date: datetime.date, run_id: Any, n_candidates: int,
-) -> dict[str, Any]:
-    """A health record pre-seeded to the WORST case (nothing loaded/scored).
-
-    Every field is filled progressively as the per-model score attempt makes
-    progress; finalize_shadow_health() then derives ``actionable``/``reasons``.
-    Pre-seeding to the worst case means an early ``continue`` still emits a
-    correct, self-describing record."""
-    return {
-        "schema": SHADOW_HEALTH_SCHEMA,
-        "run_date": run_date.isoformat(),
-        "run_id": str(run_id) if run_id is not None else None,
-        "shadow_name": shadow_name,
-        "kind": kind,
-        "artifact_path": str(artifact_path) if artifact_path is not None else None,
-        "artifact_resolved": False,
-        "artifact_resolved_path": None,
-        "loaded": False,
-        "load_error": None,
-        _SHADOW_TRAIN_CUTOFF_FIELD: None,
-        "staleness_days": None,
-        _SHADOW_CONFIG_FP_FIELD: None,
-        "n_candidates": int(n_candidates),
-        "n_scored": 0,
-        "coverage_frac": None,
-        "skip_reason": None,
-        "actionable": False,
-        "reasons": [],
-    }
-
-
-def finalize_shadow_health(
-    health: dict[str, Any], *, run_date: datetime.date,
-    max_staleness_days: int = DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS,
-    min_coverage_frac: float = DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC,
-) -> dict[str, Any]:
-    """Derive the ``actionable`` verdict + machine-readable ``reasons`` list.
-
-    A shadow is ACTIONABLE only if it loaded, produced a fresh-enough training
-    cutoff, carries provenance (config fingerprint), and scored a high-enough
-    fraction of the candidate cross-section. Any failing dimension appends a
-    stable reason token so a sentinel can classify the degradation. Pure /
-    side-effect-free so it is directly unit-testable."""
-    reasons: list[str] = []
-    if not health.get("loaded"):
-        health["staleness_days"] = None
-        health["actionable"] = False
-        health["reasons"] = [
-            "artifact_unresolved" if not health.get("artifact_resolved")
-            else "load_failed"
-        ]
-        return health
-
-    # Training-cutoff freshness (the stale-shadow class).
-    cutoff_raw = health.get(_SHADOW_TRAIN_CUTOFF_FIELD)
-    cutoff = _parse_cutoff_date(cutoff_raw)
-    if cutoff_raw in (None, ""):
-        health["staleness_days"] = None
-        reasons.append("missing_train_cutoff")
-    elif cutoff is None:
-        health["staleness_days"] = None
-        reasons.append("unparseable_train_cutoff")
-    else:
-        staleness = (run_date - cutoff).days
-        health["staleness_days"] = staleness
-        if staleness < 0:
-            reasons.append(f"train_cutoff_future_{staleness}d")
-        elif staleness > max_staleness_days:
-            reasons.append(f"stale_{staleness}d_limit_{max_staleness_days}d")
-
-    # Provenance: an unfingerprinted comparison is unverifiable.
-    if not health.get(_SHADOW_CONFIG_FP_FIELD):
-        reasons.append("missing_config_fingerprint")
-
-    # Coverage of the candidate cross-section.
-    if health.get("n_scored", 0) <= 0:
-        reasons.append(health.get("skip_reason") or "no_scores")
-    else:
-        cov = health.get("coverage_frac")
-        if cov is not None and cov < min_coverage_frac:
-            reasons.append(
-                f"low_coverage_{cov:.2f}_min_{min_coverage_frac:.2f}")
-
-    health["actionable"] = not reasons
-    health["reasons"] = reasons
-    return health
-
-
-def append_shadow_health(path: str | Path, record: dict[str, Any]) -> None:
-    """Append one health record as a JSON line to ``path`` (creates dirs)."""
-    p = Path(path)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, sort_keys=True, default=str)
-    with p.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
-
 
 def _resolve_shadow_artifact_path(
     artifact_path: str | Path,
@@ -371,47 +233,15 @@ class ApplyShadowScoringTask(Task):
 
     def run(self, ctx: InferenceContext) -> bool | None:
         panel_cfg = ctx.config.get("ranking", {}).get("panel_scoring", {})
-        if panel_cfg.get("shadow_enabled", True) is False:
-            return None
-        shadow_models = panel_cfg.get("shadow_models", []) or []
-        if not shadow_models:
-            return None
-
-        # Primary scores (must be set by main ApplyScoresTask)
-        cands = list(ctx.candidates) if ctx.candidates else []
-        if not cands:
-            log.info("ApplyShadowScoringTask: 0 candidates — skip")
-            return None
-        primary_scores = {c.ticker: float(c.panel_score)
-                          for c in cands if c.panel_score is not None}
-        if not primary_scores:
-            return None
-        sorted_primary = sorted(primary_scores.items(), key=lambda x: -x[1])
-        primary_ranks = {t: i + 1 for i, (t, _) in enumerate(sorted_primary)}
-        primary_kind = panel_cfg.get("kind", "xgb")
-
-        shadow_log_mlflow = bool(panel_cfg.get("shadow_log_mlflow", True))
-        exp_id = None
-        if shadow_log_mlflow:
-            try:
-                exp_id = _ensure_mlflow_setup(
-                    panel_cfg.get("shadow_tracking_uri"),
-                    panel_cfg.get("shadow_experiment"))
-            except Exception as exc:
-                log.warning("ApplyShadowScoringTask: MLflow setup failed: %s — skip",
-                             exc)
-                return None
-
-        from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
-        # data_root() is resolved lazily inside _resolve_shadow_artifact_path —
-        # only when a path actually needs the umbrella repo fallback — so a fully
-        # stubbed/cached call path (e.g. unit tests) never requires a data root.
 
         # ── Shadow HEALTH RECORD wiring (silent-failure sentinel feed) ──────
-        # Normalize the session date once (ctx.today may be a pd.Timestamp /
-        # datetime / date). Read operator thresholds. health_records accrues
-        # ONE record per configured shadow model regardless of which soft-fail
-        # branch it takes — the per-model try/finally below guarantees it.
+        # Set up BEFORE any early return so a record is emitted on every path —
+        # a by-design non-run (disabled / no models / no candidates) is an
+        # EXPECTED skip (actionable=True), NOT silence the sentinel must guess
+        # at. Normalize the session date once (ctx.today may be pd.Timestamp /
+        # datetime / date). shadow_health.enabled=false is a health-only kill
+        # switch (never disables the shadow scoring itself).
+        strategy_dir = ctx.config.get("_strategy_dir")
         today_val = getattr(ctx, "today", datetime.date.today())
         if isinstance(today_val, datetime.datetime):
             run_date = today_val.date()
@@ -423,7 +253,8 @@ class ApplyShadowScoringTask(Task):
             except Exception:  # noqa: BLE001
                 run_date = datetime.date.today()
         run_id = getattr(ctx, "run_id", None)
-        hcfg = _shadow_health_cfg(ctx.config)
+        hcfg = shadow_health_cfg(ctx.config)
+        health_enabled = bool(hcfg.get("enabled", True))
         try:
             max_staleness_days = int(hcfg.get(
                 "max_staleness_days", DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS))
@@ -434,16 +265,112 @@ class ApplyShadowScoringTask(Task):
                 "min_coverage_frac", DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC))
         except (TypeError, ValueError):
             min_coverage_frac = DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC
+
+        def _flush(records: "list[dict[str, Any]]") -> None:
+            """Finalize (idempotent) + append each record to the JSONL sink.
+            Best-effort: NEVER fail the (already non-fatal) shadow task."""
+            if not records:
+                return
+            for rec in records:
+                try:
+                    finalize_shadow_health(
+                        rec, run_date=run_date,
+                        max_staleness_days=max_staleness_days,
+                        min_coverage_frac=min_coverage_frac)
+                except Exception:  # noqa: BLE001
+                    log.exception("ApplyShadowScoringTask: health finalize failed")
+            if not shadow_health_sink_defined(ctx.config):
+                log.debug(
+                    "ApplyShadowScoringTask: %d shadow health record(s) not "
+                    "persisted (no _strategy_dir / shadow_health.path)",
+                    len(records))
+                return
+            try:
+                sink = shadow_health_log_path(ctx.config)
+                for rec in records:
+                    append_shadow_health(sink, rec)
+                n_fault = sum(1 for r in records if not r.get("actionable"))
+                log.info(
+                    "ApplyShadowScoringTask: wrote %d shadow health record(s) "
+                    "to %s (%d fault)", len(records), sink, n_fault)
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "ApplyShadowScoringTask: shadow health write failed: %s", exc)
+
+        def _skip_record(sm: dict, state: str, reason: str,
+                         n_candidates: int) -> "dict[str, Any]":
+            rec = new_shadow_health(
+                shadow_name=(sm.get("name", "unnamed_shadow") if sm else None),
+                kind=(sm.get("kind") if sm else None),
+                artifact_path=(sm.get("artifact_path") if sm else None),
+                run_date=run_date, run_id=run_id, n_candidates=n_candidates,
+                expected_content_sha256=(sm.get("expected_content_sha256") if sm else None),
+                expected_config_fingerprint=(sm.get("expected_config_fingerprint") if sm else None),
+            )
+            return mark_expected_skip(rec, state, reason)
+
+        shadow_models = panel_cfg.get("shadow_models", []) or []
+
+        # Task-level EXPECTED skips — emit a record, then return.
+        if panel_cfg.get("shadow_enabled", True) is False:
+            if health_enabled:
+                _flush([_skip_record({}, STATE_DISABLED, "shadow_enabled=false", 0)])
+            return None
+        if not shadow_models:
+            if health_enabled:
+                _flush([_skip_record({}, STATE_NO_SHADOW_MODELS,
+                                     "no shadow_models configured", 0)])
+            return None
+
+        # Primary scores (must be set by main ApplyScoresTask)
+        cands = list(ctx.candidates) if ctx.candidates else []
+        primary_scores = {c.ticker: float(c.panel_score)
+                          for c in cands if c.panel_score is not None}
+        if not cands or not primary_scores:
+            # Nothing to compare against this run — an EXPECTED skip, one record
+            # per configured shadow so the per-shadow timeline stays continuous.
+            reason = "no_candidates" if not cands else "no_primary_scores"
+            log.info("ApplyShadowScoringTask: %s — skip", reason)
+            if health_enabled:
+                _flush([_skip_record(sm, STATE_NO_CANDIDATES, reason,
+                                     len(primary_scores)) for sm in shadow_models])
+            return None
+        sorted_primary = sorted(primary_scores.items(), key=lambda x: -x[1])
+        primary_ranks = {t: i + 1 for i, (t, _) in enumerate(sorted_primary)}
+        primary_kind = panel_cfg.get("kind", "xgb")
+
+        # MLflow tracking setup — a setup failure DISABLES shadow MLflow logging
+        # but does NOT skip the run: the health record is still assessed (the
+        # tracking sink is orthogonal to shadow health).
+        shadow_log_mlflow = bool(panel_cfg.get("shadow_log_mlflow", True))
+        exp_id = None
+        if shadow_log_mlflow:
+            try:
+                exp_id = _ensure_mlflow_setup(
+                    panel_cfg.get("shadow_tracking_uri"),
+                    panel_cfg.get("shadow_experiment"))
+            except Exception as exc:
+                log.warning("ApplyShadowScoringTask: MLflow setup failed: %s — "
+                             "disabling shadow MLflow logging (health still assessed)",
+                             exc)
+                shadow_log_mlflow = False
+
+        from renquant_pipeline.kernel.panel_pipeline.model_registry import registry  # noqa: PLC0415
+        # data_root() is resolved lazily inside _resolve_shadow_artifact_path —
+        # only when a path actually needs the umbrella repo fallback — so a fully
+        # stubbed/cached call path (e.g. unit tests) never requires a data root.
         health_records: list[dict[str, Any]] = []
 
         for sm in shadow_models:
             name = sm.get("name", "unnamed_shadow")
             kind = sm.get("kind")
             artifact_path = sm.get("artifact_path")
-            health = _new_shadow_health(
+            health = new_shadow_health(
                 shadow_name=name, kind=kind, artifact_path=artifact_path,
                 run_date=run_date, run_id=run_id,
                 n_candidates=len(primary_scores),
+                expected_content_sha256=sm.get("expected_content_sha256"),
+                expected_config_fingerprint=sm.get("expected_config_fingerprint"),
             )
             try:
                 if not kind or not artifact_path:
@@ -453,16 +380,25 @@ class ApplyShadowScoringTask(Task):
                     continue
                 p = _resolve_shadow_artifact_path(
                     artifact_path,
-                    strategy_dir=ctx.config.get("_strategy_dir"),
+                    strategy_dir=strategy_dir,
                 )
-                # Load-time artifact-resolution check (requirement 3): a broken
-                # relative artifact_path (the ``../../`` class) resolves to a
-                # nonexistent file → artifact_resolved=False and the load_error
-                # names the offending path. Recorded here so a cached scorer is
-                # also stamped resolved; the loader still runs (some artifacts
-                # are directories) — non-existence just pre-labels the error.
                 health["artifact_resolved_path"] = str(p)
-                health["artifact_resolved"] = p.exists()
+                # ARTIFACT IDENTITY (not mere path-existence): stamp the IMMUTABLE
+                # content digest of the file scoring will actually load — if the
+                # file at this mutable path is swapped, the digest changes and the
+                # record stops reading "healthy". A missing digest == the artifact
+                # did not resolve to a real file (the ``../../`` class). Uses the
+                # SAME canonical recipe the CI gate (#525) / sentinel (#566) reuse.
+                if health_enabled:
+                    health["content_sha256"] = content_digest(p)
+                    health["artifact_resolved"] = health["content_sha256"] is not None
+                    try:
+                        health["artifact_source"] = resolve_artifact_identity(
+                            artifact_path, strategy_dir=strategy_dir).source
+                    except Exception:  # noqa: BLE001 — label only
+                        pass
+                else:
+                    health["artifact_resolved"] = p.exists()
                 try:
                     handler = registry.get(kind)
                 except ValueError as exc:
@@ -499,15 +435,14 @@ class ApplyShadowScoringTask(Task):
                         continue
                     _SCORER_CACHE[cache_key] = scorer
 
-                # Scorer available — the shadow LOADED. Stamp provenance from
-                # its metadata so a stale/unfingerprinted shadow is visible.
+                # Scorer available — the shadow LOADED. Stamp provenance/identity
+                # from its metadata so a stale/unfingerprinted shadow is visible.
                 health["loaded"] = True
                 _meta = getattr(scorer, "metadata", {}) or {}
                 if isinstance(_meta, dict):
-                    health[_SHADOW_TRAIN_CUTOFF_FIELD] = _meta.get(
-                        _SHADOW_TRAIN_CUTOFF_FIELD)
-                    health[_SHADOW_CONFIG_FP_FIELD] = _meta.get(
-                        _SHADOW_CONFIG_FP_FIELD)
+                    health["effective_train_cutoff_date"] = _meta.get(
+                        "effective_train_cutoff_date")
+                    health["config_fingerprint"] = _meta.get("config_fingerprint")
 
                 target_tickers = list(primary_scores.keys())
                 try:
@@ -664,60 +599,34 @@ class ApplyShadowScoringTask(Task):
                     log.warning("ApplyShadowScoringTask: MLflow log failed for %s: %s",
                                  name, exc)
             finally:
-                # ALWAYS emit exactly one health record per configured shadow,
+                # ALWAYS collect exactly one health record per configured shadow,
                 # whichever soft-fail branch above was taken (continue runs the
-                # finally). This is the silent-failure sentinel feed — it MUST
-                # NOT itself raise, so finalize is defensively wrapped.
-                try:
-                    finalize_shadow_health(
-                        health, run_date=run_date,
-                        max_staleness_days=max_staleness_days,
-                        min_coverage_frac=min_coverage_frac)
-                except Exception:  # noqa: BLE001
-                    log.exception(
-                        "ApplyShadowScoringTask: health finalize failed for %s",
-                        name)
+                # finally). _flush() below finalizes + persists them.
                 health_records.append(health)
 
         # Persist the per-run health records to the append-only JSONL sink so a
-        # downstream orchestrator sentinel can catch a silently-degraded shadow
-        # (unresolved artifact / stale cutoff / low coverage). Best-effort:
-        # NEVER fail the (already non-fatal) shadow task on a health write.
-        # Only persist when a sink location is DEFINED — the sentinel feed lives
-        # under <strategy_dir>/logs, so with no strategy_dir and no explicit
-        # override we skip the write rather than scatter the file in a bare cwd.
-        sink_defined = bool(hcfg.get("path")) or bool(
-            ctx.config.get("_strategy_dir"))
-        if health_records and not sink_defined:
-            log.debug(
-                "ApplyShadowScoringTask: %d shadow health record(s) not "
-                "persisted (no _strategy_dir / shadow_health.path configured)",
-                len(health_records))
-        elif health_records:
-            try:
-                sink = shadow_health_log_path(ctx.config)
-                for rec in health_records:
-                    append_shadow_health(sink, rec)
-                n_actionable = sum(1 for r in health_records
-                                   if r.get("actionable"))
-                log.info(
-                    "ApplyShadowScoringTask: wrote %d shadow health record(s) "
-                    "to %s (%d actionable)",
-                    len(health_records), sink, n_actionable)
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "ApplyShadowScoringTask: shadow health write failed: %s", exc)
-
+        # downstream orchestrator sentinel can catch a silently-degraded shadow.
+        # Best-effort + only when a sink is defined (see _flush).
+        if health_enabled:
+            _flush(health_records)
         return None
 
 
 __all__ = [
     "ApplyShadowScoringTask",
+    # Canonical shadow-health contract (home: shadow_health), re-exported for
+    # back-compat. New consumers should import from
+    # renquant_pipeline.kernel.panel_pipeline.shadow_health directly.
     "SHADOW_HEALTH_SCHEMA",
-    "DEFAULT_SHADOW_HEALTH_RELPATH",
     "DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS",
     "DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC",
-    "shadow_health_log_path",
+    "content_digest",
+    "resolve_artifact_identity",
+    "new_shadow_health",
+    "mark_expected_skip",
     "finalize_shadow_health",
     "append_shadow_health",
+    "shadow_health_log_path",
+    "shadow_health_cfg",
+    "shadow_health_sink_defined",
 ]
