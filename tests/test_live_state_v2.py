@@ -275,3 +275,68 @@ class TestRoundTripProperty:
     def test_golden_identity(self):
         s = LiveStateV2.parse(GOLDEN_V1)
         assert LiveStateV2.parse(json.loads(s.canonical_json())) == s
+
+
+class TestFunnelIntegrityHistoryRegression:
+    """Regression for the 2026-07-11 landing gap.
+
+    FunnelIntegrityTask (task_funnel_integrity.py, landed 2026-07-11) writes
+    ``funnel_integrity_history`` onto the adapter-persisted ``monitor_state``,
+    but MonitorStateV2 (last touched 2026-07-04) declared ``extra="forbid"``
+    without the field. Every P-STATE-FILE preflight from 2026-07-11 onward
+    reported a SOFT schema failure on the live book — which the warn window
+    was explicitly staged to catch "before the strict flip". Under a strict
+    flip it fails the daily run closed.
+
+    The class-level invariant these pin: a task that persists a key into
+    monitor_state must have that key declared here, or extra="forbid" turns a
+    known writer into a parse failure.
+    """
+
+    REAL_RECORD = {
+        "date": "2026-07-24",
+        "kill_families": ["conviction", "earnings_blackout", "risk_gate_vol",
+                          "veto", "wash_sale"],
+        "wash_sale_blocked": 7,
+        "verdict": "STRUCTURAL_BLOCK",
+    }
+
+    def test_history_key_parses(self):
+        """The exact monitor_state shape the live book carried on 2026-07-24."""
+        wire = dict(GOLDEN_V1)
+        wire["monitor_state"] = {
+            "no_trade_streak": 2,
+            "funnel_integrity_history": [self.REAL_RECORD],
+        }
+        s = LiveStateV2.parse(wire)
+        assert s.monitor_state.funnel_integrity_history == [self.REAL_RECORD]
+        assert s.extra_quarantine == {}, (
+            "nested monitor_state keys are NOT quarantined — an undeclared "
+            "key here fails the whole parse, it does not degrade gracefully"
+        )
+
+    def test_history_defaults_empty_when_absent(self):
+        s = LiveStateV2.parse(GOLDEN_V1)
+        assert s.monitor_state.funnel_integrity_history == []
+
+    def test_history_survives_round_trip(self):
+        wire = dict(GOLDEN_V1)
+        wire["monitor_state"] = {
+            "no_trade_streak": 0,
+            "funnel_integrity_history": [self.REAL_RECORD],
+        }
+        s = LiveStateV2.parse(wire)
+        again = LiveStateV2.parse(json.loads(s.canonical_json()))
+        assert again == s
+        assert again.monitor_state.funnel_integrity_history == [self.REAL_RECORD]
+
+    def test_writer_key_matches_schema_field(self):
+        """Bind the writer's constant to the schema field name.
+
+        If either side is renamed without the other, this fails here rather
+        than silently in preflight against the live book.
+        """
+        from renquant_pipeline.kernel.pipeline.task_funnel_integrity import (
+            HISTORY_STATE_KEY,
+        )
+        assert HISTORY_STATE_KEY in MonitorStateV2.model_fields
