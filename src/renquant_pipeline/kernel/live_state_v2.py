@@ -90,6 +90,15 @@ class MonitorStateV2(BaseModel):
     no_trade_streak_source: Optional[str] = None
     last_fill_date: Optional[str] = None
     last_check_date: Optional[str] = None
+    # Rolling per-trading-day funnel-integrity verdicts. Written by
+    # FunnelIntegrityTask._update_history (task_funnel_integrity.py, landed
+    # 2026-07-11) onto the same adapter-persisted monitor_state vehicle as
+    # MonitorIdleStreakTask, capped at funnel_integrity.history_window
+    # (default 60) entries. Record shape is owned by that task, so this is a
+    # typed passthrough — same convention as stop_orders / recent_sell_orders
+    # below. Declaring it keeps extra="forbid" meaningful for the fields this
+    # model DOES own instead of failing the whole parse on a known key.
+    funnel_integrity_history: list[dict[str, Any]] = []
 
 
 class RegimeStateV2(BaseModel):
@@ -190,7 +199,15 @@ class LiveStateV2(BaseModel):
             "recent_sell_orders": dict(self.recent_sell_orders),
         }
         if self.monitor_state is not None:
-            out["monitor_state"] = self.monitor_state.model_dump()
+            monitor = self.monitor_state.model_dump()
+            # Omit the funnel-integrity history when empty so the wire stays
+            # byte-identical to what a pre-2026-07-11 state file carried.
+            # Round-trip is preserved: the field defaults to [] on parse, so
+            # dropping an empty list cannot lose information, and a rollback
+            # to code without the field sees exactly the v1 shape.
+            if not monitor.get("funnel_integrity_history"):
+                monitor.pop("funnel_integrity_history", None)
+            out["monitor_state"] = monitor
         if self.regime_state is not None:
             out["regime_state"] = self.regime_state.model_dump()
         for field, v1_key in _HOLDING_V1_KEYS.items():
