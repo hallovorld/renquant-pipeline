@@ -1,13 +1,20 @@
-# Design — shadow deployment of the CONFIRMED blend objective (no production change)
+# Design — shadow deployment of the blend objective (PARKED, no production change)
 
-STATUS: DESIGN ONLY — review requested; no implementation, no config change,
-no artifact deployed by this PR.
-Provenance: renquant-model#68 (frozen prereg) / #73 (results, replayable) —
-tail-aware blend objective beats production `rank:pairwise` on the harvest
-statistic (+0.0552/60d clean top-10 spread, CI90 [+0.0018,+0.1085], 10/10
-seeds). Verdict registered in orchestrator `VERDICTS.md` (PROVISIONAL, R1).
-The prereg's frozen consequence: CONFIRMED buys a **shadow design PR**, and
-shadow-forward evidence is decisive for any production decision.
+STATUS: PARKED — not authorized for merge. renquant-model#73 (the replayable
+results bundle superseding #70) corrects the harvest statistic to
++0.0602/60d clean top-10 spread, CI90 [+0.0116,+0.1155], 9/10 seeds,
+winsorized-±50% guard +0.0125 — but independent of the numbers, its own
+body downgrades PR standing to **EXPLORATORY / PROVISIONAL** (the frozen
+prereg #68 screened the component arms individually, never the exact
+`blend` construction under test) and states verbatim: *"Consequence:
+WITHDRAWN. No shadow-design PR and no orchestrator ledger VERDICTS row
+re-add are authorized by this PR."* Orchestrator `VERDICTS.md` reflects
+this — the row this design cited was added then reverted in the same PR
+round (`79493a11`, "model#73 withdraws re-add authorization").
+Reopening condition: a pre-registered screen of the exact blend
+construction (committed evidence), then a re-frozen confirmatory prereg
+citing that screen. Until then this design captures the readout-rule
+mechanism for reuse but authorizes no rollout step in §5.
 
 ## 1. What ships (three small pieces, all additive)
 
@@ -64,6 +71,10 @@ shadow-forward evidence is decisive for any production decision.
 
 ## 5. Rollout order
 
+0. **Gate (not yet met):** pre-registered screen of the exact `blend`
+   construction, then a re-frozen confirmatory prereg citing that screen
+   (renquant-model#73's reopening condition). This design stays PARKED
+   until that prereg exists.
 1. This design merges (review may amend §2 thresholds — that is the review's
    job; after merge they freeze).
 2. model PR: artifact training script + provenance (mechanical port of the

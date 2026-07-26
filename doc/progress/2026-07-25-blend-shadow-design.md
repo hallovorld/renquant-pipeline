@@ -1,28 +1,43 @@
 # 2026-07-25 — Design PR: blend-objective shadow deployment
 
-STATUS:    design only; no implementation, no config, no artifact
-WHAT:      doc/design/2026-07-25-blend-shadow-deployment.md — shadow slot for the
-           CONFIRMED blend objective via the existing shadow_scoring + #211
-           health-record machinery; forward readout rule FROZEN pre-data
-           (60-session INFO read; 120-session GATE read, block-bootstrap CI,
-           winsorized guard, feed-integrity precondition; GO only submits to the
-           normal WF-promote gate).
-WHY/DIR:   Consequence step for the CONFIRMED blend-objective verdict
-           (renquant-model#68/#73, orchestrator VERDICTS.md PROVISIONAL R1):
-           the frozen prereg buys exactly a shadow design PR, nothing more.
-           Advances the 5-step rollout in §5 of the design doc — this design
-           gate first, then the model artifact PR, then the additive
-           shadow-slot PR, then the orchestrator readout job — before any
-           production surface is touched.
+STATUS:    PARKED — design only; no implementation, no config, no artifact;
+           not authorized for rollout (see WHY/DIR)
+WHAT:      doc/design/2026-07-25-blend-shadow-deployment.md — captures a
+           reusable shadow-readout design (60-session INFO read; 120-session
+           GATE read, block-bootstrap CI, winsorized guard, feed-integrity
+           precondition; GO only submits to the normal WF-promote gate) for
+           the blend objective via the existing shadow_scoring + #211
+           health-record machinery. No rollout step is currently authorized.
+WHY/DIR:   Originally framed as the consequence step for a CONFIRMED
+           blend-objective verdict (renquant-model#68/#70). That verdict is
+           superseded: renquant-model#73 (replayable results bundle) corrects
+           the numbers to +0.0602/60d, CI90 [+0.0116,+0.1155], 9/10 seeds,
+           winsorized guard +0.0125, downgrades PR standing to
+           EXPLORATORY/PROVISIONAL (the exact `blend` construction was never
+           individually screened), and states verbatim "Consequence:
+           WITHDRAWN. No shadow-design PR ... authorized by this PR."
+           Orchestrator VERDICTS.md's blend row was added then reverted in
+           the same round (`79493a11`). Re-add / reopening condition:
+           renquant-model#73's own prescription — a pre-registered screen of
+           the exact blend construction, then a re-frozen confirmatory
+           prereg citing it. This PR does not advance the §5 rollout order
+           until that prereg lands.
 EVIDENCE:
-  artifact:      renquant-model#68/#73 (frozen prereg + replayable results bundle);
-                 orchestrator VERDICTS.md row (PROVISIONAL, R1)
-  prod or exp:   design doc only — the prereg's frozen consequence for CONFIRMED
-  existing data: shadow infra = shadow_scoring.py + #211 structured health record;
-                 readout alarm pattern = GOAL-1 AC3
-  best-known?:   forward evidence outranks the survivorship-panel historical result
-                 by design; no production surface is touched at any step here
-  scope:         "authorizes NOTHING except review of the frozen readout rule;
-                 rollout steps 2-4 are separate reviewed PRs; machine landing keeps
-                 the standard operator grant"
-NEXT:      review; on merge -> model artifact PR, then the additive shadow-slot PR.
+  artifact:      renquant-model#68 (frozen prereg, MERGED) / #70 (CLOSED,
+                 superseded) / #73 (results v2, MERGED, replayable bundle,
+                 the current evidentiary artifact)
+  prod or exp:   design doc only — no shadow-design PR is currently authorized
+  existing data: shadow infra = shadow_scoring.py + #211 structured health
+                 record; readout alarm pattern = GOAL-1 AC3; orchestrator
+                 commit 79493a11 reverted the VERDICTS.md re-add for the same
+                 reason this design is parked
+  best-known?:   renquant-model#73 is the current best-known (and only
+                 evidentiary) artifact for this line; it is EXPLORATORY/
+                 PROVISIONAL, not CONFIRMED
+  scope:         "authorizes NOTHING — the readout-rule mechanism in §2 is
+                 preserved for reuse once the reopening condition (screened
+                 blend + re-frozen prereg) is met; rollout steps 1-4 in §5
+                 remain un-triggered"
+NEXT:      wait on renquant-model: pre-registered screen of the exact blend
+           construction, then a re-frozen confirmatory prereg. Only then does
+           this design (or a superseding one) become mergeable/actionable.
