@@ -34,10 +34,12 @@ EVIDENCE:
   best-known?:   renquant-model#73 is the current best-known (and only
                  evidentiary) artifact for this line; it is EXPLORATORY/
                  PROVISIONAL, not CONFIRMED
-  scope:         "authorizes NOTHING — the readout-rule mechanism in §2 is
-                 preserved for reuse once the reopening condition (screened
-                 blend + re-frozen prereg) is met; rollout steps 1-4 in §5
-                 remain un-triggered"
+  scope:         "authorizes NOTHING beyond this parked reference doc — the
+                 readout-rule mechanism in §2 is preserved for reuse once the
+                 reopening condition (screened blend + re-frozen prereg) is
+                 met; §5 steps 2-5 (gate + rollout) remain un-triggered"
 NEXT:      wait on renquant-model: pre-registered screen of the exact blend
-           construction, then a re-frozen confirmatory prereg. Only then does
-           this design (or a superseding one) become mergeable/actionable.
+           construction, then a re-frozen confirmatory prereg. Only then do
+           §5 steps 3-5 (the actual rollout PRs) become actionable; this
+           design doc itself is already an archived parked reference once
+           merged, not a pending merge decision.

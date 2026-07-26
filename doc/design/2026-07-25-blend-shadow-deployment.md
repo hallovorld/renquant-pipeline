@@ -1,6 +1,10 @@
 # Design — shadow deployment of the blend objective (PARKED, no production change)
 
-STATUS: PARKED — not authorized for merge. renquant-model#73 (the replayable
+STATUS: PARKED — not authorized for rollout/activation. This document itself
+is an inert, additive reference (no code/config/artifact change — see §3) and
+is authorized to merge as a parked record; §5 steps 2-5 (the gate and the
+actual rollout) stay blocked until the reopening condition below is met.
+renquant-model#73 (the replayable
 results bundle superseding #70) corrects the harvest statistic to
 +0.0602/60d clean top-10 spread, CI90 [+0.0116,+0.1155], 9/10 seeds,
 winsorized-±50% guard +0.0125 — but independent of the numbers, its own
@@ -71,16 +75,18 @@ mechanism for reuse but authorizes no rollout step in §5.
 
 ## 5. Rollout order
 
-0. **Gate (not yet met):** pre-registered screen of the exact `blend`
+1. This design doc merges to `main` as a parked reference (review may amend
+   §2 thresholds — that is the review's job; after merge they freeze). This
+   step makes no code/config/artifact change (§3) and is NOT gated — it only
+   records the mechanism for reuse.
+2. **Gate (not yet met):** pre-registered screen of the exact `blend`
    construction, then a re-frozen confirmatory prereg citing that screen
-   (renquant-model#73's reopening condition). This design stays PARKED
-   until that prereg exists.
-1. This design merges (review may amend §2 thresholds — that is the review's
-   job; after merge they freeze).
-2. model PR: artifact training script + provenance (mechanical port of the
+   (renquant-model#73's reopening condition). Steps 3-5 below stay BLOCKED
+   until that prereg exists — rollout/activation remains unauthorized.
+3. model PR: artifact training script + provenance (mechanical port of the
    confirmatory executor's classifier).
-3. this-repo PR: shadow-slot config entry (additive) + health-record name.
-4. orchestrator PR: readout job + ledger + launchd manifest entry (goes
+4. this-repo PR: shadow-slot config entry (additive) + health-record name.
+5. orchestrator PR: readout job + ledger + launchd manifest entry (goes
    through the run-surface review path; machine landing needs the standard
    operator grant).
-5. First INFO read ~3 months after activation; GATE read ~6 months.
+6. First INFO read ~3 months after activation; GATE read ~6 months.
