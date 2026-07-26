@@ -7,6 +7,13 @@ WHAT:      doc/design/2026-07-25-blend-shadow-deployment.md — shadow slot for 
            (60-session INFO read; 120-session GATE read, block-bootstrap CI,
            winsorized guard, feed-integrity precondition; GO only submits to the
            normal WF-promote gate).
+WHY/DIR:   Consequence step for the CONFIRMED blend-objective verdict
+           (renquant-model#68/#73, orchestrator VERDICTS.md PROVISIONAL R1):
+           the frozen prereg buys exactly a shadow design PR, nothing more.
+           Advances the 5-step rollout in §5 of the design doc — this design
+           gate first, then the model artifact PR, then the additive
+           shadow-slot PR, then the orchestrator readout job — before any
+           production surface is touched.
 EVIDENCE:
   artifact:      renquant-model#68/#73 (frozen prereg + replayable results bundle);
                  orchestrator VERDICTS.md row (PROVISIONAL, R1)
