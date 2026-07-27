@@ -18,7 +18,12 @@ dependencies = [
   # to the shared calendar UNCONDITIONALLY and fails closed below this
   # version (no local calendar fork; Codex re-review of pipeline #183).
   # Merge order: common #27 first, then this repo's crypto policy.
-  "renquant-common>=0.11.0,<1.0",
+  # >=0.15.0: renquant_common.walk_forward_fold_selection (common PR #33) —
+  # WalkForwardModelLoader delegates PIT fold eligibility/selection to the
+  # canonical shared contract at module import. Structural dependency:
+  # below 0.15.0 this module does not exist and the loader fails to import.
+  # Merge order: common #33 first, then this repo's loader refactor.
+  "renquant-common>=0.15.0,<1.0",
   "renquant-base-data>=0.1.0",
   "renquant-artifacts>=0.1.0",
   "cvxpy>=1.4",

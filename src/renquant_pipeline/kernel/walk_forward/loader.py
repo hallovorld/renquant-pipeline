@@ -34,6 +34,19 @@ from typing import TYPE_CHECKING
 
 import pandas as pd
 
+# Canonical PIT fold-eligibility/selection contract (renquant-common #33,
+# structural: requires renquant-common>=0.15.0). This loader used to carry
+# its own inline copy of the date arithmetic
+# (``effective_train_cutoff_date or cutoff_date`` + BDay lookahead, strict
+# ``<``); per the Codex review on common#33 the shared module is now the
+# single source of truth and the loader DELEGATES — the historical
+# staticmethods below are thin adapters kept for subclasses/tests.
+from renquant_common.walk_forward_fold_selection import (
+    feature_cutoff_date as _canonical_feature_cutoff_date,
+    safe_last_label_date as _canonical_safe_last_label_date,
+    select_latest_eligible_fold as _canonical_select_latest_eligible_fold,
+)
+
 from .leakage_guard import assert_no_leakage
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -252,16 +265,17 @@ class WalkForwardModelLoader:
 
     @staticmethod
     def _feature_cutoff_date(e: RetrainEntry) -> pd.Timestamp:
-        return e.effective_train_cutoff_date or e.cutoff_date
+        """Adapter over the canonical contract (common#33) — do NOT inline."""
+        return _canonical_feature_cutoff_date(
+            e.cutoff_date, e.effective_train_cutoff_date,
+        )
 
     @staticmethod
     def _safe_last_label_date(e: RetrainEntry) -> pd.Timestamp:
-        if e.lookahead_days > 0:
-            return (
-                WalkForwardModelLoader._feature_cutoff_date(e)
-                + pd.tseries.offsets.BDay(e.lookahead_days)
-            )
-        return WalkForwardModelLoader._feature_cutoff_date(e)
+        """Adapter over the canonical contract (common#33) — do NOT inline."""
+        return _canonical_safe_last_label_date(
+            e.cutoff_date, e.lookahead_days, e.effective_train_cutoff_date,
+        )
 
     def entry_as_of(self, today: "pd.Timestamp | str") -> RetrainEntry:
         """Return the latest leakage-safe manifest row for ``today``.
@@ -283,11 +297,22 @@ class WalkForwardModelLoader:
         # label horizon is strictly before today. Newer manifests stamp
         # effective_train_cutoff_date when training already pre-embargoed
         # rows before the selection cutoff, avoiding a second lookahead delay.
-        eligible = [
-            e for e in self._entries
-            if self._safe_last_label_date(e) < today_ts
-        ]
-        if not eligible:
+        #
+        # Eligibility AND selection delegate to the canonical shared contract
+        # (renquant_common.walk_forward_fold_selection, common#33) so this
+        # loader and any extraction harness answer the PIT question from ONE
+        # implementation. Tie note (byte-identical preservation): the shared
+        # selector uses ``max``, which returns the FIRST maximal element,
+        # while this loader's historical rule was ``eligible[-1]`` over the
+        # stably-ascending-sorted ``self._entries`` — the LAST entry among
+        # any duplicated cutoff_date. Feeding the reversed list makes the
+        # shared selector's first-max exactly the historical last-among-ties.
+        # (Well-formed manifests never duplicate cutoff_date; this only
+        # guards the degenerate case.)
+        chosen = _canonical_select_latest_eligible_fold(
+            list(reversed(self._entries)), today_ts,
+        )
+        if chosen is None:
             raise ValueError(
                 f"WalkForwardModelLoader: no retrain with cutoff_date / "
                 f"feature_cutoff + lookahead_days < "
@@ -296,7 +321,6 @@ class WalkForwardModelLoader:
                 f"Either the sim window starts before any fold's safe-label "
                 f"date or the manifest is empty."
             )
-        chosen = eligible[-1]
         # Built-in invariants per the contract.
         assert self._safe_last_label_date(chosen) < today_ts, (
             f"WalkForwardModelLoader internal invariant violated: chosen "
