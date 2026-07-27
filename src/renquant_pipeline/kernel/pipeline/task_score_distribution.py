@@ -16,8 +16,10 @@ Default OFF — opt-in via `score_db.enabled` config flag.
 """
 from __future__ import annotations
 
+import datetime as dt
 import logging
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -27,11 +29,22 @@ from renquant_pipeline.kernel.decision_trace import (
     candidate_trace_pool,
     model_types_from_models,
 )
+from renquant_pipeline.kernel.walk_forward.provenance import (
+    build_score_committed_record,
+    score_payload_digest,
+)
 
 from .context import InferenceContext
 from .pipeline import Task
 
 log = logging.getLogger("kernel.pipeline.score_db")
+
+# Simulated decision instant fallback (design #215 §2.2): the official
+# US-equity session close in the session timezone — the
+# ``decision_schedule.run_bundle_timestamp`` convention (the admissibility
+# ledger's ``US_EQUITY_CLOSE`` schedule: 16:00 America/New_York).
+_SESSION_TZ = "America/New_York"
+_SESSION_CLOSE = dt.time(16, 0)
 
 
 class RecordScoreDistributionTask(Task):
@@ -188,6 +201,75 @@ class RecordScoreDistributionTask(Task):
             log.warning("RecordScoreDistributionTask: skip — %s", exc)
             return False
 
+        # WF sim-time provenance (design #215 §2.3): score_committed is
+        # emitted immediately AFTER the successful INSERT, binding the
+        # provenance to the exact observation Phase-A will read. The sink
+        # and the fold echo ride on ctx (stamped by the sim adapter when it
+        # binds the fold's scorer); absent sink attr = no-op, so the default
+        # daily/live path is byte-identical. Emit failures propagate — a sim
+        # that persisted a score but cannot persist its evidence chain must
+        # fail loudly, not degrade into the post-hoc reconstruction this
+        # contract exists to kill.
+        sink = getattr(ctx, "_wf_provenance_sink", None)
+        if sink is not None:
+            self._emit_score_committed(
+                ctx, sink, rows, run_id=run_id, date_iso=date_iso,
+                run_type=run_type,
+            )
+
+    # Insert-tuple coordinates of the canonical score-payload fields.
+    # MUST mirror the column order of the score_distribution INSERT above:
+    # (run_id, date, run_type, ticker, raw_panel, rank_score,
+    #  expected_return_horizon_days, mu, mu_horizon_days, sigma, ...).
+    _ROW_TICKER, _ROW_RAW_PANEL, _ROW_RANK_SCORE = 3, 4, 5
+    _ROW_MU, _ROW_SIGMA = 7, 9
+
+    def _emit_score_committed(
+        self,
+        ctx: InferenceContext,
+        sink: Any,
+        rows: list[tuple],
+        *,
+        run_id: str,
+        date_iso: str,
+        run_type: str | None,
+    ) -> None:
+        """Build + emit the ``score_committed`` record for this bar.
+
+        The payload digest is computed from the EXACT tuples handed to the
+        INSERT (design §2.1: extraction recomputes over what it reads back
+        and requires equality). The ``artifact_digest`` echo comes from
+        ``ctx._wf_active_fold`` (the fold_resolved identity the adapter
+        stamped); the input watermark from the ctx data axis
+        (``ctx._wf_input_watermark``, adapter-stamped) with the fold-record
+        value as fallback.
+        """
+        payload_rows = [
+            {
+                "ticker": r[self._ROW_TICKER],
+                "raw_panel": r[self._ROW_RAW_PANEL],
+                "mu": r[self._ROW_MU],
+                "rank_score": r[self._ROW_RANK_SCORE],
+                "sigma": r[self._ROW_SIGMA],
+            }
+            for r in rows
+        ]
+        fold = getattr(ctx, "_wf_active_fold", None)
+        record = build_score_committed_record(
+            prediction_date=date_iso,
+            score_observation_key=[run_id, date_iso, run_type],
+            score_payload_digest=score_payload_digest(payload_rows),
+            n_rows=len(rows),
+            artifact_digest=_fold_field(fold, "artifact_digest"),
+            score_timestamp=_score_timestamp(ctx),
+            input_watermark=(
+                getattr(ctx, "_wf_input_watermark", None)
+                or _fold_field(fold, "input_watermark")
+            ),
+            persisted=True,
+        )
+        sink.emit(record)
+
 
 # ── Helpers (Phase 2 will use these from JointActionTask) ──────────────────────
 
@@ -240,6 +322,39 @@ def get_score_percentile_threshold(
     if not rows:
         return None
     return float(np.mean(rows))
+
+
+def _fold_field(fold: Any, name: str) -> Any:
+    """Read a field off ``ctx._wf_active_fold`` (mapping or object)."""
+    if fold is None:
+        return None
+    if isinstance(fold, dict):
+        return fold.get(name)
+    return getattr(fold, name, None)
+
+
+def _score_timestamp(ctx: Any) -> str:
+    """The simulated session's decision instant for this bar (design §2.2).
+
+    Primary source: ``ctx.run_timestamp`` — the ONE wall-clock/decision
+    timestamp the InferenceContext carries (the attribute the
+    ``decision_schedule.run_bundle_timestamp`` convention is stamped from).
+    A naive value is interpreted in the session timezone
+    (America/New_York), matching the convention's tz.
+
+    Fallback (the design-named convention, because sim/LEAN deliberately
+    leave ``run_timestamp=None`` for bar-date-only semantics): the official
+    US-equity session close — 16:00 America/New_York on the bar date —
+    i.e. the same ``US_EQUITY_CLOSE`` schedule the admissibility ledger
+    uses to certify decision instants. ISO-8601 with offset either way.
+    """
+    tz = ZoneInfo(_SESSION_TZ)
+    ts = getattr(ctx, "run_timestamp", None)
+    if isinstance(ts, dt.datetime):
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=tz)
+        return ts.isoformat()
+    return dt.datetime.combine(ctx.today, _SESSION_CLOSE, tzinfo=tz).isoformat()
 
 
 def _ctx_run_type(ctx: Any) -> str | None:
