@@ -1,6 +1,6 @@
 # WF sim provenance sink — fold_resolved + score_committed emitters (design #215)
 
-**STATUS:** Implemented + tested — the PIPELINE piece of the merged
+**STATUS:** delivered — the PIPELINE piece of the merged
 `doc/design/2026-07-27-wf-sim-provenance-contract.md` (§3 step 3). The
 umbrella adapter (sink construction + ctx stamping) and the backtesting
 driver seed plumb are follow-ups, per the design's §2.3 seam.
@@ -118,7 +118,7 @@ cutoff + digest + record into the existing kwargs) and lands with the
 umbrella follow-up. Deferred per the design's "SECONDARY" marking; no risk
 taken here.
 
-**WHY-DIR:** codex reviews on model#64/#65/#66 ruled post-hoc
+**WHY/DIR:** codex reviews on model#64/#65/#66 ruled post-hoc
 reconstruction of which fold/artifact scored which date inadmissible for
 G4 evidence; the merged #215 contract makes the sim persist provenance at
 generation time, two-phase (resolution + committed observation), so
