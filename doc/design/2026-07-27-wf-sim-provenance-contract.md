@@ -22,19 +22,64 @@ sim produced that score under that fold/manifest/code revision.
 
 ## 2. Contract
 
-### 2.1 Record: one append-only JSONL row per (sim_run_id, prediction_date)
+### 2.1 Two-phase append-only records (codex P1 round 1: a resolver row alone
+### does not bind to the score Phase-A consumes)
 
-`schema_version: "wf_sim_provenance.v1"`. Fields:
+`schema_version: "wf_sim_provenance.v1"`. Append-only JSONL; two record
+kinds, both keyed by `(sim_run_id, prediction_date)`. A date's provenance is
+COMPLETE only when the pair exists and cross-matches; extraction rejects
+orphaned (either kind alone), duplicated (same kind+key twice), or
+mismatched pairs as inadmissible.
+
+**`record_kind: "fold_resolved"`** — emitted at the loader boundary when the
+fold that will serve scoring is resolved:
 
 | group | fields | source (in scope at emit time) |
 |---|---|---|
-| identity | `sim_run_id`, `prediction_date`, `emitted_at_utc`, `seed` | run_backtest args / ctx |
+| identity | `sim_run_id`, `prediction_date`, `seed` | run_backtest args / ctx |
 | fold | `cutoff_date`, `trained_date`, `effective_train_cutoff_date`, `lookahead_days`, `artifact_uri`, `calibrator_uri` | the selected `RetrainEntry` (loader `entry_as_of`) |
 | manifest | `manifest_path`, `manifest_digest` | `loader._manifest_path` + file bytes |
 | artifact | `artifact_digest`, `is_real_content_digest`, `family`, `fingerprint_schema` | `_scorer_claim_for_entry` (already hashes the fold artifact bytes at load) |
 | calibrator | `calibrator_digest` (nullable) | `calibrator_as_of` resolved path |
 | code | `revision_pins` (umbrella + pipeline + model + backtesting + common + artifacts) | reuse `pit_parity_ledger.commit_path_fingerprint`'s multi-repo pin capture — NOT the cwd-only `_commit_sha` |
-| inputs | `input_watermark` (max event time of the feature store actually served) | ctx data axis |
+| audit | `emitted_at_utc` (audit-write clock ONLY — never a decision-time claim) | wall clock |
+
+**`record_kind: "score_committed"`** — emitted at the commit point AFTER the
+per-date score observation is successfully persisted
+(`RecordScoreDistributionTask.run`, post-INSERT), binding the provenance to
+the exact observation Phase-A will read:
+
+| group | fields | semantics |
+|---|---|---|
+| join | `sim_run_id`, `prediction_date`, `score_observation_key` = `(run_id, date, run_type)` | the `score_distribution` primary-key coordinates of the persisted rows |
+| binding | `score_payload_digest` = `sha256:<64hex>` over the canonical serialization of the persisted score series (rows sorted by ticker; fixed field order `(ticker, raw_panel, mu, rank_score, sigma)`; floats via `repr`), `n_rows` | computed from the exact frame handed to the INSERT — extraction recomputes over what it reads back and requires equality |
+| pairing | `artifact_digest` (echo of the `fold_resolved` value) | direct pair-integrity check without a join through the fold table |
+| time | `score_timestamp` (REQUIRED — see §2.2), `emitted_at_utc` (audit only) | |
+| durability | `persisted: true/false` | `false` when the sim runs with persistence off (`--no-persist` / `dump_walkforward_sim_metrics`); such rows are STILL emitted (from the adapter, post-scoring, digesting the in-memory payload) but are Phase-A-INADMISSIBLE by construction, since Phase-A reads the sim DB |
+
+A retry/re-score of the same bar appends a NEW `score_committed` row;
+extraction treats >1 `score_committed` for one key as a duplicate and
+rejects the date unless the rows are byte-identical (idempotent re-emit).
+
+### 2.2 Decision-time semantics (codex P1 round 1: audit-write time cannot
+### certify a historical decision)
+
+`score_timestamp` = the SIMULATED session's decision timestamp for the bar —
+the same instant the pipeline stamps into the run record for that simulated
+date (source: the sim ctx's decision timestamp for `prediction_date`;
+timezone America/New_York, persisted as ISO-8601 with offset; the
+`decision_schedule.run_bundle_timestamp` convention). A rerun performed
+today certifies a 2024 decision via THIS field; `emitted_at_utc` is
+explicitly audit-only metadata in both record kinds.
+
+PIT invariant, enforced at emit: `input_watermark <= score_timestamp` — the
+feature store served to the scorer must not contain events after the
+simulated decision instant. A violation still emits (append-only honesty)
+with `pit_violation: true`, and extraction rejects the date.
+
+| group | fields | source |
+|---|---|---|
+| inputs | `input_watermark` (max event time of the feature store actually served), `pit_violation` | ctx data axis, checked against `score_timestamp` |
 
 Digest grammar: `sha256:<64 hex>` and artifact refs `sha256:<64hex>@<locator>`
 verbatim from the admissibility ledger (`LABEL_REF_RE`) — the consumer is the
@@ -49,25 +94,29 @@ bytes (`loader.py` already drops to file-hash for non-JSON artifacts);
 `fingerprint_schema` records which dispatch path stamped the digest
 (v1 vs `accept_legacy_stamps`), so extraction never has to guess vintage.
 
-### 2.2 Emit site: the loader boundary, not the recording task
+### 2.3 Emit sites: loader boundary (fold_resolved) + persistence commit
+### point (score_committed)
 
-A `provenance_sink` (small protocol object: `emit(record: dict) -> None`,
-append-only JSONL writer, fsync per row) handed to `WalkForwardModelLoader` at
-construction. The loader emits ONE record per `entry_as_of`-resolution that
-gets served to scoring (dedup per (run_id, date) inside the sink; re-entrant
-calls for the same bar emit once). Rationale:
+A single `provenance_sink` (small protocol object: `emit(record: dict) ->
+None`, append-only JSONL writer, fsync per row) shared by both sites:
 
-- `entry_as_of`/`model_as_of`/`_scorer_claim_for_entry` are the ONLY places
-  where fold row + resolved artifact path + digest co-exist — everything is
-  in scope for free (the digest is already computed there today).
-- All sim entry points (`run_sim_104` driver, `dump_walkforward_sim_metrics`,
-  `weekly_wf_promote`) funnel through this one seam, so a single hook covers
-  every producer, including the `--no-persist` and `persistence.enabled=False`
-  paths (constraint: provenance must NOT be coupled to the sim DB switch).
-- The umbrella `sim.runner` adapter change is construction-time only (pass
-  the sink), keeping the cross-repo diff minimal.
+- `fold_resolved`: handed to `WalkForwardModelLoader` at construction;
+  emitted once per `entry_as_of`-resolution served to scoring (dedup per
+  key inside the sink; re-entrant calls for the same bar emit once).
+  `entry_as_of`/`model_as_of`/`_scorer_claim_for_entry` are the ONLY places
+  where fold row + resolved artifact path + digest co-exist, and all sim
+  entry points (`run_sim_104` driver, `dump_walkforward_sim_metrics`,
+  `weekly_wf_promote`) funnel through this seam.
+- `score_committed`: emitted by `RecordScoreDistributionTask.run`
+  immediately AFTER its successful INSERT (persistence on), or by the sim
+  adapter post-scoring with `persisted: false` (persistence off). The task
+  reaches the sink and the fold echo via ctx (the adapter stamps
+  `ctx._wf_provenance_sink` / `ctx._wf_active_fold` when it binds the
+  fold's scorer).
+- The umbrella `sim.runner` adapter change stays construction-time small
+  (pass the sink; stamp ctx), keeping the cross-repo diff minimal.
 
-### 2.3 Durability: JSONL beside the run bundle, NOT a sim-reset table
+### 2.4 Durability: JSONL beside the run bundle, NOT a sim-reset table
 
 `data/wf_provenance/<sim_run_id>.jsonl`, append-only, never truncated. The
 sim DB (`sim_runs.db`) is TRUNCATEd every `run_backtest`
@@ -81,14 +130,26 @@ columns (`training_cutoff`, `model_content_sha256`, `run_bundle_json`) for the
 per-bar row — pure column reuse, registered in `_COLUMN_MIGRATIONS` only if a
 column is missing in old DBs.
 
-### 2.4 Extraction becomes a read, reconstruction becomes a cross-check
+### 2.5 Extraction becomes a read + verify, reconstruction becomes a
+### cross-check
 
 `build_phase_a_inputs` (model repo, rebased #65) consumes the JSONL as the
-ONLY source of fold/artifact identity. `select_pit_fold` +
-`resolve_artifact_digest` survive ONLY as independent cross-checks: any
-mismatch between recorded and re-derived identity is a HARD error (evidence
-quarantined), never a fallback. `is_real_content_digest=False` rows are
-inadmissible for GO/KILL evidence by construction.
+ONLY source of fold/artifact identity, and for each date MUST:
+
+1. require the complete `fold_resolved` + `score_committed` pair with
+   matching keys and matching `artifact_digest` echo — orphans, non-identical
+   duplicates, `persisted: false`, and `pit_violation: true` rows are
+   inadmissible;
+2. read the score rows AT `score_observation_key` from `score_distribution`,
+   recompute `score_payload_digest` over what it read (same canonical
+   serialization), and require equality with the recorded digest plus
+   `n_rows` — proving the consumed observation IS the one the sim committed;
+3. run `select_pit_fold` + `resolve_artifact_digest` ONLY as independent
+   cross-checks: any mismatch between recorded and re-derived identity is a
+   HARD error (evidence quarantined), never a fallback.
+
+`is_real_content_digest=False` rows are inadmissible for GO/KILL evidence by
+construction.
 
 ## 3. Sequencing (tight, same order as reviews demand)
 

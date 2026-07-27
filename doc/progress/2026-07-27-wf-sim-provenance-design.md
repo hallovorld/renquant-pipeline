@@ -1,7 +1,8 @@
 # WF sim-time provenance contract — design PR
 
 ## STATUS
-DESIGN only; no implementation, no production-path delta.
+DESIGN only; no implementation, no production-path delta. Round 2 after
+codex CHANGES_REQUESTED (two P1 evidence-contract gaps), both addressed.
 
 ## WHAT
 `doc/design/2026-07-27-wf-sim-provenance-contract.md`: per-(run,date)
@@ -9,7 +10,15 @@ append-only JSONL provenance record emitted at the `WalkForwardModelLoader`
 boundary (the only seam where fold row + resolved artifact + digest co-exist),
 admissibility-ledger digest grammar, sim-DB-independent durability, extraction
 demoted to read + hard-error cross-check, tight sequencing behind
-common#33/pipeline#214, prereg-before-rerun.
+common#33/pipeline#214 (both MERGED 2026-07-27), prereg-before-rerun.
+Round-2 revisions per codex P1s: (a) TWO-PHASE records — `fold_resolved`
+(loader boundary) + `score_committed` (post-INSERT commit point) with
+`score_observation_key`, canonical `score_payload_digest`, `n_rows`,
+artifact-digest echo; extraction rejects orphaned/duplicate/incomplete/
+mismatched pairs; (b) `score_timestamp` = the SIMULATED session decision
+instant (decision_schedule convention, America/New_York ISO-8601) with the
+enforced PIT invariant `input_watermark <= score_timestamp`;
+`emitted_at_utc` demoted to audit-only in both record kinds.
 
 ## WHY-DIR
 Root unblock demanded by codex on model#64/#65/#66: `score_distribution`
