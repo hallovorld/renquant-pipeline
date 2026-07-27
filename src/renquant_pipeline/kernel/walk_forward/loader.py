@@ -48,9 +48,12 @@ from renquant_common.walk_forward_fold_selection import (
 )
 
 from .leakage_guard import assert_no_leakage
+from .provenance import build_fold_resolved_record, file_digest
 
 if TYPE_CHECKING:  # pragma: no cover
     from renquant_pipeline.kernel.panel_pipeline.panel_scorer import PanelScorer
+
+    from .provenance import ProvenanceSink
 
 
 @dataclass(frozen=True)
@@ -221,6 +224,7 @@ class WalkForwardModelLoader:
         manifest_path: "str | Path",
         *,
         accept_legacy_stamps: "bool | None" = None,
+        provenance_sink: "ProvenanceSink | None" = None,
     ) -> None:
         """``accept_legacy_stamps`` is the M6 stage-2 migration-window flag
         (``ranking.panel_scoring.fingerprint.accept_legacy_stamps``, policy
@@ -230,11 +234,20 @@ class WalkForwardModelLoader:
         the pre-existing shim equality path. ``False`` = post-flip
         strictness: only v1-stamped identity pairs verify; a versionless
         stamp fails closed with the "re-stamp under v1" remedy.
+
+        ``provenance_sink`` is the WF sim-time provenance emitter (design
+        #215 §2.3): when set, every ``entry_as_of`` resolution served to
+        scoring emits a ``fold_resolved`` record (deduped per bar inside
+        the sink). Default ``None`` — constructed ONLY by sim entry points;
+        the daily path never passes one, so default behavior is
+        byte-identical (zero live-surface delta).
         """
         self._manifest_path = _resolve_manifest_path(manifest_path)
         self._entries: list[RetrainEntry] = []
         self._cache: dict[str, "PanelScorer"] = {}
         self._calibrator_cache: dict[str, object] = {}
+        self._provenance_sink = provenance_sink
+        self._manifest_digest: str | None = None
         self._accept_legacy_stamps = (
             _config_accept_legacy_stamps(None)
             if accept_legacy_stamps is None
@@ -351,7 +364,69 @@ class WalkForwardModelLoader:
                     f"today={today_ts.date().isoformat()})",
             lookahead_days=chosen.lookahead_days,
         )
+        # WF sim-time provenance (design #215 §2.3): fold_resolved is
+        # emitted HERE — the only seam where the fold row, the resolved
+        # artifact path, and its digest co-exist, and where every sim entry
+        # point (model_as_of / calibrator_as_of / direct entry_as_of)
+        # funnels through. The sink dedups per (sim_run_id, prediction_date)
+        # so re-entrant calls for the same bar emit once. ``None`` (the
+        # default, and the ONLY state the daily path ever sees) skips with
+        # zero behavior delta. Emit failures propagate — a sim that cannot
+        # persist its evidence chain must abort loudly, not score silently.
+        if self._provenance_sink is not None:
+            self._emit_fold_resolved(chosen, today_ts)
         return chosen
+
+    def _emit_fold_resolved(
+        self, entry: RetrainEntry, today_ts: pd.Timestamp,
+    ) -> None:
+        """Emit the ``fold_resolved`` record for the resolution just served.
+
+        Digest sources (design §2.1): the artifact digest is the whole-file
+        sha256 over the resolved fold artifact's bytes — the same bytes
+        :meth:`_scorer_claim_for_entry` hashes at load, recomputed here so
+        the claim path stays byte-identical for sink-less callers.
+        ``fingerprint_schema`` records which dispatch route stamped the
+        fold's identity (v1 vs legacy), so extraction never guesses vintage.
+        """
+        claim = self._scorer_claim_for_entry(entry)
+        resolved = self._resolve_uri(entry.artifact_uri)
+        artifact_digest: str | None = None
+        is_real_content_digest = False
+        if isinstance(resolved, Path):
+            artifact_digest = file_digest(resolved)
+            is_real_content_digest = artifact_digest is not None
+        # Artifact family split (design §2.2): JSON payload artifacts vs
+        # whole-file-hash families like .pt checkpoints.
+        suffix = Path(str(resolved)).suffix.lstrip(".").lower()
+        family = suffix or "unknown"
+        calibrator_digest: str | None = None
+        if entry.calibrator_uri:
+            resolved_cal = self._resolve_uri(entry.calibrator_uri)
+            if isinstance(resolved_cal, Path):
+                calibrator_digest = file_digest(resolved_cal)
+        if self._manifest_digest is None:
+            self._manifest_digest = file_digest(self._manifest_path)
+        record = build_fold_resolved_record(
+            prediction_date=today_ts.date().isoformat(),
+            cutoff_date=entry.cutoff_date.date().isoformat(),
+            trained_date=entry.trained_date.date().isoformat(),
+            effective_train_cutoff_date=(
+                None if entry.effective_train_cutoff_date is None
+                else entry.effective_train_cutoff_date.date().isoformat()
+            ),
+            lookahead_days=entry.lookahead_days,
+            artifact_uri=entry.artifact_uri,
+            calibrator_uri=entry.calibrator_uri,
+            manifest_path=str(self._manifest_path),
+            manifest_digest=self._manifest_digest,
+            artifact_digest=artifact_digest,
+            is_real_content_digest=is_real_content_digest,
+            family=family,
+            fingerprint_schema=claim.schema,
+            calibrator_digest=calibrator_digest,
+        )
+        self._provenance_sink.emit(record)
 
     def model_as_of(self, today: "pd.Timestamp | str") -> "PanelScorer":
         """Return the latest retrain scorer for ``today``.
