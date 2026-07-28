@@ -903,6 +903,27 @@ class LoadScorerTask(Task):
         return p
 
     @staticmethod
+    def _blend_component0_path(ctx: InferenceContext, panel_cfg: dict) -> Path | None:
+        """Anchor the strict-consistency gate + trace stamp on the FIRST
+        blend component (frozen construction fixes it as the production
+        scorer) when `kind="blend"` carries no top-level `artifact_path`.
+
+        Shared by both the preloaded (adapter/LEAN) and fresh-load branches
+        of `run()` so the preloaded path fails closed on the same artifact
+        as the fresh-load path instead of on the composite fingerprint.
+        """
+        comps = panel_cfg.get("components") or []
+        first = comps[0] if comps and isinstance(comps[0], dict) else {}
+        if not first.get("artifact_path"):
+            return None
+        p = Path(str(first["artifact_path"]))
+        if not p.is_absolute():
+            strategy_dir = ctx.config.get("_strategy_dir")
+            if strategy_dir:
+                p = Path(strategy_dir) / p
+        return p
+
+    @staticmethod
     def _assert_config_consistency(
         ctx: InferenceContext,
         panel_cfg: dict,
@@ -949,6 +970,8 @@ class LoadScorerTask(Task):
         scorer = getattr(ctx, "_panel_scorer", None)
         if scorer is not None:
             p = self._resolve_artifact_path(ctx, panel_cfg, scorer)
+            if p is None and panel_cfg.get("kind") == "blend":
+                p = self._blend_component0_path(ctx, panel_cfg)
             if not self._assert_config_consistency(ctx, panel_cfg, scorer, p):
                 return False
             _stamp_active_panel_scorer(ctx, panel_cfg, scorer, p)
@@ -956,21 +979,7 @@ class LoadScorerTask(Task):
 
         p = self._resolve_artifact_path(ctx, panel_cfg)
         if p is None and panel_cfg.get("kind") == "blend":
-            # 2026-07-27 blend composite: kind=blend carries per-component
-            # pinned paths in `components` (see blend_scorer.py) and needs no
-            # top-level artifact_path. Anchor the existing path-based surfaces
-            # — the strict config-consistency gate + the active-scorer trace
-            # stamp — on the FIRST component, which the frozen construction
-            # fixes as the PRODUCTION panel scorer (so the consistency gate
-            # keeps checking exactly the artifact it checks today).
-            comps = panel_cfg.get("components") or []
-            first = comps[0] if comps and isinstance(comps[0], dict) else {}
-            if first.get("artifact_path"):
-                p = Path(str(first["artifact_path"]))
-                if not p.is_absolute():
-                    strategy_dir = ctx.config.get("_strategy_dir")
-                    if strategy_dir:
-                        p = Path(strategy_dir) / p
+            p = self._blend_component0_path(ctx, panel_cfg)
         if p is None:
             log.error("LoadScorerTask: panel_scoring.enabled but no artifact_path")
             _fail_closed_panel_scoring(ctx, "panel_scorer_missing_artifact_path")

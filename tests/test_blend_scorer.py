@@ -532,6 +532,26 @@ class TestKernelWiring:
         assert ctx._active_panel_model_type == "blend"
         assert str(ctx._active_panel_artifact_path).endswith("prod.json")
 
+    def test_load_scorer_task_dispatches_preloaded_blend_without_top_level_path(
+            self, tmp_path):
+        """Regression pin for the preloaded (adapter/LEAN) branch: preloading
+        a BlendPanelScorer onto ctx._panel_scorer must anchor the strict
+        consistency gate + trace stamp on component 0, same as the fresh-load
+        branch above — not fail closed against the composite fingerprint."""
+        from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (
+            LoadScorerTask,
+        )
+
+        config = _stamped_blend_config(tmp_path)
+        ctx = _kernel_ctx(config)
+        ctx._panel_scorer = load_blend_scorer(config)
+        rc = LoadScorerTask().run(ctx)
+        assert rc is not False, (
+            "LoadScorerTask fail-closed on a preloaded valid blend scorer: "
+            f"{getattr(ctx, '_panel_scoring_fail_reason', None)}")
+        assert ctx._active_panel_model_type == "blend"
+        assert str(ctx._active_panel_artifact_path).endswith("prod.json")
+
     def test_load_scorer_task_fails_closed_on_pin_mismatch(self, tmp_path):
         from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (
             LoadScorerTask,

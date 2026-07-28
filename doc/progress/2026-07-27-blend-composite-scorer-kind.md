@@ -138,3 +138,40 @@ NEXT:      (separate PRs) strategy/orchestrator: shadow_blend profile
            shadow lane (staleness surfaced via metadata
            effective_train_cutoff_date); extend the rail when the lane
            graduates.
+
+## Fix (2026-07-28, review findings addressed)
+
+WHAT:      `LoadScorerTask.run()`'s component-0 path anchor for
+           `kind="blend"` only fired in the fresh-load branch
+           (`ctx._panel_scorer is None`). The documented preloaded branch
+           (adapter / LEAN calling `LoadScorerTask.run()` with
+           `ctx._panel_scorer` already set) skipped it, so
+           `_resolve_artifact_path` returned `None` (composite metadata
+           has no top-level `artifact_path`) and `_assert_config_consistency`
+           checked the composite fingerprint instead of the component-0
+           production fingerprint — fail-closing a valid preloaded blend
+           scorer as `panel_scorer_config_mismatch`. Extracted the anchor
+           into a shared `LoadScorerTask._blend_component0_path()` static
+           method and call it from both branches
+           (`src/renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py`).
+EVIDENCE:  artifact:      tests/test_blend_scorer.py::TestKernelWiring::
+                          test_load_scorer_task_dispatches_preloaded_blend_without_top_level_path
+           prod or exp:   exp (unit test, no config/pin/artifact change)
+           existing data: confirmed the test fails on pre-fix code
+                          (`panel_scorer_config_mismatch`, skip_buys=True)
+                          and passes post-fix. `tests/test_blend_scorer.py`:
+                          38 passed (was 37). Full suite (venv
+                          `renquant-pipeline/.venv`, PYTHONPATH to sibling
+                          `renquant-common`/`renquant-base-data`/
+                          `renquant-artifacts` src): 2092 passed / 9
+                          skipped, same 2 pre-existing failures in
+                          `tests/test_replay_d6_conventions.py`
+                          (HAC t-stat null vs pinned value — reproduced
+                          identically on the unmodified pre-fix head, so
+                          unrelated to this change) both before and after
+                          the fix.
+           best-known?:   yes — closes the only reviewer-identified gap
+           scope:         "LoadScorerTask preloaded-branch anchor fix +
+                          regression test only; no config/pin/artifact
+                          change"
+NEXT:      none — addresses both CHANGES_REQUESTED reviews on this PR.
