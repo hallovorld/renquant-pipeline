@@ -245,4 +245,40 @@ class RegimeRouterHandler(_ModelHandler):
             "sub-model independently then wire via config.")
 
 
+@registry.register("blend")
+class BlendHandler(_ModelHandler):
+    """Composite z(prod) + z(clf) blend — the certified construction
+    (renquant-model#74/75/76 confirmatory line; pipeline#213 design ref).
+    Config schema (frozen — see blend_scorer.py module docstring):
+
+      ranking.panel_scoring.kind = "blend"
+      ranking.panel_scoring.components = [   # exactly TWO, order-significant
+        {"artifact_path": ...,               # 0: production panel scorer
+         "expected_content_sha256": ...,     #    abbrev-tolerant content pin
+         "expected_config_fingerprint": ...},#    verbatim fp pin (both forms)
+        {"artifact_path": ...,               # 1: top-decile classifier
+         "expected_content_sha256": ...,
+         "expected_config_fingerprint": ...},
+      ]
+
+    Both pins are REQUIRED and verified fail-closed at load. The
+    ``artifact_path`` argument is ignored — components carry their own
+    pinned paths (LoadScorerTask anchors its path-based consistency gate
+    on component 0 when no top-level artifact_path is configured).
+    """
+    requires_history = False
+
+    @classmethod
+    def scorer_loader(cls, artifact_path, config):
+        del artifact_path  # components carry their own pinned paths
+        from renquant_pipeline.kernel.panel_pipeline.blend_scorer import load_blend_scorer  # noqa: PLC0415
+        return load_blend_scorer(config)
+
+    @classmethod
+    def train_cmd(cls, args) -> list[str]:
+        raise NotImplementedError(
+            "blend is an inference-only composition; train each component "
+            "independently then wire via config.")
+
+
 __all__ = ["registry", "_ModelHandler"]

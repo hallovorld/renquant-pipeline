@@ -73,7 +73,9 @@ class ResolveInferenceFramesTask(Task):
                 scorer.metadata.get("kind") if getattr(scorer, "metadata", None)
                 else None
             )
-            if scorer_kind in ("panel_linear", "panel_ltr_xgboost"):
+            # 2026-07-27: kind "blend" joins the alpha158-rebuild kinds —
+            # ApplyScoresTask rebuilds its (union) features from raw OHLCV.
+            if scorer_kind in ("panel_linear", "panel_ltr_xgboost", "blend"):
                 return _set_target_only_matrix(
                     ctx,
                     marker_col="__alpha158_target__",
@@ -216,7 +218,9 @@ class DriftGuardTask(Task):
         # ApplyScoresTask handles feature building for these kinds.
         scorer_kind = (scorer.metadata.get("kind")
                        if hasattr(scorer, "metadata") else None)
-        if scorer_kind in ("panel_linear", "panel_ltr_xgboost"):
+        # 2026-07-27: "blend" rebuilds its union features in ApplyScoresTask
+        # exactly like the other alpha158 kinds — same drift-check skip.
+        if scorer_kind in ("panel_linear", "panel_ltr_xgboost", "blend"):
             return None
         # 2026-05-19 (shadow full-e2e): sequence-input scorers (PatchTST,
         # HF PatchTST) have requires_history=True and pull their own
