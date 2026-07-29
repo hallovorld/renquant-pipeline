@@ -96,3 +96,49 @@ def test_quantile_mode_has_true_boundary_semantics() -> None:
     ctx_one = _ctx(scores, buy_floor_quantile=1.0, buy_floor_min=0.0)
     VetoWeakBuysTask().run(ctx_one)
     assert [c.rank_score for c in ctx_one.candidates] == [4.0]
+
+
+# ---------------------------------------------------------------------------
+# UNIT GUARD: rank_score domain. The buy floor is a probability-domain
+# threshold; when calibration does not run, rank_score still holds the RAW
+# scorer output. Comparing the two vetoes the entire cross-section and reports
+# "no trade" as if the model had declined — observed 2026-07-28 with a fresh
+# PatchTST (raw mean -0.107, std 0.031 vs floor 0.200: 75/75 vetoed).
+# ---------------------------------------------------------------------------
+
+from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (  # noqa: E402
+    RANK_SCORE_DOMAIN_PROBABILITY,
+    RANK_SCORE_DOMAIN_RAW,
+)
+
+
+def test_raw_domain_rank_score_fails_loud_instead_of_vetoing_everything() -> None:
+    # The exact observed shape: an all-negative raw scale under a 0.20 floor.
+    ctx = _ctx([-0.107 + 0.03 * ((i % 7) - 3) for i in range(75)],
+               raw_floor=0.20)
+    ctx._rank_score_domain = RANK_SCORE_DOMAIN_RAW
+    VetoWeakBuysTask().run(ctx)
+    # Fail-closed, and the reason names the unit mismatch — not a silent
+    # "everything vetoed" that reads as a model verdict.
+    assert ctx.skip_buys is True
+    assert ctx._panel_scoring_contract_failed is True
+    assert ctx._panel_scoring_fail_reason == "rank_score_domain_uncalibrated"
+    assert ctx.candidates == []
+
+
+def test_probability_domain_rank_score_vetoes_normally() -> None:
+    # Same floor, calibrated domain: the ordinary veto still applies and the
+    # guard does not fire (it must not blanket-disable admission).
+    ctx = _ctx([0.05, 0.10, 0.30, 0.65, 0.90], raw_floor=0.20)
+    ctx._rank_score_domain = RANK_SCORE_DOMAIN_PROBABILITY
+    VetoWeakBuysTask().run(ctx)
+    assert getattr(ctx, "_panel_scoring_contract_failed", False) is False
+    assert [c.ticker for c in ctx.candidates] == ["T002", "T003", "T004"]
+
+
+def test_absent_domain_keeps_previous_behaviour() -> None:
+    # Callers that never set the domain (older paths) are unchanged.
+    ctx = _ctx([0.05, 0.30, 0.90], raw_floor=0.20)
+    VetoWeakBuysTask().run(ctx)
+    assert getattr(ctx, "_panel_scoring_contract_failed", False) is False
+    assert [c.ticker for c in ctx.candidates] == ["T001", "T002"]
