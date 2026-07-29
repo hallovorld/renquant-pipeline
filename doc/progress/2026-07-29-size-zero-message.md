@@ -1,6 +1,7 @@
 # Progress: the skip message blamed cash when cash was never the constraint
 
-STATUS:   delivered. Log message only — the block reason string and every
+STATUS:   delivered, REVISED after review (MED, and it was right — the first
+          revision repeated the very error it was fixing). Log message only — the block reason string and every
           sizing decision are byte-for-byte unchanged. Revised after codex
           MED+substantive: the message now keys off INVESTABLE cash (post
           cash-reservation), not raw remaining cash — a large
