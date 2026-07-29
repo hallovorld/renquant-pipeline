@@ -640,6 +640,14 @@ class TestKernelWiring:
         # the RAW union matrix (not a transformed copy) is what got stamped
         assert sorted(ctx._panel_matrix.columns) == FEAT_COLS
         assert float(ctx._panel_matrix.loc["DDD", "f1"]) == 4.0
+        # regression guard (codex review #542/#219): this alpha158-rebuild
+        # branch must stamp the RAW domain too, not just the
+        # score_with_history branch — else VetoWeakBuysTask's uncalibrated-
+        # rank_score fail-loud guard never trips for kind=blend.
+        from renquant_pipeline.kernel.panel_pipeline.job_panel_scoring import (
+            RANK_SCORE_DOMAIN_RAW,
+        )
+        assert ctx._rank_score_domain == RANK_SCORE_DOMAIN_RAW
 
 
 # ── 8. blend-lane broker tag (umbrella#535 mirror) ───────────────────────────

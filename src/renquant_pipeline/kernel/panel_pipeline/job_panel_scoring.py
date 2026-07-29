@@ -67,6 +67,17 @@ from renquant_pipeline.kernel.panel_pipeline._data_root import data_root as _dat
 
 log = logging.getLogger("kernel.panel_pipeline.scoring")
 
+#: Unit domain of `cand.rank_score`. The scoring stage writes the scorer's RAW
+#: output; the calibration stage overwrites it with a probability in [0, 1].
+#: The buy floor is a probability-domain threshold, so comparing it against a
+#: raw score is a unit error — an all-negative raw scale (PatchTST's, mean
+#: ~-0.11) can never clear a 0.20 floor, which reads as "the model wants
+#: nothing today" when in fact the model was never asked. The 2026-05-03 fix
+#: closed this from the consumer side (read rank_score, not panel_score); the
+#: uncalibrated producer path reopened it. Fail LOUD instead.
+RANK_SCORE_DOMAIN_RAW = "raw"
+RANK_SCORE_DOMAIN_PROBABILITY = "probability"
+
 
 def _runtime_cache(ctx: Any) -> dict | None:
     cache = getattr(ctx, "_panel_runtime_cache", None)
@@ -1237,6 +1248,14 @@ class ApplyScoresTask(Task):
                     _fail_closed_panel_scoring(ctx, "panel_score_collapsed")
                     return None
             ctx._panel_scores_all = scores  # noqa: SLF001
+            # rank_score is written here from the RAW scorer output. The
+            # calibration stage overwrites it with a probability when it runs
+            # (calibration.py: `c.rank_score = float(prob)`); if it does NOT
+            # run, rank_score stays in the raw score domain. Record the domain
+            # so the buy floor — a probability-domain threshold — refuses to
+            # compare against raw units instead of silently vetoing the whole
+            # cross-section (see RANK_SCORE_DOMAIN_* and the veto guard below).
+            ctx._rank_score_domain = RANK_SCORE_DOMAIN_RAW  # noqa: SLF001
             n_cand_scored = 0
             scored_tickers: set[str] = set()
             for cand in ctx.candidates:
@@ -1634,6 +1653,15 @@ class ApplyScoresTask(Task):
         # short-candidate selection task. Only kept; not consumed unless
         # long_short.enabled=true. ApplyScoresTask's only mutation here.
         ctx._panel_scores_all = scores  # noqa: SLF001
+
+        # rank_score below is the RAW scorer output on every branch that
+        # reaches this point (PatchTST history, non-history panel_ltr_xgboost,
+        # and the plain scorer.score(X) fallback all converge here).
+        # Calibration overwrites it with a probability when it runs. Record
+        # the domain so the probability-domain buy floor refuses a unit-
+        # mismatched comparison instead of vetoing the whole cross-section —
+        # mirrors the score_with_history branch above (RANK_SCORE_DOMAIN_*).
+        ctx._rank_score_domain = RANK_SCORE_DOMAIN_RAW  # noqa: SLF001
 
         n_cand_scored = 0
         scored_tickers: set[str] = set()
@@ -2089,6 +2117,27 @@ class VetoWeakBuysTask(Task):
         # harnesses and tests can assert bit-identity without parsing logs.
         ctx._panel_buy_floor = floor                           # noqa: SLF001
         ctx._panel_buy_floor_label = floor_label               # noqa: SLF001
+
+        # UNIT GUARD: the floor lives in the probability domain. If calibration
+        # did not run, rank_score still carries the scorer's RAW output and the
+        # comparison below is a unit error, not a verdict — an all-negative raw
+        # scale vetoes the entire cross-section and the run reports "no trade"
+        # as if the model had declined. Fail LOUD (fail-closed, same channel as
+        # the other scoring contract breaches) instead of trading on it or
+        # silently emptying the funnel. Absent domain (older callers / paths
+        # that never scored) keeps the previous behaviour.
+        domain = getattr(ctx, "_rank_score_domain", None)
+        if domain == RANK_SCORE_DOMAIN_RAW:
+            log.error(
+                "VetoWeakBuysTask: rank_score is in the RAW score domain "
+                "(calibration did not run) but the buy floor %.4f (%s) is a "
+                "probability-domain threshold — refusing the unit-mismatched "
+                "comparison. Fit/attach a calibrator for this scorer, or "
+                "disable panel buy admission explicitly.",
+                floor, floor_label,
+            )
+            _fail_closed_panel_scoring(ctx, "rank_score_domain_uncalibrated")
+            return None
 
         kept: list = []
         dropped = 0
@@ -3085,6 +3134,10 @@ class ApplyGlobalCalibrationTask(Task):
             bool(panel_cfg.get("global_calibration", {})
                  .get("recenter_raw_per_bar", False)),
         )
+
+        # rank_score leaves this stage as a calibrated probability, so the
+        # probability-domain buy floor may compare against it.
+        ctx._rank_score_domain = RANK_SCORE_DOMAIN_PROBABILITY  # noqa: SLF001
 
         n_cand = 0
         n_laundered = 0  # BL-2: raw<0 mapped to ER>0 (or raw>0 → ER<0)
