@@ -1,6 +1,20 @@
-# Progress: two-axis freshness for the shadow health record (GOAL-6 decision A)
+# Progress: two-axis freshness for the shadow health record (executes orch#588 option A)
 
-STATUS:   delivered. Initial commit (`b69f209`) shipped only the finalizer logic
+STATUS:   delivered.
+          CORRECTION on framing (per codex BLOCKER, 2026-07-29): this doc and its
+          WHY/DIR previously said "Operator decision 2026-07-29 (option A of
+          orch#588)" as if that PR recorded a confirmed operator selection. Checked
+          orch#588 directly: it is a MERGED DESIGN MEMO presenting option A
+          (recommended) vs option B, explicitly "for operator decision" — its PR
+          thread has no comment or record showing the operator actually selected
+          A. I cannot independently verify that selection from this session's own
+          transcript. This PR in fact executes the design's OWN recommendation
+          (option A), which is a materially different claim than "the operator
+          decided X" — restated accurately below. The underlying technical fix
+          (two-axis freshness, fixing a by-construction-unsatisfiable single-axis
+          rule) stands on its own evidence regardless of that framing question.
+
+          Initial commit (`b69f209`) shipped only the finalizer logic
           (`shadow_health.py` + 8 unit tests) — codex review (BLOCKER) caught that
           the producer (`ApplyShadowScoringTask` in `shadow_scoring.py`) never
           populated the two new fields the finalizer reads, so the two-axis rule
@@ -21,11 +35,12 @@ WHAT:     `finalize_shadow_health` replaces a single 28-calendar-day check on
           `effective_train_cutoff_date` / `config_fingerprint` copy, so the two-axis
           logic actually activates for a real shadow run.
 
-WHY/DIR:  Operator decision 2026-07-29 (option A of orch#588). The single-axis rule was
-          UNSATISFIABLE for a fwd60 recipe: the last training label needs its forward
-          window closed, so the cutoff can never be nearer than the horizon, and a
-          model retrained this morning flagged stale on arrival. The same rule shape
-          sat behind months of silently refused weekly promotions.
+WHY/DIR:  Executes orch#588's recommended option A (see STATUS correction — not
+          confirmed here as a separately-recorded operator decision). The single-axis
+          rule was UNSATISFIABLE for a fwd60 recipe: the last training label needs
+          its forward window closed, so the cutoff can never be nearer than the
+          horizon, and a model retrained this morning flagged stale on arrival. The
+          same rule shape sat behind months of silently refused weekly promotions.
 
 EVIDENCE: the two axes fail for DIFFERENT causes, both of which this project has
           actually experienced, and one number cannot watch both: axis 1 catches a
@@ -116,9 +131,18 @@ END-TO-END CHECK against the two LIVE artifacts, done rather than assumed
           * "the umbrella fork mirrors this" — there is NO umbrella copy of
             `shadow_health.py`; the umbrella imports it from the pinned pipeline, so
             no mirror is needed. I asserted the mirror before checking.
-          * "producers must stamp `trained_date` and `lookahead_days`" — both are
-            ALREADY stamped and already forwarded into the health record by
-            `shadow_scoring.py`, and both live artifacts carry them at top level.
+          * CORRECTION (per codex MED, 2026-07-29): this bullet previously said
+            "producers must stamp `trained_date` and `lookahead_days` — both are
+            ALREADY stamped and already forwarded" — that is FALSE on the pre-fix
+            producer path and contradicts this doc's own STATUS/EVIDENCE above,
+            which correctly describes the bug (the producer did NOT populate these
+            fields before the follow-up commit, confirmed by direct simulation:
+            `finalize_shadow_health` returned `actionable=False` with
+            `no_declared_lookahead_single_axis` on a producer-shaped record missing
+            them). As of THIS PR's follow-up commit, both fields ARE now stamped
+            and forwarded by `shadow_scoring.py` — that is the fix, not a
+            pre-existing fact. Both live artifacts carry them at top level now that
+            the producer stamps them.
 
 NEXT:     Nothing blocking. Where a future artifact lacks a declared horizon, the
           fail-closed path keeps the old behaviour and names itself.
