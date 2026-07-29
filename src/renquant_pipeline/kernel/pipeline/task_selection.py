@@ -618,19 +618,31 @@ class SizeAndEmitTask(Task):
                 # conviction) is below one share, and integer sizing floors
                 # that to zero. Anyone debugging the idle book was pointed at
                 # the wrong quantity, which is worse than saying nothing.
-                target_notional, _ = sizing_target_notional(
+                #
+                # Round-2 fix (codex review): the branch below must key off
+                # `investable` (post cash-reservation), not raw
+                # `remaining_cash`. `compute_position_size`'s own skip
+                # condition is `investable < price` (see sizing.py's
+                # MIN-1-SHARE check) — a large `cash_reserve_pct` can leave
+                # ample raw cash but far less investable, in which case cash
+                # (the reserved kind) genuinely IS why no share was bought,
+                # and the old `remaining_cash < price` check would have
+                # wrongly routed that case into the "position target" branch.
+                target_notional, investable = sizing_target_notional(
                     ctx.portfolio_value, remaining_cash,
                     max_pct, reserve_pct, override_pct,
                 )
-                if remaining_cash < price:
-                    detail = (f"cash ${remaining_cash:.0f} < one share "
-                              f"${price:.2f}")
+                if investable < price:
+                    detail = (f"investable cash ${investable:.0f} < one "
+                              f"share ${price:.2f} (raw cash "
+                              f"${remaining_cash:.0f}; the reserve leaves "
+                              f"less available to invest)")
                 else:
                     detail = (f"position target ${target_notional:.0f} < one "
                               f"share ${price:.2f} and shares are whole-only "
-                              f"(cash ${remaining_cash:.0f} is NOT the "
-                              f"constraint; fractional sizing is off for this "
-                              f"name)")
+                              f"(investable cash ${investable:.0f} was "
+                              f"sufficient; fractional sizing is off for "
+                              f"this name)")
                 log.info("SizeAndEmitTask: %s sized to 0 shares — skip (%s)",
                          ticker, detail)
                 # Reason string deliberately UNCHANGED: it is asserted by

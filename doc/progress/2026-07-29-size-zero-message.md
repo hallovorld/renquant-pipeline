@@ -1,11 +1,17 @@
 # Progress: the skip message blamed cash when cash was never the constraint
 
 STATUS:   delivered. Log message only — the block reason string and every
-          sizing decision are byte-for-byte unchanged.
+          sizing decision are byte-for-byte unchanged. Revised after codex
+          MED+substantive: the message now keys off INVESTABLE cash (post
+          cash-reservation), not raw remaining cash — a large
+          `cash_reserve_pct` can leave ample raw cash but far less
+          investable, in which case cash genuinely IS the constraint even
+          though `remaining_cash >= price`.
 
 WHAT:     `SizeAndEmitTask`'s whole-share `shares < 1` branch now reports which
-          quantity actually bound: cash below one share, or a position target
-          below one share with ample cash. `_block(ticker,
+          quantity actually bound: investable cash below one share (naming
+          both the investable and raw figures), or a position target below
+          one share with investable cash that was sufficient. `_block(ticker,
           "size_insufficient_cash")` is UNCHANGED.
 
 WHY/DIR:  Measured on the live book 2026-07-27
@@ -53,18 +59,39 @@ EVIDENCE: artifact: `src/renquant_pipeline/kernel/pipeline/task_selection.py`
   scope:            `renquant-pipeline`, one branch of one task, plus tests.
 
 VERIFICATION:
-          Full suite compared at this branch's one commit vs its parent
-          (`origin/main` @ `10cf32e`, byte-identical to `HEAD~1`): 2 failures
-          both (`tests/test_replay_d6_conventions.py::TestDefaultModeUnchanged
-          ::test_default_evidence_matches_pre_change_pin` and
-          `::test_default_evidence_byte_identical_on_pin_platform`), ZERO
-          introduced [VERIFIED — this session, `renquant-pipeline/.venv/bin/
-          python -m pytest -q tests/` run at both `HEAD` and `HEAD~1`].
-          `tests/test_fractional_sizing_stage2.py` (which asserts the reason
-          string): 15 passed [VERIFIED — this session, same command scoped to
-          the file]. 3 new tests in `test_size_zero_message_names_the_real_
-          constraint.py` [VERIFIED — this session], one of which fails if the
-          reason string is ever changed without an audit.
+          `tests/test_size_zero_message_names_the_real_constraint.py`: 4
+          passed [VERIFIED — this session]. Two are now BEHAVIORAL — they
+          instantiate `SizeAndEmitTask`, run it through `InferenceContext`
+          fixtures, and assert on the actual `caplog` output and
+          `ctx._blocked_by_ticker`, not on `inspect.getsource()` string
+          matches (codex's finding on the prior revision: the tests never
+          executed the branch or checked a real logged message). One drives
+          the target-bound case (ample investable cash, tiny target — the
+          live TSLA shape); the other drives a NEW reserve-limited case
+          (`cash_reserve_pct=0.05`, raw cash $600 > price, investable cash
+          $100 < price) that reproduces codex's exact counter-example and
+          confirms the fixed branch names cash, not the target, when cash
+          really is why the order was skipped.
+          `tests/test_fractional_sizing_stage2.py` (asserts the reason
+          string): 19 passed together with the file above
+          [VERIFIED — this session, plain `python3 -m pytest`,
+          PYTHONPATH-injected siblings, AND independently re-run with
+          `renquant-pipeline/.venv/bin/python3.11` + the same PYTHONPATH].
+          Full suite, plain `python3 -m pytest -q tests/`, PYTHONPATH-injected
+          siblings, this branch vs `origin/main` @ `10cf32e` in a separate
+          worktree: 50 failed / 2067 passed both branch counts (baseline
+          2063 passed — delta is exactly the 4 new/changed tests in this
+          file); `diff` of the two failing-test-NAME sets is EMPTY — zero
+          regressions [VERIFIED — this session]. This 50-failure count does
+          NOT match the doc's earlier "2 failures" figure (below), measured
+          with the repo's own `.venv`; that venv could not collect this
+          worktree's checkout at all (103 collection errors, an editable-
+          install/worktree-path artifact, not a code issue) so it was not
+          re-usable for a fresh full-suite count this pass — the load-
+          bearing fact is the zero-diff against a freshly-fetched `origin/
+          main` baseline in a matched environment, not the absolute count,
+          which is known to vary by environment (see the file's own
+          "Corrections" section below).
 
 NEXT:     Splitting `size_insufficient_cash` into a distinct
           `size_below_one_share` would be more useful still, but it is read by
