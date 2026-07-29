@@ -32,6 +32,17 @@ from .runtime_features import build_runtime_feature_frame
 
 log = logging.getLogger(__name__)
 
+#: Unit domain of the panel scores, kept in LOCKSTEP with the kernel twin's
+#: ``RANK_SCORE_DOMAIN_*`` (kernel/panel_pipeline/job_panel_scoring.py). The
+#: values are duplicated rather than imported on purpose: importing them would
+#: pull the whole kernel scoring module into this lightweight one. Drift is
+#: prevented by a test that asserts both modules agree
+#: (tests/test_panel_scoring_twin_domain_lockstep.py), not by the duplication
+#: being self-evidently safe — the 2026-07-29 finding this fixes is precisely
+#: a kernel-only guard that never reached the twin.
+RANK_SCORE_DOMAIN_RAW = "raw"
+RANK_SCORE_DOMAIN_PROBABILITY = "probability"
+
 
 def _legacy_dict_to_manifest(legacy: dict[str, Any]) -> ArtifactManifest | None:
     """Bridge legacy artifact dicts → ArtifactManifest for load_scorer.
@@ -169,6 +180,7 @@ class ApplyScoresTask(Task):
                 scorer_load_error = str(exc)
 
         artifact_scores: dict[str, float] = {}
+        scored_by_model = False
         if artifact_scorer is not None:
             try:
                 artifact_scores = artifact_scorer.predict_rows(matrix)
@@ -182,6 +194,7 @@ class ApplyScoresTask(Task):
                 score = _linear_score(row, linear_weights, intercept)
             elif ticker in artifact_scores:
                 score = _finite_float(artifact_scores[ticker])
+                scored_by_model = True
             else:
                 score = None
             if score is None:
@@ -202,6 +215,14 @@ class ApplyScoresTask(Task):
         setattr(ctx, "raw_panel_scores", dict(scores))
         setattr(ctx, "panel_scores", dict(scores))
         ctx.scores.update(scores)
+        # Unit domain, in lockstep with the kernel twin. The kernel stamps RAW
+        # on every branch where a MODEL scorer produced the number; here that
+        # is the artifact-scorer branch. Explicit snapshot scores and declared
+        # linear weights are caller-supplied and the caller owns their domain,
+        # so they are left unstamped — which the buy-floor guard reads as
+        # "previous behaviour", exactly as the kernel does for absent domains.
+        if scored_by_model:
+            setattr(ctx, "_rank_score_domain", RANK_SCORE_DOMAIN_RAW)
         return True
 
 
@@ -236,6 +257,12 @@ class ApplyGlobalCalibrationTask(Task):
             return False
         setattr(ctx, "panel_scores", dict(calibrated))
         ctx.scores.update(calibrated)
+        # The scores leaving this stage are calibrated, so the probability-
+        # domain buy floor may compare against them. Mirrors the kernel twin.
+        # The early returns above (no calibration block / identity method) do
+        # NOT stamp: they leave the scorer's own units in place, which is the
+        # case the floor guard exists to refuse.
+        setattr(ctx, "_rank_score_domain", RANK_SCORE_DOMAIN_PROBABILITY)
         return True
 
 
@@ -280,6 +307,27 @@ class VetoWeakBuysTask(Task):
         # bit-identity without parsing logs.
         setattr(ctx, "_panel_buy_floor", floor)
         setattr(ctx, "_panel_buy_floor_label", floor_label)
+
+        # UNIT GUARD, in lockstep with the kernel twin (pipeline #219). The
+        # floor is a probability-domain threshold; if calibration did not run,
+        # panel_scores still carries the scorer's RAW output and `score < floor`
+        # below is a unit error, not a verdict. An all-negative raw scale
+        # (PatchTST's, mean ~-0.11) vetoes the entire cross-section and the run
+        # reports "no trade" as though the model had declined — when it was
+        # never actually asked. Refuse the comparison instead of trading on it.
+        if getattr(ctx, "_rank_score_domain", None) == RANK_SCORE_DOMAIN_RAW:
+            log.error(
+                "VetoWeakBuysTask: panel_scores are in the RAW score domain "
+                "(calibration did not run) but the buy floor %.4f (%s) is a "
+                "probability-domain threshold — refusing the unit-mismatched "
+                "comparison. Fit/attach a calibrator for this scorer, or "
+                "disable panel buy admission explicitly.",
+                floor, floor_label,
+            )
+            _block_all(ctx, "rank_score_domain_uncalibrated")
+            _trace(ctx)
+            return False
+
         accepted: list[dict[str, Any]] = []
         dropped = 0
         scores = getattr(ctx, "panel_scores", {}) or {}
