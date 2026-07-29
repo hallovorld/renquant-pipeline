@@ -484,6 +484,48 @@ def test_run_emits_one_record_per_shadow_model(monkeypatch, tmp_path):
     assert len(recs) == 2
 
 
+# ── Two-axis freshness fields wired through the producer path (codex CR#1,
+#    PR #220) ───────────────────────────────────────────────────────────────
+# shadow_health._freshness_reasons keys on health["trained_date"] /
+# health["lookahead_days"], but ApplyShadowScoringTask originally only
+# stamped effective_train_cutoff_date / config_fingerprint onto the health
+# record from scorer.metadata — the two new fields never reached the record,
+# so the finalizer's `_declared_lookahead` always saw None and FAIL-CLOSED to
+# the old single-axis 28-day rule. That made a fwd60 model (structural cutoff
+# lag ~84 calendar days) flag stale on arrival even when trained_date == today.
+# This test exercises the REAL producer path (ApplyShadowScoringTask.run),
+# not a hand-built finalizer input, so it fails if the two fields are ever
+# un-wired again.
+
+def test_run_wires_two_axis_fields_fwd60_not_stale_on_arrival(monkeypatch, tmp_path):
+    trained_today = RUN_DATE.isoformat()
+    cutoff_lag_days = 80  # > old single-axis 28d limit, < fwd60 floor(84d)+slack(28d)=112d
+    cutoff = (RUN_DATE - datetime.timedelta(days=cutoff_lag_days)).isoformat()
+    meta = {
+        "effective_train_cutoff_date": cutoff,
+        "config_fingerprint": "cfg-fwd60",
+        "trained_date": trained_today,
+        "lookahead_days": 60,
+    }
+    _wire_loader(monkeypatch, tmp_path, _RecordingXGB(meta, dict(_FULL_SCORES)))
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, shadow_models=[{"name": "fwd60", "kind": "hf_patchtst",
+                                  "artifact_path": "model.pt"}]))
+    (rec,) = _read_records(tmp_path)
+    # The two new fields actually reached the record (this is what was unwired).
+    assert rec["trained_date"] == trained_today
+    assert rec["lookahead_days"] == 60
+    assert rec["staleness_days"] == cutoff_lag_days
+    # Two-axis: 80d cutoff lag is UNDER the fwd60 floor+slack bound (112d) even
+    # though it is OVER the old single-axis 28d limit -> must NOT be flagged.
+    assert not any(r.startswith("stale_") for r in rec["reasons"])
+    assert not any(r.startswith("cutoff_lag_") for r in rec["reasons"])
+    assert "no_declared_lookahead_single_axis" not in rec["reasons"]
+    assert rec["state"] == STATE_OK
+    assert rec["status"] == STATUS_OK
+    assert rec["actionable"] is True
+
+
 # ── Single-resolution regression (codex CR#2) ──────────────────────────────────
 # The path passed to scorer_loader, the artifact_resolved_path / artifact_source
 # recorded, and the content_sha256 stamped MUST all come from ONE

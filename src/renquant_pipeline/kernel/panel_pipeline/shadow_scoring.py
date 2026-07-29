@@ -455,6 +455,15 @@ class ApplyShadowScoringTask(Task):
                     health["effective_train_cutoff_date"] = _meta.get(
                         "effective_train_cutoff_date")
                     health["config_fingerprint"] = _meta.get("config_fingerprint")
+                    # Two-axis freshness (GOAL-6 decision A, 2026-07-29,
+                    # shadow_health.py::_freshness_reasons) reads these two
+                    # fields off the health record. Without stamping them here
+                    # the finalizer FAIL-CLOSES to the old single-axis rule
+                    # (`_declared_lookahead` returns None), so the advertised
+                    # fwd60-no-longer-stale-on-arrival fix never activates on
+                    # the real producer path — codex CR#1 on PR #220.
+                    health["trained_date"] = _meta.get("trained_date")
+                    health["lookahead_days"] = _meta.get("lookahead_days")
 
                 target_tickers = list(primary_scores.keys())
                 try:
