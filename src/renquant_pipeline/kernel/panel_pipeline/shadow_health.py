@@ -93,6 +93,25 @@ FAULT_STATES = frozenset({
 TRAIN_CUTOFF_FIELD = "effective_train_cutoff_date"
 CONFIG_FINGERPRINT_FIELD = "config_fingerprint"
 
+#: Axis-1 field: when the model was TRAINED. This is what the freshness
+#: governance policy ("no model older than 28 days") actually governs, and it
+#: is fully controllable by retrain cadence.
+TRAINED_DATE_FIELD = "trained_date"
+
+#: Axis-2 input: the recipe's label horizon in TRADING days, read per-artifact.
+#: Never hardcoded — a fwd20 and a fwd60 recipe have different structural
+#: floors, and guessing one for the other is how a gate becomes unsatisfiable.
+LOOKAHEAD_FIELD = "lookahead_days"
+
+#: Calendar slack allowed on top of the structural floor in axis 2. Absorbs
+#: holiday variance and gives the retrain cadence margin. Deliberately equal to
+#: the axis-1 ceiling so the two axes stay legible together.
+DEFAULT_CUTOFF_LAG_SLACK_DAYS = 28
+
+#: Sanity bound on a self-declared horizon: a recipe claiming a horizon beyond
+#: ~one trading year does not get an unbounded freshness allowance.
+MAX_DECLARED_LOOKAHEAD_TDAYS = 252
+
 CONTENT_SHA256_PREFIX = "sha256:"
 
 # Per-process content-digest cache for the standalone ``content_digest`` helper,
@@ -282,10 +301,107 @@ def mark_expected_skip(health: dict[str, Any], state: str, reason: str | None = 
     return _set_status(health, state, [reason or state])
 
 
+def _trading_to_calendar_days(trading_days: int) -> int:
+    """Trading days -> calendar days, the plain 5-day-week conversion.
+
+    Deliberately arithmetic rather than calendar-aware: a holiday-exact bound
+    would make the gate depend on which holidays fall inside the window, and
+    the SLACK term exists precisely to absorb that variance. Rounding up keeps
+    the bound conservative in the direction that avoids false alarms.
+    """
+    weeks, rem = divmod(int(trading_days), 5)
+    return weeks * 7 + rem + (2 if rem else 0)
+
+
+def _declared_lookahead(health: dict[str, Any]) -> int | None:
+    """The artifact's own label horizon in trading days, or None.
+
+    None means FAIL CLOSED to the single-axis rule — never a guessed default.
+    A wrong horizon is worse than no horizon: it silently widens the gate for
+    a recipe that did not earn the widening.
+    """
+    raw = health.get(LOOKAHEAD_FIELD)
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if v <= 0 or v > MAX_DECLARED_LOOKAHEAD_TDAYS:
+        return None
+    return v
+
+
+def _freshness_reasons(
+    health: dict[str, Any], *, run_date: datetime.date, cutoff_lag_days: int,
+    max_staleness_days: int, cutoff_lag_slack_days: int,
+) -> list[str]:
+    """Two-axis freshness (GOAL-6 decision A, 2026-07-29).
+
+    The single-axis rule measured `run_date - effective_train_cutoff_date`
+    against 28 calendar days. For a fwd60 recipe that bound is UNSATISFIABLE
+    by construction: the last training label needs its forward window to have
+    closed, so the cutoff can never be nearer than the horizon. A model
+    retrained this morning flagged stale on arrival, and the same rule sat
+    behind months of silently refused weekly promotions.
+
+    The two axes fail for different real causes, both of which this project has
+    experienced:
+
+      * axis 1, TRAINING RECENCY (`trained_date` age) — catches "the retrain
+        stopped running" (the per-ticker tournament frozen since April);
+      * axis 2, CUTOFF LAG beyond the structural floor — catches "the inputs
+        stopped advancing while retrains kept succeeding" (the fund-freshness
+        serving-axis clip).
+
+    One number cannot watch both, which is why the old rule missed one of them
+    every time it was tuned to catch the other.
+    """
+    out: list[str] = []
+    horizon = _declared_lookahead(health)
+
+    if horizon is None:
+        # FAIL CLOSED: no trustworthy horizon -> the old single-axis behaviour,
+        # explicitly labelled so the record shows WHY it is being judged the
+        # strict way rather than looking like a normal stale flag.
+        if cutoff_lag_days > max_staleness_days:
+            out.append(f"stale_{cutoff_lag_days}d_limit_{max_staleness_days}d")
+            out.append("no_declared_lookahead_single_axis")
+        return out
+
+    floor = _trading_to_calendar_days(horizon)
+    bound = floor + cutoff_lag_slack_days
+    health["cutoff_lag_floor_days"] = floor
+    health["cutoff_lag_bound_days"] = bound
+
+    # axis 2
+    if cutoff_lag_days > bound:
+        out.append(
+            f"cutoff_lag_{cutoff_lag_days}d_over_{bound}d"
+            f"(floor_{floor}d+slack_{cutoff_lag_slack_days}d)")
+
+    # axis 1
+    trained_raw = health.get(TRAINED_DATE_FIELD)
+    trained = _parse_cutoff_date(trained_raw)
+    if trained_raw in (None, ""):
+        health["trained_age_days"] = None
+        out.append("missing_trained_date")
+    elif trained is None:
+        health["trained_age_days"] = None
+        out.append("unparseable_trained_date")
+    else:
+        age = (run_date - trained).days
+        health["trained_age_days"] = age
+        if age < 0:
+            out.append(f"trained_date_future_{age}d")
+        elif age > max_staleness_days:
+            out.append(f"trained_{age}d_limit_{max_staleness_days}d")
+    return out
+
+
 def finalize_shadow_health(
     health: dict[str, Any], *, run_date: datetime.date,
     max_staleness_days: int = DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS,
     min_coverage_frac: float = DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC,
+    cutoff_lag_slack_days: int = DEFAULT_CUTOFF_LAG_SLACK_DAYS,
 ) -> dict[str, Any]:
     """Derive ``state`` / ``status`` / ``actionable`` / ``reasons``.
 
@@ -325,8 +441,11 @@ def finalize_shadow_health(
         health["staleness_days"] = staleness
         if staleness < 0:
             reasons.append(f"train_cutoff_future_{staleness}d")
-        elif staleness > max_staleness_days:
-            reasons.append(f"stale_{staleness}d_limit_{max_staleness_days}d")
+        else:
+            reasons.extend(_freshness_reasons(
+                health, run_date=run_date, cutoff_lag_days=staleness,
+                max_staleness_days=max_staleness_days,
+                cutoff_lag_slack_days=cutoff_lag_slack_days))
 
     # 2) Required artifact IDENTITY (immutable content + provenance), plus any
     #    config-pinned expected identity (a swapped/wrong artifact → mismatch).
@@ -422,6 +541,9 @@ __all__ = [
     "SHADOW_HEALTH_SCHEMA",
     "DEFAULT_SHADOW_HEALTH_RELPATH",
     "DEFAULT_SHADOW_HEALTH_MAX_STALENESS_DAYS",
+    "DEFAULT_CUTOFF_LAG_SLACK_DAYS",
+    "TRAINED_DATE_FIELD",
+    "LOOKAHEAD_FIELD",
     "DEFAULT_SHADOW_HEALTH_MIN_COVERAGE_FRAC",
     "STATUS_OK",
     "STATUS_EXPECTED_SKIP",
