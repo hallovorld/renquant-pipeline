@@ -100,7 +100,25 @@ EVIDENCE: the two axes fail for DIFFERENT causes, both of which this project has
                          still flagged `stale_Nd_limit_28d` on arrival despite the
                          two-axis logic having landed in `shadow_health.py`.
 
-NEXT:     The umbrella fork mirrors this in the same batch (that divergence class has
-          bitten twice already). Producers must stamp `trained_date` and
-          `lookahead_days` onto shadow artifacts; where they do not yet, the
+END-TO-END CHECK against the two LIVE artifacts, done rather than assumed
+          `[VERIFIED — direct artifact reads + the bound arithmetic, 2026-07-29]`:
+
+          | lane | trained_date | cutoff | axis1 (age vs 28d) | axis2 (lag vs 112d) |
+          |---|---|---|---|---|
+          | certified clf (live shadow) | 2026-07-28 | 2026-04-28 | 1d **PASS** | 92d **PASS** |
+          | legacy PatchTST | 2026-05-22 | 2024-11-13 | 68d **FLAG** | 623d **FLAG** |
+
+          So the change does exactly what it was decided to do: the lane that was
+          being flagged for an unsatisfiable reason now passes, and the lane that is
+          genuinely stale still flags — on BOTH axes, independently.
+
+          Two corrections to my own earlier claims in this PR:
+          * "the umbrella fork mirrors this" — there is NO umbrella copy of
+            `shadow_health.py`; the umbrella imports it from the pinned pipeline, so
+            no mirror is needed. I asserted the mirror before checking.
+          * "producers must stamp `trained_date` and `lookahead_days`" — both are
+            ALREADY stamped and already forwarded into the health record by
+            `shadow_scoring.py`, and both live artifacts carry them at top level.
+
+NEXT:     Nothing blocking. Where a future artifact lacks a declared horizon, the
           fail-closed path keeps the old behaviour and names itself.
