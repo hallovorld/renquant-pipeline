@@ -77,9 +77,35 @@ class ModelStalenessTask(PreflightTask):
                 meta = json.loads(path.read_text(encoding="utf-8"))
                 source_name = path.name
             else:
-                return PreflightCheck(
-                    self.check_name, "soft", True,
-                    f"kind={kind!r} unrecognized — staleness skip")
+                # 2026-07-30: an UNRECOGNISED kind is a provenance gap, not a pass.
+                #
+                # The 06-27 note above fixed this once — for xgb — by ADDING a kind
+                # to the allow-list. Enumerating leaves the default fail-OPEN, and
+                # the same shape recurred: measured today, the live shadow-BLEND
+                # lane runs `kind='blend'` and its staleness check was skipped
+                # entirely while it issued buy recommendations. `patchtst` (without
+                # the `hf_` prefix) and an absent kind (`None`) are also present in
+                # committed strategy configs and would take the same branch.
+                #
+                # Inverted: every unknown kind is SURFACED. The artifact JSON is
+                # still read on a best-effort basis, so a kind that happens to stamp
+                # `trained_date` there is measured rather than dismissed — but it can
+                # never come back as a silent pass.
+                try:
+                    import json  # noqa: PLC0415
+                    meta = json.loads(path.read_text(encoding="utf-8"))
+                    source_name = path.name
+                    if _parse_date(meta.get("trained_date")) is None:
+                        return PreflightCheck(
+                            self.check_name, "soft", False,
+                            f"kind={kind!r} is not a recognised scoring kind and "
+                            f"{path.name} carries no trained_date — model age "
+                            f"unmeasurable (provenance gap, NOT a pass)")
+                except Exception as exc:  # noqa: BLE001
+                    return PreflightCheck(
+                        self.check_name, "soft", False,
+                        f"kind={kind!r} unrecognised and {path.name} unreadable: "
+                        f"{exc} — model age unmeasurable (NOT a pass)")
         except Exception as exc:  # noqa: BLE001
             return PreflightCheck(
                 self.check_name, "soft", False,
