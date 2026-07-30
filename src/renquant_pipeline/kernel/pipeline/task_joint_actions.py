@@ -153,7 +153,7 @@ class JointActionTask(Task):
       ctx.last_sell_dates, ctx.regime, ctx.confidence, ctx.bear_only
       ctx.config["rotation"], ctx.config["regime_params"], ctx.config["tax"],
       ctx.config["sector_map"], ctx.config["max_positions_per_sector"],
-      ctx.config["wash_sale_days"]
+      ctx.config["wash_sale_days"], ctx.config["wash_sale_min_material_npv"]
 
     Writes:
       ctx.orders          — all BUY + ROTATE buy legs
@@ -725,7 +725,11 @@ class JointActionTask(Task):
                 # pipeline#223: buys were zeroed on 3 of 5 sessions to protect
                 # $0.04-$13.62 of NPV across 8 names while $6,868 sat unused.
                 # Opt in HERE, not globally — the parking sleeve must not.
-                min_material_npv_cost=WASH_SALE_MIN_MATERIAL_NPV,
+                # Configurable (pipeline#227 review); unconfigured falls back
+                # to the same WASH_SALE_MIN_MATERIAL_NPV default as before.
+                min_material_npv_cost=float(ctx.config.get(
+                    "wash_sale_min_material_npv", WASH_SALE_MIN_MATERIAL_NPV,
+                )),
             )
             if blocked:
                 ctx.counters["joint_blocked_wash"] = (
