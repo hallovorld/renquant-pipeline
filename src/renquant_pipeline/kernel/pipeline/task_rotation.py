@@ -662,7 +662,10 @@ class ValidatePairsTask(Task):
             resolve_asset_class,
             resolve_validated_crypto_spot_pairs,
         )
-        from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+        from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+                WASH_SALE_MIN_MATERIAL_NPV,
+                is_wash_sale_blocked_with_cost,
+            )
         rotation_asset_class = resolve_asset_class(cfg)
         rotation_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(cfg)
         for pair in ctx.rotations:
@@ -671,6 +674,10 @@ class ValidatePairsTask(Task):
                 getattr(ctx, "last_sell_pls", None) or {}, wash_days,
                 asset_class=rotation_asset_class,
                 validated_crypto_pairs=rotation_validated_crypto_pairs,
+                # pipeline#223: buys were zeroed on 3 of 5 sessions to protect
+                # $0.04-$13.62 of NPV across 8 names while $6,868 sat unused.
+                # Opt in HERE, not globally — the parking sleeve must not.
+                min_material_npv_cost=WASH_SALE_MIN_MATERIAL_NPV,
             )
             if blocked:
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=wash_sale (%s)",
