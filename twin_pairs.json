@@ -1,0 +1,75 @@
+{
+  "_comment": "GOAL-3 / renquant-orchestrator#623 R1. Which copy of each DOCUMENTED Task symbol executes, and the digest of both sides of every twin pair. Editing one side without the other fails the check --- that is the defect. Regenerate with tools/twin_pairs.py --emit and commit through review.",
+  "pairs": {
+    "ApplyGlobalCalibrationTask": {
+      "kernel_sha256": "a49fd85be9c51549bde1f072f638104dcb7d1929705102e3e65ebe703222e5b6",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "6402d10d85c9ebd66a870007a237afe94ed53f1e7569b5a5e332848529f6816a"
+    },
+    "ApplyScoresTask": {
+      "kernel_sha256": "668118abc488b49cd0f49c70b1326386235e5a5d7d6dc152ba3791be288ea650",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "f520e3aa565ff685a2be954a06fcb7f11ec91e584a28f00cccaefd4bc277e7ff"
+    },
+    "BuildFeatureMatrixTask": {
+      "kernel_sha256": "87bea000d2aa623385529d2160556e1486af9fd89f14e9d06a1527ee97a8b79f",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "c3744af93751dfef8fc57ed3d62c259b88b38a1ab81f35c780cbc6d10c8c6a85"
+    },
+    "EmitAttributedOrderIntentsTask": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "ad32195c7163a08790b100ff7326ffca999b1f8b939689a8dd41c9c236293e5b"
+    },
+    "LoadScorerTask": {
+      "kernel_sha256": "869272ff155c256fd9c55b38281e8a8d0025d11855f666ddf2495c6e76263908",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "18f9277a6cec414ea97df11cd13595f72fc9b596a7737729f0ec2bd10cf0fb06"
+    },
+    "RegimeModelAdmissionTask": {
+      "kernel_sha256": "da9714a0cd4e179ab54a472edf2641728f216203c8d8d6225556bec58778644e",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2"
+    },
+    "SelectAcceptedCandidatesTask": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/selection.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.selection",
+      "public_sha256": "f77b3a598eb86a75bbdd8f34d6f4f17cb4afa90bd6c376a3c1a5cd3786be2e9a"
+    },
+    "ValidateSelectionDoesNotPromoteTask": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/selection.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.selection",
+      "public_sha256": "9725ed72b5509fec14a770750dd8eb57d9b16332fd76feff9374f000ef39e3c6"
+    },
+    "VetoWeakBuysTask": {
+      "kernel_sha256": "64680d3a16197140f5c882a0d9258f9f3829a97275c56f780adb6ee9c49477e7",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "e110fad0d72173a95f896c1899f8b664db0474a783a8dd303e71f9f1103f88dc"
+    }
+  },
+  "schema_version": 1
+}
