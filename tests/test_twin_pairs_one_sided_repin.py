@@ -106,3 +106,77 @@ def test_the_cli_exits_0_when_the_baseline_is_the_committed_file(tmp_path, capsy
     clean, or the exit-1 test above proves nothing."""
     assert tp.main(["--diff-against", str(PINS), "--pins", str(PINS)]) == 0
     assert "no one-sided re-pins" in capsys.readouterr().out
+
+
+# --- codex BLOCKER on #232: the contract said "state a reason", CI gave no way to --
+# The first version described a one-sided re-pin as legitimate when justified, then
+# always exited 1. That is an unconditional prohibition wearing a contract's clothes:
+# it would either block real kernel-only work or push an author to touch an unrelated
+# twin purely to appease CI. An exception now suppresses the finding -- but only when
+# bound to the pair AND both exact digest tuples, so it cannot be pre-written, cannot
+# be reused, and expires the moment either side moves again.
+
+def _exc(pair="VetoWeakBuysTask", op="aaa", ok="111", np_="aaa", nk="222",
+         reason="kernel-only private helper; public behaviour unchanged"):
+    return {"pair": pair, "old_public_sha256": op, "old_kernel_sha256": ok,
+            "new_public_sha256": np_, "new_kernel_sha256": nk, "reason": reason}
+
+
+def test_an_exact_matching_exception_suppresses_the_finding():
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"),
+                              exceptions=[_exc()])
+    assert got == [], got
+
+
+def test_an_exception_for_a_DIFFERENT_new_digest_does_not_suppress():
+    """The change moved on. A justification written for one revision must not carry
+    over to the next one, or it becomes a standing licence."""
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "333"),
+                              exceptions=[_exc(nk="222")])
+    assert len(got) == 2, got            # unjustified re-pin + the now-stale exception
+    assert any("KERNEL-only" in g for g in got)
+    assert any("STALE exception" in g for g in got)
+
+
+def test_an_exception_for_a_DIFFERENT_old_digest_does_not_suppress():
+    got = tp.one_sided_repins(_pins("aaa", "999"), _pins("aaa", "222"),
+                              exceptions=[_exc(ok="111")])
+    assert any("KERNEL-only" in g for g in got)
+
+
+def test_an_exception_for_another_pair_does_not_suppress():
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"),
+                              exceptions=[_exc(pair="SomethingElseTask")])
+    assert any("KERNEL-only" in g for g in got)
+
+
+def test_an_exception_with_an_empty_reason_is_rejected():
+    """A justification with no justification is a rubber stamp."""
+    for blank in ("", "   ", None):
+        got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"),
+                                  exceptions=[_exc(reason=blank)])
+        assert any("states no reason" in g for g in got), (blank, got)
+
+
+def test_a_leftover_exception_is_reported_as_STALE():
+    """It matches nothing in this diff, so it is silently pre-authorising the NEXT
+    one-sided change. That is the failure mode an allowlist always has."""
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "111"),
+                              exceptions=[_exc()])
+    assert len(got) == 1 and "STALE exception" in got[0]
+
+
+def test_the_committed_exception_file_is_empty_and_well_formed():
+    """Shipping the mechanism with a pre-populated allowlist would defeat it."""
+    data = json.loads((REPO / "twin_repin_exceptions.json").read_text())
+    assert data["exceptions"] == []
+    assert data["schema_version"] == 1
+
+
+def test_an_unreadable_exception_file_is_FATAL_not_no_exceptions(tmp_path, capsys, monkeypatch):
+    bad = tmp_path / "exc.json"
+    bad.write_text("{not json")
+    monkeypatch.setattr(tp, "EXCEPTIONS", bad)
+    rc = tp.main(["--diff-against", str(PINS), "--pins", str(PINS)])
+    assert rc == 2
+    assert "must not read as" in capsys.readouterr().err

@@ -36,6 +36,10 @@ jobs:
         working-directory: renquant-pipeline
         run: make test
 
+      # A one-sided re-pin is not forbidden -- it is justifiable via a committed
+      # entry in twin_repin_exceptions.json bound to both exact digest tuples. This
+      # step fails only when the divergence is UNJUSTIFIED, or when a stale exception
+      # is still lying around pre-authorising the next one.
       # A pin update that moves BOTH digests of a twin pair is a normal change.
       # One that moves only one BLESSES a divergence, and `make test`'s verify()
       # cannot see it -- the file and its pin moved together, so verify() is clean.
