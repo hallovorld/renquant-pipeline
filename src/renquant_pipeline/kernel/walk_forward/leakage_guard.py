@@ -19,6 +19,46 @@ from typing import Any
 import pandas as pd
 
 
+#: Calendar-day allowance for market holidays, per 20 trading days. Fitted to
+#: one sample only (see the docstring below) — module-private for that
+#: reason. See the derivation at the call site in ``assert_no_leakage``.
+_HOLIDAY_ALLOWANCE_DAYS_PER_20_TDAYS_MEASURED_2016_2026 = 4
+
+
+def _measured_trading_day_calendar_bound(tdays: int) -> int:
+    """A calendar-day bound on ``tdays`` trading days, MEASURED — not a
+    proven general guarantee.
+
+    2026-07-30 review (renquant-pipeline#229): this allowance was fitted to
+    one sample, SPY's actual trading dates 2016-01-04 -> 2026-07-29 (2,597
+    cutoffs), and the function takes no exchange-calendar, instrument, or
+    validity-window argument. Nothing here establishes that the bound stays
+    conservative for a future holiday cluster, a non-US corpus, or any
+    calendar outside that measured window — so this is kept module-private
+    (leading underscore, not re-exported) rather than presented as a
+    ready-to-use correctness primitive. Wiring a real fix requires the
+    actual label-end timestamp or a versioned trading-calendar input tied to
+    the corpus (tracked in #228); until then, treat this as a research
+    measurement consumed only by this module's own tests.
+
+    Within the measured 2016-2026 US-equity sample: never under-counts —
+    the returned span reaches at least the ``tdays``-th trading day.
+    Over-counting is acceptable here and under-counting is not, because this
+    bounds how far a training label could have seen.
+
+    ``ceil(tdays * 7 / 5)`` alone is NOT sufficient -- for 60 it equals 84,
+    which is exactly ``BDay(60)``, the form this replaces. The holiday
+    allowance is the correction, scoped as above.
+    """
+    if tdays <= 0:
+        return 0
+    weeks_span = -(-tdays * 7 // 5)          # ceil, no float
+    holidays = -(
+        -tdays * _HOLIDAY_ALLOWANCE_DAYS_PER_20_TDAYS_MEASURED_2016_2026 // 20
+    )
+    return weeks_span + holidays
+
+
 def _to_timestamp(value: Any, *, label: str) -> pd.Timestamp:
     """Coerce date / datetime / str / Timestamp to pd.Timestamp.
 
@@ -90,9 +130,34 @@ def assert_no_leakage(
         raise ValueError(
             f"lookahead_days must be ≥ 0, got {lookahead_days}"
         )
-    # 2026-05-11 G1: when lookahead_days > 0, training labels reach
-    # `trained + lookahead_days` (calendar days, conservative upper bound).
-    # E.g. fwd_60d_excess at cutoff 2024-01-01 saw prices through ~2024-03-01.
+    # 2026-07-30 (renquant-pipeline#228): THIS LINE IS KNOWN-SHORT and is
+    # deliberately NOT yet corrected. `BDay` counts business days and does not
+    # skip market holidays, so for a TRADING-day label such as fwd_60d_excess
+    # it lands short of the real horizon. Measured on SPY's actual trading
+    # dates 2016-01-04 -> 2026-07-29 (2,597 cutoffs): `BDay(60)` falls before
+    # the true 60th trading day on 99.8% of cutoffs, short by mean +3.17 /
+    # median +3 / max +10 calendar days = mean 2.23 / median 2 / max 6 TRADING
+    # days. `_measured_trading_day_calendar_bound` above measures a
+    # correction for that specific sample. It is module-private and NOT a
+    # validated general replacement (2026-07-30 review, #229): it has no
+    # exchange-calendar / instrument / validity-window input, so it is not
+    # established to stay conservative outside the measured 2016-2026
+    # US-equity sample -- a real fix needs the actual label-end timestamp or
+    # a versioned trading-calendar input tied to the corpus (#228).
+    #
+    # It is not wired in here because switching it CHANGES WHICH FOLD THE
+    # WALK-FORWARD SELECTION PICKS -- and therefore which model is promoted.
+    # Verified: tests/test_wf_fold_selection_parity.py
+    # ::test_newest_fold_inside_embargo_window_older_wins fails under the
+    # corrected bound, correctly detecting that fold selection moved. That is a
+    # production behaviour change with a power cost (over-purging removes
+    # rows), so #228's acceptance criteria require an A/B rather than a silent
+    # tightening. Landing the measurement without the switch keeps this PR
+    # behaviour-identical and leaves the change auditable.
+    #
+    # A trap for whoever does wire it: `BDay(60)` spans exactly 12 weeks = 84
+    # calendar days and `ceil(60 * 7/5)` is also 84, so merely switching the
+    # UNIT to calendar days changes nothing. Holidays are the whole defect.
     if lookahead_days > 0:
         last_label_seen = trained + pd.tseries.offsets.BDay(int(lookahead_days))
     else:
