@@ -77,9 +77,50 @@ class ModelStalenessTask(PreflightTask):
                 meta = json.loads(path.read_text(encoding="utf-8"))
                 source_name = path.name
             else:
+                # 2026-07-30: an UNRECOGNISED kind is ALWAYS a non-pass.
+                #
+                # The 06-27 note above fixed this once — for xgb — by ADDING a kind
+                # to the allow-list. Enumerating leaves the default fail-OPEN, and
+                # the same shape recurred: measured 2026-07-30, the live shadow-BLEND
+                # lane runs `kind='blend'` and its staleness check was skipped
+                # entirely while it issued buy recommendations. `patchtst` (without
+                # the `hf_` prefix) and an absent kind (`None`) are also present in
+                # committed strategy configs and took the same branch.
+                #
+                # My first fix measured the dates best-effort and PASSED when they
+                # were fresh. Review rejected that (#233) and is right: freshness
+                # being measurable does not establish that an unrecognised artifact
+                # carries the schema or training provenance this rail requires.
+                # Passing on fresh dates SILENTLY CERTIFIES A NEW MODEL KIND, which
+                # is exactly the extension work that has to stay visible.
+                #
+                # So: never a pass. But the measured freshness is REPORTED in the
+                # message, because discarding it would make the finding
+                # unactionable — the reader needs to know whether registering this
+                # kind is routine or urgent. This check is SOFT, so a non-pass
+                # surfaces without blocking the run.
+                measured = "dates unreadable"
+                try:
+                    import json  # noqa: PLC0415
+                    probe = json.loads(path.read_text(encoding="utf-8"))
+                    t = _parse_date(probe.get("trained_date"))
+                    c = _parse_date(probe.get("effective_train_cutoff_date"))
+                    today = ctx.as_of if getattr(ctx, "as_of", None) else dt.date.today()
+                    parts = []
+                    parts.append(f"trained_date={t.isoformat()} "
+                                 f"(age {(today - t).days}d)" if t else
+                                 "trained_date absent")
+                    parts.append(f"cutoff={c.isoformat()} (age {(today - c).days}d)"
+                                 if c else "effective_train_cutoff_date absent")
+                    measured = "; ".join(parts)
+                except Exception as exc:  # noqa: BLE001
+                    measured = f"artifact unreadable: {exc}"
                 return PreflightCheck(
-                    self.check_name, "soft", True,
-                    f"kind={kind!r} unrecognized — staleness skip")
+                    self.check_name, "soft", False,
+                    f"kind={kind!r} is not a registered scoring kind — this rail "
+                    f"cannot establish its schema or training provenance, so it is "
+                    f"NOT a staleness pass however fresh it looks. Measured anyway: "
+                    f"{measured}. Register the kind to make this actionable.")
         except Exception as exc:  # noqa: BLE001
             return PreflightCheck(
                 self.check_name, "soft", False,
