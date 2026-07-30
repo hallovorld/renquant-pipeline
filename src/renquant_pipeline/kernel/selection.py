@@ -108,48 +108,64 @@ def wash_sale_npv_cost(
     return deferred_savings_now * nav_factor
 
 
-# renquant-pipeline#223. cost_npv = loss * tax_rate * (1 - (1+r)^-h); with the
-# defaults below that is loss * 0.30 * (1 - 1.05**-2) ~= loss * 0.0279, so $1.00
-# of NPV is a realized loss of about $35.85. Buy-side call sites opt in; the
-# parking sleeve deliberately does NOT (its foregone return is ~risk-free, so an
-# unconditional block there is closer to defensible).
-WASH_SALE_MIN_MATERIAL_NPV = 1.0
+# renquant-pipeline#223 / codex round 3: THE PIPELINE DOES NOT OWN THIS POLICY.
+#
+# An earlier revision of this file defaulted the floor to $1.00 when the config
+# key was absent. That silently changed the behaviour of every existing strategy
+# configuration, and it put a policy number in the repo that only CONSUMES
+# policy. Under the operating model, thresholds live in renquant-strategy and
+# this repo reads them.
+#
+# So an ABSENT key means LEGACY: floor 0.0, i.e. block on any realized loss,
+# byte-identical to pre-#223 behaviour. The $1.00 policy is declared in the
+# strategy-owned config surface and reaches here through the pin, which makes the
+# rollout auditable and reversible instead of an implicit pipeline change.
+#
+# For the reader: cost_npv = loss * tax_rate * (1 - (1+r)^-h); with this
+# function's defaults that is loss * 0.30 * (1 - 1.05**-2) ~= loss * 0.0279, so
+# $1.00 of NPV corresponds to a realized loss of about $35.85. That arithmetic
+# explains what a dollar of floor MEANS; it does not decide the dollar figure,
+# which is a policy judgement and therefore not made here.
+WASH_SALE_MIN_MATERIAL_NPV_LEGACY = 0.0
 
 #: Config key for the materiality floor (flat top-level, matching this repo's
-#: existing `wash_sale_days` convention).
+#: existing `wash_sale_days` convention). Declared in the strategy config.
 WASH_SALE_MIN_MATERIAL_NPV_KEY = "wash_sale_min_material_npv"
 
 
 def resolve_wash_sale_min_material_npv(config: "dict | None") -> float:
     """The configured materiality floor, in dollars of NPV cost.
 
-    Exists because reading the key with a bare ``float(cfg.get(...))`` is
-    unsafe on a config file two ways, both of which this function closes:
+    An absent or unusable key yields ``WASH_SALE_MIN_MATERIAL_NPV_LEGACY``
+    (``0.0``) — the pre-#223 behaviour of blocking on any realized loss. This
+    repo never substitutes a policy value of its own.
+
+    Reading the key with a bare ``float(cfg.get(...))`` is unsafe two ways, and
+    both are closed here:
 
     * a NON-NUMERIC value (a typo, a quoted unit like ``"1.00 USD"``) makes
       ``float()`` RAISE inside a live pipeline task;
     * a NEGATIVE or ``NaN`` value passes ``float()`` silently and then
       **disables the wash-sale rule**: the materiality test is
       ``cost_npv >= floor``, and every comparison against ``NaN`` is False, so
-      no realized loss is ever material and nothing is ever blocked. A config
-      typo must not be able to switch off a tax gate silently.
+      no realized loss would ever be material and nothing would ever be blocked.
+      A config typo must not be able to switch off a tax gate silently.
 
-    Both fall back to ``WASH_SALE_MIN_MATERIAL_NPV`` — treated as UNSET, never
-    as ``0.0`` and never as "no floor". An absent key yields the same default,
-    and an explicit ``0.0`` is honoured as a deliberate opt-out restoring
-    pre-#223 behaviour.
+    Both failure modes fall back to LEGACY, which is the safe direction: the
+    fallback blocks more, never less. An explicit ``0.0`` is indistinguishable
+    from unset by design — both mean "no floor", i.e. legacy behaviour.
     """
     if not config:
-        return WASH_SALE_MIN_MATERIAL_NPV
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     raw = config.get(WASH_SALE_MIN_MATERIAL_NPV_KEY, None)
     if raw is None or isinstance(raw, bool):
-        return WASH_SALE_MIN_MATERIAL_NPV
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     try:
         val = float(raw)
     except (TypeError, ValueError):
-        return WASH_SALE_MIN_MATERIAL_NPV
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     if not math.isfinite(val) or val < 0.0:
-        return WASH_SALE_MIN_MATERIAL_NPV
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     return val
 
 

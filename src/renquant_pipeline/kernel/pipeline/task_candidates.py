@@ -70,7 +70,7 @@ class WashSaleFilterTask(Task):
       wash_sale_hold_years : float — expected hold of replacement (2.0)
       wash_sale_min_material_npv : float — NPV cost floor below which a loss
                              sale does not block a buy (pipeline#223). Absent
-                             ⇒ WASH_SALE_MIN_MATERIAL_NPV (kernel.selection),
+                             ⇒ WASH_SALE_MIN_MATERIAL_NPV_LEGACY (kernel.selection),
                              the same default the other two buy-admission call
                              sites (task_joint_actions.py, task_rotation.py)
                              use when unconfigured.

@@ -22,19 +22,26 @@ import datetime
 import pytest
 
 from renquant_pipeline.kernel.selection import (
-    WASH_SALE_MIN_MATERIAL_NPV,
+    WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
     is_wash_sale_blocked_with_cost,
     wash_sale_npv_cost,
 )
 
 TODAY = datetime.date(2026, 7, 30)
-RECENT = {"AAA": datetime.date(2026, 7, 20)}          # 10d ago, inside 30d
+RECENT = {"AAA": datetime.date(2026, 7, 20)}
+
+# The strategy-owned policy value, as it will appear in the strategy-104 config.
+# Task-level tests that intend "the floor is ACTIVE" must say so explicitly:
+# under the codex-round-3 contract an ABSENT key means LEGACY (block on any
+# loss), and the pipeline never substitutes a policy number of its own.
+POLICY_CFG = {"wash_sale_days": 30, "wash_sale_min_material_npv": 1.0}
+LEGACY_CFG = {"wash_sale_days": 30}          # 10d ago, inside 30d
 
 
 def _call(loss: float, **kw):
     """Buy-path semantics: the floor is opt-in, so the tests pass it explicitly,
     exactly as task_joint_actions.py and task_rotation.py now do."""
-    kw.setdefault("min_material_npv_cost", WASH_SALE_MIN_MATERIAL_NPV)
+    kw.setdefault("min_material_npv_cost", 1.0)  # strategy-owned policy value
     return is_wash_sale_blocked_with_cost(
         "AAA", TODAY, RECENT, {"AAA": loss}, 30, **kw)
 
@@ -131,12 +138,12 @@ from types import SimpleNamespace  # noqa: E402
 def test_candidate_filter_task_defaults_to_the_same_floor_as_the_other_two_paths():
     """task_candidates.py::WashSaleFilterTask is the LIVE per-ticker admission
     gate. Without any config override it must use the same
-    WASH_SALE_MIN_MATERIAL_NPV default as task_joint_actions.py /
+    WASH_SALE_MIN_MATERIAL_NPV_LEGACY default as task_joint_actions.py /
     task_rotation.py, or the fix does not reach the path that matters."""
     from renquant_pipeline.kernel.pipeline.task_candidates import WashSaleFilterTask
 
     tc = SimpleNamespace(
-        ticker="AAA", today=TODAY, config={"wash_sale_days": 30},
+        ticker="AAA", today=TODAY, config=POLICY_CFG,
         last_sell_dates=dict(RECENT), last_sell_pls={"AAA": -1.43},
         blocked_by=None,
     )
@@ -145,7 +152,7 @@ def test_candidate_filter_task_defaults_to_the_same_floor_as_the_other_two_paths
 
 
 def test_candidate_filter_task_still_blocks_a_material_loss_by_default():
-    tc = _candidate_tc(loss=-5000.0, cfg={"wash_sale_days": 30})
+    tc = _candidate_tc(loss=-5000.0, cfg=POLICY_CFG)
     from renquant_pipeline.kernel.pipeline.task_candidates import WashSaleFilterTask
     assert WashSaleFilterTask().run(tc) is False
     assert str(tc.blocked_by).startswith("wash_sale")
@@ -206,7 +213,7 @@ def test_validate_pairs_task_honors_a_configured_floor():
         return ctx.rotations
 
     # Default floor (unconfigured): trivial loss survives the wash-sale guard.
-    assert [p.buy_ticker for p in _run({"wash_sale_days": 30})] == ["AAA"]
+    assert [p.buy_ticker for p in _run(POLICY_CFG)] == ["AAA"]
 
     # Configured floor of 0.0 restores the unconditional block.
     assert _run({"wash_sale_days": 30, "wash_sale_min_material_npv": 0.0}) == []
@@ -253,15 +260,20 @@ def test_joint_action_task_honors_a_configured_floor():
         JointActionTask().run(ctx)
         return ctx
 
-    # Default floor (unconfigured): trivial loss does not block the buy.
+    # Unconfigured (codex round 3): legacy floor 0.0, trivial loss still blocks.
     ctx = _run(_cfg())
-    assert ctx.counters.get("joint_blocked_wash", 0) == 0
-    assert any(o["ticker"] == "AAA" for o in ctx.orders)
+    assert ctx.counters.get("joint_blocked_wash", 0) == 1
+    assert not any(o["ticker"] == "AAA" for o in ctx.orders)
 
-    # Configured floor of 0.0 restores the unconditional block.
+    # Configured floor of 0.0 is indistinguishable from unset by design.
     ctx = _run(_cfg(wash_sale_min_material_npv=0.0))
     assert ctx.counters.get("joint_blocked_wash", 0) == 1
     assert not any(o["ticker"] == "AAA" for o in ctx.orders)
+
+    # Configured strategy-owned policy value (1.0) re-admits a trivial loss.
+    ctx = _run(_cfg(wash_sale_min_material_npv=1.0))
+    assert ctx.counters.get("joint_blocked_wash", 0) == 0
+    assert any(o["ticker"] == "AAA" for o in ctx.orders)
 
 
 # --- the resolver must not let a config typo break the tax gate -------------
@@ -281,23 +293,23 @@ def test_joint_action_task_honors_a_configured_floor():
 
 def test_a_nonnumeric_value_does_not_raise_and_falls_back():
     from renquant_pipeline.kernel.selection import (
-        WASH_SALE_MIN_MATERIAL_NPV,
+        WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
         resolve_wash_sale_min_material_npv,
     )
     for bad in ("", "abc", "1.00 USD", [], {}, object()):
         assert resolve_wash_sale_min_material_npv(
-            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV, bad
+            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV_LEGACY, bad
 
 
 def test_nan_and_negative_cannot_disable_the_rule():
     """The dangerous case: NaN would make `cost >= floor` always False."""
     from renquant_pipeline.kernel.selection import (
-        WASH_SALE_MIN_MATERIAL_NPV,
+        WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
         resolve_wash_sale_min_material_npv,
     )
     for bad in (float("nan"), float("inf"), float("-inf"), -1.0, -0.01):
         assert resolve_wash_sale_min_material_npv(
-            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV, bad
+            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV_LEGACY, bad
 
 
 def test_an_infinite_floor_would_disable_1091_entirely():
@@ -323,11 +335,11 @@ def test_an_infinite_floor_would_disable_1091_entirely():
 
     # and the resolver never hands `inf` through
     from renquant_pipeline.kernel.selection import (
-        WASH_SALE_MIN_MATERIAL_NPV,
+        WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
         resolve_wash_sale_min_material_npv,
     )
     assert resolve_wash_sale_min_material_npv(
-        {"wash_sale_min_material_npv": float("inf")}) == WASH_SALE_MIN_MATERIAL_NPV
+        {"wash_sale_min_material_npv": float("inf")}) == WASH_SALE_MIN_MATERIAL_NPV_LEGACY
 
 
 def test_nan_and_negative_are_fail_safe_but_still_rejected():
@@ -347,11 +359,11 @@ def test_nan_and_negative_are_fail_safe_but_still_rejected():
 
 def test_absent_and_explicit_zero_are_distinguished():
     from renquant_pipeline.kernel.selection import (
-        WASH_SALE_MIN_MATERIAL_NPV,
+        WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
         resolve_wash_sale_min_material_npv,
     )
-    assert resolve_wash_sale_min_material_npv({}) == WASH_SALE_MIN_MATERIAL_NPV
-    assert resolve_wash_sale_min_material_npv(None) == WASH_SALE_MIN_MATERIAL_NPV
+    assert resolve_wash_sale_min_material_npv({}) == WASH_SALE_MIN_MATERIAL_NPV_LEGACY
+    assert resolve_wash_sale_min_material_npv(None) == WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     # explicit 0.0 is a deliberate opt-out and IS honoured
     assert resolve_wash_sale_min_material_npv(
         {"wash_sale_min_material_npv": 0.0}) == 0.0
@@ -363,3 +375,56 @@ def test_a_configured_value_is_honored():
         {"wash_sale_min_material_npv": 25.0}) == 25.0
     assert resolve_wash_sale_min_material_npv(
         {"wash_sale_min_material_npv": "25.0"}) == 25.0   # numeric string OK
+
+
+# --- codex round 3: the pipeline must not substitute a policy value ----------
+
+def test_absent_config_key_preserves_LEGACY_blocking():
+    """An absent key must mean pre-#223 behaviour, not a pipeline-chosen 1.00.
+    An earlier revision defaulted to 1.00 and would have silently changed every
+    existing strategy configuration."""
+    from renquant_pipeline.kernel.selection import (
+        WASH_SALE_MIN_MATERIAL_NPV_LEGACY,
+        resolve_wash_sale_min_material_npv,
+    )
+    assert WASH_SALE_MIN_MATERIAL_NPV_LEGACY == 0.0
+    for cfg in (None, {}, LEGACY_CFG):
+        assert resolve_wash_sale_min_material_npv(cfg) == 0.0
+    # and end-to-end: a trivial loss still blocks with no policy key present
+    assert is_wash_sale_blocked_with_cost(
+        "AAA", TODAY, RECENT, {"AAA": -1.43}, 30,
+        min_material_npv_cost=resolve_wash_sale_min_material_npv({}))[0] is True
+
+
+def test_an_explicit_policy_key_readmits_sub_floor_losses():
+    from renquant_pipeline.kernel.selection import resolve_wash_sale_min_material_npv
+    floor = resolve_wash_sale_min_material_npv({"wash_sale_min_material_npv": 1.0})
+    assert floor == 1.0
+    assert is_wash_sale_blocked_with_cost(
+        "AAA", TODAY, RECENT, {"AAA": -1.43}, 30,
+        min_material_npv_cost=floor)[0] is False
+
+
+def test_an_unusable_policy_value_falls_back_to_BLOCKING_not_to_open():
+    """The fallback direction must be the safe one: a typo blocks more, never
+    less. A NaN would otherwise disable the gate entirely, since every
+    comparison against NaN is False."""
+    from renquant_pipeline.kernel.selection import resolve_wash_sale_min_material_npv
+    for bad in ("1.00 USD", "", "abc", -1.0, float("nan"), float("inf"), True, None):
+        assert resolve_wash_sale_min_material_npv(
+            {"wash_sale_min_material_npv": bad}) == 0.0, bad
+
+
+def test_task_level_absent_policy_key_still_BLOCKS(monkeypatch):
+    """The legacy direction at TASK level, not just at function level. An earlier
+    revision defaulted the task floor to 1.00, which would have re-admitted
+    sub-floor losses on every existing strategy config without a review."""
+    from types import SimpleNamespace
+
+    from renquant_pipeline.kernel.pipeline.task_candidates import WashSaleFilterTask
+    tc = SimpleNamespace(
+        ticker="AAA", today=TODAY, config=LEGACY_CFG,
+        last_sell_dates=dict(RECENT), last_sell_pls={"AAA": -1.43},
+        blocked_by=None)
+    assert WashSaleFilterTask().run(tc) is False, (
+        "with no policy key the trivial-NPV loss must still block (legacy)")

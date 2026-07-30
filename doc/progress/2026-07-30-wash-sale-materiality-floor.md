@@ -80,3 +80,49 @@ Also fixed a docstring that contradicted the code: it said unknown P/L was
 
 20 tests. Full-suite differential vs `origin/main`: failing-test sets
 byte-identical, zero regressions.
+
+## Round-4 (claude, 2026-07-30) — the pipeline stops choosing the policy number
+
+Codex's 4th review: an absent `wash_sale_min_material_npv` key still resolved
+to a pipeline-picked `1.0`, so merging this PR would have silently changed
+behaviour for every existing strategy config that has not declared the key —
+verified against `renquant-strategy-104/configs/strategy_config*.json`, none
+of which declare it.
+
+Fix: renamed `WASH_SALE_MIN_MATERIAL_NPV` (`1.0`) to
+`WASH_SALE_MIN_MATERIAL_NPV_LEGACY = 0.0`. `resolve_wash_sale_min_material_npv`
+now falls back to `LEGACY` (block on any realized loss, byte-identical to
+pre-#223) on an absent key, a non-numeric value, or a NaN/negative value — the
+pipeline never substitutes its own materiality judgement. Updated all 3 call
+sites' comments/docstrings accordingly and added 4 tests proving: an absent
+key still blocks a trivial loss end-to-end, including at
+`WashSaleFilterTask` (task level, not just the resolver); an explicit
+`wash_sale_min_material_npv: 1.0` re-admits it; an unusable value falls back
+to blocking, never to open. Also corrected
+`test_joint_action_task_honors_a_configured_floor`, which still asserted the
+old "unconfigured releases a trivial loss" behaviour — it now asserts the
+LEGACY default blocks, with a third case proving the explicit `1.0` policy
+value releases.
+
+The `1.0` policy value itself is not deleted, only relocated: turning the
+floor on for real is a follow-up PR that declares
+`wash_sale_min_material_npv: 1.0` in the strategy-owned config surface
+(`renquant-strategy-104`) with its own pin/release, so the rollout is
+auditable and reversible rather than an implicit pipeline default. Not done
+in this PR.
+
+EVIDENCE:  artifact: `tests/test_wash_sale_materiality_floor.py` (24 tests,
++4 over round-3).
+           prod or exp: kernel correctness fix; no IC/Sharpe/APY claim.
+           existing data: `PYTHONPATH=<renquant-common>/src <RenQuant>/.venv/bin/python3
+-m pytest tests/ --tb=no -q` — `origin/main` = 1 failed / 2124 passed / 7
+skipped; this branch = 1 failed / 2148 passed / 7 skipped. Same single
+pre-existing failure (`test_xgboost_scorer_contract.py`, unrelated to this
+change) on both; net +24 passed matches the 24 tests in the new file exactly
+— zero regressions. (Earlier rounds' "50 failed" figure in this doc/PR was
+measured against bare system `python3` missing sibling-repo packages on
+`PYTHONPATH`, not this repo's actual test health; the venv comparison above
+is the accurate one.)
+           best-known?: n/a — bug fix, no variant comparison.
+           scope: "correctness/rollout-safety fix for the materiality-floor
+default, not a model/data performance claim."

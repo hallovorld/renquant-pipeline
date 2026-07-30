@@ -679,7 +679,7 @@ class ValidatePairsTask(Task):
                 # $0.04-$13.62 of NPV across 8 names while $6,868 sat unused.
                 # Opt in HERE, not globally — the parking sleeve must not.
                 # Configurable (pipeline#227 review); unconfigured falls back
-                # to the same WASH_SALE_MIN_MATERIAL_NPV default as before.
+                # to the same WASH_SALE_MIN_MATERIAL_NPV_LEGACY default as before.
                 min_material_npv_cost=rotation_min_material_npv,
             )
             if blocked:
