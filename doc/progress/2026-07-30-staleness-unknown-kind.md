@@ -52,13 +52,25 @@ blocker. A soft finding on an unregistered kind *is* the signal.
 
 ## 4. Suite
 
-`tests/test_staleness_unknown_kind.py` — 11 tests. Five unknown kinds (`blend`,
-`patchtst`, `ensemble`, `""`, `None`) must fail without dates; an unknown kind
-**with** valid dates must still **pass** (or the fix is a blanket refusal); an
-unknown kind with an **old** date must still **alarm** (anti-vacuity — measuring has
-to be able to fail, or the best-effort read is the old skip in new wording); an
-unreadable artifact fails; the two recognised kinds are unchanged; and
-`panel_scoring.enabled = false` still skips, which is the one legitimate skip.
+`tests/test_staleness_unknown_kind.py` — 11 tests, matching the CORRECTED contract
+in §3. This section described the superseded one until review caught it (#233,
+third pass); the document contradicted itself on the exact safety rule the PR
+changes, which is the same defect as a PR body that outlives its corrections.
+
+- five unknown kinds (`blend`, `patchtst`, `ensemble`, `""`, `None`) do **not**
+  pass when the artifact carries no dates;
+- an unknown kind **with fresh, valid dates still does NOT pass** — and the
+  measurement must survive into the message. ~~must still pass (or the fix is a
+  blanket refusal)~~ was the old rule and is wrong: freshness does not establish
+  schema or training provenance, so passing on it silently certifies a new kind;
+- **anti-vacuity, restated for the new contract**: non-passing is now
+  unconditional, so the only thing that makes the finding actionable is that
+  **fresh and stale print DIFFERENT text**. If they printed the same, the reported
+  measurement would be decorative. ~~measuring has to be able to fail~~ no longer
+  discriminates anything, since it always does;
+- an unreadable artifact does not pass;
+- the two **recognised** kinds are unchanged;
+- `panel_scoring.enabled = false` still skips — the one legitimate skip.
 
 ## 5. Two of my own errors, in the tests not the fix
 
