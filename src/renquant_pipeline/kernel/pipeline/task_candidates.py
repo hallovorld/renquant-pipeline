@@ -49,8 +49,10 @@ class WashSaleFilterTask(Task):
     This task runs at the per-ticker pre-screen stage where μ̂ isn't
     available yet, so:
       - GAIN sales pass (no cost)
-      - LOSS sales WITHIN window are still blocked here (conservative;
-        the post-NGB economic gate can re-admit them by passing μ̂)
+      - LOSS sales WITHIN window are blocked unless their NPV cost is below
+        the materiality floor (pipeline#223/#227: no downstream call site
+        ever passes μ̂, so this is the ONLY re-admission a loss sale gets —
+        "the post-NGB economic gate can re-admit them" does not happen)
       - sales OUTSIDE window pass (rule doesn't apply)
 
     Config:
@@ -66,6 +68,12 @@ class WashSaleFilterTask(Task):
       wash_sale_tax_rate   : float — combined federal+state rate (0.30)
       wash_sale_discount_rate : float — for NPV (0.05)
       wash_sale_hold_years : float — expected hold of replacement (2.0)
+      wash_sale_min_material_npv : float — NPV cost floor below which a loss
+                             sale does not block a buy (pipeline#223). Absent
+                             ⇒ WASH_SALE_MIN_MATERIAL_NPV_LEGACY (kernel.selection),
+                             the same default the other two buy-admission call
+                             sites (task_joint_actions.py, task_rotation.py)
+                             use when unconfigured.
     """
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
@@ -73,11 +81,15 @@ class WashSaleFilterTask(Task):
             resolve_asset_class,
             resolve_validated_crypto_spot_pairs,
         )
-        from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+        from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+            is_wash_sale_blocked_with_cost,
+            resolve_wash_sale_min_material_npv,
+        )
         wash_days = int(tc.config.get("wash_sale_days", 0))
         tax_rate = float(tc.config.get("wash_sale_tax_rate", 0.30))
         disc = float(tc.config.get("wash_sale_discount_rate", 0.05))
         hold_yrs = float(tc.config.get("wash_sale_hold_years", 2.0))
+        min_material_npv = resolve_wash_sale_min_material_npv(tc.config)
         blocked, reason, cost_npv = is_wash_sale_blocked_with_cost(
             tc.ticker,
             tc.today,
@@ -88,6 +100,11 @@ class WashSaleFilterTask(Task):
             discount_rate=disc,
             estimated_hold_years=hold_yrs,
             expected_dollar_return=None,   # μ̂ not yet known at this stage
+            # pipeline#223/#227: this is the live buy-admission path; a
+            # ticker dropped here never reaches task_joint_actions.py or
+            # task_rotation.py, so it must opt in too or the fix is a no-op
+            # for the path that actually zeroed sessions.
+            min_material_npv_cost=min_material_npv,
             asset_class=resolve_asset_class(tc.config or {}),
             validated_crypto_pairs=resolve_validated_crypto_spot_pairs(tc.config or {}),
         )

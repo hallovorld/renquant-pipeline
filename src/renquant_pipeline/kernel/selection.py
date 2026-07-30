@@ -108,6 +108,88 @@ def wash_sale_npv_cost(
     return deferred_savings_now * nav_factor
 
 
+# renquant-pipeline#223 / codex round 3: THE PIPELINE DOES NOT OWN THIS POLICY.
+#
+# An earlier revision of this file defaulted the floor to $1.00 when the config
+# key was absent. That silently changed the behaviour of every existing strategy
+# configuration, and it put a policy number in the repo that only CONSUMES
+# policy. Under the operating model, thresholds live in renquant-strategy and
+# this repo reads them.
+#
+# So an ABSENT key means LEGACY: floor 0.0, i.e. block on any realized loss,
+# byte-identical to pre-#223 behaviour. The $1.00 policy is declared in the
+# strategy-owned config surface and reaches here through the pin, which makes the
+# rollout auditable and reversible instead of an implicit pipeline change.
+#
+# For the reader: cost_npv = loss * tax_rate * (1 - (1+r)^-h); with this
+# function's defaults that is loss * 0.30 * (1 - 1.05**-2) ~= loss * 0.0279, so
+# $1.00 of NPV corresponds to a realized loss of about $35.85. That arithmetic
+# explains what a dollar of floor MEANS; it does not decide the dollar figure,
+# which is a policy judgement and therefore not made here.
+WASH_SALE_MIN_MATERIAL_NPV_LEGACY = 0.0
+
+#: Config key for the materiality floor (flat top-level, matching this repo's
+#: existing `wash_sale_days` convention). Declared in the strategy config.
+WASH_SALE_MIN_MATERIAL_NPV_KEY = "wash_sale_min_material_npv"
+
+
+def resolve_wash_sale_min_material_npv(config: "dict | None") -> float:
+    """The configured materiality floor, in dollars of NPV cost.
+
+    An absent or unusable key yields ``WASH_SALE_MIN_MATERIAL_NPV_LEGACY``
+    (``0.0``) — the pre-#223 behaviour of blocking on any realized loss. This
+    repo never substitutes a policy value of its own.
+
+    Reading the key with a bare ``float(cfg.get(...))`` is unsafe two ways, and
+    both are closed here:
+
+    * a NON-NUMERIC value (a typo, a quoted unit like ``"1.00 USD"``) makes
+      ``float()`` RAISE inside a live pipeline task;
+    * ``+inf`` passes ``float()`` silently and then **disables the wash-sale
+      rule**: the release test is ``cost_npv < min_material_npv_cost``, and
+      every finite cost is below ``inf``, so every realized loss is classified
+      immaterial and nothing is ever blocked.
+    * a NEGATIVE or ``NaN`` value also passes ``float()`` silently, but is
+      FAIL-SAFE rather than dangerous: ``cost_npv < NaN`` is False and
+      ``cost_npv < negative`` is False, so the block HOLDS and the floor is
+      merely inert. Still rejected here, because a typo should not quietly
+      revert #223 either.
+
+    Measured, not reasoned — on a \\$100,000 realized loss:
+
+    ==============  ==========================  ===================
+    configured      result                      verdict
+    ==============  ==========================  ===================
+    non-numeric     ``float()`` raises          crash
+    ``+inf``        UNBLOCKED                   disables §1091
+    ``NaN``         blocked                     fail-safe, inert
+    negative        blocked                     fail-safe, inert
+    ==============  ==========================  ===================
+
+    (An earlier revision of this docstring named ``NaN`` as the value that
+    disables the rule and cited the test as ``cost_npv >= floor``. Both were
+    wrong — the code reads ``cost_npv < min_material_npv_cost`` — and the
+    committed tests in ``tests/test_wash_sale_materiality_floor.py`` assert the
+    corrected behaviour, so the two contradicted each other until this fix.)
+
+    All failure modes fall back to LEGACY, which is the safe direction: the
+    fallback blocks more, never less. An explicit ``0.0`` is indistinguishable
+    from unset by design — both mean "no floor", i.e. legacy behaviour.
+    """
+    if not config:
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
+    raw = config.get(WASH_SALE_MIN_MATERIAL_NPV_KEY, None)
+    if raw is None or isinstance(raw, bool):
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
+    if not math.isfinite(val) or val < 0.0:
+        return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
+    return val
+
+
 def is_wash_sale_blocked_with_cost(
     ticker: str,
     today: datetime.date,
@@ -120,6 +202,7 @@ def is_wash_sale_blocked_with_cost(
     estimated_hold_years: float = 2.0,
     expected_dollar_return: float | None = None,
     safety_margin: float = 1.5,
+    min_material_npv_cost: float = 0.0,
     asset_class: str = "us_equity",
     validated_crypto_pairs: "frozenset[str] | None" = None,
 ) -> tuple[bool, str, float]:
@@ -132,15 +215,21 @@ def is_wash_sale_blocked_with_cost(
          asset class, never a global disable; the ``us_equity`` default
          keeps the equity path byte-identical.
       1. If sale is outside the 30-day window → no rule applies → not blocked
-      2. If prior sale was a GAIN (or unknown but assume gain in absence
-         of data) → §1091 does not apply → not blocked
+      2. If prior sale was a GAIN → §1091 does not apply → not blocked.
+         If P/L is UNKNOWN → hard block, BEFORE any floor is consulted, so
+         ``min_material_npv_cost`` cannot release it (#223 requirement 2,
+         deliberately NOT implemented here — see the progress doc). An earlier
+         version of this docstring said unknown was "assumed gain → not
+         blocked", which contradicted the ``pl is None`` branch below.
       3. If prior sale was a LOSS:
            cost_npv = wash_sale_npv_cost(loss, tax_rate, ...)
          (a) if expected_dollar_return is known → block if expected_return
              < safety_margin × cost_npv
-         (b) else (no μ̂ at this stage) → soft-block: keep blocking on
-             losses but log the cost so caller can route to a later
-             economic-aware gate
+         (b) else (no μ̂ at this stage) → block on losses whose NPV cost
+             reaches ``min_material_npv_cost``; below that floor the amount
+             cannot justify blocking a buy at all, so it does not
+             (2026-07-30: branch (b) is the ONLY branch production ever
+             reaches, because no live caller passes ``expected_dollar_return``)
 
     Returns: (blocked: bool, reason: str, cost_npv: float)
 
@@ -189,6 +278,45 @@ def is_wash_sale_blocked_with_cost(
         estimated_hold_years=estimated_hold_years,
     )
     if expected_dollar_return is None:
+        # Branch (b) is the ONLY branch that runs in production: measured
+        # 2026-07-30, none of the three live call sites
+        # (task_joint_actions.py, task_rotation.py, the selection path) passes
+        # `expected_dollar_return`, so the cost-vs-return test in branch (a)
+        # never executes. The docstring's promise that "callers that have mu-hat
+        # should pass expected_dollar_return" is fulfilled by no caller.
+        #
+        # Without mu-hat we cannot compare cost against return — but we do not
+        # need a return model to know that a trivial amount cannot justify
+        # blocking a buy. Measured consequence of having no floor here: buys were
+        # zeroed on 3 of 5 sessions to protect $0.04-$13.62 of NPV across 8
+        # names, while $6,868 of cash sat unused.
+        #
+        # The floor is on the DEFERRAL's time value, which is what §1091 actually
+        # costs: a wash sale does not destroy the loss, it adds it to the
+        # replacement lot's basis, so the economic cost is only the delay in
+        # taking the deduction. With the defaults above,
+        #     cost_npv = loss * 0.30 * (1 - 1.05**-2) ~= loss * 0.0279
+        # so a $1.00 floor corresponds to a realized loss of about $35.85.
+        # Anything smaller is immaterial by arithmetic, not by preference.
+        #
+        # The DEFAULT is 0.0, i.e. byte-identical to the previous behaviour, and
+        # callers opt in. That is deliberate: the floor's justification is that
+        # blocking a buy costs the expected return of the position it blocks --
+        # which does not hold on the PARKING SLEEVE, where the foregone return is
+        # ~risk-free, so an unconditional block there is closer to defensible.
+        # My first version defaulted to 1.0 and broke
+        # test_parking_sleeve.py::test_live_wash_sale_blocks_rebuy_after_recent_
+        # loss_sale, which is the suite correctly refusing a global change
+        # justified by evidence from one path only.
+        if cost_npv < min_material_npv_cost:
+            return (
+                False,
+                f"loss sale ${pl:.2f} {days_since}d ago, but NPV cost "
+                f"${cost_npv:.4f} < materiality floor "
+                f"${min_material_npv_cost:.2f} — blocking a buy cannot be "
+                f"justified by this amount without a return model",
+                cost_npv,
+            )
         # Can't run cost-vs-return test at this stage — keep block.
         return (
             True,

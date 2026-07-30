@@ -153,7 +153,7 @@ class JointActionTask(Task):
       ctx.last_sell_dates, ctx.regime, ctx.confidence, ctx.bear_only
       ctx.config["rotation"], ctx.config["regime_params"], ctx.config["tax"],
       ctx.config["sector_map"], ctx.config["max_positions_per_sector"],
-      ctx.config["wash_sale_days"]
+      ctx.config["wash_sale_days"], ctx.config["wash_sale_min_material_npv"]
 
     Writes:
       ctx.orders          — all BUY + ROTATE buy legs
@@ -713,12 +713,22 @@ class JointActionTask(Task):
 
             # Wash-sale check (cost-aware: gain sales pass, loss sales blocked
             # unless caller has μ̂ to compare against NPV cost — see §1091)
-            from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+            from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+                is_wash_sale_blocked_with_cost,
+                resolve_wash_sale_min_material_npv,
+            )
             blocked, _, _ = is_wash_sale_blocked_with_cost(
                 a.cand_ticker, ctx.today, ctx.last_sell_dates,
                 getattr(ctx, "last_sell_pls", None) or {}, wash_days,
                 asset_class=joint_asset_class,
                 validated_crypto_pairs=joint_validated_crypto_pairs,
+                # pipeline#223: buys were zeroed on 3 of 5 sessions to protect
+                # $0.04-$13.62 of NPV across 8 names while $6,868 sat unused.
+                # Opt in HERE, not globally — the parking sleeve must not.
+                # Configurable (pipeline#227 review); unconfigured falls back
+                # to the same WASH_SALE_MIN_MATERIAL_NPV_LEGACY default as before.
+                min_material_npv_cost=resolve_wash_sale_min_material_npv(
+                    ctx.config),
             )
             if blocked:
                 ctx.counters["joint_blocked_wash"] = (
