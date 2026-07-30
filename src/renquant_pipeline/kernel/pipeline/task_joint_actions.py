@@ -714,8 +714,8 @@ class JointActionTask(Task):
             # Wash-sale check (cost-aware: gain sales pass, loss sales blocked
             # unless caller has μ̂ to compare against NPV cost — see §1091)
             from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
-                WASH_SALE_MIN_MATERIAL_NPV,
                 is_wash_sale_blocked_with_cost,
+                resolve_wash_sale_min_material_npv,
             )
             blocked, _, _ = is_wash_sale_blocked_with_cost(
                 a.cand_ticker, ctx.today, ctx.last_sell_dates,
@@ -727,9 +727,8 @@ class JointActionTask(Task):
                 # Opt in HERE, not globally — the parking sleeve must not.
                 # Configurable (pipeline#227 review); unconfigured falls back
                 # to the same WASH_SALE_MIN_MATERIAL_NPV default as before.
-                min_material_npv_cost=float(ctx.config.get(
-                    "wash_sale_min_material_npv", WASH_SALE_MIN_MATERIAL_NPV,
-                )),
+                min_material_npv_cost=resolve_wash_sale_min_material_npv(
+                    ctx.config),
             )
             if blocked:
                 ctx.counters["joint_blocked_wash"] = (

@@ -82,16 +82,14 @@ class WashSaleFilterTask(Task):
             resolve_validated_crypto_spot_pairs,
         )
         from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
-            WASH_SALE_MIN_MATERIAL_NPV,
             is_wash_sale_blocked_with_cost,
+            resolve_wash_sale_min_material_npv,
         )
         wash_days = int(tc.config.get("wash_sale_days", 0))
         tax_rate = float(tc.config.get("wash_sale_tax_rate", 0.30))
         disc = float(tc.config.get("wash_sale_discount_rate", 0.05))
         hold_yrs = float(tc.config.get("wash_sale_hold_years", 2.0))
-        min_material_npv = float(tc.config.get(
-            "wash_sale_min_material_npv", WASH_SALE_MIN_MATERIAL_NPV,
-        ))
+        min_material_npv = resolve_wash_sale_min_material_npv(tc.config)
         blocked, reason, cost_npv = is_wash_sale_blocked_with_cost(
             tc.ticker,
             tc.today,

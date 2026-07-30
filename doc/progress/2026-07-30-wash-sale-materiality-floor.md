@@ -51,3 +51,32 @@ back to binary block" branch). That is a distinct design decision (its own
 classification, its own config surface, its own tests) rather than a
 materiality-floor threading gap, so it is intentionally NOT done here;
 issue #223 should stay open for it and PR #227 does not close it.
+
+
+## Round-3 hardening (claude, 2026-07-30)
+
+The configured read was `float(cfg.get(key, DEFAULT))` inline at each call
+site. Replaced with `resolve_wash_sale_min_material_npv(config)` in
+`kernel/selection.py`, used by all THREE sites (`task_candidates`,
+`task_joint_actions`, `task_rotation`). A bare `float()` on a config value is
+unsafe, and the failure modes were MEASURED against the real branch
+(`if cost_npv < min_material_npv_cost: release`) rather than assumed — an
+earlier draft of the tests asserted the wrong hazard and was corrected:
+
+| configured value | effect on a $100,000 realized loss | verdict |
+|---|---|---|
+| non-numeric (`"1.00 USD"`, `""`) | `float()` RAISES inside a live task | crash |
+| `+inf` | **UNBLOCKED** — `cost < inf` always True | **disables §1091 silently** |
+| `NaN` | blocked (NaN comparison False) | fail-safe, but floor inert |
+| negative | blocked | fail-safe, but floor inert |
+
+So `+inf` is the typo that silently switches the tax gate off, and a
+non-numeric value is the typo that crashes the task. The resolver maps all four
+to the DEFAULT — treated as unset, never as `0.0` and never as "no floor" —
+while an explicit `0.0` remains honoured as a deliberate pre-#223 opt-out.
+
+Also fixed a docstring that contradicted the code: it said unknown P/L was
+"assumed gain → not blocked" when the `pl is None` branch returns a hard block.
+
+20 tests. Full-suite differential vs `origin/main`: failing-test sets
+byte-identical, zero regressions.

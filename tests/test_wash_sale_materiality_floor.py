@@ -262,3 +262,104 @@ def test_joint_action_task_honors_a_configured_floor():
     ctx = _run(_cfg(wash_sale_min_material_npv=0.0))
     assert ctx.counters.get("joint_blocked_wash", 0) == 1
     assert not any(o["ticker"] == "AAA" for o in ctx.orders)
+
+
+# --- the resolver must not let a config typo break the tax gate -------------
+#
+# A bare float(cfg.get(key, DEFAULT)) is unsafe on a real config file. Measured
+# against the actual branch (`if cost_npv < min_material_npv_cost: release`),
+# not assumed — an earlier draft of these tests asserted the wrong hazard:
+#
+#   floor=nan       -> huge loss BLOCKED   (fail-safe: nan comparison is False)
+#   floor=negative  -> huge loss BLOCKED   (fail-safe: floor silently inert)
+#   floor=+inf      -> huge loss UNBLOCKED (DANGEROUS: releases everything)
+#   non-numeric     -> float() RAISES inside a live pipeline task
+#
+# So `+inf` is the value that silently switches off SS1091, and a typo is the
+# value that crashes the task. Both fall back to the default in the resolver.
+
+
+def test_a_nonnumeric_value_does_not_raise_and_falls_back():
+    from renquant_pipeline.kernel.selection import (
+        WASH_SALE_MIN_MATERIAL_NPV,
+        resolve_wash_sale_min_material_npv,
+    )
+    for bad in ("", "abc", "1.00 USD", [], {}, object()):
+        assert resolve_wash_sale_min_material_npv(
+            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV, bad
+
+
+def test_nan_and_negative_cannot_disable_the_rule():
+    """The dangerous case: NaN would make `cost >= floor` always False."""
+    from renquant_pipeline.kernel.selection import (
+        WASH_SALE_MIN_MATERIAL_NPV,
+        resolve_wash_sale_min_material_npv,
+    )
+    for bad in (float("nan"), float("inf"), float("-inf"), -1.0, -0.01):
+        assert resolve_wash_sale_min_material_npv(
+            {"wash_sale_min_material_npv": bad}) == WASH_SALE_MIN_MATERIAL_NPV, bad
+
+
+def test_an_infinite_floor_would_disable_1091_entirely():
+    """Proves the guard is load-bearing, not defensive decoration.
+
+    `+inf` is the dangerous typo: `cost_npv < inf` is always True, so every
+    realized loss is classified immaterial and NOTHING is ever blocked. Measured
+    below on a $100,000 loss, which no sane policy would release.
+    """
+    import datetime
+    from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost
+    today = datetime.date(2026, 7, 30)
+    sells = {"AAA": today - datetime.timedelta(days=5)}
+    huge = {"AAA": -100_000.0}
+
+    blocked_inf, _, _ = is_wash_sale_blocked_with_cost(
+        "AAA", today, sells, huge, 30, min_material_npv_cost=float("inf"))
+    assert blocked_inf is False, "inf floor releases everything — the hazard"
+
+    blocked_ok, _, _ = is_wash_sale_blocked_with_cost(
+        "AAA", today, sells, huge, 30, min_material_npv_cost=1.0)
+    assert blocked_ok is True, "a sane floor must still block a huge loss"
+
+    # and the resolver never hands `inf` through
+    from renquant_pipeline.kernel.selection import (
+        WASH_SALE_MIN_MATERIAL_NPV,
+        resolve_wash_sale_min_material_npv,
+    )
+    assert resolve_wash_sale_min_material_npv(
+        {"wash_sale_min_material_npv": float("inf")}) == WASH_SALE_MIN_MATERIAL_NPV
+
+
+def test_nan_and_negative_are_fail_safe_but_still_rejected():
+    """These do NOT disable blocking (nan/negative comparisons keep the block),
+    but they silently make the floor inert, so the resolver still rejects them
+    rather than letting a typo quietly revert #223."""
+    import datetime
+    from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost
+    today = datetime.date(2026, 7, 30)
+    sells = {"AAA": today - datetime.timedelta(days=5)}
+    for floor in (float("nan"), -1.0):
+        blocked, _, _ = is_wash_sale_blocked_with_cost(
+            "AAA", today, sells, {"AAA": -100_000.0}, 30,
+            min_material_npv_cost=floor)
+        assert blocked is True, f"{floor} should stay fail-safe"
+
+
+def test_absent_and_explicit_zero_are_distinguished():
+    from renquant_pipeline.kernel.selection import (
+        WASH_SALE_MIN_MATERIAL_NPV,
+        resolve_wash_sale_min_material_npv,
+    )
+    assert resolve_wash_sale_min_material_npv({}) == WASH_SALE_MIN_MATERIAL_NPV
+    assert resolve_wash_sale_min_material_npv(None) == WASH_SALE_MIN_MATERIAL_NPV
+    # explicit 0.0 is a deliberate opt-out and IS honoured
+    assert resolve_wash_sale_min_material_npv(
+        {"wash_sale_min_material_npv": 0.0}) == 0.0
+
+
+def test_a_configured_value_is_honored():
+    from renquant_pipeline.kernel.selection import resolve_wash_sale_min_material_npv
+    assert resolve_wash_sale_min_material_npv(
+        {"wash_sale_min_material_npv": 25.0}) == 25.0
+    assert resolve_wash_sale_min_material_npv(
+        {"wash_sale_min_material_npv": "25.0"}) == 25.0   # numeric string OK

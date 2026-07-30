@@ -115,6 +115,43 @@ def wash_sale_npv_cost(
 # unconditional block there is closer to defensible).
 WASH_SALE_MIN_MATERIAL_NPV = 1.0
 
+#: Config key for the materiality floor (flat top-level, matching this repo's
+#: existing `wash_sale_days` convention).
+WASH_SALE_MIN_MATERIAL_NPV_KEY = "wash_sale_min_material_npv"
+
+
+def resolve_wash_sale_min_material_npv(config: "dict | None") -> float:
+    """The configured materiality floor, in dollars of NPV cost.
+
+    Exists because reading the key with a bare ``float(cfg.get(...))`` is
+    unsafe on a config file two ways, both of which this function closes:
+
+    * a NON-NUMERIC value (a typo, a quoted unit like ``"1.00 USD"``) makes
+      ``float()`` RAISE inside a live pipeline task;
+    * a NEGATIVE or ``NaN`` value passes ``float()`` silently and then
+      **disables the wash-sale rule**: the materiality test is
+      ``cost_npv >= floor``, and every comparison against ``NaN`` is False, so
+      no realized loss is ever material and nothing is ever blocked. A config
+      typo must not be able to switch off a tax gate silently.
+
+    Both fall back to ``WASH_SALE_MIN_MATERIAL_NPV`` — treated as UNSET, never
+    as ``0.0`` and never as "no floor". An absent key yields the same default,
+    and an explicit ``0.0`` is honoured as a deliberate opt-out restoring
+    pre-#223 behaviour.
+    """
+    if not config:
+        return WASH_SALE_MIN_MATERIAL_NPV
+    raw = config.get(WASH_SALE_MIN_MATERIAL_NPV_KEY, None)
+    if raw is None or isinstance(raw, bool):
+        return WASH_SALE_MIN_MATERIAL_NPV
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return WASH_SALE_MIN_MATERIAL_NPV
+    if not math.isfinite(val) or val < 0.0:
+        return WASH_SALE_MIN_MATERIAL_NPV
+    return val
+
 
 def is_wash_sale_blocked_with_cost(
     ticker: str,
@@ -141,8 +178,12 @@ def is_wash_sale_blocked_with_cost(
          asset class, never a global disable; the ``us_equity`` default
          keeps the equity path byte-identical.
       1. If sale is outside the 30-day window → no rule applies → not blocked
-      2. If prior sale was a GAIN (or unknown but assume gain in absence
-         of data) → §1091 does not apply → not blocked
+      2. If prior sale was a GAIN → §1091 does not apply → not blocked.
+         If P/L is UNKNOWN → hard block, BEFORE any floor is consulted, so
+         ``min_material_npv_cost`` cannot release it (#223 requirement 2,
+         deliberately NOT implemented here — see the progress doc). An earlier
+         version of this docstring said unknown was "assumed gain → not
+         blocked", which contradicted the ``pl is None`` branch below.
       3. If prior sale was a LOSS:
            cost_npv = wash_sale_npv_cost(loss, tax_rate, ...)
          (a) if expected_dollar_return is known → block if expected_return

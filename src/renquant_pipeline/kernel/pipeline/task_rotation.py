@@ -663,14 +663,12 @@ class ValidatePairsTask(Task):
             resolve_validated_crypto_spot_pairs,
         )
         from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
-            WASH_SALE_MIN_MATERIAL_NPV,
             is_wash_sale_blocked_with_cost,
+            resolve_wash_sale_min_material_npv,
         )
         rotation_asset_class = resolve_asset_class(cfg)
         rotation_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(cfg)
-        rotation_min_material_npv = float(cfg.get(
-            "wash_sale_min_material_npv", WASH_SALE_MIN_MATERIAL_NPV,
-        ))
+        rotation_min_material_npv = resolve_wash_sale_min_material_npv(cfg)
         for pair in ctx.rotations:
             blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
                 pair.buy_ticker, ctx.today, ctx.last_sell_dates or {},
