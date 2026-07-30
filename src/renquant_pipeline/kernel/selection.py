@@ -145,13 +145,34 @@ def resolve_wash_sale_min_material_npv(config: "dict | None") -> float:
 
     * a NON-NUMERIC value (a typo, a quoted unit like ``"1.00 USD"``) makes
       ``float()`` RAISE inside a live pipeline task;
-    * a NEGATIVE or ``NaN`` value passes ``float()`` silently and then
-      **disables the wash-sale rule**: the materiality test is
-      ``cost_npv >= floor``, and every comparison against ``NaN`` is False, so
-      no realized loss would ever be material and nothing would ever be blocked.
-      A config typo must not be able to switch off a tax gate silently.
+    * ``+inf`` passes ``float()`` silently and then **disables the wash-sale
+      rule**: the release test is ``cost_npv < min_material_npv_cost``, and
+      every finite cost is below ``inf``, so every realized loss is classified
+      immaterial and nothing is ever blocked.
+    * a NEGATIVE or ``NaN`` value also passes ``float()`` silently, but is
+      FAIL-SAFE rather than dangerous: ``cost_npv < NaN`` is False and
+      ``cost_npv < negative`` is False, so the block HOLDS and the floor is
+      merely inert. Still rejected here, because a typo should not quietly
+      revert #223 either.
 
-    Both failure modes fall back to LEGACY, which is the safe direction: the
+    Measured, not reasoned — on a \\$100,000 realized loss:
+
+    ==============  ==========================  ===================
+    configured      result                      verdict
+    ==============  ==========================  ===================
+    non-numeric     ``float()`` raises          crash
+    ``+inf``        UNBLOCKED                   disables §1091
+    ``NaN``         blocked                     fail-safe, inert
+    negative        blocked                     fail-safe, inert
+    ==============  ==========================  ===================
+
+    (An earlier revision of this docstring named ``NaN`` as the value that
+    disables the rule and cited the test as ``cost_npv >= floor``. Both were
+    wrong — the code reads ``cost_npv < min_material_npv_cost`` — and the
+    committed tests in ``tests/test_wash_sale_materiality_floor.py`` assert the
+    corrected behaviour, so the two contradicted each other until this fix.)
+
+    All failure modes fall back to LEGACY, which is the safe direction: the
     fallback blocks more, never less. An explicit ``0.0`` is indistinguishable
     from unset by design — both mean "no floor", i.e. legacy behaviour.
     """
