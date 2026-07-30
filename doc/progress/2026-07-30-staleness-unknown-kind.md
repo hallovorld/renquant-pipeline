@@ -31,13 +31,24 @@ pass. Beyond `blend`, committed strategy configs also carry `patchtst` (no `hf_`
 prefix) and one with **no kind at all** — both take the same branch
 `[VERIFIED — sweep of every `strategy_config*.json`]`.
 
-## 3. The fix inverts the default
+## 3. The fix inverts the default — and my first version of it was still fail-open
 
-An unrecognised kind is now a **provenance gap**, never a pass. The artifact JSON is
-still read best-effort, so a kind that happens to stamp `trained_date` there is
-**measured** rather than dismissed — it simply can no longer come back as a silent
-pass. Refusing everything unknown would trade a fail-open for a permanent alarm,
-which is how a check gets switched off wholesale.
+An unrecognised kind is now a **provenance gap, never a pass**.
+
+**Corrected at review (#233).** My first implementation read the dates best-effort
+and **passed when they were fresh**. That is still the central fail-open: freshness
+being measurable **does not establish** that an unrecognised artifact carries the
+schema or training provenance this rail requires, so passing on fresh dates
+**silently certifies a new model kind** — the exact extension work that has to stay
+visible. It also contradicted this document's own title.
+
+Now: **never a pass, however fresh it looks.** The measured dates are still read and
+**reported in the message**, because discarding them would make the finding
+unactionable — the reader needs to tell a routine registration from an urgent one.
+
+My "refusing everything unknown trades a fail-open for a permanent alarm" worry was
+overweighted: this check is **SOFT**, so a non-pass is a visible finding, not a
+blocker. A soft finding on an unregistered kind *is* the signal.
 
 ## 4. Suite
 

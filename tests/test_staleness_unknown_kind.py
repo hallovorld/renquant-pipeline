@@ -48,13 +48,16 @@ def test_an_unrecognised_kind_without_trained_date_FAILS(tmp_path, kind):
     _artifact(tmp_path, {"note": "no dates here"})
     res = ModelStalenessTask().check(_Ctx(tmp_path, kind))
     assert res.ok is False, f"kind={kind!r} came back as a pass (res.ok)"
-    assert "NOT a pass" in res.message
+    assert "not a registered scoring kind" in res.message
+    assert "NOT a staleness pass" in res.message
 
 
-def test_an_unrecognised_kind_WITH_a_trained_date_is_still_measured(tmp_path):
-    """Best-effort, not blanket refusal: a kind that happens to stamp its date on
-    the artifact JSON gets measured rather than dismissed. Refusing everything
-    unknown would trade a fail-open for a permanent alarm."""
+def test_an_unrecognised_kind_with_FRESH_dates_STILL_DOES_NOT_PASS(tmp_path):
+    """CORRECTED at review (#233). My first fix let an unknown kind PASS when its
+    dates happened to be fresh. That silently CERTIFIES A NEW MODEL KIND: freshness
+    being measurable does not establish that the artifact carries the schema or
+    training provenance this rail requires. Never a pass — but the measured
+    freshness IS reported, or the finding is unactionable."""
     # BOTH dates: the module's existing contract treats an absent
     # effective_train_cutoff_date as its own provenance gap ("SURFACE, not skip"),
     # so trained_date alone is not a pass for ANY kind. My first fixture omitted it
@@ -62,22 +65,31 @@ def test_an_unrecognised_kind_WITH_a_trained_date_is_still_measured(tmp_path):
     _artifact(tmp_path, {"trained_date": "2026-07-29",
                          "effective_train_cutoff_date": "2026-07-20"})
     res = ModelStalenessTask().check(_Ctx(tmp_path, "blend"))
-    assert res.ok is True, res.message
-
-
-def test_an_unrecognised_kind_with_an_OLD_trained_date_still_alarms(tmp_path):
-    """Anti-vacuity for the branch above: measuring must be able to FAIL, or the
-    best-effort read is just the old skip wearing a new message."""
-    _artifact(tmp_path, {"trained_date": "2020-01-02"})
-    res = ModelStalenessTask().check(_Ctx(tmp_path, "blend"))
     assert res.ok is False, res.message
+    assert "not a registered scoring kind" in res.message
+    # the measurement must survive into the message
+    assert "2026-07-29" in res.message and "2026-07-20" in res.message
+
+
+def test_the_reported_measurement_distinguishes_fresh_from_stale(tmp_path):
+    """Anti-vacuity for the message. Non-passing is now unconditional, so the ONLY
+    thing that makes the finding actionable is whether the reader can tell a
+    routine registration from an urgent one. If both cases printed the same text
+    the measurement would be decorative."""
+    _artifact(tmp_path, {"trained_date": "2020-01-02"})
+    old = ModelStalenessTask().check(_Ctx(tmp_path, "blend")).message
+    _artifact(tmp_path, {"trained_date": "2026-07-29"})
+    new = ModelStalenessTask().check(_Ctx(tmp_path, "blend")).message
+    assert old != new
+    assert "2020-01-02" in old and "2026-07-29" in new
 
 
 def test_an_unreadable_artifact_under_an_unknown_kind_FAILS(tmp_path):
     (tmp_path / "art.json").write_text("{not json")
     res = ModelStalenessTask().check(_Ctx(tmp_path, "blend"))
     assert res.ok is False
-    assert "unmeasurable" in res.message
+    assert "not a registered scoring kind" in res.message
+    assert "unreadable" in res.message
 
 
 @pytest.mark.parametrize("kind", ["xgb", "panel_ltr_xgboost"])
