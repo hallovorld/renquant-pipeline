@@ -7,13 +7,18 @@ by mean +3.17 / max +10 calendar days = mean 2.23 / max 6 TRADING days.
 
 A trap this pins: `BDay(60)` spans exactly 12 weeks = 84 calendar days and
 `ceil(60*7/5)` is also 84, so switching the unit alone fixes nothing.
+
+The bound under test is module-private (`_measured_trading_day_calendar_bound`):
+it is a measurement fitted to this one sample, not a validated general
+guarantee (2026-07-30 review, #229) -- these tests pin the measurement, not
+a claim that it generalizes to other calendars/exchanges.
 """
 from __future__ import annotations
 
 import pytest
 
 from renquant_pipeline.kernel.walk_forward.leakage_guard import (
-    trading_days_to_calendar_bound as bound,
+    _measured_trading_day_calendar_bound as bound,
 )
 
 
@@ -61,13 +66,13 @@ def test_the_guard_is_still_on_the_KNOWN_SHORT_bound_and_that_is_deliberate():
     import pandas as pd
 
     from renquant_pipeline.kernel.walk_forward.leakage_guard import (
+        _measured_trading_day_calendar_bound,
         assert_no_leakage,
-        trading_days_to_calendar_bound,
     )
 
     trained = pd.Timestamp("2024-01-01")
     today = trained + pd.Timedelta(days=90)
     assert (trained + pd.tseries.offsets.BDay(60)) < today
-    assert trading_days_to_calendar_bound(60) > 90, (
+    assert _measured_trading_day_calendar_bound(60) > 90, (
         "the corrected bound WOULD reject this fold")
     assert_no_leakage(trained, today, lookahead_days=60)  # still admitted
