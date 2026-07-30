@@ -150,9 +150,48 @@ def verify(pins: dict[str, Any]) -> list[str]:
     return problems
 
 
+def one_sided_repins(old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Pairs whose pin update BLESSES a change to only one side.
+
+    `verify()` catches an edit that was never re-pinned. It cannot catch the other
+    order: edit one twin, re-emit, commit. Both the file and its pin move together,
+    so `verify()` is clean and the divergence is now the reviewed baseline. The only
+    place that shows is the pin DIFF, where a reviewer has to notice that
+    `public_sha256` did not move while `kernel_sha256` did.
+
+    This makes that mechanical. It compares two pin files -- normally the PR's base
+    and head -- and reports every pair where exactly one digest changed. It is not a
+    prohibition: a one-sided change can be legitimate (a comment, a kernel-only
+    private helper). It is a demand that the reason be stated, which is the same
+    contract `verify()`'s R1 message already asks for.
+    """
+    problems: list[str] = []
+    a, b = old.get("pairs") or {}, new.get("pairs") or {}
+    for name in sorted(set(a) & set(b)):
+        pub_moved = a[name].get("public_sha256") != b[name].get("public_sha256")
+        ker_moved = a[name].get("kernel_sha256") != b[name].get("kernel_sha256")
+        if not b[name].get("kernel_twin_file"):
+            continue          # no twin, so "one-sided" is not defined for it
+        if pub_moved and not ker_moved:
+            problems.append(
+                f"{name}: this pin update blesses a PUBLIC-only change — the kernel "
+                f"twin's digest is unchanged. State why the twin does not need it, or "
+                f"apply the change to both")
+        elif ker_moved and not pub_moved:
+            problems.append(
+                f"{name}: this pin update blesses a KERNEL-only change — the public "
+                f"implementation's digest is unchanged. This is the #623 R1 shape "
+                f"arriving through the pin file instead of past it. State why, or "
+                f"apply the change to both")
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--emit", action="store_true", help="print fresh pins (never writes)")
+    ap.add_argument("--diff-against", metavar="PINS",
+                    help="compare the committed pins against an earlier pin file "
+                         "(normally the PR base) and report one-sided re-pins")
     ap.add_argument("--pins", type=pathlib.Path, default=PINS)
     args = ap.parse_args(argv)
 
@@ -168,6 +207,26 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"FATAL: pin file unreadable: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+
+    if args.diff_against:
+        base_path = pathlib.Path(args.diff_against)
+        if not base_path.exists():
+            print(f"FATAL: base pin file missing at {base_path} — a missing baseline "
+                  f"cannot be shown to agree with anything", file=sys.stderr)
+            return 2
+        try:
+            base = json.loads(base_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            print(f"FATAL: base pin file unreadable: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+            return 2
+        blessed = one_sided_repins(base, pins)
+        if blessed:
+            print("\n".join(blessed))
+            print(f"\ntwin-pairs: {len(blessed)} one-sided re-pin(s)")
+            return 1
+        print("twin-pairs: no one-sided re-pins against the given baseline")
+        return 0
 
     problems = verify(pins)
     if problems:
