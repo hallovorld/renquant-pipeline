@@ -568,6 +568,38 @@ class SizeAndEmitTask(Task):
                             sizing_mode="fractional",
                             target_notional=target_notional)
                 continue
+            # MEASUREMENT ONLY — no control flow depends on this block.
+            #
+            # strategy-104's enablement contract for `sizing.one_share_floor_enabled`
+            # (doc/progress/2026-07-12-one-share-floor-enablement.md) requires, as a
+            # PREREQUISITE to enabling, "at least one production dry-run with
+            # floor=OFF that proves the chain emits all 8 counters". The only
+            # floor counter that existed was `one_share_floor_roundups`, which can
+            # only increment when the floor is ON — so the evidence the contract
+            # demands was structurally unobtainable, and the flag could never be
+            # legitimately flipped.
+            #
+            # This counts the ELIGIBLE SET — candidates that cleared every
+            # admission gate and round to zero shares purely by integer sizing —
+            # using the identical predicate as the rescue branch below MINUS the
+            # flag itself. It therefore reports, with the floor OFF, exactly how
+            # much capital the floor WOULD have had a claim on. `_eligible` is
+            # a superset of the rescued set: the deferred pass below can still
+            # decline a candidate for want of leftover cash.
+            if shares < 1 and override_pct is None and max_pct > 0:
+                _eligible_cap = (
+                    float(regime_p.get("max_position_pct", 0.15))
+                    * float(ctx.portfolio_value or 0.0)
+                )
+                if price <= _eligible_cap + 1e-6:
+                    ctx.counters["floor_eligible_count"] = (
+                        ctx.counters.get("floor_eligible_count", 0) + 1
+                    )
+                    ctx.counters["floor_eligible_notional"] = (
+                        float(ctx.counters.get("floor_eligible_notional", 0.0))
+                        + float(price)
+                    )
+
             if shares < 1 and one_share_floor_on and override_pct is None and max_pct > 0:
                 # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
                 # ONE share iff (a) one share fits under the regime's own

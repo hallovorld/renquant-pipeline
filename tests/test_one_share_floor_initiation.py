@@ -579,3 +579,92 @@ def _assert_portfolio_evidence(reserve_pct):
         if t in on_rescued:
             continue
         assert off_orders[t] == on_orders.get(t), t
+
+
+# ── The eligibility DENOMINATOR, measurable with the flag OFF ────────────────
+class TestFloorEligibleCounterOffState:
+    """strategy-104's enablement contract requires a floor=OFF dry-run that
+    emits the counters. `one_share_floor_roundups` can only increment with the
+    flag ON, so that evidence was structurally unobtainable and the flag could
+    never be legitimately flipped.
+
+    These pin the denominator: it counts with the flag OFF, it counts the same
+    set with the flag ON, and — the load-bearing control — it changes NOTHING
+    about orders or block reasons in either state.
+    """
+
+    def test_counted_with_the_flag_OFF(self):
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] == 1
+        assert ctx.counters["floor_eligible_notional"] == pytest.approx(BLK_PRICE)
+
+    def test_flag_OFF_behaviour_is_UNCHANGED(self):
+        """The control. A counter that also changed behaviour would be a
+        capital change smuggled in as telemetry."""
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.orders == []
+        assert ctx._blocked_by_ticker["BLK"] == "size_insufficient_cash"
+        assert "one_share_floor_roundups" not in ctx.counters
+
+    def test_the_eligible_set_is_a_SUPERSET_of_the_rescued_set(self):
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _flag_on_config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] >= ctx.counters.get(
+            "one_share_floor_roundups", 0)
+        assert ctx.counters["floor_eligible_count"] == 1
+
+    def test_a_name_ABOVE_the_regime_cap_is_not_eligible(self):
+        """Anti-vacuity: without this the counter would just be 'shares < 1'."""
+        big = _cand("ASML")
+        ctx = _ctx([big], ["ASML"], _config(), prices={"ASML": 5_000.0})
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+    def test_a_cheap_name_that_SIZES_normally_is_not_eligible(self):
+        """Second anti-vacuity control: eligibility is about integer rounding,
+        not about being a candidate."""
+        oxy = _cand("OXY")
+        ctx = _ctx([oxy], ["OXY"], _config(), prices={"OXY": 48.0})
+        SizeAndEmitTask().run(ctx)
+        assert len(ctx.orders) == 1
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+    def test_notional_accumulates_across_names(self):
+        a, b = _cand("BLK"), _cand("CAT")
+        ctx = _ctx([a, b], ["BLK", "CAT"], _config(),
+                   prices={"BLK": BLK_PRICE, "CAT": 900.0})
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] == 2
+        assert ctx.counters["floor_eligible_notional"] == pytest.approx(
+            BLK_PRICE + 900.0)
+
+    def test_a_ZERO_conviction_name_is_not_eligible(self):
+        """The `max_pct > 0` guard exists because of a REAL pre-fix bug: BLK at
+        $1,100 with conviction exactly 0.0 was rescued anyway. `max_pct == 0` is
+        "the model says invest nothing", not a rounding artifact.
+
+        Added after a mutation check showed deleting that guard failed ZERO
+        tests. The FIRST version of this test was itself vacuous — it used a
+        zero raw signal, which is blocked upstream as `negative_raw_signal_no_long`
+        and never reaches this branch at all, so it passed with the guard
+        deleted too. The fixture below keeps the raw signal POSITIVE and drives
+        `conviction_multiplier` to exactly 0 via `min_mult=0.0` with a
+        panel_score below the sizing floor; the assertion on `blocked` is what
+        proves the candidate actually got as far as sizing.
+        """
+        cfg = _config()
+        cfg["ranking"]["panel_scoring"]["sizing"] = {
+            "enabled": True, "floor": 0.5, "ceiling": 1.0, "min_mult": 0.0,
+        }
+        weak = _cand("BLK", panel_score=0.4)      # below floor -> multiplier 0.0
+        ctx = _ctx([weak], ["BLK"], cfg)
+        SizeAndEmitTask().run(ctx)
+        # reached sizing (NOT rejected upstream) …
+        assert ctx._blocked_by_ticker["BLK"] == "size_insufficient_cash"
+        # … and the guard kept it out of the eligible set anyway.
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
