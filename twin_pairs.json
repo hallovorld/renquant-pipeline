@@ -1,8 +1,13 @@
 {
-  "_comment": "GOAL-3 / renquant-orchestrator#623 R1. Which copy of each DOCUMENTED Task symbol executes, and the digest of both sides of every twin pair. Editing one side without the other fails the check --- that is the defect. Regenerate with tools/twin_pairs.py --emit and commit through review.",
+  "_comment": "GOAL-3 / renquant-orchestrator#623 R1. Which copy of each DOCUMENTED public symbol executes, and the digest of both sides of every twin pair. Editing one side without the other fails the check --- that is the defect. Regenerate with tools/twin_pairs.py --emit and commit through review.",
   "pairs": {
+    "ATTRIBUTION_VERSION": {
+      "kernel_twin_file": null,
+      "kind": "not-a-source-object",
+      "public_type": "str"
+    },
     "ApplyGlobalCalibrationTask": {
-      "kernel_sha256": "a49fd85be9c51549bde1f072f638104dcb7d1929705102e3e65ebe703222e5b6",
+      "kernel_sha256": "aece9b83c50e38c195dccab0d54b0baf3ff6f7c6ab4225f57cfbf26ff664feea",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
@@ -10,7 +15,7 @@
       "public_sha256": "6402d10d85c9ebd66a870007a237afe94ed53f1e7569b5a5e332848529f6816a"
     },
     "ApplyScoresTask": {
-      "kernel_sha256": "668118abc488b49cd0f49c70b1326386235e5a5d7d6dc152ba3791be288ea650",
+      "kernel_sha256": "f7a73efa89d724ac071077f66bfb0cba69e3986a9c551a3405de901106344230",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
@@ -18,12 +23,24 @@
       "public_sha256": "f520e3aa565ff685a2be954a06fcb7f11ec91e584a28f00cccaefd4bc277e7ff"
     },
     "BuildFeatureMatrixTask": {
-      "kernel_sha256": "87bea000d2aa623385529d2160556e1486af9fd89f14e9d06a1527ee97a8b79f",
+      "kernel_sha256": "cde771333199e8eab7f7f16851a1f6a317e97f156c122bf4bc92ebdd96112d81",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.panel_scoring",
       "public_sha256": "c3744af93751dfef8fc57ed3d62c259b88b38a1ab81f35c780cbc6d10c8c6a85"
+    },
+    "ContractResult": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "3e8b95ad9bb42cdac815fc64acd11fe90e897699609fe3a6ec95d684cdd8c0d9"
+    },
+    "DEFAULT_MAX_STALENESS_MINUTES": {
+      "kernel_twin_file": null,
+      "kind": "not-a-source-object",
+      "public_type": "float"
     },
     "EmitAttributedOrderIntentsTask": {
       "kernel_twin_file": null,
@@ -31,6 +48,27 @@
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.panel_scoring",
       "public_sha256": "ad32195c7163a08790b100ff7326ffca999b1f8b939689a8dd41c9c236293e5b"
+    },
+    "InferenceContext": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "b402bbf1154950144dd47bef50e3d7d74fff86b908ae89e8f6bd0395a2d72b54"
+    },
+    "LiveContextSnapshot": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "5a2ce8f1960180dd35fc3c8e47ab619407c5080cad5e760e27d555bba6f706a8"
+    },
+    "LiveStateContract": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/live_state_contract.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.live_state_contract",
+      "public_sha256": "d50d1881e1802b3620689e4101d71022186fa5af2070453cdc929710da43cb6a"
     },
     "LoadScorerTask": {
       "kernel_sha256": "869272ff155c256fd9c55b38281e8a8d0025d11855f666ddf2495c6e76263908",
@@ -40,13 +78,35 @@
       "public_module": "renquant_pipeline.panel_scoring",
       "public_sha256": "18f9277a6cec414ea97df11cd13595f72fc9b596a7737729f0ec2bd10cf0fb06"
     },
+    "ModelAdmissionResult": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/model_admission.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.model_admission",
+      "public_sha256": "10b58be68c7286d58f45ebe6087a4040361667602fe6c68bc9843941ba4f4af6"
+    },
+    "PanelScoringJob": {
+      "kernel_sha256": "bc1d082dd37b10b86114e572f4afe6d66e9e5a0e8e9bbd0c03b326410fd36e73",
+      "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
+      "public_file": "renquant_pipeline/panel_scoring.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.panel_scoring",
+      "public_sha256": "bdb3f75a6307435ce97182691ccf567405f7f57b0b8f2ae57f8c6275b8923927"
+    },
     "RegimeModelAdmissionTask": {
-      "kernel_sha256": "da9714a0cd4e179ab54a472edf2641728f216203c8d8d6225556bec58778644e",
+      "kernel_sha256": "3b4c2d113ab61385d575c5c3be7d696577dfdf1f5d01cfc1d0a05c6bae4e9e1e",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.panel_scoring",
       "public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2"
+    },
+    "RuntimeInferencePipeline": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "e29544b459c13270dc0e97083b5e23c2b905e2e0de5169b2d66dede9d30ccfee"
     },
     "SelectAcceptedCandidatesTask": {
       "kernel_twin_file": null,
@@ -54,6 +114,28 @@
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.selection",
       "public_sha256": "f77b3a598eb86a75bbdd8f34d6f4f17cb4afa90bd6c376a3c1a5cd3786be2e9a"
+    },
+    "SelectionJob": {
+      "kernel_sha256": "7c4efd9771e042aaaa3474644e5447d7517a7268e5fa3a072645bcc222fc5cf4",
+      "kernel_twin_file": "renquant_pipeline/kernel/pipeline/job_selection.py",
+      "public_file": "renquant_pipeline/selection.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.selection",
+      "public_sha256": "396ca18839d1e0ea6e0c10dbbb118546173e63199710a8d954c361d2ed93ff88"
+    },
+    "SoftwareStopRegistry": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/software_stops.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.software_stops",
+      "public_sha256": "7fccf47dc9108eb809bebcad8b51247468baefe553fefd0af6a24bfd6ecd1150"
+    },
+    "SoftwareStopRegistryCorrupt": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/software_stops.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.software_stops",
+      "public_sha256": "06bcdb553ae9272f5217c9f33824699a2dc71d3172b2bb2cf208a8703207ec6c"
     },
     "ValidateSelectionDoesNotPromoteTask": {
       "kernel_twin_file": null,
@@ -63,12 +145,233 @@
       "public_sha256": "9725ed72b5509fec14a770750dd8eb57d9b16332fd76feff9374f000ef39e3c6"
     },
     "VetoWeakBuysTask": {
-      "kernel_sha256": "64680d3a16197140f5c882a0d9258f9f3829a97275c56f780adb6ee9c49477e7",
+      "kernel_sha256": "10a94b963caa4521f39d1e11e6146d3995d97191a144d6d126785187a10f93de",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.panel_scoring",
       "public_sha256": "e110fad0d72173a95f896c1899f8b664db0474a783a8dd303e71f9f1103f88dc"
+    },
+    "account_snapshot_from_live_state": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/live_state_contract.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.live_state_contract",
+      "public_sha256": "e8f76542819e7ce1864c875234168f5e8ec9973f0f763ef192fc637be7c0da47"
+    },
+    "active_scorer_identity": {
+      "kernel_sha256": "48b389bd47bb96aa4a97824f36dd285ffbf4a0d1bd661ca65c4a9af27a45d11b",
+      "kernel_twin_file": "renquant_pipeline/kernel/decision_trace.py",
+      "public_file": "renquant_pipeline/decision_trace.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.decision_trace",
+      "public_sha256": "10a19768940ebe434718aeb483d20fa9ed1f2f25b9ce1a391edcd2a9509c8a4d"
+    },
+    "append_ticker_daily_state_rows": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/decision_trace.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.decision_trace",
+      "public_sha256": "97543895b09cecacf81941cb542c551292761d9d17b2b1b4874fe20f238ad0b1"
+    },
+    "build_run_bundle": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "8da0d70e4e9aa0fbddb776333d8fb3db751d95752d3501bbf731ad9aa97f2bd0"
+    },
+    "build_runtime_feature_frame": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/runtime_features.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.runtime_features",
+      "public_sha256": "2de9d3643955cc2f38be006a514f9fd6524fbd720e0a6fb8463867ce0acd4ea2"
+    },
+    "build_ticker_daily_state_rows": {
+      "kernel_sha256": "3b25fc13a55aa9f1dc521faefb92a43cdc1d4b512582bb62fd06239fae8dcd08",
+      "kernel_twin_file": "renquant_pipeline/kernel/decision_trace.py",
+      "public_file": "renquant_pipeline/decision_trace.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.decision_trace",
+      "public_sha256": "a18de9fa117fefab9429095aef674430c3ca6731abed8dd2b97b142ac6c8ec15"
+    },
+    "compute_staleness": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/software_stops.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.software_stops",
+      "public_sha256": "5c9cbcc0935488d8fc0ae216ae2051d47e918d0e9047ee75fd6e0b391c09e132"
+    },
+    "evaluate_model_admission": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/model_admission.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.model_admission",
+      "public_sha256": "5d1c2076a2d1c5d295475c2a4df604e83d2b2207ea8ab8763809238f2406972c"
+    },
+    "hash_jsonable": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "2e2a6547acaec021148f51e17fec7b74ad6c2d70ce75f8a90ed780a979b753e2"
+    },
+    "live_context_snapshot_from_live_context": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "85c6d9a695508fa9723f417ef12956cbdb4f0e5ad91cc582a4334fbe431d7f02"
+    },
+    "live_state_legacy_path": {
+      "kernel_sha256": "72de12e77b719d295576f838279e85a122b3628c8b617db732b04fe477665bee",
+      "kernel_twin_file": "renquant_pipeline/kernel/state_paths.py",
+      "public_file": "renquant_pipeline/state_paths.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.state_paths",
+      "public_sha256": "735b08cce5225b9446d869d69005092e72a8d5710a0c654ee38ff31c2eefb46c"
+    },
+    "live_state_path": {
+      "kernel_sha256": "c62ddd710cbc87323d391eaf8637a96bf48ab1db2b63f3b6f0cb93bcacb28178",
+      "kernel_twin_file": "renquant_pipeline/kernel/state_paths.py",
+      "public_file": "renquant_pipeline/state_paths.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.state_paths",
+      "public_sha256": "c67166f371ddeef0329d8a9d730e23a33a43b9b1fef5041167e0f7f2de51ed20"
+    },
+    "load_live_state_contract": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/live_state_contract.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.live_state_contract",
+      "public_sha256": "407a74459f323326e6811f5badc05a05a902bbd839b2e8e1d5faac7842d88214"
+    },
+    "model_type_from_artifact": {
+      "kernel_sha256": "042cc907de86cf8a231a9cfdfe22a2ca7af8b0af68a1f80fd925778be7bffb5f",
+      "kernel_twin_file": "renquant_pipeline/kernel/decision_trace.py",
+      "public_file": "renquant_pipeline/decision_trace.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.decision_trace",
+      "public_sha256": "c86a327a3bf9c3037be629323b5678f74ab0399bd34726351497b0034197675b"
+    },
+    "registry_path_for": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/software_stops.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.software_stops",
+      "public_sha256": "970d87e8bc3147df86baf50901305f45a56c0d4bc0d855315b2463455a89c0d0"
+    },
+    "resolve_live_state_read": {
+      "kernel_sha256": "214f51f3ab69c9b167c072005f61f5bb47281f58488ad90b0069f3275f95a765",
+      "kernel_twin_file": "renquant_pipeline/kernel/state_paths.py",
+      "public_file": "renquant_pipeline/state_paths.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.state_paths",
+      "public_sha256": "ba9f077522533cd2fba207a0ca2b3de51bd4eaf565aafbddaddee734c6c6c06e"
+    },
+    "run_native_inference_snapshot": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/native_inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.native_inference",
+      "public_sha256": "8fe69b7af057c62eac4def3c98990f822e2ca0d11df9a0b06935df04a85bea9e"
+    },
+    "runs_db_legacy_path": {
+      "kernel_sha256": "fdf4d7298a2603183c9c934b7fdb95ac59034e0b46bd3b0bf755a4738feccfce",
+      "kernel_twin_file": "renquant_pipeline/kernel/state_paths.py",
+      "public_file": "renquant_pipeline/state_paths.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.state_paths",
+      "public_sha256": "fdf4d7298a2603183c9c934b7fdb95ac59034e0b46bd3b0bf755a4738feccfce"
+    },
+    "runs_db_path": {
+      "kernel_sha256": "57641e17538d8af1f9bd386019ae659ff0fd5f8d5f2bc852d2da2c8c17d993e9",
+      "kernel_twin_file": "renquant_pipeline/kernel/state_paths.py",
+      "public_file": "renquant_pipeline/state_paths.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.state_paths",
+      "public_sha256": "fae3f7fb0bddf0d2b8b1615aa67ec7b5defd3c527b2e407305b4052a7eb79e0f"
+    },
+    "runtime_inference_payload": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "91eb97c6982925c30ef49766d082a1c2eafbdc9c612dad8ba3887980022abc72"
+    },
+    "runtime_inference_payload_from_live_context": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "fec3ab11bbc8d3842b6a9825b01cd30fb21d0473e00f5a5029161da82775e419"
+    },
+    "score_snapshot": {
+      "kernel_sha256": "8c9391333a7e4731e3d5cf85f23e0ca98ecbc6ad3a2245f477d0502e50a56ce9",
+      "kernel_twin_file": "renquant_pipeline/kernel/pipeline/order_attribution.py",
+      "public_file": "renquant_pipeline/order_attribution.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.order_attribution",
+      "public_sha256": "1c7bc8374305a10c06e536b0dac1246892bad322de57354a5ce87918f4c9c6a6"
+    },
+    "stamp_order_attribution": {
+      "kernel_sha256": "4fcefbba686011854a85726f2c740d4d6988e240fa07b165b8e28c5466de1e53",
+      "kernel_twin_file": "renquant_pipeline/kernel/pipeline/order_attribution.py",
+      "public_file": "renquant_pipeline/order_attribution.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.order_attribution",
+      "public_sha256": "aa2c2d71a9039c178d2198f3614bccdc60cc053e742c18154071991350d1813f"
+    },
+    "transform_feature_rows": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/runtime_features.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.runtime_features",
+      "public_sha256": "0bb8e087ee95c0a0663b4e431e72412e9c11f8b3208ac0ee51419b1bbf04c3ae"
+    },
+    "validate_feature_contract": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "3dcba966b3ae8c264572cddafe2819b62423484e4c138d1099127f41894dff82"
+    },
+    "validate_model_evidence_contract": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "08990419b634ce46237d55a7f9b2ef0f7062ad07f42b153d690da2706a62594e"
+    },
+    "validate_order_attribution": {
+      "kernel_sha256": "0d4a2cffecd10de279b26a086504bcecc567c92bdbd57512ece3ee1ca7f70f43",
+      "kernel_twin_file": "renquant_pipeline/kernel/pipeline/order_attribution.py",
+      "public_file": "renquant_pipeline/order_attribution.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.order_attribution",
+      "public_sha256": "7231d14c4265f9d1fb173d49c3f789143a8e0d35beb58be355b35684e3622f85"
+    },
+    "validate_panel_artifact_contract": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_artifacts/contracts.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_artifacts.contracts",
+      "public_sha256": "4c06b2637095f9bc6e90ed09c94b5143f1bd44b0f0b3ccb26990b1f511affa99"
+    },
+    "write_runtime_inference_payload": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "4e9d2162a70459452b9c428baa97f91d70ef3da6f51ccca33c7425c22d93f6ca"
+    },
+    "write_runtime_inference_payload_from_live_context": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/inference.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.inference",
+      "public_sha256": "16172224472637ff9900b5277c42facc954e26aa35c857b41c758c03e7b22459"
     }
   },
   "schema_version": 1
