@@ -741,3 +741,44 @@ def test_the_helper_is_A3_eligibility_MINUS_the_flag():
                               price=10_000.0,
                               regime_params={"max_position_pct": 0.15},
                               portfolio_value=10_000.0)
+
+
+# ============================ ONE predicate, or the counter drifts ============
+# codex on #237: "keep the eligibility predicate in one production helper shared
+# with the rescue branch, because this counter is being used as ENABLEMENT EVIDENCE
+# and a duplicated predicate will silently drift from the behavior it is meant to
+# measure." That was true when written; these make it stay true.
+
+def test_the_eligibility_predicate_has_exactly_ONE_production_definition():
+    """A second `def floor_eligible` — or an inlined copy of its condition — is how
+    the measurement stops measuring the thing it reports on."""
+    import ast
+    import pathlib
+
+    src_root = pathlib.Path(__file__).resolve().parent.parent / "src"
+    defs = []
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "floor_eligible":
+                defs.append(str(path.relative_to(src_root)))
+    assert defs == ["renquant_pipeline/kernel/pipeline/task_selection.py"], defs
+
+
+def test_BOTH_the_counter_and_the_rescue_branch_call_that_helper():
+    """Counting by AST, not grep: the call spans several lines at both sites, and a
+    line-oriented regex over a multi-line call is how this repo has published wrong
+    counts before."""
+    import ast
+    import pathlib
+
+    path = (pathlib.Path(__file__).resolve().parent.parent / "src"
+            / "renquant_pipeline" / "kernel" / "pipeline" / "task_selection.py")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call)
+             and getattr(n.func, "id", None) == "floor_eligible"]
+    assert len(calls) == 2, [n.lineno for n in calls]
+    # the two sites are in different branches: their line numbers straddle the
+    # deferred-rescue pass, so an inlined duplicate in either one fails the test above
+    assert calls[0].lineno < calls[1].lineno
