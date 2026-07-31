@@ -579,3 +579,165 @@ def _assert_portfolio_evidence(reserve_pct):
         if t in on_rescued:
             continue
         assert off_orders[t] == on_orders.get(t), t
+
+
+# ── The eligibility DENOMINATOR, measurable with the flag OFF ────────────────
+class TestFloorEligibleCounterOffState:
+    """strategy-104's enablement contract requires a floor=OFF dry-run that
+    emits the counters. `one_share_floor_roundups` can only increment with the
+    flag ON, so that evidence was structurally unobtainable and the flag could
+    never be legitimately flipped.
+
+    These pin the denominator: it counts with the flag OFF, it counts the same
+    set with the flag ON, and — the load-bearing control — it changes NOTHING
+    about orders or block reasons in either state.
+    """
+
+    def test_counted_with_the_flag_OFF(self):
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] == 1
+        assert ctx.counters["floor_eligible_notional"] == pytest.approx(BLK_PRICE)
+
+    def test_flag_OFF_behaviour_is_UNCHANGED(self):
+        """The control. A counter that also changed behaviour would be a
+        capital change smuggled in as telemetry."""
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.orders == []
+        assert ctx._blocked_by_ticker["BLK"] == "size_insufficient_cash"
+        assert "one_share_floor_roundups" not in ctx.counters
+
+    def test_the_eligible_set_is_a_SUPERSET_of_the_rescued_set(self):
+        blk = _cand("BLK")
+        ctx = _ctx([blk], ["BLK"], _flag_on_config())
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] >= ctx.counters.get(
+            "one_share_floor_roundups", 0)
+        assert ctx.counters["floor_eligible_count"] == 1
+
+    def test_a_name_ABOVE_the_regime_cap_is_not_eligible(self):
+        """Anti-vacuity: without this the counter would just be 'shares < 1'."""
+        big = _cand("ASML")
+        ctx = _ctx([big], ["ASML"], _config(), prices={"ASML": 5_000.0})
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+    def test_a_cheap_name_that_SIZES_normally_is_not_eligible(self):
+        """Second anti-vacuity control: eligibility is about integer rounding,
+        not about being a candidate."""
+        oxy = _cand("OXY")
+        ctx = _ctx([oxy], ["OXY"], _config(), prices={"OXY": 48.0})
+        SizeAndEmitTask().run(ctx)
+        assert len(ctx.orders) == 1
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+    def test_notional_accumulates_across_names(self):
+        a, b = _cand("BLK"), _cand("CAT")
+        ctx = _ctx([a, b], ["BLK", "CAT"], _config(),
+                   prices={"BLK": BLK_PRICE, "CAT": 900.0})
+        SizeAndEmitTask().run(ctx)
+        assert ctx.counters["floor_eligible_count"] == 2
+        assert ctx.counters["floor_eligible_notional"] == pytest.approx(
+            BLK_PRICE + 900.0)
+
+    def test_a_ZERO_conviction_name_is_not_eligible(self):
+        """The `max_pct > 0` guard exists because of a REAL pre-fix bug: BLK at
+        $1,100 with conviction exactly 0.0 was rescued anyway. `max_pct == 0` is
+        "the model says invest nothing", not a rounding artifact.
+
+        Added after a mutation check showed deleting that guard failed ZERO
+        tests. The FIRST version of this test was itself vacuous — it used a
+        zero raw signal, which is blocked upstream as `negative_raw_signal_no_long`
+        and never reaches this branch at all, so it passed with the guard
+        deleted too. The fixture below keeps the raw signal POSITIVE and drives
+        `conviction_multiplier` to exactly 0 via `min_mult=0.0` with a
+        panel_score below the sizing floor; the assertion on `blocked` is what
+        proves the candidate actually got as far as sizing.
+        """
+        cfg = _config()
+        cfg["ranking"]["panel_scoring"]["sizing"] = {
+            "enabled": True, "floor": 0.5, "ceiling": 1.0, "min_mult": 0.0,
+        }
+        weak = _cand("BLK", panel_score=0.4)      # below floor -> multiplier 0.0
+        ctx = _ctx([weak], ["BLK"], cfg)
+        SizeAndEmitTask().run(ctx)
+        # reached sizing (NOT rejected upstream) …
+        assert ctx._blocked_by_ticker["BLK"] == "size_insufficient_cash"
+        # … and the guard kept it out of the eligible set anyway.
+        assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+
+# --- the counters must be ZERO, not absent (codex #237) -----------------------
+#
+# They were created only inside the positive branch, so a floor-OFF run with no
+# eligible candidate emitted NOTHING for them. Absent reads as "the integration is
+# missing"; zero reads as "measured, and it was none". A counter that disappears
+# exactly when its value is the interesting one cannot be enablement evidence — and
+# a zero-eligibility session is precisely what the contract's dry run must be able
+# to report.
+
+def _floor_counters(ctx):
+    return (ctx.counters.get("floor_eligible_count"),
+            ctx.counters.get("floor_eligible_notional"))
+
+
+def test_no_eligible_candidate_still_emits_BOTH_counters_as_zero():
+    """Every candidate sizes to >= 1 share, so nothing is floor-eligible."""
+    ranked = [_cand("AAA")]
+    ctx = _ctx(ranked, ["AAA"], _config(one_share_floor=False), prices={"AAA": 1.0})
+    SizeAndEmitTask().run(ctx)
+    count, notional = _floor_counters(ctx)
+    assert count == 0, "floor_eligible_count is absent — indistinguishable from a "\
+                       "missing integration"
+    assert notional == 0.0, "floor_eligible_notional is absent"
+
+
+def test_an_EMPTY_candidate_set_still_emits_BOTH_counters_as_zero():
+    """The dry run the contract asks for may legitimately select nothing."""
+    ctx = _ctx([], [], _config(one_share_floor=False))
+    SizeAndEmitTask().run(ctx)
+    assert _floor_counters(ctx) == (0, 0.0)
+
+
+def test_the_counters_are_emitted_with_the_flag_ON_too():
+    """Anti-vacuity for the initialisation: it must not be flag-conditional."""
+    ctx = _ctx([], [], _config(one_share_floor=True))
+    SizeAndEmitTask().run(ctx)
+    assert _floor_counters(ctx) == (0, 0.0)
+
+
+# --- one predicate, shared (codex #237) --------------------------------------
+
+def test_the_eligibility_predicate_exists_once_in_production():
+    """The counter is ENABLEMENT EVIDENCE, so a second copy of the predicate would
+    silently drift from the behaviour it certifies — and a counter that has drifted
+    from its subject is worse than no counter, because the contract would be
+    satisfied by a number describing something else."""
+    import inspect
+    from renquant_pipeline.kernel.pipeline import task_selection as ts
+    src = inspect.getsource(ts)
+    assert src.count("regime_cap_dollars = (") == 1, (
+        "the regime-cap computation appears more than once — the measurement "
+        "counter and the rescue branch must share one predicate")
+    assert src.count("def floor_eligible(") == 1
+
+
+def test_the_helper_is_A3_eligibility_MINUS_the_flag():
+    """It must not consult the flag: a flag-OFF count needs the flag-free predicate."""
+    from renquant_pipeline.kernel.pipeline.task_selection import floor_eligible
+    import inspect
+    assert "one_share_floor" not in inspect.getsource(floor_eligible)
+    common = dict(price=10.0, regime_params={"max_position_pct": 0.15},
+                  portfolio_value=10_000.0)
+    assert floor_eligible(shares=0.4, override_pct=None, max_pct=0.1, **common)
+    # each guard, individually
+    assert not floor_eligible(shares=1.2, override_pct=None, max_pct=0.1, **common)
+    assert not floor_eligible(shares=0.4, override_pct=0.05, max_pct=0.1, **common)
+    assert not floor_eligible(shares=0.4, override_pct=None, max_pct=0.0, **common)
+    assert not floor_eligible(shares=0.4, override_pct=None, max_pct=0.1,
+                              price=10_000.0,
+                              regime_params={"max_position_pct": 0.15},
+                              portfolio_value=10_000.0)

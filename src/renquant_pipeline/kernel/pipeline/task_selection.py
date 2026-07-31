@@ -136,6 +136,32 @@ class RunSelectionTask(Task):
         )
 
 
+def floor_eligible(*, shares: float, override_pct, max_pct: float,
+                   price: float, regime_params: dict,
+                   portfolio_value: float) -> bool:
+    """Would the one-share floor have a claim on this candidate?
+
+    ONE definition, used by both the measurement counter (flag OFF) and the rescue
+    branch (flag ON). Codex on #237: the counter is being used as ENABLEMENT
+    EVIDENCE, so a duplicated predicate would silently drift from the behaviour it
+    is meant to measure — and a counter that has drifted from its subject is worse
+    than no counter, because the contract would be satisfied by a number describing
+    something else.
+
+    This is A-3 eligibility MINUS the flag: the candidate rounds to zero shares by
+    integer sizing alone, is not a BEAR defensive slot, has a positive cap, and one
+    share fits under the UNSCALED regime cap. It is a SUPERSET of the rescued set —
+    the deferred pass can still decline for want of leftover cash.
+    """
+    if not (shares < 1 and override_pct is None and max_pct > 0):
+        return False
+    regime_cap_dollars = (
+        float(regime_params.get("max_position_pct", 0.15))
+        * float(portfolio_value or 0.0)
+    )
+    return price <= regime_cap_dollars + 1e-6
+
+
 class SizeAndEmitTask(Task):
     """Size each selected ticker and emit buy orders → ctx.orders."""
 
@@ -340,6 +366,16 @@ class SizeAndEmitTask(Task):
         # does the rescue pass spend whatever is genuinely left over — in
         # the SAME relative rank order, so among rescue candidates
         # themselves, higher rank still wins ties for leftover cash.
+        # ALWAYS emitted, whatever the run does. Codex on #237: created only inside
+        # the positive branch, these were ABSENT rather than zero whenever a
+        # floor-OFF run had no eligible candidate — and a zero-eligibility session
+        # is precisely the observation the enablement contract needs. Absent reads
+        # as "the integration is missing"; zero reads as "measured, and it was
+        # none". A counter that disappears exactly when its value is the
+        # interesting one cannot be enablement evidence.
+        ctx.counters.setdefault("floor_eligible_count", 0)
+        ctx.counters.setdefault("floor_eligible_notional", 0.0)
+
         deferred_rescues: list[tuple[str, float, Any, float, float, float]] = []
 
         def _emit_order(ticker: str, shares: float, price: float, c: Any,
@@ -568,6 +604,31 @@ class SizeAndEmitTask(Task):
                             sizing_mode="fractional",
                             target_notional=target_notional)
                 continue
+            # MEASUREMENT ONLY — no control flow depends on this block.
+            #
+            # strategy-104's enablement contract for `sizing.one_share_floor_enabled`
+            # (doc/progress/2026-07-12-one-share-floor-enablement.md) requires, as a
+            # PREREQUISITE to enabling, "at least one production dry-run with
+            # floor=OFF that proves the chain emits all 8 counters". The only
+            # floor counter that existed was `one_share_floor_roundups`, which can
+            # only increment when the floor is ON — so the evidence the contract
+            # demands was structurally unobtainable, and the flag could never be
+            # legitimately flipped.
+            #
+            # This counts the ELIGIBLE SET — candidates that cleared every
+            # admission gate and round to zero shares purely by integer sizing —
+            # using the identical predicate as the rescue branch below MINUS the
+            # flag itself. It therefore reports, with the floor OFF, exactly how
+            # much capital the floor WOULD have had a claim on. `_eligible` is
+            # a superset of the rescued set: the deferred pass below can still
+            # decline a candidate for want of leftover cash.
+            if floor_eligible(shares=shares, override_pct=override_pct,
+                              max_pct=max_pct, price=price,
+                              regime_params=regime_p,
+                              portfolio_value=ctx.portfolio_value):
+                ctx.counters["floor_eligible_count"] += 1
+                ctx.counters["floor_eligible_notional"] += float(price)
+
             if shares < 1 and one_share_floor_on and override_pct is None and max_pct > 0:
                 # A-3 eligibility (contract, RS-2 §A-3): round UP to exactly
                 # ONE share iff (a) one share fits under the regime's own
@@ -602,11 +663,14 @@ class SizeAndEmitTask(Task):
                 # eligibility, so the block-reason string for a genuine
                 # zero-target legacy candidate stays "size_insufficient_cash"
                 # (the existing fallback below), exactly as before this fix.
-                regime_cap_dollars = (
-                    float(regime_p.get("max_position_pct", 0.15))
-                    * float(ctx.portfolio_value or 0.0)
-                )
-                if price <= regime_cap_dollars + 1e-6:
+                # Same predicate object as the measurement counter above, so the
+                # counter cannot drift from the behaviour it certifies. The flag
+                # itself stays in the enclosing `if` — the helper is A-3 eligibility
+                # MINUS the flag, which is exactly what a flag-OFF count needs.
+                if floor_eligible(shares=shares, override_pct=override_pct,
+                                  max_pct=max_pct, price=price,
+                                  regime_params=regime_p,
+                                  portfolio_value=ctx.portfolio_value):
                     deferred_rescues.append((ticker, price, c, conv, sig_m, max_pct))
                     continue
             if shares < 1:
