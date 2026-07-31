@@ -98,3 +98,37 @@ actually reached sizing. Deleting the guard now fails it.
 It does not enable the floor, does not implement the other 6 contract metrics, and does
 not touch the orchestrator scorecard integration the contract also requires. It removes
 exactly one blocker: the prerequisite that could not be met by construction.
+
+## Review round 1 — the counters were absent, not zero, exactly when that mattered
+
+Codex: the metrics were created only inside the positive branch, so a floor-OFF run
+with **no** eligible candidate emitted nothing for them — *"a zero-eligibility session
+remains unobservable and can look like a missing integration"*.
+
+That is fatal for this PR's purpose. The whole point is to satisfy the enablement
+contract's dry-run prerequisite, and **absent** reads as *"the integration is missing"*
+while **zero** reads as *"measured, and it was none"*. A counter that disappears
+exactly when its value is the interesting observation cannot be enablement evidence.
+
+`floor_eligible_count` and `floor_eligible_notional` are now `setdefault`-ed for
+**every** sizing run, before the loop and independent of the flag.
+
+## And the predicate was about to become a twin
+
+Codex again: *"keep the eligibility predicate in one production helper shared with the
+rescue branch, because this counter is being used as enablement evidence and a
+duplicated predicate will silently drift from the behavior it is meant to measure."*
+
+It was already duplicated — my measurement block recomputed the regime cap and the
+`price <= cap + 1e-6` comparison that the rescue branch computes twelve lines later.
+This repo keeps a registry for exactly that shape.
+
+Extracted `floor_eligible(...)`, used by **both**. It is A-3 eligibility **minus the
+flag**, which is what a flag-OFF count needs, and a test asserts the helper's source
+never mentions `one_share_floor` so it cannot quietly acquire the flag later.
+**A counter that has drifted from its subject is worse than no counter, because the
+contract would then be satisfied by a number describing something else.**
+
+`[VERIFIED — this session]` 32 pass. Load-bearing by injection, not assertion:
+removing the unconditional init fails **3** tests; re-duplicating the predicate in the
+rescue branch fails **1**; all pass again on restore.

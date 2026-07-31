@@ -668,3 +668,76 @@ class TestFloorEligibleCounterOffState:
         assert ctx._blocked_by_ticker["BLK"] == "size_insufficient_cash"
         # … and the guard kept it out of the eligible set anyway.
         assert ctx.counters.get("floor_eligible_count", 0) == 0
+
+
+# --- the counters must be ZERO, not absent (codex #237) -----------------------
+#
+# They were created only inside the positive branch, so a floor-OFF run with no
+# eligible candidate emitted NOTHING for them. Absent reads as "the integration is
+# missing"; zero reads as "measured, and it was none". A counter that disappears
+# exactly when its value is the interesting one cannot be enablement evidence — and
+# a zero-eligibility session is precisely what the contract's dry run must be able
+# to report.
+
+def _floor_counters(ctx):
+    return (ctx.counters.get("floor_eligible_count"),
+            ctx.counters.get("floor_eligible_notional"))
+
+
+def test_no_eligible_candidate_still_emits_BOTH_counters_as_zero():
+    """Every candidate sizes to >= 1 share, so nothing is floor-eligible."""
+    ranked = [_cand("AAA")]
+    ctx = _ctx(ranked, ["AAA"], _config(one_share_floor=False), prices={"AAA": 1.0})
+    SizeAndEmitTask().run(ctx)
+    count, notional = _floor_counters(ctx)
+    assert count == 0, "floor_eligible_count is absent — indistinguishable from a "\
+                       "missing integration"
+    assert notional == 0.0, "floor_eligible_notional is absent"
+
+
+def test_an_EMPTY_candidate_set_still_emits_BOTH_counters_as_zero():
+    """The dry run the contract asks for may legitimately select nothing."""
+    ctx = _ctx([], [], _config(one_share_floor=False))
+    SizeAndEmitTask().run(ctx)
+    assert _floor_counters(ctx) == (0, 0.0)
+
+
+def test_the_counters_are_emitted_with_the_flag_ON_too():
+    """Anti-vacuity for the initialisation: it must not be flag-conditional."""
+    ctx = _ctx([], [], _config(one_share_floor=True))
+    SizeAndEmitTask().run(ctx)
+    assert _floor_counters(ctx) == (0, 0.0)
+
+
+# --- one predicate, shared (codex #237) --------------------------------------
+
+def test_the_eligibility_predicate_exists_once_in_production():
+    """The counter is ENABLEMENT EVIDENCE, so a second copy of the predicate would
+    silently drift from the behaviour it certifies — and a counter that has drifted
+    from its subject is worse than no counter, because the contract would be
+    satisfied by a number describing something else."""
+    import inspect
+    from renquant_pipeline.kernel.pipeline import task_selection as ts
+    src = inspect.getsource(ts)
+    assert src.count("regime_cap_dollars = (") == 1, (
+        "the regime-cap computation appears more than once — the measurement "
+        "counter and the rescue branch must share one predicate")
+    assert src.count("def floor_eligible(") == 1
+
+
+def test_the_helper_is_A3_eligibility_MINUS_the_flag():
+    """It must not consult the flag: a flag-OFF count needs the flag-free predicate."""
+    from renquant_pipeline.kernel.pipeline.task_selection import floor_eligible
+    import inspect
+    assert "one_share_floor" not in inspect.getsource(floor_eligible)
+    common = dict(price=10.0, regime_params={"max_position_pct": 0.15},
+                  portfolio_value=10_000.0)
+    assert floor_eligible(shares=0.4, override_pct=None, max_pct=0.1, **common)
+    # each guard, individually
+    assert not floor_eligible(shares=1.2, override_pct=None, max_pct=0.1, **common)
+    assert not floor_eligible(shares=0.4, override_pct=0.05, max_pct=0.1, **common)
+    assert not floor_eligible(shares=0.4, override_pct=None, max_pct=0.0, **common)
+    assert not floor_eligible(shares=0.4, override_pct=None, max_pct=0.1,
+                              price=10_000.0,
+                              regime_params={"max_position_pct": 0.15},
+                              portfolio_value=10_000.0)
