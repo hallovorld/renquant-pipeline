@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin every public Task export and its same-named kernel twin. (GOAL-3, orch#623 R1)
+"""Pin every public export and its same-named kernel twin. (GOAL-3, orch#623 R1)
 
 The orchestrator's twin registry (renquant-orchestrator#623) names the defect: *"the
 failure is not that duplicates exist — some duplication is deliberate. The failure is
@@ -10,8 +10,8 @@ real defect (pipeline#222).
 
 Measured here, R1 is not a one-off:
 
-* **9 of 9** public ``*Task`` exports resolve to a **non-kernel** module;
-* **6 of those 9** have a **same-named class under ``kernel/``**.
+* **19** public exports have a same-named definition under ``kernel/``;
+* the previous ``*Task``-only scope covered **6** of them.
 
 So six documented symbols each have a twin, and nothing mechanically relates them.
 
@@ -61,18 +61,36 @@ def _rel(path: str | None) -> str | None:
     return "/".join(parts[-3:])
 
 
-def public_task_names(module) -> list[str]:
-    """Public ``*Task`` exports, read off ``__all__``.
+def public_export_names(module) -> list[str]:
+    """EVERY public export, read off ``__all__``. No name filter.
 
     ``__all__`` and not ``dir()``: the documented surface is the one a caller is told to
     import, and it is the surface #623 R1 is about.
+
+    THE FILTER THIS FUNCTION USED TO HAVE. It selected ``n.endswith("Task")``. That is an
+    enumerated scope, and an enumerated scope passes forever for everything outside it.
+    Measured 2026-07-31: **19** public exports have a same-named definition under
+    ``kernel/``; the ``*Task`` filter covered **6**. The 13 it silently excluded include
+    ``stamp_order_attribution`` and ``validate_order_attribution`` -- order-attribution
+    functions on the capital path -- plus ``PanelScoringJob`` and ``SelectionJob``, which
+    are Jobs and so never matched a suffix looking for Tasks.
+
+    The default is now inverted: scan everything, and let ``kernel_twin`` decide. A tool
+    built to find the copy that runs must not have a scope narrower than the class of
+    defect it is looking for.
     """
-    return sorted(n for n in getattr(module, "__all__", []) if n.endswith("Task"))
+    return sorted(getattr(module, "__all__", []))
 
 
 def kernel_twin(name: str) -> str | None:
-    """Path of a same-named class under ``kernel/``, or None."""
-    pattern = re.compile(rf"^class {re.escape(name)}\b", re.M)
+    """Path of a same-named class OR function under ``kernel/``, or None.
+
+    THE SECOND ENUMERATED SCOPE. This matched ``^class NAME`` only, so a function twin
+    was invisible even to a caller that had already stopped filtering on ``*Task``. Two
+    narrow scopes stacked: the first excluded the names, the second excluded the kinds.
+    """
+    pattern = re.compile(
+        rf"^(?:class|def|async def) {re.escape(name)}\b", re.M)
     for path in sorted(KERNEL_DIR.rglob("*.py")):
         if pattern.search(path.read_text(encoding="utf-8")):
             return _rel(str(path))
@@ -83,9 +101,23 @@ def survey() -> dict[str, Any]:
     import renquant_pipeline as rp
 
     pairs: dict[str, Any] = {}
-    for name in public_task_names(rp):
+    for name in public_export_names(rp):
         obj = getattr(rp, name)
-        public_file = _rel(inspect.getsourcefile(obj))
+        try:
+            source_file = inspect.getsourcefile(obj)
+        except TypeError:
+            # Not a source object (a constant, a re-exported value). It is RECORDED,
+            # not skipped: silently dropping names from `__all__` would put them
+            # outside the scan the same way the `*Task` filter did, and the invariant
+            # that every documented export appears in this file is what lets a reader
+            # trust the absence of a warning.
+            pairs[name] = {
+                "kind": "not-a-source-object",
+                "public_type": type(obj).__name__,
+                "kernel_twin_file": kernel_twin(name),
+            }
+            continue
+        public_file = _rel(source_file)
         entry: dict[str, Any] = {
             "public_module": getattr(obj, "__module__", None),
             "public_file": public_file,
@@ -97,13 +129,14 @@ def survey() -> dict[str, Any]:
         if twin:
             src = (KERNEL_DIR.parent.parent / twin).read_text(encoding="utf-8")
             block = re.search(
-                rf"^class {re.escape(name)}\b.*?(?=^class |\Z)", src, re.M | re.S)
+                rf"^(?:class|def|async def) {re.escape(name)}\b"
+                rf".*?(?=^class |^def |^async def |\Z)", src, re.M | re.S)
             entry["kernel_sha256"] = _digest(block.group(0)) if block else None
         pairs[name] = entry
     return {
         "schema_version": 1,
         "_comment": (
-            "GOAL-3 / renquant-orchestrator#623 R1. Which copy of each DOCUMENTED Task "
+            "GOAL-3 / renquant-orchestrator#623 R1. Which copy of each DOCUMENTED public "
             "symbol executes, and the digest of both sides of every twin pair. Editing "
             "one side without the other fails the check --- that is the defect. "
             "Regenerate with tools/twin_pairs.py --emit and commit through review."
@@ -121,11 +154,11 @@ def verify(pins: dict[str, Any]) -> list[str]:
 
     for name in sorted(set(want) - set(live)):
         problems.append(
-            f"{name}: pinned but no longer a public Task export — re-emit so the pin "
+            f"{name}: pinned but no longer a public export — re-emit so the pin "
             f"describes the actual surface")
     for name in sorted(set(live) - set(want)):
         problems.append(
-            f"{name}: public Task export with no pin — run --emit and commit. An "
+            f"{name}: public export with no pin — run --emit and commit. An "
             f"unpinned export is indistinguishable from a checked one")
 
     for name in sorted(set(want) & set(live)):
@@ -176,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     n = len(pins["pairs"])
     twins = sum(1 for v in pins["pairs"].values() if v.get("kernel_twin_file"))
-    print(f"twin-pairs OK — {n} public Task exports pinned, {twins} with a kernel twin")
+    print(f"twin-pairs OK — {n} public exports pinned, {twins} with a kernel twin")
     return 0
 
 
