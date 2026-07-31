@@ -225,14 +225,49 @@ def one_sided_repins(old: dict[str, Any], new: dict[str, Any],
             f"in twin_repin_exceptions.json naming this pair and BOTH digest tuples "
             f"with a reason")
 
-    for i, e in enumerate(exc):
-        if i in used:
+    # STALENESS IS ABOUT THE PINS, NOT ABOUT THIS DIFF.
+    #
+    # The first version reported every exception not used by the CURRENT diff. That
+    # makes a legitimate exception a time bomb: it is used on the PR that adds it,
+    # and then the very next unrelated PR has no matching pin movement, so the same
+    # committed entry is reported and CI fails permanently. The check's subject was
+    # "did this diff use it" when the question is "does it still describe the pins".
+    #
+    # An exception is a record that a specific pair moved from one exact digest tuple
+    # to another, with a reason. It remains TRUE as long as the pair still sits at the
+    # `new_*` tuple. It is superseded the moment either side moves again -- which is
+    # the property the original comment wanted, and it is checkable against `new`
+    # rather than against the diff.
+    for e in exc:
+        name = e.get("pair")
+        why = str(e.get("reason") or "").strip()
+        if not why:
+            problems.append(
+                f"{name or '?'}: exception states no reason. A justification with no "
+                f"justification is a rubber stamp")
             continue
-        problems.append(
-            f"{e.get('pair', '?')}: STALE exception in twin_repin_exceptions.json — it "
-            f"matches no one-sided re-pin in this diff. Exceptions are bound to one "
-            f"exact digest tuple; a leftover one silently pre-authorises the NEXT "
-            f"change. Remove it")
+        missing = [k for k in ("pair", "old_public_sha256", "old_kernel_sha256",
+                               "new_public_sha256", "new_kernel_sha256")
+                   if not e.get(k)]
+        if missing:
+            problems.append(
+                f"{name or '?'}: exception is missing required key(s) {missing} — it "
+                f"cannot be bound to a digest movement and cannot be checked")
+            continue
+        if name not in b:
+            problems.append(
+                f"{name}: exception names a pair that no longer exists in the pins — "
+                f"remove it, the movement it records can no longer be verified")
+            continue
+        cur = _pair_digests(b[name])
+        if (e.get("new_public_sha256"), e.get("new_kernel_sha256")) != cur:
+            problems.append(
+                f"{name}: SUPERSEDED exception in twin_repin_exceptions.json — it "
+                f"records a move to {e.get('new_public_sha256', '?')[:12]}…/"
+                f"{e.get('new_kernel_sha256', '?')[:12]}… but the pins now read "
+                f"{(cur[0] or '?')[:12]}…/{(cur[1] or '?')[:12]}…. It no longer "
+                f"describes the current state, and leaving it would pre-authorise a "
+                f"movement nobody justified. Remove it or re-declare the new one")
     return problems
 
 

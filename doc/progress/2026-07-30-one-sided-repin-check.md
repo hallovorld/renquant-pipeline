@@ -81,3 +81,39 @@ flags every pin update gets ignored within a week), and the CLI comparing the pi
 to themselves must exit 0 (otherwise the exit-1 test proves nothing).
 
 Together with the existing suite: **28 passed** `[VERIFIED — pytest, this session]`.
+
+## Review round 1 — the exception policy broke every later PR
+
+Codex: an exception is used on the PR that adds it, but after merge the next unrelated
+PR has no matching pin movement, so `one_sided_repins()` reported the same committed
+entry as STALE and CI failed **permanently**. A legitimate, justified exception was a
+time bomb.
+
+**The check's subject was wrong.** It asked *"did this diff use the entry"* when the
+question is *"does the entry still describe the pins"*. An exception is an audit record
+of a movement that happened — not a token consumed by one diff — so it stays true for
+as long as the pair sits at its `new_*` tuple.
+
+Rewritten against `new` rather than against the diff. An entry is now reported when:
+
+* its `reason` is empty (unchanged — a rubber stamp);
+* it is missing a required key, so it cannot be bound to a movement at all;
+* it names a pair that no longer exists in the pins;
+* **SUPERSEDED** — the pins have moved past its `new_*` tuple, so it describes a state
+  that no longer exists and would pre-authorise a movement nobody justified.
+
+That last case preserves the property the original comment wanted (*"goes stale the
+moment either side moves again"*) — which was always checkable against the pins, and
+never needed the diff.
+
+**Regression, exactly as asked:** `test_a_CURRENT_exception_survives_an_unrelated_later_PR`
+puts the pins at the settled tuple with nothing moving — every subsequent PR's baseline —
+and requires it clean. `test_the_landing_PR_and_the_NEXT_one_both_pass_with_the_same_entry`
+asserts both halves together, since each alone can pass while the pair is broken.
+
+`[VERIFIED — this session]` 21 tests pass. Load-bearing confirmed by restoring the old
+"not used by this diff" rule: both new regressions **fail**, and all 21 pass again on
+restore.
+
+The committed `_comment` was updated too — it described the old semantics, and a policy
+file that misstates its own rule is how the next author re-derives the bug.

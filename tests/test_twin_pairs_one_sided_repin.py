@@ -133,9 +133,9 @@ def test_an_exception_for_a_DIFFERENT_new_digest_does_not_suppress():
     over to the next one, or it becomes a standing licence."""
     got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "333"),
                               exceptions=[_exc(nk="222")])
-    assert len(got) == 2, got            # unjustified re-pin + the now-stale exception
+    assert len(got) == 2, got            # unjustified re-pin + the superseded entry
     assert any("KERNEL-only" in g for g in got)
-    assert any("STALE exception" in g for g in got)
+    assert any("SUPERSEDED exception" in g for g in got)
 
 
 def test_an_exception_for_a_DIFFERENT_old_digest_does_not_suppress():
@@ -158,12 +158,40 @@ def test_an_exception_with_an_empty_reason_is_rejected():
         assert any("states no reason" in g for g in got), (blank, got)
 
 
-def test_a_leftover_exception_is_reported_as_STALE():
-    """It matches nothing in this diff, so it is silently pre-authorising the NEXT
-    one-sided change. That is the failure mode an allowlist always has."""
+def test_an_exception_whose_pins_have_moved_on_is_reported_as_SUPERSEDED():
+    """It records a move to aaa/222 but the pins read aaa/111, so it no longer
+    describes the current state and would pre-authorise a future movement."""
     got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "111"),
                               exceptions=[_exc()])
-    assert len(got) == 1 and "STALE exception" in got[0]
+    assert len(got) == 1 and "SUPERSEDED exception" in got[0]
+
+
+def test_a_CURRENT_exception_survives_an_unrelated_later_PR():
+    """THE regression codex asked for, and the defect that prompted this rewrite.
+
+    An exception is used on the PR that adds it, and then the next unrelated PR has
+    no matching pin movement. The first version reported "not used by this diff" as
+    STALE, so a legitimate, justified exception broke CI permanently from the merge
+    onward. The check's subject was "did this diff use it" when the question is "does
+    it still describe the pins".
+
+    Here: the pins already sit at the exception's `new_*` tuple and nothing moves.
+    That is every subsequent PR's baseline, and it must be clean.
+    """
+    settled = _pins("aaa", "222")          # where the justified re-pin landed
+    got = tp.one_sided_repins(settled, settled, exceptions=[_exc()])
+    assert got == [], got
+
+
+def test_the_landing_PR_and_the_NEXT_one_both_pass_with_the_same_entry():
+    """The two halves together, since each alone can pass while the pair is broken."""
+    e = _exc()
+    landing = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"),
+                                  exceptions=[e])
+    assert landing == [], landing
+    following = tp.one_sided_repins(_pins("aaa", "222"), _pins("aaa", "222"),
+                                    exceptions=[e])
+    assert following == [], following
 
 
 def test_the_committed_exception_file_is_empty_and_well_formed():
