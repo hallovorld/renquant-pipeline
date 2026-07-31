@@ -1,4 +1,4 @@
-"""GOAL-3 #623 row R7 — is the cost-aware branch reachable in production yet?
+"""GOAL-3 #623 row R7 — does any call site in this repo's src/ reach the branch?
 
 The registry recorded: *"`is_wash_sale_blocked_with_cost` branch (a) validates nothing
 in production — no caller passes `expected_dollar_return`"*, measured at **3** call
@@ -11,7 +11,16 @@ pass a real `expected_dollar_return`. The one site that names the parameter pass
 So the row is stale in the direction of UNDERSTATING it: the call sites doubled while
 the defect persisted. That is the registry-rot this file exists to stop — the count is
 now asserted, so the next caller added without the parameter fails a test instead of
-quietly extending an unreachable branch.
+quietly extending an unreached branch.
+
+SCOPE, corrected after review. This file measures THIS REPOSITORY'S `src/` and nothing
+else, so it cannot support "the branch never executes in production": `renquant_pipeline`
+is a shared package and a consumer could supply the parameter. The cross-repo census
+that closes that gap is in `doc/audit/2026-07-31-r7-reverification.md` (zero calls in
+any repo outside this one; the umbrella's six are its vendored copy of this kernel), and
+`tools/call_site_inventory.py` makes it rerunnable. It is deliberately NOT asserted here
+— it is a fact about ten checkouts on one machine, which is an observation to date, not
+a property of this repository.
 """
 
 from __future__ import annotations
@@ -48,7 +57,8 @@ def test_the_call_site_count_is_asserted_not_remembered():
 
 
 def test_zero_call_sites_pass_a_real_expected_dollar_return():
-    """THE R7 finding, still true. Branch (a) is unreachable in production."""
+    """THE R7 finding, still true: branch (a) is not reached from any call site in
+    `src/`. Not "never executes in production" — see this module's docstring."""
     passing = []
     for path, line, kw in _call_sites():
         node = kw.get("expected_dollar_return")
