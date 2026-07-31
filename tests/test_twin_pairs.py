@@ -28,12 +28,19 @@ def test_the_committed_pins_verify_clean():
 
 
 def test_the_measured_shape_is_pinned():
-    """These three numbers ARE the #623 R1 finding. If any moves, the finding moved."""
+    """These numbers ARE the #623 R1 finding. If any moves, the finding moved.
+
+    WIDENED 2026-07-31. They used to read 9 exports / 6 twins, because the scan
+    selected `n.endswith("Task")` and matched `^class NAME` only. Both were
+    enumerated scopes and both passed forever outside themselves. The real surface
+    is 51 exports with 19 kernel twins.
+    """
     pairs = PINS["pairs"]
-    assert len(pairs) == 9
-    assert sum(1 for v in pairs.values() if v.get("kernel_twin_file")) == 6
-    assert sum(1 for v in pairs.values() if v["public_is_kernel"]) == 0, (
-        "a public Task now resolves INTO the kernel — the twin situation changed")
+    assert len(pairs) == 51
+    assert sum(1 for v in pairs.values() if v.get("kernel_twin_file")) == 19
+    sourced = [v for v in pairs.values() if "public_is_kernel" in v]
+    assert sum(1 for v in sourced if v["public_is_kernel"]) == 0, (
+        "a public export now resolves INTO the kernel — the twin situation changed")
 
 
 # --- THE regression: one side edited, the other not --------------------------
@@ -95,7 +102,7 @@ def test_a_pin_for_something_no_longer_exported_is_a_problem():
     pins["pairs"]["RetiredTask"] = {"public_module": "x", "public_file": "x",
                                     "public_sha256": "y"}
     problems = tp.verify(pins)
-    assert len(problems) == 1 and "no longer a public Task export" in problems[0]
+    assert len(problems) == 1 and "no longer a public export" in problems[0]
 
 
 def test_empty_pins_are_a_problem_not_a_pass():
@@ -105,7 +112,7 @@ def test_empty_pins_are_a_problem_not_a_pass():
 
 # --- helpers -----------------------------------------------------------------
 
-def test_public_task_names_reads_dunder_all_not_dir():
+def test_public_export_names_reads_dunder_all_not_dir():
     """`__all__` is the DOCUMENTED surface, and that is what #623 R1 is about. Reading
     dir() would pin internals nobody is told to import.
 
@@ -114,11 +121,18 @@ def test_public_task_names_reads_dunder_all_not_dir():
     surface than the one callers can import --- the same "checked set is not the real
     set" gap this file exists to close. My first version of this test asserted the
     opposite and was wrong; the code was right.
+
+    Note what is ALSO not filtered, as of 2026-07-31: the name itself. `helper` is
+    returned. A `*Task` suffix filter left 13 kernel twins -- including
+    `stamp_order_attribution` on the capital path -- permanently outside the scan.
     """
     class M:
         __all__ = ["BTask", "ATask", "helper", "_HiddenTask"]
-    assert tp.public_task_names(M) == ["ATask", "BTask", "_HiddenTask"]
-    assert "helper" not in tp.public_task_names(M)
+    assert tp.public_export_names(M) == ["ATask", "BTask", "_HiddenTask", "helper"]
+    # INVERTED 2026-07-31. This line used to assert `helper` was EXCLUDED. That
+    # exclusion is the defect: it is exactly how 13 kernel twins stayed outside
+    # the scan. A non-Task export is not a non-twin.
+    assert "helper" in tp.public_export_names(M)
 
 
 def test_kernel_twin_returns_None_for_a_name_with_no_kernel_class():
