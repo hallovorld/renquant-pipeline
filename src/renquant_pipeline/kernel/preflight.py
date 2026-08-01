@@ -433,6 +433,42 @@ def _check_panel_artifact_contract(
     )
 
 
+#: What a stamped WF-gate verdict is a statement ABOUT. Three distinct values, and the
+#: third is why this is not a boolean: `UNSTATED` means the producer did not record the
+#: scope at all, which is neither "the artifact was scored" nor "it wasn't".
+GATE_SCOPE_ARTIFACT = "artifact"      # this booster was itself evaluated
+GATE_SCOPE_RECIPE = "recipe"          # a recipe/manifest was validated; this booster was not
+GATE_SCOPE_UNSTATED = "unstated"      # no artifact_usage block -- unknown, not clean
+
+
+def _gate_evidence_scope(wf: dict) -> dict:
+    """Read the producer's own qualifier off the gate stamp.
+
+    Defensive on shape by construction: `artifact_usage` arriving as a string would make
+    ``(x or {}).get(...)`` raise, because a non-empty string is truthy and the fallback
+    never fires. That exact shape has already produced four separate defects in this
+    programme, so the type is checked rather than assumed.
+    """
+    au = wf.get("artifact_usage")
+    if not isinstance(au, dict):
+        return {"gate_evidence_scope": GATE_SCOPE_UNSTATED,
+                "gate_candidate_artifact_used": None,
+                "gate_eval_scope": None}
+    used = au.get("candidate_artifact_used")
+    if used is True:
+        scope = GATE_SCOPE_ARTIFACT
+    elif used is False:
+        scope = GATE_SCOPE_RECIPE
+    else:
+        # Absent or non-boolean. NOT False -- an unrecognised value has not established
+        # that the artifact went unscored any more than that it was scored.
+        scope = GATE_SCOPE_UNSTATED
+    return {"gate_evidence_scope": scope,
+            "gate_candidate_artifact_used": used if isinstance(used, bool) else None,
+            "gate_eval_scope": au.get("eval_scope")
+            if isinstance(au.get("eval_scope"), str) else None}
+
+
 def _check_wf_gate_metadata(
     config: dict,
     strategy_dir: Path,
@@ -487,6 +523,26 @@ def _check_wf_gate_metadata(
         "strategy_minus_spy_sharpe_mean": wf.get("strategy_minus_spy_sharpe_mean"),
         "wf_reason": wf.get("wf_reason"),
         "run_at": wf.get("run_at"),
+        # WHAT IS THIS PASS A STATEMENT ABOUT? The producer answers that and this
+        # consumer was discarding the answer. `RenQuant/scripts/run_wf_gate.py`
+        # deliberately writes `candidate_artifact_used=False` whenever the strategy
+        # config uses a walk-forward manifest -- its own docstring says the manifest
+        # "validates a retraining recipe / manifest instead; it must not silently
+        # stamp the candidate artifact as passed."
+        #
+        # Measured 2026-08-01 across every stamped artifact under
+        # backtesting/renquant_104/artifacts: 53 carry a gate block, **53 of 53** have
+        # `candidate_artifact_used=False`, **40** of those carry `passed=True`, and
+        # **51 of 53** share ONE recipe fingerprint `sha256:cfdd6cb8e950da0f`. So the
+        # pass distinguishes recipes, not boosters -- and P-WF-GATE, the production
+        # trust boundary for admitting buys, was reading `passed` alone.
+        #
+        # SURFACED, NOT ENFORCED. Making this a failure would block new buys on every
+        # artifact in the tree at once. The admission decision is unchanged here; the
+        # qualifier now reaches the run bundle so the policy question ("may a
+        # recipe-level pass admit capital?") is answerable from evidence instead of
+        # being invisible.
+        **_gate_evidence_scope(wf),
     }
     if passed is False:
         if _is_sell_only_run(run_mode):
