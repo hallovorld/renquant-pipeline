@@ -263,6 +263,20 @@ def removed_live_exceptions(base_exc: list[dict], head_exc: list[dict],
         after_pub = e.get("new_public_sha256")
         after_ker = e.get("new_kernel_sha256")
         cur = b.get(name) or {}
+        # A record carrying no `new_*` digests identifies NO state, so "is it still in
+        # force?" has no answer. Falling through leaves `still_applies` False and the
+        # deletion passes -- a narrower survivor of the same fail-open the flattened-key
+        # fix just closed, measured 2026-08-01 on a record with `pair` and `old_*` only.
+        # Reported as MALFORMED, which is neither live nor aged-out: reading it as
+        # aged-out hides a deletion, reading it as live would block tidying the file.
+        if after_pub is None or after_ker is None:
+            problems.append(
+                f"{name or '<no pair>'}: a deleted exception is MALFORMED — it carries "
+                f"no new_public_sha256/new_kernel_sha256, so whether it was still in "
+                f"force cannot be decided. Required keys: pair, "
+                f"old_public_sha256, old_kernel_sha256, new_public_sha256, "
+                f"new_kernel_sha256, reason.")
+            continue
         still_applies = (
             name in b
             and cur.get("public_sha256") == after_pub

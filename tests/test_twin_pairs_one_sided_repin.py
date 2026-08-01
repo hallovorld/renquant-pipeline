@@ -392,3 +392,19 @@ def test_CLI_rejects_a_MALFORMED_base_exception_file(tmp_path, monkeypatch, caps
                   "--base-exceptions", str(be)])
     assert rc == 2
     assert "must be an object" in capsys.readouterr().err
+
+
+def test_deleting_a_record_with_NO_new_digests_is_MALFORMED_not_aged_out():
+    """A residual fail-open, narrower than the flattened-key one fixed above.
+
+    A record with `pair` and `old_*` but no `new_*` identifies no state, so
+    `still_applies` falls to False and the deletion passes silently. Measured
+    2026-08-01 on the tip that fixed the schema. MALFORMED is neither live nor aged-out:
+    reading it as aged-out hides a deletion, reading it as live would block tidying.
+    """
+    partial = {"pair": "renquant_pipeline.VetoWeakBuysTask", "reason": "x",
+               "old_public_sha256": "a" * 64, "old_kernel_sha256": "b" * 64}
+    out = tp.removed_live_exceptions([partial], [], _pins2("a" * 64, "c" * 64),
+                                     _pins2("a" * 64, "c" * 64))
+    assert len(out) == 1 and "MALFORMED" in out[0]
+    assert "new_public_sha256" in out[0]
