@@ -62,6 +62,7 @@ from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
     STATE_DISABLED,
     STATE_NO_CANDIDATES,
     STATE_NO_SHADOW_MODELS,
+    TASK_LEVEL_SHADOW_NAME,
     append_shadow_health,
     content_digest,
     finalize_shadow_health,
@@ -296,7 +297,11 @@ class ApplyShadowScoringTask(Task):
         def _skip_record(sm: dict, state: str, reason: str,
                          n_candidates: int) -> "dict[str, Any]":
             rec = new_shadow_health(
-                shadow_name=(sm.get("name", "unnamed_shadow") if sm else None),
+                # A task-level skip (`sm` empty) is not about a lane — but it must
+                # still NAME one, or the consumer's strict parser discards the
+                # record and the timeline it exists to keep continuous has a hole.
+                shadow_name=(sm.get("name", "unnamed_shadow") if sm
+                             else TASK_LEVEL_SHADOW_NAME),
                 kind=(sm.get("kind") if sm else None),
                 artifact_path=(sm.get("artifact_path") if sm else None),
                 run_date=run_date, run_id=run_id, n_candidates=n_candidates,

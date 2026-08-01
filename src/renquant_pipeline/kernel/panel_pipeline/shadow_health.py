@@ -75,6 +75,25 @@ STATUS_FAULT = "fault"
 # ── State vocabulary (the precise sub-state; closed set) ───────────────────────
 STATE_DISABLED = "disabled"                 # shadow scoring turned off (task-level)
 STATE_NO_SHADOW_MODELS = "no_shadow_models"  # none configured (task-level)
+
+#: The `shadow_name` used on a TASK-LEVEL skip — one that is about the task, not about
+#: any lane (`shadow_enabled=false`, or no `shadow_models` configured at all).
+#:
+#: WHY IT IS NOT `None`. The consumer's strict parser
+#: (`rq104_shadow_scorer_sentinel.is_valid_v1_record`) requires
+#: `isinstance(shadow_name, str)` and IGNORES the whole record otherwise. Measured
+#: 2026-07-31 on the live log: 12 `degraded` rows parsed, and **4 `no_shadow_models`
+#: rows were discarded** — so the `expected_skip` status this module defines had never
+#: been exercised for them. The producer was emitting a record its own consumer refuses
+#: by definition.
+#:
+#: The consumer is right to demand it: a record that cannot be attributed to a lane is
+#: not evidence about a lane. The fix belongs here — say WHICH lane, even when the
+#: answer is "none, this is about the task".
+#:
+#: Deliberately not a plausible lane name. A real lane is named in config; this must be
+#: unmistakably a sentinel so no reader mistakes it for a configured shadow.
+TASK_LEVEL_SHADOW_NAME = "__task_level__"
 STATE_NO_CANDIDATES = "no_candidates"        # nothing to score this run (per-model)
 STATE_OK = "ok"                              # loaded + fresh + provenanced + covered
 STATE_DEGRADED = "degraded"                  # loaded but stale/low-cov/identity issue
@@ -550,6 +569,7 @@ __all__ = [
     "STATUS_FAULT",
     "STATE_DISABLED",
     "STATE_NO_SHADOW_MODELS",
+    "TASK_LEVEL_SHADOW_NAME",
     "STATE_NO_CANDIDATES",
     "STATE_OK",
     "STATE_DEGRADED",
