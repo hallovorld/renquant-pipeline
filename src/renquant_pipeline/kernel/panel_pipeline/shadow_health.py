@@ -284,7 +284,12 @@ def new_shadow_health(
         TRAIN_CUTOFF_FIELD: None,
         "staleness_days": None,
         "n_candidates": int(n_candidates),
+        # n_scored counts finite shadow scores WITHIN the candidate set (the
+        # coverage numerator); n_scored_total counts every finite score the
+        # shadow produced, so a shadow scoring a wider matrix than the
+        # candidates stays observable without pushing a fraction past 1.0.
         "n_scored": 0,
+        "n_scored_total": 0,
         "coverage_frac": None,
         "skip_reason": None,
         "state": None,

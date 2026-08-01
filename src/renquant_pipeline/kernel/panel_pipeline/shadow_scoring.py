@@ -562,13 +562,21 @@ class ApplyShadowScoringTask(Task):
                 shadow_dict = series.to_dict()
                 # Coverage of the candidate cross-section by FINITE shadow scores
                 # (a shadow that scores NaN for everyone is a silent failure too).
+                # The numerator is intersected with the candidate set: a shadow may
+                # score a WIDER matrix than the primary's candidates (the clf lane
+                # scored 322 names against 292 candidates), and counting those extras
+                # made coverage_frac exceed 1.0 on every session since go-live —
+                # 12/12 records fault, peak 1.1039 — so the fraction measured the
+                # shadow's matrix width, not coverage of the candidates.
                 _finite = {t: v for t, v in shadow_dict.items()
                            if isinstance(v, (int, float))
                            and not isinstance(v, bool)
                            and math.isfinite(float(v))}
-                health["n_scored"] = len(_finite)
+                scored_candidates = set(primary_scores).intersection(_finite)
+                health["n_scored"] = len(scored_candidates)
+                health["n_scored_total"] = len(_finite)
                 health["coverage_frac"] = (
-                    len(_finite) / health["n_candidates"]
+                    len(scored_candidates) / health["n_candidates"]
                     if health["n_candidates"] else None)
                 sorted_shadow = sorted(shadow_dict.items(), key=lambda x: -x[1])
                 shadow_ranks = {t: i + 1 for i, (t, _) in enumerate(sorted_shadow)}
