@@ -1,5 +1,20 @@
 """PanelScoringJob — swap in cross-sectional panel scores during inference.
 
+WHICH COPY EXECUTES (twin registry R1)
+--------------------------------------
+**This is NOT what the public export resolves to.** ``renquant_pipeline/__init__.py``
+maps ``VetoWeakBuysTask`` and its siblings to ``renquant_pipeline/panel_scoring.py``.
+A caller importing the documented public symbol does **not** run this file; the kernel
+pipeline does.
+
+Both are live, on different paths. The hazard is one-directional and has already been
+paid: a fix landed here alone does not reach the public export
+(`renquant-pipeline#222` — three kernel guards the public twin never received). When you
+change admission behaviour here, check `panel_scoring.py`.
+
+`tests/test_r1_executable_pointer.py` fails if the public mapping moves without these
+headers moving with it.
+
 Slots between CandidateJob (Phase 2) and RankingJob (Phase 3) of the
 standard InferencePipeline. When the config flag
 `ranking.panel_scoring.enabled` is true and a panel-LTR artifact is

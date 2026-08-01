@@ -1,5 +1,22 @@
 """Panel-score admission tasks for runtime inference.
 
+WHICH COPY EXECUTES (twin registry R1)
+--------------------------------------
+**This module is what the public export resolves to.** ``renquant_pipeline/__init__.py``
+maps ``VetoWeakBuysTask`` (and its siblings) to ``.panel_scoring`` — *not* to the kernel
+implementation in ``kernel/panel_pipeline/job_panel_scoring.py``. Anyone importing the
+documented public symbol runs the code in **this file**.
+
+The kernel module is a genuine second implementation, not dead code: the kernel pipeline
+uses it directly. The duplication is deliberate — this module stays lightweight and does
+not pull the kernel scoring stack in — but it has already cost a kernel-only fix that
+never reached the executing copy (`renquant-pipeline#222`, three missing guards).
+
+So: **a fix applied only to the kernel does not reach the public export.** If you are
+patching admission behaviour, patch here, and check whether the kernel needs the same
+change. `tests/test_r1_executable_pointer.py` fails if that mapping ever moves without
+this header moving with it.
+
 This module owns the strict runtime contract around panel scores. It does not
 train models and it does not import model libraries at module import time.
 Scorers are resolved through ``renquant_common.load_scorer`` against entry
