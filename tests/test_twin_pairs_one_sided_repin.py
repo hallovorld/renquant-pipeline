@@ -223,9 +223,17 @@ def _pins2(public, kernel, name="renquant_pipeline.VetoWeakBuysTask"):
 def _exception(name="renquant_pipeline.VetoWeakBuysTask",
                old_pub="a" * 64, old_ker="b" * 64,
                new_pub="a" * 64, new_ker="c" * 64):
-    return {"pair": name, "why": "kernel-only comment",
-            "old": {"public_sha256": old_pub, "kernel_sha256": old_ker},
-            "new": {"public_sha256": new_pub, "kernel_sha256": new_ker}}
+    """The REAL schema — flattened keys, as the committed file's `_comment` requires.
+
+    My first version of this helper invented a nested `old`/`new` shape. The guard under
+    test read the same invented shape, so both agreed with each other and neither agreed
+    with the data: `still_applies` was always False and deleting a live record passed CI
+    `[codex on #232]`. A fixture written in the schema of the code under test proves the
+    two are consistent, never that either is right.
+    """
+    return {"pair": name, "reason": "kernel-only comment",
+            "old_public_sha256": old_pub, "old_kernel_sha256": old_ker,
+            "new_public_sha256": new_pub, "new_kernel_sha256": new_ker}
 
 
 def test_deleting_a_STILL_APPLICABLE_exception_is_caught():
@@ -309,3 +317,78 @@ def test_a_WELL_FORMED_exception_file_still_loads(tmp_path):
 
 def test_an_ABSENT_exception_file_is_still_no_exceptions(tmp_path):
     assert tp.load_exceptions(tmp_path / "nope.json") == []
+
+
+# ---------------------------------------------------------------------------
+# codex on #232, round 3: a CLI-level regression whose base exception file uses
+# the REAL schema. This is the test that would have caught the dead guard —
+# every function-level test I wrote agreed with my invented shape.
+# ---------------------------------------------------------------------------
+
+def _write_pins(path, public, kernel, name="renquant_pipeline.VetoWeakBuysTask"):
+    path.write_text(json.dumps({"pairs": {name: {
+        "public_module": "renquant_pipeline.x", "public_file": "x.py",
+        "kernel_twin_file": "kernel/x.py",
+        "public_sha256": public, "kernel_sha256": kernel}}}), encoding="utf-8")
+    return path
+
+
+def _run_cli(tmp_path, monkeypatch, *, base_exc, head_exc,
+             base_pins=("a" * 64, "c" * 64), head_pins=("a" * 64, "c" * 64)):
+    bp = _write_pins(tmp_path / "base_pins.json", *base_pins)
+    hp = _write_pins(tmp_path / "head_pins.json", *head_pins)
+    be = tmp_path / "base_exceptions.json"
+    he = tmp_path / "head_exceptions.json"
+    be.write_text(json.dumps({"schema_version": 1, "exceptions": base_exc}), encoding="utf-8")
+    he.write_text(json.dumps({"schema_version": 1, "exceptions": head_exc}), encoding="utf-8")
+    monkeypatch.setattr(tp, "EXCEPTIONS", he)
+    return tp.main(["--pins", str(hp), "--diff-against", str(bp),
+                    "--base-exceptions", str(be)])
+
+
+def test_CLI_catches_a_live_exception_deleted_with_unchanged_pins(tmp_path, monkeypatch,
+                                                                  capsys):
+    """THE regression. Base carries a real-schema record whose `new_*` tuple equals the
+    pins; head deletes it and moves nothing. Must exit non-zero.
+
+    Every function-level test of this guard passed while it was dead, because they and
+    the guard shared an invented schema. Only a run through `main()` with a file in the
+    schema the repo actually commits could tell the difference.
+    """
+    rc = _run_cli(tmp_path, monkeypatch, base_exc=[_exception()], head_exc=[])
+    out = capsys.readouterr().out
+    assert rc == 1, out
+    assert "STILL APPLIES" in out
+    assert "deleted live exception" in out
+
+
+def test_CLI_is_silent_when_the_record_is_KEPT(tmp_path, monkeypatch, capsys):
+    """ANTI-VACUITY: if this failed too, the guard would block every PR touching the
+    file and authors would delete records to get green."""
+    e = _exception()
+    rc = _run_cli(tmp_path, monkeypatch, base_exc=[e], head_exc=[e])
+    assert rc == 0, capsys.readouterr().out
+
+
+def test_CLI_allows_deleting_a_record_whose_pair_MOVED_AGAIN(tmp_path, monkeypatch,
+                                                             capsys):
+    """The record has aged out: the pins no longer sit at the tuple it blesses."""
+    rc = _run_cli(tmp_path, monkeypatch, base_exc=[_exception()], head_exc=[],
+                  base_pins=("a" * 64, "c" * 64), head_pins=("a" * 64, "d" * 64))
+    out = capsys.readouterr().out
+    assert "STILL APPLIES" not in out
+
+
+def test_CLI_rejects_a_MALFORMED_base_exception_file(tmp_path, monkeypatch, capsys):
+    """The fail-closed path, end to end rather than at the loader."""
+    bp = _write_pins(tmp_path / "base_pins.json", "a" * 64, "c" * 64)
+    hp = _write_pins(tmp_path / "head_pins.json", "a" * 64, "c" * 64)
+    be = tmp_path / "base_exceptions.json"
+    be.write_text('{"exceptions": [7]}', encoding="utf-8")
+    he = tmp_path / "head_exceptions.json"
+    he.write_text(json.dumps({"exceptions": []}), encoding="utf-8")
+    monkeypatch.setattr(tp, "EXCEPTIONS", he)
+    rc = tp.main(["--pins", str(hp), "--diff-against", str(bp),
+                  "--base-exceptions", str(be)])
+    assert rc == 2
+    assert "must be an object" in capsys.readouterr().err

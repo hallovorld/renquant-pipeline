@@ -174,3 +174,39 @@ the delete-after-landing PR shape returns **rc=1** with the diagnostic above.
   running `--help`, not by grep;
 - the appended tests redefined a module-level `_pins` helper that already existed, which
   would have **changed the behaviour of every test above them**. Renamed.
+
+---
+
+## ROUND 3 — the guard I added was dead code, and my tests agreed with it
+
+> *"`one_sided_repins()` and the committed file use flattened keys such as
+> `old_public_sha256` and `new_kernel_sha256`, but `removed_live_exceptions()` and
+> `_exception_key()` read nested `old`/`new` objects. For a real base record, `after` is
+> `{}`, so `still_applies` is always false and deleting a live record still passes CI."*
+> `[codex on #232]`
+
+Exactly right. The committed file's own `_comment` names the required keys —
+`pair, old_public_sha256, old_kernel_sha256, new_public_sha256, new_kernel_sha256,
+reason` — and `one_sided_repins` reads them. **I wrote the deletion guard against a
+nested shape that exists nowhere**, so it could never fire.
+
+**And every test I wrote for it passed**, because I built the fixtures in the same
+invented schema. A guard and its fixture agreeing with each other proves the two are
+consistent; it says nothing about whether either matches the data. That is the
+validate-the-wrong-object defect at its purest — and it is the third time this file's
+history records a version of it.
+
+Fixed on the canonical flattened schema throughout, and the fixtures moved with it.
+
+**The regression that would have caught it** is the one the review asked for: a
+**CLI-level** run through `main()` with a base exception file in the schema the repo
+actually commits, and a head that deletes it while the pins do not move. Restoring the
+nested read now fails it. Four CLI cases in total — the catch, the anti-vacuity
+"record kept → silent", the aged-out "pair moved again → allowed", and a malformed base
+file exiting 2 with a diagnostic.
+
+The lesson generalises past this file: **a fixture written in the schema of the code
+under test cannot detect a schema mistake.** Where a real committed artifact exists, the
+fixture should be built from its documented shape, not from the reader's.
+
+Tests 34 → 38.

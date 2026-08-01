@@ -260,23 +260,22 @@ def removed_live_exceptions(base_exc: list[dict], head_exc: list[dict],
         if key in head_keys:
             continue
         name = e.get("pair")
-        after = (e.get("new") or {})
+        after_pub = e.get("new_public_sha256")
+        after_ker = e.get("new_kernel_sha256")
         cur = b.get(name) or {}
         still_applies = (
             name in b
-            and cur.get("public_sha256") == after.get("public_sha256")
-            and cur.get("kernel_sha256") == after.get("kernel_sha256")
+            and cur.get("public_sha256") == after_pub
+            and cur.get("kernel_sha256") == after_ker
         )
         if not still_applies:
             continue          # the pair moved again -- the record has aged out
-        moved = (a.get(name) or {}) != cur
-        if moved:
+        if (a.get(name) or {}) != cur:
             continue          # this PR re-pins the pair, so a fresh justification is due
         problems.append(
             f"{name}: an exception that STILL APPLIES was deleted while the pins did "
             f"not move. The pair is pinned at exactly the tuple this record justifies "
-            f"({after.get('public_sha256', '?')[:12]}/"
-            f"{after.get('kernel_sha256', '?')[:12]}), so removing it discards the "
+            f"({str(after_pub)[:12]}/{str(after_ker)[:12]}), so removing it discards the "
             f"justification for a divergence that is still in force. Re-pin the pair "
             f"with a fresh justification, or keep the record."
         )
@@ -284,11 +283,18 @@ def removed_live_exceptions(base_exc: list[dict], head_exc: list[dict],
 
 
 def _exception_key(e: dict) -> tuple:
-    """Identity of an exception: the pair plus both digest tuples it blesses."""
-    before, after = (e.get("old") or {}), (e.get("new") or {})
+    """Identity of an exception: the pair plus both digest tuples it blesses.
+
+    FLATTENED keys, which is the schema this file actually uses -- the committed
+    `_comment` names them and `one_sided_repins` reads them. My first version of this
+    helper read a NESTED `old`/`new` shape that exists nowhere `[codex on #232]`, so
+    every lookup returned `None` and the deletion guard could never fire. The tests
+    passed because I had written their fixtures in the same invented schema: a guard and
+    its test agreeing with each other about a shape the data does not have.
+    """
     return (e.get("pair"),
-            before.get("public_sha256"), before.get("kernel_sha256"),
-            after.get("public_sha256"), after.get("kernel_sha256"))
+            e.get("old_public_sha256"), e.get("old_kernel_sha256"),
+            e.get("new_public_sha256"), e.get("new_kernel_sha256"))
 
 
 def one_sided_repins(old: dict[str, Any], new: dict[str, Any],
