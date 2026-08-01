@@ -117,3 +117,60 @@ restore.
 
 The committed `_comment` was updated too — it described the old semantics, and a policy
 file that misstates its own rule is how the next author re-derives the bug.
+
+---
+
+## ROUND 2 2026-08-01 — the record could be deleted after it landed, and a malformed file crashed
+
+Two findings `[codex on #232]`, both real.
+
+### 1. Delete-after-landing
+
+> *"CI lets a later PR delete that record silently. If the base has an exception whose
+> new tuple still equals the proposed pins, and the head removes it while leaving the
+> pins unchanged, `one_sided_repins` receives an empty list and passes."*
+
+**That is this check's own defect one level up: the guard passed because its subject had
+been removed.** An exception is a committed audit record of a divergence that is *still
+in force* while the pins sit at its `new` tuple, so deleting it discards the
+justification without any re-pin.
+
+`removed_live_exceptions(base_exc, head_exc, base_pins, head_pins)` fails on exactly that
+case, and CI now hands it the base ref's exception file. Three deletions stay legitimate,
+each with a test:
+
+| deletion | verdict | why |
+|---|---|---|
+| record still applies, pins unchanged | **FAIL** | the justification is still load-bearing |
+| the pair moved again | allow | the record has aged out; keeping it is the `SUPERSEDED` case this file already reports |
+| this PR re-pins the same pair | allow | `one_sided_repins` already demands a fresh justification — a second finding for one fact would push authors to keep stale records to silence it |
+| the export vanished | allow | nothing is pinned at that tuple any more |
+
+An absent exception file **on the base** is legitimate (none existed) and becomes an empty
+list; an absent file passed explicitly via `--base-exceptions` is **fatal**, because an
+absent baseline cannot be shown to have kept its records.
+
+### 2. A malformed exception file crashed instead of failing closed
+
+> *"a syntactically valid file such as `{"exceptions":[7]}` reaches `e.get` and crashes
+> rather than producing the explicit fail-closed diagnostic this CI guard promises."*
+
+`load_exceptions` now validates the shape and raises `ExceptionFileError` naming the
+offending index and type. **A crash and a diagnostic are both non-zero; only one tells the
+author what to fix, and only one is distinguishable from the tool itself being broken** —
+which matters most for a file whose only job is to *suppress* findings.
+
+Six malformed shapes are parametrised (`{"exceptions": 7}`, `[7]`, `["a"]`, `[{}, 3]`,
+a missing key, a bare `7`), paired with a well-formed case and the repo's own committed
+file so the validator cannot pass by rejecting everything.
+
+Tests 20 → 34. Verified end-to-end through `main()`, not only at the function boundary:
+the delete-after-landing PR shape returns **rc=1** with the diagnostic above.
+
+### Two defects of my own, caught while doing this
+
+- my `--base-exceptions` argparse insertion matched `parser.add_argument`, but the
+  variable is `ap` — **it silently inserted nothing** while I printed "wired". Found by
+  running `--help`, not by grep;
+- the appended tests redefined a module-level `_pins` helper that already existed, which
+  would have **changed the behaviour of every test above them**. Renamed.

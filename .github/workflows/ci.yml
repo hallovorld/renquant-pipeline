@@ -52,4 +52,12 @@ jobs:
         run: |
           set -euo pipefail
           git show "origin/${{ github.base_ref }}:twin_pairs.json" > /tmp/base_pins.json
-          python tools/twin_pairs.py --diff-against /tmp/base_pins.json
+          # The base's EXCEPTION file too. Without it, a PR that deletes a still-
+          # applicable record passes: one_sided_repins receives an empty list and has
+          # nothing to report. An absent file on the base is legitimate (no exceptions
+          # existed), so it becomes an empty list rather than a failure.
+          git show "origin/${{ github.base_ref }}:twin_repin_exceptions.json" \
+            > /tmp/base_exceptions.json 2>/dev/null || echo '{"exceptions": []}' \
+            > /tmp/base_exceptions.json
+          python tools/twin_pairs.py --diff-against /tmp/base_pins.json \
+            --base-exceptions /tmp/base_exceptions.json

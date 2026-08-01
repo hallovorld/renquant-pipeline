@@ -190,14 +190,105 @@ def _pair_digests(entry: dict) -> tuple[str | None, str | None]:
     return entry.get("public_sha256"), entry.get("kernel_sha256")
 
 
+class ExceptionFileError(ValueError):
+    """The exception file is syntactically valid JSON but not the shape we promise.
+
+    Raised rather than tolerated: this file's only job is to SUPPRESS findings, so a
+    shape we cannot read must fail closed and loudly. Reviewed `[codex on #232]`:
+    *"a syntactically valid file such as `{"exceptions":[7]}` reaches `e.get` and
+    crashes rather than producing the explicit fail-closed diagnostic this CI guard
+    promises."* A crash and a diagnostic are both non-zero, but only one tells the
+    author what to fix.
+    """
+
+
 def load_exceptions(path: pathlib.Path | None = None) -> list[dict]:
-    """Committed justifications for one-sided re-pins. Missing file == no exceptions."""
+    """Committed justifications for one-sided re-pins. Missing file == no exceptions.
+
+    STRUCTURE IS CHECKED, not assumed. `{"exceptions": 7}`, `{"exceptions": [7]}` and
+    a bare `7` are all valid JSON and none is an exception list; each used to reach
+    `e.get(...)` inside the comparison and die with an AttributeError three frames
+    away from the file that caused it.
+    """
     target = path or EXCEPTIONS
     if not target.exists():
         return []
     data = json.loads(target.read_text(encoding="utf-8"))
-    items = data.get("exceptions") if isinstance(data, dict) else data
-    return list(items or [])
+    if isinstance(data, dict):
+        if "exceptions" not in data:
+            raise ExceptionFileError(
+                f"{target.name}: object with no 'exceptions' key — "
+                f"found {sorted(data)!r}")
+        items = data["exceptions"]
+    else:
+        items = data
+    if items is None:
+        return []
+    if not isinstance(items, list):
+        raise ExceptionFileError(
+            f"{target.name}: 'exceptions' must be a list, got "
+            f"{type(items).__name__}")
+    for i, e in enumerate(items):
+        if not isinstance(e, dict):
+            raise ExceptionFileError(
+                f"{target.name}: exceptions[{i}] must be an object, got "
+                f"{type(e).__name__} ({e!r})")
+    return list(items)
+
+
+def removed_live_exceptions(base_exc: list[dict], head_exc: list[dict],
+                            old: dict[str, Any], new: dict[str, Any]) -> list[str]:
+    """Exceptions that were APPLICABLE on the base and are gone from the head.
+
+    Reviewed `[codex on #232]`: *"CI lets a later PR delete that record silently. If
+    the base has an exception whose new tuple still equals the proposed pins, and the
+    head removes it while leaving the pins unchanged, `one_sided_repins` receives an
+    empty list and passes. That loses the justification/provenance without any
+    re-pin."*
+
+    Exactly right, and it is this check's own shape one level up: the guard passed
+    because its subject had been removed. An exception is a committed audit record of
+    a divergence that is STILL IN FORCE while the pins sit at its `new` tuple — so
+    deleting it is only legitimate if the pair has since moved again, which is the
+    case this function excludes.
+    """
+    problems: list[str] = []
+    head_keys = {_exception_key(e) for e in head_exc}
+    a, b = old.get("pairs") or {}, new.get("pairs") or {}
+    for e in base_exc:
+        key = _exception_key(e)
+        if key in head_keys:
+            continue
+        name = e.get("pair")
+        after = (e.get("new") or {})
+        cur = b.get(name) or {}
+        still_applies = (
+            name in b
+            and cur.get("public_sha256") == after.get("public_sha256")
+            and cur.get("kernel_sha256") == after.get("kernel_sha256")
+        )
+        if not still_applies:
+            continue          # the pair moved again -- the record has aged out
+        moved = (a.get(name) or {}) != cur
+        if moved:
+            continue          # this PR re-pins the pair, so a fresh justification is due
+        problems.append(
+            f"{name}: an exception that STILL APPLIES was deleted while the pins did "
+            f"not move. The pair is pinned at exactly the tuple this record justifies "
+            f"({after.get('public_sha256', '?')[:12]}/"
+            f"{after.get('kernel_sha256', '?')[:12]}), so removing it discards the "
+            f"justification for a divergence that is still in force. Re-pin the pair "
+            f"with a fresh justification, or keep the record."
+        )
+    return problems
+
+
+def _exception_key(e: dict) -> tuple:
+    """Identity of an exception: the pair plus both digest tuples it blesses."""
+    before, after = (e.get("old") or {}), (e.get("new") or {})
+    return (e.get("pair"),
+            before.get("public_sha256"), before.get("kernel_sha256"),
+            after.get("public_sha256"), after.get("kernel_sha256"))
 
 
 def one_sided_repins(old: dict[str, Any], new: dict[str, Any],
@@ -307,6 +398,9 @@ def one_sided_repins(old: dict[str, Any], new: dict[str, Any],
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--emit", action="store_true", help="print fresh pins (never writes)")
+    ap.add_argument("--base-exceptions", metavar="EXCEPTIONS", default=None,
+                    help="the BASE ref's twin_repin_exceptions.json; without it a "
+                         "still-applicable record can be deleted silently")
     ap.add_argument("--diff-against", metavar="PINS",
                     help="compare the committed pins against an earlier pin file "
                          "(normally the PR base) and report one-sided re-pins")
@@ -345,10 +439,31 @@ def main(argv: list[str] | None = None) -> int:
                   f"{type(e).__name__}: {e} — an unreadable exception file must not "
                   f"read as 'no exceptions'", file=sys.stderr)
             return 2
+
+        # The BASE's exception file, when CI supplies it. Without this, deleting a
+        # still-applicable record passes silently: one_sided_repins sees an empty list
+        # and finds nothing to complain about.
+        base_exc: list[dict] = []
+        if args.base_exceptions:
+            base_exc_path = pathlib.Path(args.base_exceptions)
+            if not base_exc_path.exists():
+                print(f"FATAL: --base-exceptions given but missing at {base_exc_path} "
+                      f"— an absent baseline cannot be shown to have kept its records",
+                      file=sys.stderr)
+                return 2
+            try:
+                base_exc = load_exceptions(base_exc_path)
+            except Exception as e:  # noqa: BLE001
+                print(f"FATAL: base exception file unreadable: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+                return 2
+
         blessed = one_sided_repins(base, pins, exceptions=exc)
-        if blessed:
-            print("\n".join(blessed))
-            print(f"\ntwin-pairs: {len(blessed)} one-sided re-pin(s)")
+        deleted = removed_live_exceptions(base_exc, exc, base, pins)
+        if blessed or deleted:
+            print("\n".join(blessed + deleted))
+            print(f"\ntwin-pairs: {len(blessed)} one-sided re-pin(s), "
+                  f"{len(deleted)} deleted live exception(s)")
             return 1
         print("twin-pairs: no one-sided re-pins against the given baseline")
         return 0

@@ -208,3 +208,104 @@ def test_an_unreadable_exception_file_is_FATAL_not_no_exceptions(tmp_path, capsy
     rc = tp.main(["--diff-against", str(PINS), "--pins", str(PINS)])
     assert rc == 2
     assert "must not read as" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# codex on #232, round 2: the record can be deleted after it lands, and a
+# malformed exception file crashed instead of failing closed with a diagnostic.
+# ---------------------------------------------------------------------------
+
+def _pins2(public, kernel, name="renquant_pipeline.VetoWeakBuysTask"):
+    return {"pairs": {name: {"public_sha256": public, "kernel_sha256": kernel,
+                             "kernel_twin_file": "kernel/x.py"}}}
+
+
+def _exception(name="renquant_pipeline.VetoWeakBuysTask",
+               old_pub="a" * 64, old_ker="b" * 64,
+               new_pub="a" * 64, new_ker="c" * 64):
+    return {"pair": name, "why": "kernel-only comment",
+            "old": {"public_sha256": old_pub, "kernel_sha256": old_ker},
+            "new": {"public_sha256": new_pub, "kernel_sha256": new_ker}}
+
+
+def test_deleting_a_STILL_APPLICABLE_exception_is_caught():
+    """THE hole codex found: base has the record, head deletes it, pins do not move.
+
+    `one_sided_repins` sees an empty exception list and finds nothing to complain
+    about — the guard passes because its subject was removed, which is this check's
+    own defect one level up.
+    """
+    base_pins = _pins2("a" * 64, "c" * 64)      # already AT the blessed tuple
+    head_pins = _pins2("a" * 64, "c" * 64)      # unchanged
+    problems = tp.removed_live_exceptions([_exception()], [], base_pins, head_pins)
+    assert len(problems) == 1, problems
+    assert "STILL APPLIES" in problems[0]
+    assert "VetoWeakBuysTask" in problems[0]
+
+
+def test_keeping_the_exception_is_silent():
+    """ANTI-VACUITY. If this fired on an unchanged file, every PR would be blocked."""
+    pins = _pins2("a" * 64, "c" * 64)
+    e = _exception()
+    assert tp.removed_live_exceptions([e], [e], pins, pins) == []
+
+
+def test_deleting_an_exception_whose_pair_MOVED_AGAIN_is_allowed():
+    """The record has aged out: the pins no longer sit at the tuple it blesses, so it
+    justifies nothing and keeping it forever would be the SUPERSEDED case this file
+    already reports."""
+    base_pins = _pins2("a" * 64, "c" * 64)
+    head_pins = _pins2("a" * 64, "d" * 64)      # kernel moved again
+    assert tp.removed_live_exceptions([_exception()], [], base_pins, head_pins) == []
+
+
+def test_deleting_an_exception_while_RE_PINNING_the_same_pair_is_allowed():
+    """A PR that re-pins the pair owes a fresh justification, which `one_sided_repins`
+    demands on its own. Reporting the deletion too would be a second finding for one
+    fact, and would push an author to keep a stale record to silence it."""
+    base_pins = _pins2("a" * 64, "c" * 64)
+    head_pins = _pins2("a" * 64, "e" * 64)
+    assert tp.removed_live_exceptions([_exception()], [], base_pins, head_pins) == []
+
+
+def test_an_exception_for_a_pair_that_VANISHED_may_be_deleted():
+    """The export is gone; nothing is pinned at that tuple any more."""
+    base_pins = _pins2("a" * 64, "c" * 64)
+    head_pins = {"pairs": {}}
+    assert tp.removed_live_exceptions([_exception()], [], base_pins, head_pins) == []
+
+
+@pytest.mark.parametrize("blob,fragment", [
+    ('{"exceptions": 7}', "must be a list"),
+    ('{"exceptions": [7]}', "must be an object"),
+    ('{"exceptions": ["a"]}', "must be an object"),
+    ('{"exceptions": [{}, 3]}', "exceptions[1]"),
+    ('{"nope": []}', "no 'exceptions' key"),
+    ('7', "must be a list"),
+])
+def test_a_MALFORMED_exception_file_fails_closed_with_a_DIAGNOSTIC(tmp_path, blob,
+                                                                   fragment):
+    """Codex: `{"exceptions":[7]}` reached `e.get` and crashed rather than producing
+    the fail-closed diagnostic this guard promises. A crash and a diagnostic are both
+    non-zero; only one tells the author what to fix, and only one is distinguishable
+    from the tool itself being broken."""
+    p = tmp_path / "twin_repin_exceptions.json"
+    p.write_text(blob, encoding="utf-8")
+    with pytest.raises(tp.ExceptionFileError) as ei:
+        tp.load_exceptions(p)
+    assert fragment in str(ei.value), str(ei.value)
+
+
+def test_a_WELL_FORMED_exception_file_still_loads(tmp_path):
+    """ANTI-VACUITY for the parametrisation above: the validator must not reject the
+    shape the repo actually commits."""
+    p = tmp_path / "twin_repin_exceptions.json"
+    p.write_text(json.dumps({"exceptions": [_exception()]}), encoding="utf-8")
+    got = tp.load_exceptions(p)
+    assert len(got) == 1 and got[0]["pair"].endswith("VetoWeakBuysTask")
+    # and the committed file itself, which is the one that must never trip this
+    assert isinstance(tp.load_exceptions(), list)
+
+
+def test_an_ABSENT_exception_file_is_still_no_exceptions(tmp_path):
+    assert tp.load_exceptions(tmp_path / "nope.json") == []
