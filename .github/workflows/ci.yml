@@ -11,6 +11,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: renquant-pipeline
+          # The one-sided re-pin check below compares this PR's pin file against the
+          # base ref's, so the base commit must be present. depth 0 is the simple
+          # correct answer; a shallow clone would make the check silently skip.
+          fetch-depth: 0
       - uses: actions/checkout@v4
         with:
           repository: hallovorld/renquant-common
@@ -31,3 +35,29 @@ jobs:
       - name: Test
         working-directory: renquant-pipeline
         run: make test
+
+      # A one-sided re-pin is not forbidden -- it is justifiable via a committed
+      # entry in twin_repin_exceptions.json bound to both exact digest tuples. This
+      # step fails only when the divergence is UNJUSTIFIED, or when a stale exception
+      # is still lying around pre-authorising the next one.
+      # A pin update that moves BOTH digests of a twin pair is a normal change.
+      # One that moves only one BLESSES a divergence, and `make test`'s verify()
+      # cannot see it -- the file and its pin moved together, so verify() is clean.
+      # The only place it shows is this diff. Runs on pull_request only: on a plain
+      # push there is no base ref to diff against, and inventing one would make the
+      # check pass for the wrong reason.
+      - name: Twin pairs — no one-sided re-pin
+        if: github.event_name == 'pull_request'
+        working-directory: renquant-pipeline
+        run: |
+          set -euo pipefail
+          git show "origin/${{ github.base_ref }}:twin_pairs.json" > /tmp/base_pins.json
+          # The base's EXCEPTION file too. Without it, a PR that deletes a still-
+          # applicable record passes: one_sided_repins receives an empty list and has
+          # nothing to report. An absent file on the base is legitimate (no exceptions
+          # existed), so it becomes an empty list rather than a failure.
+          git show "origin/${{ github.base_ref }}:twin_repin_exceptions.json" \
+            > /tmp/base_exceptions.json 2>/dev/null || echo '{"exceptions": []}' \
+            > /tmp/base_exceptions.json
+          python tools/twin_pairs.py --diff-against /tmp/base_pins.json \
+            --base-exceptions /tmp/base_exceptions.json
