@@ -1,13 +1,38 @@
-<!-- Keep this body SHORT. Durable detail belongs in the doc the checklist names. -->
+## What & why
 
-## What
-<one paragraph — what changed and why, in brief>
+<!-- Bottom line first: the conclusion and the decision needed. -->
 
-## Checklist (repo contract)
-- [ ] Tests pass, or this is docs-only (say so). If a fix changes behaviour, a test **fails without it**.
-- [ ] Baseline recorded: suite counts on `origin/main` **and** on this branch, side by side. Any new failure is **explained**, not absorbed by editing the test.
-- [ ] English throughout; no live production inputs touched; not self-merged (Codex reviews).
-- [ ] **Gate design rule (GOAL-5 AC6):** if this PR adds/tightens a HARD capital-admission gate (can take a name or the book from tradeable→not-tradeable via `raise` / zero-candidates / sell-only / buy-block, not a market decision), the PR states its **governed override path** — *identity* (who lifts it, via what reviewed surface), *expiry* (explicit restore condition + auto-alarm, **not "temporary"**), *binding* (scoped by fingerprint + provenance in the run bundle). True kill-switches say so explicitly. **N/A if no such gate.** Canonical statement: `renquant-orchestrator doc/design/2026-07-20-ac6-gate-design-rule.md`; Universal Rule §7 in `RenQuant doc/arch/subrepo-operating-model.md`.
-- [ ] **This repo's specific exposure:** if the change touches an admission, sizing, wash-sale, staleness or leakage guard, say which **copy** of the logic you changed and which copy **executes** — the public export and the kernel are not always the same object (`renquant-orchestrator doc/arch/twin-implementation-registry.md`).
+## Evidence
 
-🤖 Generated with [Claude Code](https://claude.com/claude-code)
+<!-- Every number carries a provenance tag: [本次实测/早前实测/推导/假设]. -->
+
+## Checklist
+
+- [ ] `make test` green, count stated.
+- [ ] Progress doc under `doc/progress/<date>-<slug>.md`.
+- [ ] **Gate design rule (GOAL-5 AC6):** if this PR adds or tightens a HARD
+      capital-admission gate — one that can take a name or the book from
+      tradeable → not-tradeable via `raise` / zero-candidates / sell-only /
+      buy-block, as opposed to a market decision — the progress or design doc
+      states its **governed override path**:
+      - **identity** — who lifts it, via what *reviewed* surface;
+      - **expiry** — an explicit restore condition plus an auto-alarm.
+        "Temporary" is not an expiry; "until X is deployed" is;
+        - **binding** — scoped by fingerprint, with the override's provenance
+        carried in the run bundle.
+
+      A true kill-switch says so explicitly. **N/A if this PR adds no such gate.**
+
+      Canonical rule: Universal Rule §7 in the umbrella
+      `doc/arch/subrepo-operating-model.md`; rationale and worked examples in
+      `renquant-orchestrator` `doc/design/2026-07-20-ac6-gate-design-rule.md`.
+
+> **This checklist item is a review surface, not enforcement.** Nothing mechanical
+> rejects a run bundle that omits override provenance today — measured
+> 2026-07-31, `renquant-orchestrator` #690: the shared `LiveRunBundle` schema
+> declares 7 fields and silently drops the rest, so a provenance field added to
+> that path would be validated by nothing. Until that is fixed, this item and the
+> reviewer reading it *are* the gate.
+
+<!-- This repo owns the largest share of hard-gate code in the programme, which is
+     why AC6 R2 landed here first. See renquant-orchestrator#564. -->
