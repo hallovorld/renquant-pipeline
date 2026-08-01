@@ -12,12 +12,28 @@ that already existed (twin-registry R5 on orch#694; `ack_expiry()` on orch#697, 
 |---|---|
 | 5 — R8 canonical key + parity | **met** — `wf_gate_provenance.py`, presence-keying in `bundle_seal.py`, `gate_stamp_parity.py`, `test_twin_r8_canonical_gate_key.py` |
 | 6 — R9 declared root, ambiguity is an error | **partial** — two tools refuse on AMBIGUOUS; nothing enforces it repo-wide |
-| 2 — R1/R3 parity test | **partial** — `tests/test_twin_parity.py` exists; coverage of R1/R3 not confirmed |
+| 2 — R1/R3 parity test | **absent for R1/R3** — `tests/test_twin_parity.py` covers the R0 sibling-repo pins, not the kernel-vs-public or trainer twins |
 | **1 — executable pointer** | **absent** — a grep for a header naming the live copy returned nothing |
 | 3 — single source for role assignment (R5/R6) | **absent** — orch#694 *detects* disagreement; it does not create a single source |
-| 4 — reachability assertion (R7) | **absent** |
+| 4 — reachability assertion (R7) | **MET** — `tests/test_wash_sale_cost_branch_reachability.py`; re-measured 2026-07-31: **6** call sites, **0** pass a real `expected_dollar_return` |
 
-**1 of 6 met.** This PR does condition **1**, for R1.
+**2 of 6 met.** This PR does condition **1**, for R1.
+
+> **CORRECTION 2026-08-01.** An earlier version of this table marked condition **4** as
+> *absent* and totalled *"1 of 6"*. Both were wrong. My grep was
+> `reachab|never reached|call site` over `tests/`, piped through `head -3`; it returned
+> three alphabetically-first files and I read *"these are not it"* as *"it does not
+> exist"*. **A truncated search result is not a negative result** — and I published a
+> status table off one.
+>
+> Condition **2** moved the other way, from *"partial — coverage of R1/R3 not confirmed"*
+> to **absent for R1/R3**: `tests/test_twin_parity.py` tests
+> `scripts/check_twin_parity.py`, which pins **sibling-repo constants / functions / tax
+> rules** (the R0 tripwires). It does not touch R1's kernel-vs-public twin or R3's three
+> trainers.
+>
+> The measured facts elsewhere in this document — the `__init__.py` mapping, the missing
+> pointer, `renquant-pipeline#222` — are unaffected.
 
 ## What R1 is
 
