@@ -9,10 +9,39 @@ AC6's rollout has four rungs. R0/R1 (the canonical statement) exist: the design 
 `renquant-orchestrator` and Universal Rule §7 in the umbrella architecture contract.
 **R2 — the per-repo mechanical wiring — had landed only in `renquant-orchestrator`.**
 
-This repo is where the rule actually bites: #564's grep put **85 files** here matching
-`admission|_veto|sell_only|hard.?gate|fail.?closed`, the largest share in the programme.
-The rule was canonical everywhere and present on the review surface of one repo that owns
-comparatively little gate code.
+This repo is where the rule actually bites — but the comparison needs its **counting
+rule stated**, because it flips:
+
+| repo | all `*.py` | `src/` + `ops/` only |
+|---|---:|---:|
+| `renquant-pipeline` | 150 | **89** |
+| `renquant-orchestrator` | **161** | 66 |
+| `renquant-backtesting` | 26 | 17 |
+| `renquant-model` | 23 | 7 |
+| everything else (5 repos) | ≤ 21 each | ≤ 11 each |
+
+`[VERIFIED — regex `admission|_veto|sell_only|hard.?gate|fail.?closed` over every
+non-vendored `*.py` in the nine repo checkouts, 2026-07-31; vendored copies
+(`.subrepo_runtime`, `artifacts/**/bundle`, `.venv`, worktrees) excluded, or the umbrella's
+snapshots would count the same file many times]`
+
+**Counting all Python files, `renquant-orchestrator` is larger (161 vs 150) — so
+"the largest share in the programme" is only true of NON-TEST code.** Restricted to
+`src/` + `ops/`, this repo leads **89 to 66**, and that is the count the claim rests on:
+a rule about gate *design* is about the gate code, not about the tests that exercise it.
+
+~~*"one repo that owns comparatively little gate code"*~~ — **withdrawn.**
+`renquant-orchestrator` owns 66 core files matching the same pattern, which is not
+~~*"comparatively little"*~~ under any of these counts; it is second of nine. (Struck
+there too: the guard requires **every** occurrence of a withdrawn phrase to be marked,
+including one inside the sentence explaining the withdrawal.) The accurate
+statement is narrower: **AC6 R2 had landed in the repo with the second-largest share and
+not yet in the largest**, which is a reason to add it here, not a reason to disparage
+where it already is.
+
+The **85** in #564 is close to but not identical with the 89 measured here — different
+exclusion rules, a week apart. Neither is wrong; the number moves, which is why the
+counting rule now travels with it.
 
 So: a PR template, carrying the same item, **delegating to the canonical rule rather than
 paraphrasing it** — a per-repo copy drifts from the rule it copies.

@@ -61,3 +61,43 @@ def test_it_states_that_this_is_NOT_enforcement():
     does — measured on orch#690."""
     text = TEMPLATE.read_text(encoding="utf-8")
     assert "review surface, not enforcement" in text
+
+
+def test_the_largest_share_claim_carries_its_COUNTING_RULE():
+    """Self-audit before review. The claim flips depending on what you count.
+
+    Measured 2026-07-31 over the nine repo checkouts with the same regex: counting all
+    `*.py`, `renquant-orchestrator` leads 161 to 150; counting `src/` + `ops/` only,
+    this repo leads 89 to 66. "The largest share in the programme" is therefore true
+    only of NON-TEST code — so the qualifier has to travel with the number, on both
+    surfaces, or a reader checking it the obvious way finds it false.
+    """
+    import pathlib
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for rel in ("doc/progress/2026-07-31-ac6-r2-pr-template.md",
+                ".github/pull_request_template.md"):
+        text = (root / rel).read_text(encoding="utf-8")
+        assert "largest share" in text, rel
+        qualified = ("NON-TEST" in text or "non-test" in text
+                     or "src/` + `ops/" in text or "src/+ops/" in text)
+        assert qualified, f"{rel}: 'largest share' with no counting rule attached"
+
+
+def test_the_withdrawn_disparagement_is_marked_not_deleted():
+    """ANTI-VACUITY pair: the correction must not be achieved by quietly dropping the
+    comparison. `renquant-orchestrator` owns 66 core files matching the same pattern —
+    second of nine, not "comparatively little" — and the reason to land AC6 R2 here is
+    that this repo is FIRST, not that anywhere else is small.
+    """
+    import pathlib
+    import re
+    doc = (pathlib.Path(__file__).resolve().parent.parent
+           / "doc/progress/2026-07-31-ac6-r2-pr-template.md").read_text(encoding="utf-8")
+    flat = re.sub(r"\s*\n>?\s*", " ", doc)
+    struck = [m.span() for m in re.finditer(r"~~.+?~~", flat, re.S)]
+    hits = [m.start() for m in re.finditer(r"comparatively little", flat)]
+    assert hits, "the withdrawal itself must stay on the record"
+    for at in hits:
+        assert any(a <= at < b for a, b in struck), \
+            "'comparatively little' is asserted outside a withdrawal"
+    assert "second-largest share" in doc

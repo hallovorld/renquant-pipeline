@@ -34,5 +34,7 @@
 > that path would be validated by nothing. Until that is fixed, this item and the
 > reviewer reading it *are* the gate.
 
-<!-- This repo owns the largest share of hard-gate code in the programme, which is
-     why AC6 R2 landed here first. See renquant-orchestrator#564. -->
+<!-- This repo owns the largest share of NON-TEST hard-gate code in the programme
+     (src/+ops/: 89 files here vs 66 in renquant-orchestrator, measured 2026-07-31),
+     which is why AC6 R2 landed here. Counting all *.py the order reverses, so the
+     counting rule travels with the claim. See renquant-orchestrator#564. -->
