@@ -113,13 +113,31 @@ class RuntimeInferencePipeline(Pipeline):
         super().__init__([RuntimeInferenceJob(stages)], name="runtime-inference")
 
 
+def _wash_sale_decision_records(ctx: Any) -> list[dict[str, Any]]:
+    """Wash-sale materiality-floor waiver/finding records staged on ctx.
+
+    Producer: ``kernel.pipeline.task_candidates.collect_wash_sale_decision_records``
+    (s104 design 2026-08-02 / pipeline#223). These are appended into the
+    ``decision_trace`` the run bundle collects. Absent attribute (the floor-0
+    default, and every pre-floor context) ⇒ empty list ⇒ the payload is
+    byte-identical to before this surface existed.
+    """
+    records = _get_field(ctx, "wash_sale_decision_records")
+    if not records:
+        return []
+    return [dict(r) for r in records if isinstance(r, dict)]
+
+
 def runtime_inference_payload(ctx: InferenceContext) -> dict[str, Any]:
     """Return the JSON payload consumed by native live-bundle tooling."""
     return {
         "schema_version": 1,
         "source": "renquant_pipeline.runtime_inference",
         "market_as_of": ctx.market_snapshot.get("as_of"),
-        "decision_trace": list(ctx.decision_trace),
+        "decision_trace": [
+            *ctx.decision_trace,
+            *_wash_sale_decision_records(ctx),
+        ],
         "order_intents": list(ctx.order_intents),
         "scores": dict(ctx.scores),
         "blocked_by": dict(ctx.blocked_by),
@@ -390,6 +408,15 @@ def live_context_snapshot_from_live_context(
             field_name="blocked_by",
         )
         scores = _scores_from_live_context(ctx)
+
+    # s104 wash-sale materiality floor (pipeline#223): waiver/finding records
+    # ride the decision trace into the run bundle. They live on a SEPARATE ctx
+    # attribute (never inside ctx.decision_trace), so the explicit-vs-built
+    # branch above is unaffected and nothing double-counts; absent attribute
+    # (the floor-0 default) leaves decision_trace byte-identical.
+    waiver_records = _wash_sale_decision_records(ctx)
+    if waiver_records:
+        decision_trace = [*decision_trace, *waiver_records]
 
     return LiveContextSnapshot(
         strategy_config=dict(config),

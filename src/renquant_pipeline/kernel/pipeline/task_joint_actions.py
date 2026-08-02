@@ -715,7 +715,9 @@ class JointActionTask(Task):
             # unless caller has μ̂ to compare against NPV cost — see §1091)
             from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
                 is_wash_sale_blocked_with_cost,
+                resolve_wash_sale_materiality_policy,
                 resolve_wash_sale_min_material_npv,
+                wash_sale_materiality_floor_waives,
             )
             blocked, _, _ = is_wash_sale_blocked_with_cost(
                 a.cand_ticker, ctx.today, ctx.last_sell_dates,
@@ -730,6 +732,23 @@ class JointActionTask(Task):
                 min_material_npv_cost=resolve_wash_sale_min_material_npv(
                     ctx.config),
             )
+            if blocked:
+                # s104 materiality floor (design 2026-08-02; pipeline#223):
+                # honor the SAME governed waiver the candidate gate applied —
+                # otherwise a name waived there would be silently re-blocked
+                # here and the floor would be inert scaffolding. floor == 0.0
+                # short-circuits (normative, byte-identical); the per-name
+                # decision-trace record is emitted at the candidate gate,
+                # the single choke point every buy candidate passes through.
+                ws_policy = resolve_wash_sale_materiality_policy(ctx.config)
+                if ws_policy.floor_usd > 0.0 and wash_sale_materiality_floor_waives(
+                    floor_usd=ws_policy.floor_usd,
+                    assumed_marginal_rate=ws_policy.assumed_marginal_rate,
+                    event_net_realized_pl_usd=(
+                        getattr(ctx, "last_sell_pls", None) or {}
+                    ).get(a.cand_ticker),
+                ):
+                    blocked = False
             if blocked:
                 ctx.counters["joint_blocked_wash"] = (
                     ctx.counters.get("joint_blocked_wash", 0) + 1

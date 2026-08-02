@@ -511,6 +511,14 @@ class InferencePipeline:
                     ctx.candidates.append(tc.candidate)
                 elif getattr(tc, "blocked_by", None):
                     blocked_map[tc.ticker] = tc.blocked_by
+            # s104 wash-sale materiality floor (pipeline#223): per-name waiver
+            # records + config findings → ctx.wash_sale_decision_records (the
+            # surface the run bundle collects). No-op — attribute never
+            # created — when the floor is 0.0/absent and the config is valid.
+            from .task_candidates import (  # noqa: PLC0415
+                collect_wash_sale_decision_records,
+            )
+            collect_wash_sale_decision_records(ctx, cand_tctxs)
             log.info("Phase 2b (buy scan): %d candidates from %d tickers",
                      len(ctx.candidates), len(universe))
 

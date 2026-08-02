@@ -664,11 +664,16 @@ class ValidatePairsTask(Task):
         )
         from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
             is_wash_sale_blocked_with_cost,
+            resolve_wash_sale_materiality_policy,
             resolve_wash_sale_min_material_npv,
+            wash_sale_materiality_floor_waives,
         )
         rotation_asset_class = resolve_asset_class(cfg)
         rotation_validated_crypto_pairs = resolve_validated_crypto_spot_pairs(cfg)
         rotation_min_material_npv = resolve_wash_sale_min_material_npv(cfg)
+        # s104 materiality floor (design 2026-08-02; pipeline#223): resolved
+        # once per bar; floor == 0.0 (the default) short-circuits below.
+        rotation_ws_policy = resolve_wash_sale_materiality_policy(cfg)
         for pair in ctx.rotations:
             blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
                 pair.buy_ticker, ctx.today, ctx.last_sell_dates or {},
@@ -682,6 +687,20 @@ class ValidatePairsTask(Task):
                 # to the same WASH_SALE_MIN_MATERIAL_NPV_LEGACY default as before.
                 min_material_npv_cost=rotation_min_material_npv,
             )
+            if blocked and rotation_ws_policy.floor_usd > 0.0:
+                # Honor the SAME governed waiver the candidate gate applied —
+                # otherwise a name waived there would be silently re-blocked
+                # on the rotation buy leg and the floor would be inert
+                # scaffolding. The per-name decision-trace record is emitted
+                # at the candidate gate, the single choke point.
+                if wash_sale_materiality_floor_waives(
+                    floor_usd=rotation_ws_policy.floor_usd,
+                    assumed_marginal_rate=rotation_ws_policy.assumed_marginal_rate,
+                    event_net_realized_pl_usd=(
+                        getattr(ctx, "last_sell_pls", None) or {}
+                    ).get(pair.buy_ticker),
+                ):
+                    blocked = False
             if blocked:
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=wash_sale (%s)",
                          pair.sell_ticker, pair.buy_ticker, ws_reason)

@@ -658,6 +658,9 @@ class ComputeWashSaleMaskTask(Task):
     name = "ComputeWashSaleMaskTask"
 
     def run(self, ctx) -> bool | None:
+        from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+            resolve_wash_sale_materiality_policy,
+        )
         wash_days = int((ctx.config or {}).get("wash_sale_days", 0))
         min_reentry = int((ctx.config or {}).get("min_reentry_days", 0))
         tickers = _get_path(ctx, "_qp_tickers") or []
@@ -665,6 +668,12 @@ class ComputeWashSaleMaskTask(Task):
             ctx._qp_wash_mask = np.zeros(len(tickers), dtype=bool)  # noqa: SLF001
             return
         held_tickers = set(ctx.holdings.keys()) if getattr(ctx, "holdings", None) else set()
+        # s104 materiality floor (design 2026-08-02; pipeline#223): the QP
+        # mask must honor the SAME governed waiver the candidate gate applied,
+        # or a waived candidate would enter the QP at weight 0 with Δw ≤ 0 and
+        # the floor would be inert scaffolding on the QP path. floor == 0.0
+        # (the default) keeps the mask byte-identical.
+        ws_policy = resolve_wash_sale_materiality_policy(ctx.config or {})
         mask, n_wash, n_churn, n_sat = _compute_qp_wash_mask(
             tickers=tickers,
             today=ctx.today,
@@ -680,6 +689,8 @@ class ComputeWashSaleMaskTask(Task):
             # saturation-abstain legs are NOT §1091 and stay asset-class-agnostic.
             asset_class=_ctx_asset_class(ctx),
             validated_crypto_pairs=_ctx_validated_crypto_pairs(ctx),
+            materiality_floor_usd=ws_policy.floor_usd,
+            assumed_marginal_rate=ws_policy.assumed_marginal_rate,
         )
         ctx._qp_wash_mask = mask  # noqa: SLF001
         if n_wash or n_churn or n_sat:
@@ -3617,6 +3628,8 @@ def _compute_qp_wash_mask(
     calibrator_saturated: bool,
     asset_class: str = "us_equity",
     validated_crypto_pairs: "frozenset[str] | None" = None,
+    materiality_floor_usd: float = 0.0,
+    assumed_marginal_rate: float = 0.40,
 ) -> tuple[np.ndarray, int, int, int]:
     """Build QP block mask for wash-sale, anti-churn, and saturation abstain.
 
@@ -3624,8 +3637,19 @@ def _compute_qp_wash_mask(
     wash-sale leg (single source of truth: ``is_wash_sale_blocked_with_cost``);
     the min-reentry anti-churn and calibrator-saturation legs are risk
     controls, not tax law, and apply to every asset class.
+
+    ``materiality_floor_usd`` (s104 design 2026-08-02; pipeline#223) applies
+    the governed materiality waiver to the §1091 leg ONLY — anti-churn and
+    saturation-abstain are risk controls, not tax law, and are never waived.
+    Default 0.0 short-circuits (normative): the mask is byte-identical to the
+    pre-floor behavior, and the ``estimate <= floor`` comparison is never
+    evaluated. An unavailable estimate leaves the mask blocked (fail toward
+    protection).
     """
-    from renquant_pipeline.kernel.selection import is_wash_sale_blocked_with_cost  # noqa: PLC0415
+    from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+        is_wash_sale_blocked_with_cost,
+        wash_sale_materiality_floor_waives,
+    )
     mask = np.zeros(len(tickers), dtype=bool)
     n_wash = n_churn = n_sat = 0
     for i, t in enumerate(tickers):
@@ -3639,6 +3663,15 @@ def _compute_qp_wash_mask(
                 asset_class=asset_class,
                 validated_crypto_pairs=validated_crypto_pairs,
             )
+            if blocked and materiality_floor_usd > 0.0:
+                # Same waiver arithmetic as the candidate gate (which emits
+                # the per-name decision-trace record); see s104 design.
+                if wash_sale_materiality_floor_waives(
+                    floor_usd=materiality_floor_usd,
+                    assumed_marginal_rate=assumed_marginal_rate,
+                    event_net_realized_pl_usd=last_sell_pls.get(t),
+                ):
+                    blocked = False
             if blocked:
                 mask[i] = True
                 n_wash += 1

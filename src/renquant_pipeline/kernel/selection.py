@@ -1,8 +1,8 @@
 """Candidate scoring, guards, and tiered selection loop.
 
-Self-contained: only datetime, dataclasses, math.  No hard common/ imports
-(kernel.asset_class provides the §1091 asset-class dispatch, crypto RFC
-2026-07-10 P5).
+Self-contained: stdlib only (datetime, dataclasses, math, decimal,
+hashlib, json).  No hard common/ imports (kernel.asset_class provides the
+§1091 asset-class dispatch, crypto RFC 2026-07-10 P5).
 
 Public API:
   compute_relative_strength(stock_ret, etf_ret)  → float
@@ -12,9 +12,12 @@ Public API:
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import logging
 import math
 from dataclasses import dataclass, field
+from decimal import ROUND_CEILING, Decimal
 
 log = logging.getLogger("pipeline.execution")
 
@@ -188,6 +191,249 @@ def resolve_wash_sale_min_material_npv(config: "dict | None") -> float:
     if not math.isfinite(val) or val < 0.0:
         return WASH_SALE_MIN_MATERIAL_NPV_LEGACY
     return val
+
+
+# ── Governed wash-sale materiality floor (s104 design 2026-08-02) ─────────────
+#
+# renquant-strategy-104 doc/design/2026-08-02-wash-sale-materiality-floor.md is
+# the governing contract; this repo only ENFORCES it (pipeline#223). This knob
+# is DISTINCT from `wash_sale_min_material_npv` above: that one compares the
+# NPV *time-value* of the deferral against a floor inside the block decision;
+# this one compares the ESTIMATED FOREGONE TAX BENEFIT
+# (disallowed_loss_usd × assumed_marginal_rate, rounded UP to the cent) of an
+# ALREADY-BLOCKED name against a governed floor, and may waive the block
+# per-name with a decision-trace record.
+#
+# Contract points enforced here:
+#   * `risk.wash_sale.materiality_floor_usd` — absent ⇒ 0.0 ⇒ the entire code
+#     path is INERT (byte-identical decisions and messages to today).
+#   * Zero-floor short-circuit is NORMATIVE: at floor == 0.0 the
+#     `estimate <= floor` comparison is NEVER evaluated — callers guard with
+#     `blocked and policy.floor_usd > 0.0`. A name whose estimate is exactly
+#     $0.00 still blocks at floor 0.
+#   * Validation is FAIL-CLOSED on the VALUE itself: non-number, negative,
+#     NaN/inf, or above the design ceiling ($50 — raising it requires amending
+#     the s104 design first) ⇒ the floor is DISABLED (0.0) and a loud finding
+#     is recorded. Never silently clamp; a bad value never waives anything.
+#   * `risk.wash_sale.assumed_marginal_rate` — default 0.40, ceiling 1.0, same
+#     fail-closed validation; an invalid rate also disables the floor (a bad
+#     rate must never feed a waiver, and substituting the default for a typo
+#     would let the typo waive at 0.40).
+#   * Rounding UP means the floor systematically UNDER-fires: in doubt, block.
+
+WASH_SALE_MATERIALITY_FLOOR_KEY = "materiality_floor_usd"
+WASH_SALE_MATERIALITY_FLOOR_CEILING_USD = 50.0
+WASH_SALE_ASSUMED_MARGINAL_RATE_KEY = "assumed_marginal_rate"
+WASH_SALE_ASSUMED_MARGINAL_RATE_DEFAULT = 0.40
+WASH_SALE_ASSUMED_MARGINAL_RATE_CEILING = 1.0
+
+
+@dataclass(frozen=True)
+class WashSaleMaterialityPolicy:
+    """Resolved + validated materiality-floor policy for one run.
+
+    ``findings`` non-empty ⇔ at least one configured VALUE was invalid; in
+    that case ``floor_usd`` is forced to 0.0 (disabled — nothing waives) and
+    the findings must be surfaced loudly on the decision-record surface.
+    """
+
+    floor_usd: float
+    assumed_marginal_rate: float
+    config_fingerprint: str
+    findings: tuple[str, ...] = ()
+
+    def finding_records(self) -> list[dict]:
+        """Findings as decision-trace records (run-bundle surface shape)."""
+        return [
+            {
+                "gate": "wash_sale",
+                "record": "config_validation_finding",
+                "waived": False,
+                "finding": finding,
+                "config_fingerprint": self.config_fingerprint,
+            }
+            for finding in self.findings
+        ]
+
+
+def _wash_sale_policy_fingerprint(wash_cfg: dict) -> str:
+    """Fingerprint of the raw ``risk.wash_sale`` policy subtree.
+
+    Deliberately NOT ``renquant_common.config_consistency.fingerprint_config``
+    — that hashes MODEL-relevant fields only and would not change when the
+    floor changes. This stamp exists so every waiver is attributable to the
+    exact reviewed policy that authorized it (AC6 binding in the s104 design),
+    so it must change iff the wash-sale policy subtree changes. Same
+    ``sha256:<16 hex>`` format convention as ``fingerprint_config``.
+    """
+    try:
+        blob = json.dumps(
+            wash_cfg, sort_keys=True, separators=(",", ":"), default=str,
+        )
+    except (TypeError, ValueError):
+        blob = repr(wash_cfg)
+    return "sha256:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _validated_policy_value(
+    wash_cfg: dict,
+    key: str,
+    *,
+    default: float,
+    ceiling: float,
+    findings: list[str],
+) -> float:
+    """Read one policy number with fail-closed validation.
+
+    Absent key ⇒ ``default`` silently (the documented default IS the absent
+    behavior). A PRESENT but invalid value ⇒ ``default`` + a loud finding —
+    the caller then disables the whole floor (never let a bad value waive).
+    Only int/float count as numbers: a quoted "5.0" is a config type error,
+    not five dollars (fail-closed on the value itself, never coerce).
+    """
+    if key not in wash_cfg:
+        return default
+    raw = wash_cfg.get(key)
+    label = f"risk.wash_sale.{key}"
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        findings.append(
+            f"{label}={raw!r} is not a number — floor DISABLED (fail-closed),"
+            f" nothing waived"
+        )
+        return default
+    val = float(raw)
+    if not math.isfinite(val):
+        findings.append(
+            f"{label}={val!r} is not finite — floor DISABLED (fail-closed),"
+            f" nothing waived"
+        )
+        return default
+    if val < 0.0:
+        findings.append(
+            f"{label}={val!r} is negative — floor DISABLED (fail-closed),"
+            f" nothing waived"
+        )
+        return default
+    if val > ceiling:
+        findings.append(
+            f"{label}={val!r} exceeds the design ceiling {ceiling!r} — "
+            f"refused as a contract violation (raising the ceiling requires "
+            f"amending the s104 design first); floor DISABLED (fail-closed),"
+            f" nothing waived"
+        )
+        return default
+    return val
+
+
+def resolve_wash_sale_materiality_policy(
+    config: "dict | None",
+) -> WashSaleMaterialityPolicy:
+    """Resolve ``risk.wash_sale.{materiality_floor_usd,assumed_marginal_rate}``.
+
+    Pure read — no logging, no mutation — so calling it on every path is
+    output-invariant by construction. Absent keys ⇒ floor 0.0 (inert) and
+    rate 0.40, no findings. ANY invalid configured value ⇒ floor forced to
+    0.0 + findings (loud, recorded by the caller on the block's output
+    surface; never silently clamped).
+    """
+    risk_cfg = (config or {}).get("risk")
+    wash_cfg = risk_cfg.get("wash_sale") if isinstance(risk_cfg, dict) else None
+    if not isinstance(wash_cfg, dict):
+        wash_cfg = {}
+    findings: list[str] = []
+    floor = _validated_policy_value(
+        wash_cfg,
+        WASH_SALE_MATERIALITY_FLOOR_KEY,
+        default=0.0,
+        ceiling=WASH_SALE_MATERIALITY_FLOOR_CEILING_USD,
+        findings=findings,
+    )
+    rate = _validated_policy_value(
+        wash_cfg,
+        WASH_SALE_ASSUMED_MARGINAL_RATE_KEY,
+        default=WASH_SALE_ASSUMED_MARGINAL_RATE_DEFAULT,
+        ceiling=WASH_SALE_ASSUMED_MARGINAL_RATE_CEILING,
+        findings=findings,
+    )
+    if findings:
+        # Fail-closed: an invalid value on EITHER knob disables the floor
+        # entirely. A bad rate must never feed a waiver arithmetic, and a bad
+        # floor must never waive at a substituted number.
+        floor = 0.0
+    return WashSaleMaterialityPolicy(
+        floor_usd=floor,
+        assumed_marginal_rate=rate,
+        config_fingerprint=_wash_sale_policy_fingerprint(wash_cfg),
+        findings=tuple(findings),
+    )
+
+
+def estimate_foregone_wash_sale_tax_benefit_usd(
+    event_net_realized_pl_usd: "float | None",
+    *,
+    assumed_marginal_rate: float,
+) -> "float | None":
+    """Estimated foregone tax benefit of §1091 disallowance, ceil'd to the cent.
+
+    ``event_net_realized_pl_usd`` is the SAME-EVENT-NETTED realized P/L of the
+    prior sell event — gains and losses within one disposal net BEFORE the
+    estimate (the disposed-lot netting defect class, fixed 2026-07-27 in
+    ``kernel.portfolio.compute_disposed_lot_tax``, must not be inherited by
+    this estimator). Two sanctioned sources:
+
+    * ``ctx.last_sell_pls[ticker]`` — the adapter-computed FIFO realized $ P/L
+      of the most recent FULL liquidation. This is the NET of the whole event
+      (every disposed lot summed, gains offsetting losses), not a
+      losses-only sum, so same-event netting is included by construction.
+    * ``kernel.portfolio.event_net_realized_pnl_from_disposed_lots`` — derives
+      the same quantity from lot detail through the EXISTING netted lot
+      engine, for callers that have per-lot data.
+
+    Returns ``None`` when the estimate is UNAVAILABLE (missing / non-finite
+    P/L) — the caller must let the block STAND, stamped
+    ``estimate_unavailable`` (fail toward protection). A non-negative event
+    P/L has no disallowed loss ⇒ $0.00 (defensive: the gate never blocks gain
+    sales, so this input is unreachable from a blocked name).
+
+    Rounding is UP (``Decimal`` ROUND_CEILING to cents), so the floor
+    systematically UNDER-fires: when in doubt, the block stands.
+    """
+    pl = event_net_realized_pl_usd
+    if pl is None or isinstance(pl, bool) or not isinstance(pl, (int, float)):
+        return None
+    pl = float(pl)
+    if not math.isfinite(pl):
+        return None
+    if pl >= 0.0:
+        return 0.0
+    disallowed_loss = Decimal(str(abs(pl)))
+    rate = Decimal(str(float(assumed_marginal_rate)))
+    est = (disallowed_loss * rate).quantize(
+        Decimal("0.01"), rounding=ROUND_CEILING,
+    )
+    return float(est)
+
+
+def wash_sale_materiality_floor_waives(
+    *,
+    floor_usd: float,
+    assumed_marginal_rate: float,
+    event_net_realized_pl_usd: "float | None",
+) -> bool:
+    """True iff the governed floor waives one ALREADY-BLOCKED name.
+
+    Callers MUST guard with ``blocked and floor_usd > 0.0`` — the zero-floor
+    short-circuit is normative in the s104 design (the comparison is never
+    evaluated at floor 0). The internal guard here is defense-in-depth only.
+    An unavailable estimate never waives (block stands).
+    """
+    if floor_usd <= 0.0:
+        return False
+    est = estimate_foregone_wash_sale_tax_benefit_usd(
+        event_net_realized_pl_usd,
+        assumed_marginal_rate=assumed_marginal_rate,
+    )
+    return est is not None and est <= floor_usd
 
 
 def is_wash_sale_blocked_with_cost(

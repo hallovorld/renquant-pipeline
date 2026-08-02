@@ -310,6 +310,26 @@ def _prior_history(ctx: Any, today_iso: str) -> list[dict]:
 
 
 def _wash_sale_count(blocked: dict[str, str], counters: dict) -> int:
+    """Session wash-sale kill count — the mass-block aggregation input.
+
+    s104 materiality floor (design 2026-08-02; pipeline#223): waiving is
+    PER-NAME at ``WashSaleFilterTask``. A waived name never sets
+    ``blocked_by``, so it is absent from ``blocked`` here and is NOT counted
+    — the aggregate is exactly the count of STANDING blocks. Deliberate
+    consequences, per the design:
+
+    * mixed sessions keep honest aggregate semantics — waiving some names can
+      lower the count below ``min_count``/p99 but never flips a standing
+      block into a pass or vice versa;
+    * if EVERY blocked name waives, the count is 0 and
+      ``wash_sale_mass_block`` does not fire — correct, because no name was
+      actually suppressed; each waive is individually accounted for by its
+      decision-trace record ``{gate, waived, est_foregone_tax_usd, floor_usd,
+      config_fingerprint}`` in the run bundle, not by this alarm.
+
+    At the default floor 0.0 nothing ever waives and this count is
+    byte-identical to the pre-floor behavior.
+    """
     from_map = sum(
         1 for reason in blocked.values() if gate_family(reason) == "wash_sale"
     )
@@ -653,6 +673,13 @@ class WashSaleMassBlockInvariant:
     (default 5) AND — once ≥ ``min_history_sessions`` (default 10) of history
     exist — strictly above the historical p99 of per-session wash-sale kill
     counts. Cold start falls back to the absolute floor alone.
+
+    The count is STANDING blocks only — names waived per-name by the s104
+    materiality floor are not in it (see ``_wash_sale_count``). A session
+    where every blocked name waives therefore does not fire this invariant;
+    the waives remain visible via their decision-trace records in the run
+    bundle, and blocks stamped ``estimate_unavailable`` still count as
+    standing blocks.
     """
 
     name = "wash_sale_mass_block"

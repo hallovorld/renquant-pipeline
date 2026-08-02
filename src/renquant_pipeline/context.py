@@ -192,3 +192,14 @@ class TickerInferenceContext:
     exit_signal: Any = None      # ExitSignal | None
     candidate: Any = None        # CandidateResult | None
     blocked_by: str | None = None  # candidate-gate reason when chain stops before assembly
+    # s104 wash-sale materiality floor (design 2026-08-02; pipeline#223).
+    # Both None at the floor-0 default (the inert path never writes them).
+    # wash_sale_waiver: the per-name decision-trace record
+    #   {gate, ticker, waived, est_foregone_tax_usd, floor_usd,
+    #    config_fingerprint} written by WashSaleFilterTask when a blocked
+    #   name's estimated foregone tax benefit is <= the configured floor.
+    # wash_sale_floor_findings: config-validation finding records (list of
+    #   dicts) when a configured floor/rate VALUE is invalid — the floor is
+    #   then DISABLED and pp_inference surfaces the findings loudly.
+    wash_sale_waiver: Any = None
+    wash_sale_floor_findings: Any = None
