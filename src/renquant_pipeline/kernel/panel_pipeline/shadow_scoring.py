@@ -74,6 +74,7 @@ from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
     shadow_health_cfg,
     shadow_health_log_path,
     shadow_health_sink_defined,
+    task_config_identity,
 )
 
 log = logging.getLogger("kernel.panel_pipeline.shadow_scoring")
@@ -241,6 +242,15 @@ class ApplyShadowScoringTask(Task):
         # datetime / date). shadow_health.enabled=false is a health-only kill
         # switch (never disables the shadow scoring itself).
         strategy_dir = ctx.config.get("_strategy_dir")
+        # Identity of the STRATEGY CONFIG this task ran under (#256), stamped
+        # on EVERY record — task-level AND per-lane — so the shared sink can
+        # attribute a task-level `no_shadow_models` to the profile that wrote
+        # it (the shadow_blend companion) instead of it reading as "the MAIN
+        # config dropped all shadow lanes". Computed ONCE per run; distinct
+        # from the per-lane `config_fingerprint` (the ARTIFACT's
+        # training-config fingerprint). (None, None) when the runner did not
+        # stamp `_strategy_config_path` — never guessed.
+        task_config_path, task_config_sha256 = task_config_identity(ctx.config)
         today_val = getattr(ctx, "today", datetime.date.today())
         if isinstance(today_val, datetime.datetime):
             run_date = today_val.date()
@@ -309,6 +319,8 @@ class ApplyShadowScoringTask(Task):
                 run_date=run_date, run_id=run_id, n_candidates=n_candidates,
                 expected_content_sha256=(sm.get("expected_content_sha256") if sm else None),
                 expected_config_fingerprint=(sm.get("expected_config_fingerprint") if sm else None),
+                task_config_path=task_config_path,
+                task_config_sha256=task_config_sha256,
             )
             return mark_expected_skip(rec, state, reason)
 
@@ -376,6 +388,8 @@ class ApplyShadowScoringTask(Task):
                 n_candidates=len(primary_scores),
                 expected_content_sha256=sm.get("expected_content_sha256"),
                 expected_config_fingerprint=sm.get("expected_config_fingerprint"),
+                task_config_path=task_config_path,
+                task_config_sha256=task_config_sha256,
             )
             try:
                 if not kind or not artifact_path:

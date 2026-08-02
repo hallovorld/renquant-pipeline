@@ -162,6 +162,14 @@ MAX_DECLARED_LOOKAHEAD_TDAYS = 252
 
 CONTENT_SHA256_PREFIX = "sha256:"
 
+#: Config key under which the live runner stamps the RESOLVED path of the
+#: strategy config file it loaded (``live/runner.py`` — set alongside
+#: ``_strategy_dir`` / ``_strategy_config_name``). This is the one place the
+#: run already knows WHICH config file it is running under, so the health
+#: record's task-config identity reads it rather than re-deriving (and
+#: possibly mis-guessing) a path.
+STRATEGY_CONFIG_PATH_KEY = "_strategy_config_path"
+
 # Per-process content-digest cache for the standalone ``content_digest`` helper,
 # keyed by (path, mtime_ns, size) so a 700-bar sim does not re-hash a 100 MB
 # checkpoint every bar. NOTE: the (path, mtime, size) key is a PERFORMANCE
@@ -219,6 +227,33 @@ def content_digest(path: str | Path | None) -> str | None:
         return None
     _DIGEST_CACHE[key] = digest
     return digest
+
+
+def task_config_identity(config: dict) -> "tuple[str | None, str | None]":
+    """``(task_config_path, task_config_sha256)`` — the identity of the
+    STRATEGY CONFIG file the emitting task ran under (issue #256).
+
+    The shadow-health sink receives records from MULTIPLE invocations per
+    session (the main daily run plus companion profiles such as shadow_blend).
+    A task-level ``no_shadow_models`` record with no config identity cannot be
+    told apart from "the MAIN config dropped all shadow lanes" — the exact
+    alarm class the record exists to make legible — so EVERY record is stamped
+    with the config file the task actually ran under.
+
+    Reads the resolved path the runner stamped at ``STRATEGY_CONFIG_PATH_KEY``
+    and hashes the file with the canonical ``content_digest`` recipe
+    (``sha256:<16 hex>`` — the SAME convention the record's artifact
+    ``content_sha256`` uses, so the sentinel compares one digest form).
+
+    FAIL CLOSED: when the runner did not stamp a path, returns ``(None,
+    None)`` rather than guessing ``<strategy_dir>/strategy_config.json`` — a
+    guessed default could stamp the MAIN config's identity onto a companion
+    profile's record, recreating the very false-attribution vector this field
+    kills. An absent identity stays legibly absent."""
+    path = (config or {}).get(STRATEGY_CONFIG_PATH_KEY)
+    if not path:
+        return None, None
+    return str(path), content_digest(str(path))
 
 
 def resolve_artifact_identity(
@@ -283,6 +318,8 @@ def new_shadow_health(
     run_date: datetime.date, run_id: Any, n_candidates: int,
     expected_content_sha256: Any = None,
     expected_config_fingerprint: Any = None,
+    task_config_path: Any = None,
+    task_config_sha256: Any = None,
 ) -> dict[str, Any]:
     """A health record pre-seeded to the WORST case (nothing loaded/scored).
 
@@ -294,6 +331,19 @@ def new_shadow_health(
         "schema": SHADOW_HEALTH_SCHEMA,
         "run_date": run_date.isoformat(),
         "run_id": str(run_id) if run_id is not None else None,
+        # Identity of the STRATEGY CONFIG the emitting task ran under (#256):
+        # the resolved config file path + its content digest (see
+        # ``task_config_identity``). Run-level, stamped identically on
+        # task-level AND per-lane records, so a task-level `no_shadow_models`
+        # written by a companion profile (shadow_blend) is attributable to
+        # THAT profile, not mistaken for the main config dropping its lanes.
+        # NOT the same object as `config_fingerprint` below — that is the
+        # ARTIFACT's training-config fingerprint read off the loaded scorer's
+        # metadata. Additive v1 fields (no schema bump — the trained_date /
+        # n_scored_total precedent): readers that ignore them are unaffected.
+        "task_config_path": str(task_config_path) if task_config_path else None,
+        "task_config_sha256": (
+            str(task_config_sha256) if task_config_sha256 else None),
         "shadow_name": shadow_name,
         "kind": kind,
         "artifact_path": str(artifact_path) if artifact_path is not None else None,
@@ -617,8 +667,10 @@ __all__ = [
     "TRAIN_CUTOFF_FIELD",
     "CONFIG_FINGERPRINT_FIELD",
     "CONTENT_SHA256_PREFIX",
+    "STRATEGY_CONFIG_PATH_KEY",
     "ArtifactIdentity",
     "content_digest",
+    "task_config_identity",
     "resolve_artifact_identity",
     "new_shadow_health",
     "mark_expected_skip",
