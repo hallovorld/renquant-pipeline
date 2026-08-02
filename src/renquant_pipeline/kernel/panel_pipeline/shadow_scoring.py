@@ -62,6 +62,8 @@ from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
     STATE_DISABLED,
     STATE_NO_CANDIDATES,
     STATE_NO_SHADOW_MODELS,
+    STATE_NOT_YET_PUBLISHED,
+    ShadowNotYetPublished,
     TASK_LEVEL_SHADOW_NAME,
     append_shadow_health,
     content_digest,
@@ -437,11 +439,30 @@ class ApplyShadowScoringTask(Task):
                 shadow_cfg = dict(ctx.config)
                 shadow_cfg.setdefault("ranking", {})["panel_scoring"] = shadow_panel_cfg
 
-                cache_key = (kind, str(p))
+                # Cache key includes the certified CONTENT digest, not just the
+                # path: a ledger-pointer lane (momentum_residual) keeps ONE
+                # stable path whose bytes advance on every weekly append, and a
+                # path-only key would pin the first-loaded tail for the life of
+                # a long sim process. The digest is already in hand from the
+                # single canonical resolution above — same-bytes loads still
+                # hit the cache.
+                cache_key = (kind, str(p), identity.content_sha256)
                 scorer = _SCORER_CACHE.get(cache_key)
                 if scorer is None:
                     try:
                         scorer = handler.scorer_loader(p, shadow_cfg)
+                    except ShadowNotYetPublished as exc:
+                        # The designed pre-first-publish window of a
+                        # ledger-pointer lane (model#197 amendment 2): the ref
+                        # RESOLVED (we are past the identity gate) but the
+                        # verified ledger carries zero rows. An EXPECTED skip —
+                        # distinct from unresolved_artifact and load_failed —
+                        # so the sentinel keeps the lane's timeline continuous
+                        # without alarming on the designed state.
+                        mark_expected_skip(health, STATE_NOT_YET_PUBLISHED, str(exc))
+                        log.info("ApplyShadowScoringTask: shadow %s (%s) not "
+                                 "yet published: %s", name, kind, exc)
+                        continue
                     except Exception as exc:
                         # The identity certified a real file (we only reach here
                         # when identity.resolved), so a raise is a genuine load
@@ -472,7 +493,17 @@ class ApplyShadowScoringTask(Task):
 
                 target_tickers = list(primary_scores.keys())
                 try:
-                    if getattr(scorer, "requires_history", False):
+                    if getattr(scorer, "scores_by_ticker", False):
+                        # Ledger-pointer kinds (momentum_residual): the loaded
+                        # scorer IS the verified per-ticker score set frozen at
+                        # its cutoff — serving is a lookup over the candidate
+                        # tickers. Checked FIRST: these scorers consume neither
+                        # ctx._panel_matrix nor a history panel, so neither the
+                        # matrix-empty skip nor the degenerate-cross-section
+                        # guard applies (a history-primary run's target-only
+                        # placeholder matrix is irrelevant to this lane).
+                        series = scorer.score_tickers(target_tickers)
+                    elif getattr(scorer, "requires_history", False):
                         # 2026-06-10 FROZEN-SCORE FIX (shadow path). Same bug as
                         # the primary ApplyScoresTask path: lazy-loading the
                         # sequence panel from the STATIC training parquet

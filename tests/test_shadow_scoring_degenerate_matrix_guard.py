@@ -98,7 +98,7 @@ def _wire(monkeypatch, scorer):
             source="strategy_dir", content_sha256="sha256:deadbeefdeadbeef",
             error=None))
     monkeypatch.setattr(registry, "get", lambda kind: object())
-    shadow_scoring._SCORER_CACHE[("xgb", "dummy")] = scorer
+    shadow_scoring._SCORER_CACHE[("xgb", "dummy", "sha256:deadbeefdeadbeef")] = scorer
 
 
 def test_degenerate_matrix_skips_nonhistory_shadow(monkeypatch):
@@ -110,7 +110,7 @@ def test_degenerate_matrix_skips_nonhistory_shadow(monkeypatch):
         ApplyShadowScoringTask().run(_ctx(matrix))
         assert rec.called is False  # degenerate cross-section → skipped, never scored
     finally:
-        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy"), None)
+        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy", "sha256:deadbeefdeadbeef"), None)
 
 
 def test_varied_matrix_still_scores_nonhistory_shadow(monkeypatch):
@@ -122,4 +122,4 @@ def test_varied_matrix_still_scores_nonhistory_shadow(monkeypatch):
         ApplyShadowScoringTask().run(_ctx(matrix))
         assert rec.called is True  # real cross-section → guard does NOT over-fire
     finally:
-        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy"), None)
+        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy", "sha256:deadbeefdeadbeef"), None)

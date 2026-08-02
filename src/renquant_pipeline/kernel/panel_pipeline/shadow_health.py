@@ -95,6 +95,18 @@ STATE_NO_SHADOW_MODELS = "no_shadow_models"  # none configured (task-level)
 #: unmistakably a sentinel so no reader mistakes it for a configured shadow.
 TASK_LEVEL_SHADOW_NAME = "__task_level__"
 STATE_NO_CANDIDATES = "no_candidates"        # nothing to score this run (per-model)
+#: A ledger-pointer lane whose artifact_path RESOLVES but whose ledger carries
+#: ZERO rows yet — the designed pre-first-publish window (model#197 amendment 2,
+#: the s104 PENDING_FIRST_ARTIFACT guard). Distinct from ``unresolved_artifact``
+#: (the ref points nowhere — the ``../../`` fault class) and from ``load_failed``
+#: (the ledger exists with rows but a verification check refused it): this is the
+#: one absent-state that is BY DESIGN, so it is an expected skip, not a fault —
+#: the same tri-state discipline as ok / expected_skip / fault itself. Additive
+#: state within the existing status buckets: the deployed sentinel constrains
+#: ``status`` to the canonical three and requires ``state`` only to be a string
+#: (ops/renquant104/rq104_shadow_scorer_sentinel.py::is_valid_v1_record), so no
+#: schema bump.
+STATE_NOT_YET_PUBLISHED = "not_yet_published"
 STATE_OK = "ok"                              # loaded + fresh + provenanced + covered
 STATE_DEGRADED = "degraded"                  # loaded but stale/low-cov/identity issue
 STATE_NOT_SCORED = "not_scored"              # loaded but produced no usable scores
@@ -103,10 +115,23 @@ STATE_LOAD_FAILED = "load_failed"            # resolved but scorer_loader raised
 
 EXPECTED_SKIP_STATES = frozenset({
     STATE_DISABLED, STATE_NO_SHADOW_MODELS, STATE_NO_CANDIDATES,
+    STATE_NOT_YET_PUBLISHED,
 })
 FAULT_STATES = frozenset({
     STATE_DEGRADED, STATE_NOT_SCORED, STATE_UNRESOLVED_ARTIFACT, STATE_LOAD_FAILED,
 })
+
+class ShadowNotYetPublished(Exception):
+    """Raised by a kind handler whose configured artifact is a LEDGER POINTER
+    that resolves to a real file carrying zero published rows yet.
+
+    This is the designed PENDING_FIRST_ARTIFACT window (model#197 amendment 2):
+    the s104 config entry pins the cutoff-stable ledger, and until the weekly
+    train job's first publish the ledger legitimately has no tail row to serve.
+    ``ApplyShadowScoringTask`` catches this exception SPECIFICALLY — before its
+    generic load-failure handler — and stamps ``STATE_NOT_YET_PUBLISHED`` as an
+    expected skip. Every OTHER loader exception remains a recorded FAULT."""
+
 
 # Provenance / identity metadata field names read off the loaded scorer.
 TRAIN_CUTOFF_FIELD = "effective_train_cutoff_date"
@@ -576,6 +601,8 @@ __all__ = [
     "STATE_NO_SHADOW_MODELS",
     "TASK_LEVEL_SHADOW_NAME",
     "STATE_NO_CANDIDATES",
+    "STATE_NOT_YET_PUBLISHED",
+    "ShadowNotYetPublished",
     "STATE_OK",
     "STATE_DEGRADED",
     "STATE_NOT_SCORED",
