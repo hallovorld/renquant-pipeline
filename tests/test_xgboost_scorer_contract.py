@@ -79,13 +79,23 @@ def _ctx(artifact: dict) -> InferenceContext:
 
 
 def test_panel_scoring_loads_real_xgboost_artifact_without_explicit_scores(tmp_path) -> None:
+    """UPDATED to the #219 unit-guard contract (#246 root cause). This fixture has
+    no calibrator, so panel_scores stay in the RAW score domain while the buy floor
+    is a probability-domain threshold — the guard REFUSES the unit-mismatched
+    comparison rather than trading on it. Scoring itself still works; admission is
+    blocked with the reason recorded, and the acceptance contract still holds: an
+    EXPLICIT empty accepted set, never a missing attribute (the pre-guard version
+    of this test asserted AAPL was accepted; that behaviour was the unit bug the
+    guard exists to prevent)."""
     ctx = _ctx(_xgb_artifact(tmp_path))
 
     RuntimeInferencePipeline([PanelScoringJob(emit_orders=True)]).run(ctx)
 
-    assert ctx.scores["AAPL"] > ctx.scores["MSFT"]
-    assert [row["ticker"] for row in ctx.accepted_candidates] == ["AAPL"]
-    assert ctx.order_intents[0]["attribution"]["score_snapshot"]["artifact_id"] == "unit-xgb-panel"
+    assert ctx.scores["AAPL"] > ctx.scores["MSFT"]     # scoring is unaffected
+    assert ctx.buy_blocked is True
+    assert ctx.blocked_by["AAPL"] == "rank_score_domain_uncalibrated"
+    assert ctx.accepted_candidates == []               # explicit empty, not missing
+    assert ctx.order_intents == []
 
 
 def test_broken_local_xgboost_artifact_fails_closed(tmp_path) -> None:

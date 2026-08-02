@@ -545,6 +545,14 @@ def _trace(ctx: Any, selected: list[str] | None = None) -> None:
 def _block_all(ctx: Any, reason: str) -> None:
     for ticker in _watchlist(ctx):
         _block(ctx, ticker, reason)
+    # The acceptance contract holds on EVERY exit: a full block yields an EXPLICIT
+    # empty accepted set, never a missing attribute. Downstream readers use
+    # `getattr(ctx, "accepted_candidates", []) or []`, so an unset attribute is
+    # indistinguishable from "zero accepted" — the silent-empty shape (#246). The
+    # reason survives in `blocked_by`/`buy_blocked`; only set when absent so a
+    # later per-ticker acceptance pass is never clobbered.
+    if not hasattr(ctx, "accepted_candidates"):
+        setattr(ctx, "accepted_candidates", [])
     ctx_registry(ctx).submit(
         gate="panel_scoring", scope="book", verdict="block",
         reason=str(reason),
