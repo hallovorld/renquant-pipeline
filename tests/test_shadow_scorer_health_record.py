@@ -289,7 +289,7 @@ _FULL_SCORES = {"AAA": 3.0, "BBB": 2.0, "CCC": 1.0}
 
 
 def _ctx(tmp_path, *, shadow_models, candidates=None, matrix=None,
-         shadow_enabled=True, shadow_health=None):
+         shadow_enabled=True, shadow_health=None, config_path=None):
     if candidates is None:
         candidates = [SimpleNamespace(ticker=t, panel_score=float(i + 1), rank_score=None)
                       for i, t in enumerate(IDX)]
@@ -303,6 +303,10 @@ def _ctx(tmp_path, *, shadow_models, candidates=None, matrix=None,
     cfg = {"ranking": {"panel_scoring": panel}, "_strategy_dir": str(tmp_path)}
     if shadow_health is not None:
         cfg["shadow_health"] = shadow_health
+    if config_path is not None:
+        # The live runner stamps the RESOLVED strategy-config path it loaded
+        # (live/runner.py) — the source of the record's task-config identity.
+        cfg["_strategy_config_path"] = str(config_path)
     return SimpleNamespace(
         config=cfg, candidates=candidates,
         _panel_matrix=_VARIED if matrix is None else matrix,
@@ -608,3 +612,94 @@ def test_run_unresolved_identity_skips_loader(monkeypatch, tmp_path):
     assert rec["state"] == STATE_UNRESOLVED_ARTIFACT
     assert rec["status"] == STATUS_FAULT
     assert rec["actionable"] is False
+
+
+# ── Task-config identity stamp (issue #256) ────────────────────────────────────
+# The sink receives records from MULTIPLE invocations per session: the main
+# daily run's per-lane records, then the shadow_blend companion profile's
+# task-level `no_shadow_models` — into the SAME file, always after. Without a
+# strategy-config identity on the record, a reader cannot tell "the MAIN
+# config dropped all shadow lanes" from "a different profile that legitimately
+# has none also wrote here", and the sentinel's last-record-per-date-wins task
+# state can fire the disappeared-from-config clause off ANOTHER profile's
+# record. Every record — task-level AND per-lane — therefore carries
+# task_config_path + task_config_sha256 (the config file the task ran under;
+# NOT the per-lane `config_fingerprint`, which is the ARTIFACT's).
+
+def _write_config_file(tmp_path, name, payload):
+    p = tmp_path / name
+    p.write_text(json.dumps(payload))
+    return p
+
+
+def test_task_level_no_shadow_models_carries_task_config_identity(tmp_path):
+    profile = _write_config_file(
+        tmp_path, "strategy_config.shadow_blend.json", {"profile": "companion"})
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, shadow_models=[], config_path=profile))
+    (rec,) = _read_records(tmp_path)
+    assert rec["state"] == STATE_NO_SHADOW_MODELS
+    assert rec["task_config_path"] == str(profile)
+    assert rec["task_config_sha256"] == content_digest(profile)
+    assert rec["task_config_sha256"].startswith("sha256:")
+
+
+def test_per_lane_records_carry_the_same_task_config_identity(monkeypatch, tmp_path):
+    main_cfg = _write_config_file(
+        tmp_path, "strategy_config.json", {"profile": "main"})
+    _wire_loader(monkeypatch, tmp_path,
+                 _RecordingXGB(dict(_FRESH_META), dict(_FULL_SCORES)))
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, config_path=main_cfg, shadow_models=[
+            {"name": "shadow_a", "kind": "hf_patchtst", "artifact_path": "model.pt"},
+            {"name": "shadow_b", "kind": "hf_patchtst", "artifact_path": "model.pt"}]))
+    recs = _read_records(tmp_path)
+    assert len(recs) == 2
+    assert all(r["task_config_path"] == str(main_cfg) for r in recs)
+    assert all(r["task_config_sha256"] == content_digest(main_cfg) for r in recs)
+    # The ARTIFACT's training-config fingerprint is a DIFFERENT object and
+    # must keep its meaning untouched by the new fields.
+    assert all(r["config_fingerprint"] == "cfg-1" for r in recs)
+
+
+def test_two_invocations_with_different_configs_are_distinguishable(monkeypatch, tmp_path):
+    """The measured live scenario: the main run (with a lane) and the
+    shadow_blend companion (no lanes) write into the SAME sink in the same
+    session. The stamp must let a reader attribute the task-level
+    `no_shadow_models` to the companion's config, not the main one."""
+    main_cfg = _write_config_file(
+        tmp_path, "strategy_config.json", {"profile": "main"})
+    blend_cfg = _write_config_file(
+        tmp_path, "strategy_config.shadow_blend.json", {"profile": "companion"})
+    _wire_loader(monkeypatch, tmp_path,
+                 _RecordingXGB(dict(_FRESH_META), dict(_FULL_SCORES)))
+    # Main daily run: one configured lane → a per-lane record.
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, config_path=main_cfg,
+        shadow_models=[{"name": "patchtst_v1", "kind": "hf_patchtst",
+                        "artifact_path": "model.pt"}]))
+    # Companion profile: no lanes → a task-level record, appended AFTER.
+    ApplyShadowScoringTask().run(_ctx(
+        tmp_path, config_path=blend_cfg, shadow_models=[]))
+    lane_rec, task_rec = _read_records(tmp_path)
+    assert lane_rec["shadow_name"] == "patchtst_v1"
+    assert task_rec["state"] == STATE_NO_SHADOW_MODELS
+    # Distinguishable by BOTH identity fields.
+    assert lane_rec["task_config_path"] != task_rec["task_config_path"]
+    assert lane_rec["task_config_sha256"] != task_rec["task_config_sha256"]
+    assert lane_rec["task_config_sha256"] == content_digest(main_cfg)
+    assert task_rec["task_config_sha256"] == content_digest(blend_cfg)
+
+
+def test_unstamped_config_path_stays_legibly_absent(tmp_path):
+    """FAIL CLOSED: when the runner did not stamp `_strategy_config_path`,
+    the fields are None — never a guessed `<strategy_dir>/strategy_config.json`,
+    which could stamp the MAIN config's identity onto a companion profile's
+    record and recreate the false-attribution vector."""
+    # A strategy_config.json EXISTS at the guessable location …
+    _write_config_file(tmp_path, "strategy_config.json", {"profile": "main"})
+    # … but no `_strategy_config_path` is stamped (config_path omitted).
+    ApplyShadowScoringTask().run(_ctx(tmp_path, shadow_models=[]))
+    (rec,) = _read_records(tmp_path)
+    assert rec["task_config_path"] is None
+    assert rec["task_config_sha256"] is None
