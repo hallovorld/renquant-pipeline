@@ -77,7 +77,7 @@ def _wire(monkeypatch, scorer, captured):
                         lambda cfg: True)
     monkeypatch.setattr(shadow_scoring, "append_shadow_health",
                         lambda sink, rec: captured.append(rec))
-    shadow_scoring._SCORER_CACHE[("xgb", "dummy")] = scorer
+    shadow_scoring._SCORER_CACHE[("xgb", "dummy", "sha256:deadbeefdeadbeef")] = scorer
 
 
 def _varied_matrix(index):
@@ -92,7 +92,7 @@ def test_wider_shadow_matrix_caps_coverage_at_the_candidate_set(monkeypatch):
     try:
         ApplyShadowScoringTask().run(_ctx(_varied_matrix(WIDE)))
     finally:
-        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy"), None)
+        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy", "sha256:deadbeefdeadbeef"), None)
     assert len(captured) == 1
     rec = captured[0]
     assert rec["n_candidates"] == 3
@@ -107,7 +107,7 @@ def test_shadow_scoring_only_noncandidates_is_zero_coverage_fault(monkeypatch):
     try:
         ApplyShadowScoringTask().run(_ctx(_varied_matrix(WIDE)))
     finally:
-        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy"), None)
+        shadow_scoring._SCORER_CACHE.pop(("xgb", "dummy", "sha256:deadbeefdeadbeef"), None)
     assert len(captured) == 1
     rec = captured[0]
     assert rec["n_scored"] == 0 and rec["coverage_frac"] == 0.0

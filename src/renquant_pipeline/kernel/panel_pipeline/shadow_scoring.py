@@ -62,6 +62,8 @@ from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
     STATE_DISABLED,
     STATE_NO_CANDIDATES,
     STATE_NO_SHADOW_MODELS,
+    STATE_NOT_YET_PUBLISHED,
+    ShadowNotYetPublished,
     TASK_LEVEL_SHADOW_NAME,
     append_shadow_health,
     content_digest,
@@ -437,11 +439,30 @@ class ApplyShadowScoringTask(Task):
                 shadow_cfg = dict(ctx.config)
                 shadow_cfg.setdefault("ranking", {})["panel_scoring"] = shadow_panel_cfg
 
-                cache_key = (kind, str(p))
+                # Cache key includes the certified CONTENT digest, not just the
+                # path: a ledger-pointer lane (momentum_residual) keeps ONE
+                # stable path whose bytes advance on every weekly append, and a
+                # path-only key would pin the first-loaded tail for the life of
+                # a long sim process. The digest is already in hand from the
+                # single canonical resolution above — same-bytes loads still
+                # hit the cache.
+                cache_key = (kind, str(p), identity.content_sha256)
                 scorer = _SCORER_CACHE.get(cache_key)
                 if scorer is None:
                     try:
                         scorer = handler.scorer_loader(p, shadow_cfg)
+                    except ShadowNotYetPublished as exc:
+                        # The designed pre-first-publish window of a
+                        # ledger-pointer lane (model#197 amendment 2): the ref
+                        # RESOLVED (we are past the identity gate) but the
+                        # verified ledger carries zero rows. An EXPECTED skip —
+                        # distinct from unresolved_artifact and load_failed —
+                        # so the sentinel keeps the lane's timeline continuous
+                        # without alarming on the designed state.
+                        mark_expected_skip(health, STATE_NOT_YET_PUBLISHED, str(exc))
+                        log.info("ApplyShadowScoringTask: shadow %s (%s) not "
+                                 "yet published: %s", name, kind, exc)
+                        continue
                     except Exception as exc:
                         # The identity certified a real file (we only reach here
                         # when identity.resolved), so a raise is a genuine load
@@ -450,6 +471,49 @@ class ApplyShadowScoringTask(Task):
                         log.warning("ApplyShadowScoringTask: shadow %s (%s) load failed: %s",
                                      name, kind, exc)
                         continue
+
+                    # ── SINGLE-READ IDENTITY CLOSURE (codex CR on #253) ────
+                    # A ledger-pointer loader reads the live path once and
+                    # reports the digest of the bytes it ACTUALLY consumed.
+                    # If that disagrees with the identity certified above, an
+                    # append landed between the two reads — serving now would
+                    # put new bytes under an old certified digest. Re-certify
+                    # ONCE: when the re-resolved identity (same file) matches
+                    # the consumed bytes, the record certifies exactly what
+                    # was loaded and the lane proceeds; anything else is a
+                    # refusal BEFORE caching or marking loaded.
+                    _lmeta = getattr(scorer, "metadata", {}) or {}
+                    consumed = (_lmeta.get("consumed_content_sha256")
+                                if isinstance(_lmeta, dict) else None)
+                    if consumed and consumed != identity.content_sha256:
+                        recert = resolve_artifact_identity(
+                            artifact_path, strategy_dir=strategy_dir)
+                        if (recert.resolved
+                                and str(recert.resolved_path) == str(p)
+                                and recert.content_sha256 == consumed):
+                            identity = recert
+                            health["artifact_resolved_path"] = identity.resolved_path
+                            health["artifact_source"] = identity.source
+                            health["content_sha256"] = identity.content_sha256
+                            health["artifact_resolved"] = identity.resolved
+                            cache_key = (kind, str(p), identity.content_sha256)
+                            log.info(
+                                "ApplyShadowScoringTask: shadow %s (%s) "
+                                "re-certified after concurrent append (%s)",
+                                name, kind, consumed)
+                        else:
+                            health["load_error"] = (
+                                "artifact_identity_divergence: certified "
+                                f"{identity.content_sha256} but the loader "
+                                f"consumed {consumed}; re-certification "
+                                + (f"returned {recert.content_sha256} at "
+                                   f"{recert.resolved_path}" if recert.resolved
+                                   else f"failed ({recert.error})")
+                                + " — refusing to serve bytes the record does "
+                                  "not certify")
+                            log.warning("ApplyShadowScoringTask: shadow %s (%s): %s",
+                                         name, kind, health["load_error"])
+                            continue
                     _SCORER_CACHE[cache_key] = scorer
 
                 # Scorer available — the shadow LOADED. Stamp provenance/identity
@@ -472,7 +536,17 @@ class ApplyShadowScoringTask(Task):
 
                 target_tickers = list(primary_scores.keys())
                 try:
-                    if getattr(scorer, "requires_history", False):
+                    if getattr(scorer, "scores_by_ticker", False):
+                        # Ledger-pointer kinds (momentum_residual): the loaded
+                        # scorer IS the verified per-ticker score set frozen at
+                        # its cutoff — serving is a lookup over the candidate
+                        # tickers. Checked FIRST: these scorers consume neither
+                        # ctx._panel_matrix nor a history panel, so neither the
+                        # matrix-empty skip nor the degenerate-cross-section
+                        # guard applies (a history-primary run's target-only
+                        # placeholder matrix is irrelevant to this lane).
+                        series = scorer.score_tickers(target_tickers)
+                    elif getattr(scorer, "requires_history", False):
                         # 2026-06-10 FROZEN-SCORE FIX (shadow path). Same bug as
                         # the primary ApplyScoresTask path: lazy-loading the
                         # sequence panel from the STATIC training parquet

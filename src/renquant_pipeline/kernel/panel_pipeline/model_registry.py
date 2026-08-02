@@ -281,4 +281,41 @@ class BlendHandler(_ModelHandler):
             "independently then wire via config.")
 
 
+@registry.register("momentum_residual")
+class MomentumResidualHandler(_ModelHandler):
+    """Standalone momentum pipeline serving handler (GOAL-7 slice 4b — the
+    model#197 F-1 blocker: without this registration the s104
+    `momentum_residual` shadow entry fault-records on every daily run after
+    the grant batch's pin advance).
+
+    The configured ``artifact_path`` is NOT a model file: it is the
+    append-only digest-chained LEDGER
+    (`artifacts/momentum/momentum_artifact_ledger.jsonl`) — the one
+    cutoff-stable file in the weekly publish set (s104#77). The loader
+    verifies the full ledger chain (imported from the renquant-model
+    package, never reimplemented), takes the TAIL row, loads +
+    content-sha-verifies the dated artifact beside the ledger, reproduces
+    the composite via the package's own construction, and serves the
+    per-ticker scores (``scores_by_ticker`` — no feature matrix, no
+    history panel). An EMPTY ledger raises ``ShadowNotYetPublished`` →
+    the designed ``not_yet_published`` expected skip; every other
+    verification refusal is a recorded FAULT naming the exact check.
+    """
+    requires_history = False
+
+    @classmethod
+    def scorer_loader(cls, artifact_path, config):
+        from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (  # noqa: PLC0415
+            load_momentum_residual_scorer,
+        )
+        return load_momentum_residual_scorer(artifact_path, config)
+
+    @classmethod
+    def train_cmd(cls, args) -> list[str]:
+        raise NotImplementedError(
+            "momentum_residual is trained by the renquant-model weekly job "
+            "(tools/momentum_train_run.py, operator-landed per model#197) — "
+            "the pipeline only serves the published ledger, never trains.")
+
+
 __all__ = ["registry", "_ModelHandler"]

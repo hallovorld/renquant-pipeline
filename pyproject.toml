@@ -45,6 +45,17 @@ gbdt = ["renquant-model[gbdt]>=0.1,<0.2"]
 # falls back to file-importing scripts/patchtst_hf.py from an umbrella
 # checkout (rollback only).
 patchtst = ["renquant-model[patchtst]>=0.1,<0.2"]
+# Momentum-residual shadow lane (GOAL-7 slice 4b, model#197 F-1): the serving
+# handler (kernel/panel_pipeline/momentum_residual_scorer.py) imports the
+# ledger chain verification + artifact contract from renquant_model_momentum
+# and the composite construction from renquant_model_common.momentum_features
+# — both shipped by the base renquant-model distribution from 0.2.1 (the
+# slice-2 merge, model#196); no heavy backend extra needed (numpy/pandas
+# only). The import is GUARDED: without this extra (or the sibling
+# renquant-model checkout on the path) the momentum_residual shadow lane
+# emits a load-failure FAULT health record naming the missing dependency;
+# nothing crashes and the primary path is untouched.
+momentum = ["renquant-model>=0.2.1,<0.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
