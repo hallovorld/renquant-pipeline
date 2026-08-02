@@ -32,7 +32,13 @@ transform, before scoring), persist ONE artifact per run:
 - Sidecar keys in the run bundle (additive, absent-tolerant, the
   serving_bundle/g4_session/wf_gate_provenance idiom):
   `serving_features = {path, sha256, n_rows, n_cols, feature_cutoff,
-  transform_version, panel_read_sha256}`.
+  feature_builder_version, panel_read_sha256}`. Named `feature_builder_version`
+  (not a new `transform_version` term) to match the existing downstream
+  contract verbatim — `FeatureSnapshot.from_mapping`
+  (`renquant_orchestrator/realtime_data_plane.py:150-152`) and `RunProvenance`
+  (`renquant_orchestrator/shadow_realtime_serving.py:92-110`) both require
+  this exact key. Reusing it here is what makes the Stage-3 producer a real
+  formatting step instead of needing a translation layer.
 - The writer NEVER raises into the decision path (record-don't-raise; a
   failed write records `status: write_failed` in the sidecar block).
 - Retention: files live under the run output dir like the rest of the bundle;

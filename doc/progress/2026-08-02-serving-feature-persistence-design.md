@@ -28,3 +28,13 @@ EVIDENCE:
 NEXT: review → implementation PR here (step 2) → orchestrator sidecar
 consumption (step 3) → operator pin batch (step 4). AC6: N/A — a recorder,
 no gate touched.
+
+FIXED (codex review, PR #250): the sidecar schema's naming was internally
+inconsistent — the Proposal section coined `transform_version` while the
+Contracts section already assumed `feature_builder_version`, the exact key
+`FeatureSnapshot.from_mapping` requires
+(`renquant_orchestrator/realtime_data_plane.py:150-152`) and `RunProvenance`
+requires (`renquant_orchestrator/shadow_realtime_serving.py:92-110`). Renamed
+the sidecar key to `feature_builder_version` throughout so the Stage-3
+producer claim (a pure formatting step, no translation layer) is actually
+true against the existing downstream contract.
