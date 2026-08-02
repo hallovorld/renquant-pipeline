@@ -34,11 +34,27 @@ EVIDENCE:
   claim (flagged in codex review, PR #251): `pytest --collect-only -q
   tests/test_wash_sale_materiality_floor_usd.py` collects **44 tests**;
   `pytest -q tests/test_wash_sale_materiality_floor_usd.py` passes **44**
-  `[VERIFIED — pytest on this PR head, 2026-08-02]`.
-  Full suite: **2337 passed, 9 skipped, 2 failed** — the exact same 2
-  `test_replay_d6_conventions` pin-platform failures fail identically on
-  pristine `origin/main` (2292 passed / same 2 failed), i.e. pre-existing,
-  not a regression `[VERIFIED — both suites run on this machine, 2026-08-02]`.
+  `[VERIFIED — pytest on this PR head (post-merge of origin/main 6b82ed5),
+  2026-08-02]`. 29 `test_` defs; 44 collected because three tests
+  parametrize (floor-0 A/B ×2, invalid-floor ×11 shapes, invalid-rate ×5
+  shapes) `[VERIFIED — collected-id list]`.
+  Full suite on this PR head: **2347 collected; 2337 passed, 9 skipped,
+  2 failed** `[VERIFIED — make test in the PR worktree, 2026-08-02]`.
+  Baseline, current `origin/main` tip 6b82ed5 in a SIBLING-located worktree
+  (same venv, same machine): **2303 collected; 2293 passed, 9 skipped,
+  2 failed**, and the 2 failing ids are the SAME two
+  `test_replay_d6_conventions` pin-platform tests — pre-existing, not a
+  regression `[VERIFIED — make test at 6b82ed5, 2026-08-02]`.
+  Collected-id diff main→head: +44, ALL in
+  `tests/test_wash_sale_materiality_floor_usd.py`; 0 added elsewhere,
+  0 removed `[VERIFIED — comm on sorted --collect-only id lists,
+  2026-08-02]`; passed delta 2337 − 2293 = 44 `[DERIVED — from the two
+  VERIFIED runs]`.
+  (Measurement trap, for the record: an earlier baseline of "2292 passed"
+  was taken from a scratchpad-located worktree, where
+  `tests/test_xgboost_scorer_contract.py`'s `importorskip` of a SIBLING
+  checkout collects fewer tests — the operator's-disk effect. Baselines for
+  this repo must run from a sibling-located worktree.)
 NEXT: (3) pins advance on both repos → (4) explicit non-zero floor lands via
 a reviewed config PR in `renquant-strategy-104`. AC6 posture: this PR
 implements a governed loosening whose override triplet (identity / expiry /
