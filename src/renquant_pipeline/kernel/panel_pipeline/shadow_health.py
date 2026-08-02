@@ -99,7 +99,8 @@ STATE_NO_CANDIDATES = "no_candidates"        # nothing to score this run (per-mo
 #: ZERO rows yet — the designed pre-first-publish window (model#197 amendment 2,
 #: the s104 PENDING_FIRST_ARTIFACT guard). Distinct from ``unresolved_artifact``
 #: (the ref points nowhere — the ``../../`` fault class) and from ``load_failed``
-#: (the ledger exists with rows but a verification check refused it): this is the
+#: (any other refusal: a verification check failed, or a certified ledger
+#: disappeared before the loader's read — pipeline#254): this is the
 #: one absent-state that is BY DESIGN, so it is an expected skip, not a fault —
 #: the same tri-state discipline as ok / expected_skip / fault itself. Additive
 #: state within the existing status buckets: the deployed sentinel constrains
@@ -130,7 +131,10 @@ class ShadowNotYetPublished(Exception):
     train job's first publish the ledger legitimately has no tail row to serve.
     ``ApplyShadowScoringTask`` catches this exception SPECIFICALLY — before its
     generic load-failure handler — and stamps ``STATE_NOT_YET_PUBLISHED`` as an
-    expected skip. Every OTHER loader exception remains a recorded FAULT."""
+    expected skip. Every OTHER loader exception remains a recorded FAULT —
+    including a certified ledger that DISAPPEARS before the loader's read: the
+    task gates on ``identity.resolved`` first, so only a successfully read,
+    chain-verified EMPTY ledger may raise this (pipeline#254)."""
 
 
 # Provenance / identity metadata field names read off the loaded scorer.

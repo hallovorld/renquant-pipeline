@@ -297,9 +297,11 @@ class MomentumResidualHandler(_ModelHandler):
     content-sha-verifies the dated artifact beside the ledger, reproduces
     the composite via the package's own construction, and serves the
     per-ticker scores (``scores_by_ticker`` — no feature matrix, no
-    history panel). An EMPTY ledger raises ``ShadowNotYetPublished`` →
-    the designed ``not_yet_published`` expected skip; every other
-    verification refusal is a recorded FAULT naming the exact check.
+    history panel). A successfully read, chain-verified EMPTY ledger
+    raises ``ShadowNotYetPublished`` → the designed ``not_yet_published``
+    expected skip; every other refusal — including a certified ledger
+    that disappears before the loader's read (pipeline#254) — is a
+    recorded FAULT naming the exact check.
     """
     requires_history = False
 

@@ -16,6 +16,10 @@ The suite pins, in order:
     missing renquant-model dependency);
   * the EMPTY ledger → `not_yet_published` EXPECTED skip (the designed
     PENDING_FIRST_ARTIFACT window, model#197 amendment 2) — not a fault;
+  * the certified-then-deleted ledger (#254): a resolver-to-loader deletion is
+    a named `ledger_unreadable:` FAULT (STATE_LOAD_FAILED, nothing cached),
+    NEVER the not_yet_published skip — that skip is reserved for a
+    successfully read, chain-verified empty ledger;
   * the record-don't-raise control: a faulting momentum lane leaves the
     primary candidates byte-identical to a run with no momentum lane at all;
   * the digest-keyed scorer cache: a weekly ledger append busts the cache so a
@@ -538,5 +542,56 @@ def test_identity_divergence_without_recertification_faults(tmp_path, monkeypatc
     # the divergent scorer is never cached under any key.
     assert rec["content_sha256"] == stale.content_sha256
     assert rec["content_sha256"] != sh.content_digest(ledger)
+    assert not [k for k in shadow_scoring._SCORER_CACHE
+                if k[0] == "momentum_residual"]
+
+
+# ── Certified-then-deleted ledger: a FAULT, never the designed skip (#254) ─────
+
+def test_loader_missing_ledger_is_a_named_fault_not_a_skip(tmp_path):
+    """Regression (#254, from #253's post-merge review): the loader only ever
+    sees ALREADY-RESOLVED paths (the task gates on ``identity.resolved``
+    first), so a FileNotFoundError from its single read means the file
+    disappeared between certification and use — a named ``ledger_unreadable:``
+    refusal, never ShadowNotYetPublished."""
+    root = _momentum_root(tmp_path)
+    _publish(root, CUTOFF)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    ledger.unlink()                                # certified path, then gone
+    with pytest.raises(ValueError, match=r"^ledger_unreadable:"):
+        load_momentum_residual_scorer(ledger)
+
+
+def test_ledger_deleted_between_certify_and_load_faults_load_failed(
+        tmp_path, monkeypatch):
+    """Codex's deterministic resolver-to-loader deletion regression (#254):
+    the task resolves + certifies the ledger, the file is deleted before the
+    loader's read. NOT the designed pre-first-publish window — the record
+    must be a STATE_LOAD_FAILED fault with a named load_error, and nothing
+    may be cached for the lane."""
+    root = _momentum_root(tmp_path)
+    first = _publish(root, CUTOFF)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+
+    real_resolve = sh.resolve_artifact_identity
+    state = {"raced": False}
+
+    def _deleting_resolve(ref, **kwargs):
+        ident = real_resolve(ref, **kwargs)
+        if not state["raced"]:
+            state["raced"] = True
+            ledger.unlink()      # the deletion lands AFTER certification
+        return ident
+
+    monkeypatch.setattr(shadow_scoring, "resolve_artifact_identity",
+                        _deleting_resolve)
+    rec = _run_and_get_fault(tmp_path, _candidates(_finite_scores(first)))
+    assert rec["state"] != STATE_NOT_YET_PUBLISHED  # the #254 regression pin
+    assert rec["load_error"].startswith("ledger_unreadable:")
+    assert "disappeared" in rec["load_error"]
+    # The record certifies what WAS certified (the pre-delete bytes) …
+    assert rec["artifact_resolved"] is True
+    assert rec["content_sha256"] is not None
+    # … and the failed lane leaves NO cache entry behind.
     assert not [k for k in shadow_scoring._SCORER_CACHE
                 if k[0] == "momentum_residual"]

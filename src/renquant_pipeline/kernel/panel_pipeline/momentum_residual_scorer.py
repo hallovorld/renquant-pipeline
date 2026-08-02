@@ -40,7 +40,10 @@ agree (re-certifying once for the benign append race).
 FAIL-CLOSED DISCIPLINE. Every verification refusal raises with a distinct,
 grep-able prefix that the health record's `load_error` carries verbatim:
 
-  * ``ledger_unreadable:`` — the resolved ledger's bytes could not be read;
+  * ``ledger_unreadable:`` — the resolved ledger's bytes could not be read,
+    including a certified ledger that DISAPPEARED before the loader's single
+    read: the task gates on ``identity.resolved`` first, so absence here is
+    a fault, never the pre-publish window (pipeline#254);
   * ``ledger_chain_verification_failed:`` — the ledger's per-row digest chain
     does not verify (a rewritten/reordered/edited row);
   * ``dated_artifact_missing:`` / ``dated_artifact_unparseable:`` — the tail
@@ -56,9 +59,9 @@ grep-able prefix that the health record's `load_error` carries verbatim:
     disagrees with the stored scores. Digests verify identity, not validity;
     this is the golden-reproduction check that pairs with them.
 
-The ONE non-fault refusal: a ledger that resolves but carries ZERO rows — the
-designed PENDING_FIRST_ARTIFACT window (model#197 amendment 2) — raises
-``ShadowNotYetPublished``, which the task stamps as the distinct
+The ONE non-fault refusal: a SUCCESSFULLY READ, chain-verified ledger carrying
+ZERO rows — the designed PENDING_FIRST_ARTIFACT window (model#197 amendment 2)
+— raises ``ShadowNotYetPublished``, which the task stamps as the distinct
 ``not_yet_published`` EXPECTED skip, not a fault.
 
 Tests: tests/test_momentum_residual_shadow_handler.py.
@@ -240,13 +243,20 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
     #    snapshot — the live file is never opened again.
     try:
         raw = ledger.read_bytes()
-    except FileNotFoundError:
-        # The package contract treats a missing file as an empty ledger —
-        # same designed NOT_YET_PUBLISHED window as the zero-row case.
-        raise ShadowNotYetPublished(
-            f"momentum ledger {ledger} is absent at the resolved path — the "
-            "designed PENDING_FIRST_ARTIFACT window (model#197 amendment 2): "
-            "the weekly train job has not published its first artifact yet")
+    except FileNotFoundError as exc:
+        # NEVER the designed pre-first-publish skip (pipeline#254 — a
+        # regression from #253 mapped this to ShadowNotYetPublished). The
+        # task only calls this loader AFTER certifying ``identity.resolved``
+        # over this exact path, so a file absent NOW disappeared between
+        # certification and use — a load FAULT the record must name. The one
+        # non-fault refusal stays the successfully read, chain-verified
+        # EMPTY ledger below.
+        raise ValueError(
+            f"ledger_unreadable: {ledger} disappeared between identity "
+            "certification and the loader's read — the task certified this "
+            "resolved path immediately before this call, so absence here is "
+            "a load fault, not the designed PENDING_FIRST_ARTIFACT window"
+        ) from exc
     except OSError as exc:
         raise ValueError(f"ledger_unreadable: {ledger}: {exc}") from exc
     consumed_digest = (CONTENT_SHA256_PREFIX
