@@ -23,9 +23,24 @@ hf_patchtst precedent), the loader raises an ImportError NAMING the missing
 dependency, which `ApplyShadowScoringTask` records as a load-failure FAULT —
 the lane degrades visibly, nothing crashes, the primary path is untouched.
 
+SINGLE-READ IDENTITY CLOSURE (codex CR on pipeline#253). The task certifies
+the ledger's content digest via ``resolve_artifact_identity`` BEFORE calling
+this loader; re-opening the live path here would open a TOCTOU window — a
+weekly append landing between the two reads would serve the NEW tail under
+the OLD certified digest. The loader therefore reads the live path's bytes
+EXACTLY ONCE, and everything downstream — the consumed digest, the chain
+verification (over a private snapshot of those same bytes, still the
+package's verifier), the tail selection — derives from that one snapshot.
+The digest of the bytes actually consumed is exposed as
+``metadata["consumed_content_sha256"]`` (the identity recipe:
+``sha256:<16 hex>``); the task refuses to cache, mark loaded, or record
+health as certified unless the certified identity and the consumed digest
+agree (re-certifying once for the benign append race).
+
 FAIL-CLOSED DISCIPLINE. Every verification refusal raises with a distinct,
 grep-able prefix that the health record's `load_error` carries verbatim:
 
+  * ``ledger_unreadable:`` — the resolved ledger's bytes could not be read;
   * ``ledger_chain_verification_failed:`` — the ledger's per-row digest chain
     does not verify (a rewritten/reordered/edited row);
   * ``dated_artifact_missing:`` / ``dated_artifact_unparseable:`` — the tail
@@ -54,12 +69,14 @@ import hashlib
 import json
 import logging
 import math
+import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 import pandas as pd
 
 from renquant_pipeline.kernel.panel_pipeline.shadow_health import (
+    CONTENT_SHA256_PREFIX,
     ShadowNotYetPublished,
 )
 
@@ -215,12 +232,35 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
     mm, composite_scores = _import_momentum_construction()
     ledger = Path(ledger_path)
 
-    # 1) LEDGER CHAIN — the package's own verification, never reimplemented.
-    #    A missing file verifies as an empty ledger (the package contract), so
-    #    both missing-at-a-resolved-path and zero-row cases funnel into the
-    #    designed NOT_YET_PUBLISHED window below.
+    # 1) ONE read of the live path → an immutable in-memory snapshot (codex
+    #    CR on #253: the task certified the digest BEFORE this call; a second
+    #    open of the live path would let a weekly append between the two
+    #    reads serve a NEW tail under the OLD certified identity). The
+    #    consumed digest and the chain verification both derive from THIS
+    #    snapshot — the live file is never opened again.
     try:
-        rows = mm.load_and_verify_ledger(ledger)
+        raw = ledger.read_bytes()
+    except FileNotFoundError:
+        # The package contract treats a missing file as an empty ledger —
+        # same designed NOT_YET_PUBLISHED window as the zero-row case.
+        raise ShadowNotYetPublished(
+            f"momentum ledger {ledger} is absent at the resolved path — the "
+            "designed PENDING_FIRST_ARTIFACT window (model#197 amendment 2): "
+            "the weekly train job has not published its first artifact yet")
+    except OSError as exc:
+        raise ValueError(f"ledger_unreadable: {ledger}: {exc}") from exc
+    consumed_digest = (CONTENT_SHA256_PREFIX
+                       + hashlib.sha256(raw).hexdigest()[:16])
+
+    # 2) LEDGER CHAIN over the snapshot — the package's own verification,
+    #    never reimplemented. The verifier takes a path, so the snapshot
+    #    bytes go to a private temp file; verifying the snapshot (not the
+    #    live path) is exactly what keeps the read single.
+    try:
+        with tempfile.TemporaryDirectory(prefix="momentum-ledger-snap-") as td:
+            snap = Path(td) / "momentum_artifact_ledger.jsonl"
+            snap.write_bytes(raw)
+            rows = mm.load_and_verify_ledger(snap)
     except mm.LedgerIntegrityError as exc:
         raise ValueError(f"ledger_chain_verification_failed: {exc}") from exc
     if not rows:
@@ -230,20 +270,25 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
             "the weekly train job has not published its first artifact yet")
     row = rows[-1]
 
-    # 2) DATED ARTIFACT beside the ledger, per the tail row's cutoff.
+    # 3) DATED ARTIFACT beside the ledger, per the tail row's cutoff. Also a
+    #    single read: parse once, verify over the parsed object (the package
+    #    recomputes the canonical-JSON sha of exactly what was consumed), so
+    #    no check/use divergence is possible for the dated file either. The
+    #    dated file is immutable by the append-only store contract; its
+    #    row-pin check below is what enforces that.
     dated = ledger.parent / str(row["cutoff_date"]) / MOMENTUM_DATED_ARTIFACT_BASENAME
-    if not dated.is_file():
+    try:
+        artifact = json.loads(dated.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         raise ValueError(
             f"dated_artifact_missing: ledger tail row {row['row_index']} "
             f"(cutoff {row['cutoff_date']}, artifact sha "
             f"{str(row['artifact_content_sha256'])[:12]}…) has no dated "
             f"artifact at {dated}")
-    try:
-        artifact = json.loads(dated.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError(f"dated_artifact_unparseable: {dated}: {exc}") from exc
 
-    # 3) CONTENT IDENTITY, both directions: the artifact's self-carried sha
+    # 4) CONTENT IDENTITY, both directions: the artifact's self-carried sha
     #    recomputes (package verifier), AND it is the exact artifact the
     #    append-only row pinned.
     try:
@@ -257,7 +302,7 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
             f"row pinned {str(row['artifact_content_sha256'])[:12]}… — the "
             "dated file is not the artifact the append-only ledger recorded")
 
-    # 4) ROW ↔ ARTIFACT cross-field parity (identity ≠ validity).
+    # 5) ROW ↔ ARTIFACT cross-field parity (identity ≠ validity).
     if artifact.get("kind") != row["kind"]:
         raise ValueError(
             f"artifact_kind_mismatch: row says {row['kind']!r}, artifact says "
@@ -279,7 +324,7 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
             f"'min_features' (got {min_features!r}) — cannot reproduce the "
             "declared construction")
 
-    # 5) GOLDEN REPRODUCTION — the package's construction over the stored
+    # 6) GOLDEN REPRODUCTION — the package's construction over the stored
     #    features must reproduce the stored scores; serve the reconstruction.
     scores = _reconstruct_scores(artifact, composite_scores,
                                  min_features=min_features)
@@ -287,6 +332,12 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
     metadata: dict[str, Any] = {
         "kind": artifact["kind"],
         "cutoff_date": row["cutoff_date"],
+        # SINGLE-READ CLOSURE: the digest (identity recipe) of the exact
+        # ledger bytes this load consumed. The task compares it against the
+        # identity it certified BEFORE the load and refuses/re-certifies on
+        # divergence — new bytes are never served under an old certified
+        # digest (codex CR on #253).
+        "consumed_content_sha256": consumed_digest,
         # STALENESS SURFACE (deliberate): the sentinel's freshness axis reads
         # `effective_train_cutoff_date` off this metadata, and for this lane it
         # is the tail row's cutoff_date — the weekly publish cadence — per the

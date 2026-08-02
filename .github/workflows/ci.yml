@@ -27,11 +27,31 @@ jobs:
         with:
           repository: hallovorld/renquant-artifacts
           path: renquant-artifacts
+      - uses: actions/checkout@v4
+        with:
+          # The momentum_residual serving handler (slice 4b, model#197 F-1)
+          # imports renquant_model_momentum + renquant_model_common from the
+          # renquant-model distribution; source-installed below so the
+          # serving-boundary suite RUNS here instead of module-skipping
+          # (codex CR on #253 — a green run must not certify only the
+          # absent-dependency path). Same precedent as backtesting's CI.
+          repository: hallovorld/renquant-model
+          path: renquant-model
       - uses: actions/setup-python@v5
         with:
           python-version: "3.10"
       - name: Install test tools
-        run: python -m pip install -e renquant-common -e renquant-base-data -e renquant-artifacts -e renquant-pipeline pytest xgboost
+        run: python -m pip install -e renquant-common -e renquant-base-data -e renquant-artifacts -e renquant-model -e renquant-pipeline pytest xgboost
+      # Fail-closed guard: the momentum serving-boundary suite importorskips
+      # renquant_model_momentum for machines genuinely without it — CI must
+      # never be such a machine, or the suite goes vacuously green. This step
+      # makes the skip condition impossible here (and fails loudly if the
+      # model package ever drops off the CI path) before the full run.
+      - name: Momentum serving-boundary suite must RUN (no module skip)
+        working-directory: renquant-pipeline
+        run: |
+          python -c "import renquant_model_momentum, renquant_model_common.momentum_features; print('renquant-model importable in CI')"
+          python -m pytest tests/test_momentum_residual_shadow_handler.py -q
       - name: Test
         working-directory: renquant-pipeline
         run: make test

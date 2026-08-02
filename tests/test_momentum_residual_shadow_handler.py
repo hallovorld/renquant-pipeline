@@ -123,21 +123,30 @@ class _SyntheticReaders:
         return {"synthetic": "0" * 64}
 
 
-def _publish(root: Path, asof: str, *, seed=7, mutate=None) -> dict:
-    """Train with the REAL core + write dated artifact + ledger row exactly as
-    the train tool does (dated JSON beside the ledger; package append)."""
-    artifact = mm.train_momentum_artifact(
+def _build(asof: str, *, seed=7) -> dict:
+    """Train one artifact with the REAL core (pure — nothing written)."""
+    return mm.train_momentum_artifact(
         asof, UNIVERSE, PARAMS,
         readers=_SyntheticReaders(UNIVERSE, asof, seed=seed))
-    if mutate is not None:
-        artifact = mutate(artifact)
-    dated = root / asof / MOMENTUM_DATED_ARTIFACT_BASENAME
+
+
+def _publish_artifact(root: Path, artifact: dict) -> dict:
+    """Write dated artifact + ledger row exactly as the train tool does
+    (dated JSON beside the ledger; package append)."""
+    dated = root / artifact["cutoff_date"] / MOMENTUM_DATED_ARTIFACT_BASENAME
     dated.parent.mkdir(parents=True, exist_ok=True)
     dated.write_text(
         json.dumps(artifact, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8")
     mm.append_to_artifact_ledger(artifact, root / "momentum_artifact_ledger.jsonl")
     return artifact
+
+
+def _publish(root: Path, asof: str, *, seed=7, mutate=None) -> dict:
+    artifact = _build(asof, seed=seed)
+    if mutate is not None:
+        artifact = mutate(artifact)
+    return _publish_artifact(root, artifact)
 
 
 def _finite_scores(artifact) -> dict[str, float]:
@@ -447,3 +456,87 @@ def test_ledger_append_busts_scorer_cache_within_one_process(tmp_path):
     rec1, rec2 = _read_records(tmp_path)
     assert rec1["effective_train_cutoff_date"] == PREV_CUTOFF
     assert rec2["effective_train_cutoff_date"] == CUTOFF          # NEW tail served
+
+
+# ── Single-read identity closure (codex CR on #253: the TOCTOU window) ─────────
+
+def test_loader_metadata_carries_consumed_digest(tmp_path):
+    """The loader reports the digest (identity recipe) of the exact ledger
+    bytes it consumed — the field the task's divergence check keys on."""
+    root = _momentum_root(tmp_path)
+    _publish(root, CUTOFF)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    scorer = load_momentum_residual_scorer(ledger)
+    assert scorer.metadata["consumed_content_sha256"] == sh.content_digest(ledger)
+
+
+def test_append_between_certify_and_load_recertifies_never_mixes(tmp_path, monkeypatch):
+    """Codex's deterministic regression: a weekly append lands BETWEEN the
+    task's identity certification and the loader's read. The serve must never
+    put the NEW tail under the OLD certified digest — here the benign race
+    re-certifies: the record's content_sha256 is the digest of the bytes the
+    loader actually consumed (the post-append ledger), and the served tail is
+    the post-append cutoff under exactly that identity."""
+    root = _momentum_root(tmp_path)
+    first = _publish(root, PREV_CUTOFF, seed=3)
+    second = _build(CUTOFF, seed=9)          # deterministic, published mid-race
+    ledger = root / "momentum_artifact_ledger.jsonl"
+
+    real_resolve = sh.resolve_artifact_identity
+    state = {"raced": False}
+
+    def _racing_resolve(ref, **kwargs):
+        ident = real_resolve(ref, **kwargs)
+        if not state["raced"]:
+            state["raced"] = True
+            _publish_artifact(root, second)  # the append lands AFTER certification
+        return ident
+
+    monkeypatch.setattr(shadow_scoring, "resolve_artifact_identity", _racing_resolve)
+    cands = _candidates({t: v for t, v in _finite_scores(first).items()
+                         if t in _finite_scores(second)})
+    ApplyShadowScoringTask().run(
+        _ctx(tmp_path, shadow_models=[_entry()], candidates=cands))
+
+    (rec,) = _read_records(tmp_path)
+    post_append_digest = sh.content_digest(ledger)
+    assert rec["loaded"] is True
+    # NEVER new-bytes-under-old-identity: the certified digest is the
+    # POST-append ledger — the exact bytes the loader consumed.
+    assert rec["content_sha256"] == post_append_digest
+    assert rec["effective_train_cutoff_date"] == CUTOFF   # the NEW tail
+    # The cache binds the scorer to the digest that was actually certified.
+    keys = list(shadow_scoring._SCORER_CACHE)
+    assert [k for k in keys if k[0] == "momentum_residual"] == [
+        ("momentum_residual", str(ledger.resolve()), post_append_digest)]
+
+
+def test_identity_divergence_without_recertification_faults(tmp_path, monkeypatch):
+    """When re-certification cannot confirm the consumed bytes (the resolver
+    keeps certifying the STALE identity), the lane must refuse — a FAULT
+    naming the divergence, nothing cached, never served."""
+    root = _momentum_root(tmp_path)
+    first = _publish(root, PREV_CUTOFF, seed=3)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    stale = sh.resolve_artifact_identity(LEDGER_REL, strategy_dir=tmp_path)
+    assert stale.resolved
+    _publish(root, CUTOFF, seed=9)           # the file moves on; the stub does not
+
+    monkeypatch.setattr(shadow_scoring, "resolve_artifact_identity",
+                        lambda *a, **k: stale)
+    ApplyShadowScoringTask().run(
+        _ctx(tmp_path, shadow_models=[_entry()],
+             candidates=_candidates(_finite_scores(first))))
+
+    (rec,) = _read_records(tmp_path)
+    assert rec["loaded"] is False
+    assert rec["state"] == STATE_LOAD_FAILED
+    assert rec["status"] == STATUS_FAULT
+    assert rec["actionable"] is False
+    assert rec["load_error"].startswith("artifact_identity_divergence:")
+    # The record certifies only what WAS certified — the stale digest — and
+    # the divergent scorer is never cached under any key.
+    assert rec["content_sha256"] == stale.content_sha256
+    assert rec["content_sha256"] != sh.content_digest(ledger)
+    assert not [k for k in shadow_scoring._SCORER_CACHE
+                if k[0] == "momentum_residual"]

@@ -471,6 +471,49 @@ class ApplyShadowScoringTask(Task):
                         log.warning("ApplyShadowScoringTask: shadow %s (%s) load failed: %s",
                                      name, kind, exc)
                         continue
+
+                    # ── SINGLE-READ IDENTITY CLOSURE (codex CR on #253) ────
+                    # A ledger-pointer loader reads the live path once and
+                    # reports the digest of the bytes it ACTUALLY consumed.
+                    # If that disagrees with the identity certified above, an
+                    # append landed between the two reads — serving now would
+                    # put new bytes under an old certified digest. Re-certify
+                    # ONCE: when the re-resolved identity (same file) matches
+                    # the consumed bytes, the record certifies exactly what
+                    # was loaded and the lane proceeds; anything else is a
+                    # refusal BEFORE caching or marking loaded.
+                    _lmeta = getattr(scorer, "metadata", {}) or {}
+                    consumed = (_lmeta.get("consumed_content_sha256")
+                                if isinstance(_lmeta, dict) else None)
+                    if consumed and consumed != identity.content_sha256:
+                        recert = resolve_artifact_identity(
+                            artifact_path, strategy_dir=strategy_dir)
+                        if (recert.resolved
+                                and str(recert.resolved_path) == str(p)
+                                and recert.content_sha256 == consumed):
+                            identity = recert
+                            health["artifact_resolved_path"] = identity.resolved_path
+                            health["artifact_source"] = identity.source
+                            health["content_sha256"] = identity.content_sha256
+                            health["artifact_resolved"] = identity.resolved
+                            cache_key = (kind, str(p), identity.content_sha256)
+                            log.info(
+                                "ApplyShadowScoringTask: shadow %s (%s) "
+                                "re-certified after concurrent append (%s)",
+                                name, kind, consumed)
+                        else:
+                            health["load_error"] = (
+                                "artifact_identity_divergence: certified "
+                                f"{identity.content_sha256} but the loader "
+                                f"consumed {consumed}; re-certification "
+                                + (f"returned {recert.content_sha256} at "
+                                   f"{recert.resolved_path}" if recert.resolved
+                                   else f"failed ({recert.error})")
+                                + " — refusing to serve bytes the record does "
+                                  "not certify")
+                            log.warning("ApplyShadowScoringTask: shadow %s (%s): %s",
+                                         name, kind, health["load_error"])
+                            continue
                     _SCORER_CACHE[cache_key] = scorer
 
                 # Scorer available — the shadow LOADED. Stamp provenance/identity

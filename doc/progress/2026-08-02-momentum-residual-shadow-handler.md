@@ -7,6 +7,11 @@ amendment 2 (build-order): slice 3 (evaluator) → **this slice 4b** → 4c
 merge s104#77 → pin advance. This PR must MERGE AND PIN before the batch's
 pin advance; nothing reads the new kind until the s104 `shadow_models` entry
 exists on the pinned config.
+NEXT: land this PR (codex approval) → advance the renquant-pipeline pin —
+BOTH before the grant batch's pin advance, per model#197 amendment 2's
+revised order (… → 4b → 4c → grant). Slice 4c (the umbrella gate rule for
+ledger-pointer entries) is the next build item after this merges; the grant
+batch itself remains operator-gated and does not start from this repo.
 
 WHAT: registers kind `momentum_residual` in the panel model registry and
 implements the serving contract declared by s104#77's narrative key (the F-1
@@ -71,6 +76,34 @@ fault-records on the momentum lane every run after the batch):
   existing tests that pre-seeded the old 2-tuple key updated to the new
   contract.
 
+REVIEW ROUND 1 (codex CHANGES_REQUESTED, two blockers — both fixed here):
+- TOCTOU (blocker 1): the task certified the ledger digest, then the loader
+  REOPENED the live path — a weekly append between the two reads would serve
+  the NEW tail under the OLD certified digest. Fix = single-read closure:
+  the loader reads the live path's bytes EXACTLY ONCE, derives the consumed
+  digest and the chain verification (over a private snapshot of those same
+  bytes — still the package's verifier, which takes a path) from that one
+  snapshot, and exposes `metadata["consumed_content_sha256"]`. The task
+  compares it to the certified identity BEFORE caching or marking loaded:
+  on divergence it re-certifies ONCE (same resolved file, digest must equal
+  the consumed bytes — the benign append race then serves the new tail
+  under its OWN certified identity, health fields updated to match), else
+  refuses with an `artifact_identity_divergence:` FAULT, nothing cached.
+  Deterministic regressions: append injected between certification and load
+  (must re-certify, never mix); a resolver pinned to the stale identity
+  (must fault, cache empty).
+- CI vacuous-green (blocker 2): the suite importorskipped
+  `renquant_model_momentum` and pipeline CI has no model checkout, so
+  required CI proved only the absent-dependency path. Fix = the backtesting
+  precedent: `.github/workflows/ci.yml` now checks out
+  `hallovorld/renquant-model` and source-installs it (`pip install -e
+  renquant-model`), plus a fail-closed guard step that (a) imports
+  `renquant_model_momentum` (fails the job if the model package ever drops
+  off the CI path) and (b) runs the serving-boundary suite explicitly —
+  the module-skip condition is now impossible in the required check while
+  the importorskip stays for machines genuinely without the distribution.
+- Also added this doc's previously-missing top-level `NEXT:` field.
+
 WHY/DIR: model#197 amendment 2, F-1 — the grant batch cannot advance the pin
 before this handler exists, or the daily shadow load fault-records on the
 momentum entry from day one. The lane inherits every GOAL-1 silent-death
@@ -94,21 +127,24 @@ EVIDENCE:
                  (reimplementing chain math pipeline-side) is the never-copy
                  violation the design forbids
   scope:         "this is tests/test_momentum_residual_shadow_handler.py
-                 (15 tests, real package writers, real registry + resolver)
+                 (18 tests, real package writers, real registry + resolver)
                  + the full pipeline suite, exp path (inert until the s104
                  entry exists AND the pin advances), vs baseline =
                  origin/main 398cda9"
 
-  Measured counts: new suite **15 passed** `[VERIFIED — pytest -q
+  Measured counts (post review round 1): new suite **18 passed** (15 + the 3
+  single-read-closure regressions) `[VERIFIED — pytest -q
   tests/test_momentum_residual_shadow_handler.py, this branch, 2026-08-02]`.
   Touched shadow suites (health record, shadow health, artifact resolution,
-  coverage counts, degenerate-matrix guard + the new suite) **64 passed**
+  coverage counts, degenerate-matrix guard + the new suite) **67 passed**
   `[VERIFIED — pytest -q, same session]`. Full suite baseline at origin/main
   398cda9: **2 failed, 2356 passed, 9 skipped** (the 2 = the known
   pre-existing platform failures in `test_replay_d6_conventions`
   pin-platform byte-identity) `[VERIFIED — make test in this worktree,
-  pre-change]`; post-change full-suite figure recorded in the PR body from
-  the same invocation `[VERIFIED — make test, post-change]`.
+  pre-change]`; post-fix: **2 failed, 2374 passed, 9 skipped** — same 2,
+  zero regressions `[VERIFIED — make test, post-change]`. CI execution of
+  the suite (not skipped): enforced mechanically by the new workflow guard
+  step; the post-push CI run is the proof surface.
 
 TEST MAP (each failure path its own distinct record):
   happy path scores + healthy record (no monkeypatched registry/resolver);
@@ -120,7 +156,10 @@ TEST MAP (each failure path its own distinct record):
   reconstruction mismatch; blocked import → fault naming
   `renquant_model_momentum` + the `[momentum]` remedy; primary candidates
   byte-identical under a faulting lane (record-don't-raise control); weekly
-  append busts the digest-keyed scorer cache within one process.
+  append busts the digest-keyed scorer cache within one process; loader
+  metadata carries the consumed digest; append injected between
+  certification and load → re-certify, never new-bytes-under-old-identity;
+  stale-pinned resolver → `artifact_identity_divergence` fault, cache empty.
 
 DEPLOYMENT NOTE (for the grant batch, not this PR): the daily runner's
 environment must make `renquant_model_momentum` importable (sibling
