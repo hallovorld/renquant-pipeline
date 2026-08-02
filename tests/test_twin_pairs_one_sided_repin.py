@@ -31,14 +31,16 @@ def _pins(public: str, kernel: str | None, twin: str | None = "k/file.py") -> di
 
 def test_a_kernel_only_repin_is_reported():
     """THE DEFECT, arriving through the pin file instead of past it."""
-    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"))
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "222"),
+                              exceptions=[])
     assert len(got) == 1
     assert "KERNEL-only change" in got[0]
     assert "#623 R1" in got[0]
 
 
 def test_a_public_only_repin_is_reported():
-    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("bbb", "111"))
+    got = tp.one_sided_repins(_pins("aaa", "111"), _pins("bbb", "111"),
+                              exceptions=[])
     assert len(got) == 1
     assert "PUBLIC-only change" in got[0]
 
@@ -46,30 +48,33 @@ def test_a_public_only_repin_is_reported():
 def test_both_sides_moving_is_NOT_reported():
     """Anti-vacuity control. A check that flags every pin update would be ignored
     within a week, which is the same as not having it."""
-    assert tp.one_sided_repins(_pins("aaa", "111"), _pins("bbb", "222")) == []
+    assert tp.one_sided_repins(_pins("aaa", "111"), _pins("bbb", "222"),
+                               exceptions=[]) == []
 
 
 def test_no_change_at_all_is_NOT_reported():
-    assert tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "111")) == []
+    assert tp.one_sided_repins(_pins("aaa", "111"), _pins("aaa", "111"),
+                               exceptions=[]) == []
 
 
 def test_a_pair_with_no_kernel_twin_is_skipped():
     """"One-sided" is undefined without a second side. Reporting it would train the
     reader to ignore the output -- three of the nine pinned exports have no twin."""
     assert tp.one_sided_repins(_pins("aaa", None, twin=None),
-                               _pins("bbb", None, twin=None)) == []
+                               _pins("bbb", None, twin=None),
+                               exceptions=[]) == []
 
 
 def test_a_pair_added_or_removed_is_not_a_one_sided_repin():
     """Those are `verify()`'s job (unpinned export / pinned-but-gone). Reporting them
     here too would double-count and blur which check owns which failure."""
-    assert tp.one_sided_repins(_pins("aaa", "111"), {"pairs": {}}) == []
-    assert tp.one_sided_repins({"pairs": {}}, _pins("aaa", "111")) == []
+    assert tp.one_sided_repins(_pins("aaa", "111"), {"pairs": {}}, exceptions=[]) == []
+    assert tp.one_sided_repins({"pairs": {}}, _pins("aaa", "111"), exceptions=[]) == []
 
 
 def test_empty_or_malformed_inputs_do_not_crash():
     for bad in ({}, {"pairs": None}, {"nope": 1}):
-        assert tp.one_sided_repins(bad, bad) == []
+        assert tp.one_sided_repins(bad, bad, exceptions=[]) == []
 
 
 # --- CLI ------------------------------------------------------------------------
@@ -194,11 +199,25 @@ def test_the_landing_PR_and_the_NEXT_one_both_pass_with_the_same_entry():
     assert following == [], following
 
 
-def test_the_committed_exception_file_is_empty_and_well_formed():
-    """Shipping the mechanism with a pre-populated allowlist would defeat it."""
+def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
+    """The mechanism shipped with an EMPTY list (a pre-populated allowlist would
+    have defeated it). The first real entry landed with pipeline#250 rollout
+    step 2 — a KERNEL-only ApplyScoresTask movement whose serving-transform
+    sites exist only in the kernel copy. This pin holds the file to exactly
+    the justified entries: every entry must carry both digest tuples and a
+    non-empty reason, and adding one means updating this list in the same
+    reviewed diff."""
     data = json.loads((REPO / "twin_repin_exceptions.json").read_text())
-    assert data["exceptions"] == []
     assert data["schema_version"] == 1
+    entries = data["exceptions"]
+    assert [(e["pair"], e["old_kernel_sha256"][:12], e["new_kernel_sha256"][:12])
+            for e in entries] == [
+        ("ApplyScoresTask", "f7a73efa89d7", "5cf79a1be970"),
+    ]
+    for e in entries:
+        for key in ("pair", "old_public_sha256", "old_kernel_sha256",
+                    "new_public_sha256", "new_kernel_sha256", "reason"):
+            assert str(e.get(key) or "").strip(), (e.get("pair"), key)
 
 
 def test_an_unreadable_exception_file_is_FATAL_not_no_exceptions(tmp_path, capsys, monkeypatch):

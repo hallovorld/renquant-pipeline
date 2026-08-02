@@ -1345,6 +1345,10 @@ class ApplyScoresTask(Task):
             X = pd.DataFrame.from_dict(rows, orient="index")
             if scorer_kind == "panel_linear":
                 # PanelLinearScorer.score_raw applies stored ZScoreNorm + Fillna + Clip
+                # pipeline#250 rollout step 2: record the AS-SERVED matrix at
+                # the exact point scoring consumes it (record-don't-raise).
+                from renquant_pipeline.serving_features import stage_serving_features  # noqa: PLC0415
+                stage_serving_features(ctx, X, scorer)
                 try:
                     scores: pd.Series = scorer.score_raw(X)
                 except Exception as exc:  # noqa: BLE001
@@ -1636,6 +1640,14 @@ class ApplyScoresTask(Task):
                              "PatchTST (seq_len=%d)",
                              len(scores), scorer.seq_len)
                 else:
+                    # pipeline#250 rollout step 2: X_aligned here is the
+                    # SERVING matrix — post transform_feature_frame for
+                    # panel_ltr_xgboost, the raw union for kind=blend (whose
+                    # per-component transforms run inside the scorer). Record
+                    # the identical object scoring consumes (record-don't-
+                    # raise; a write failure never reaches the decision path).
+                    from renquant_pipeline.serving_features import stage_serving_features  # noqa: PLC0415
+                    stage_serving_features(ctx, X_aligned, scorer)
                     try:
                         # 2026-06-02 Track C: pass ctx so a configured
                         # RegimeEnsemblePanelScorer can dispatch by
@@ -1653,6 +1665,11 @@ class ApplyScoresTask(Task):
                     log.info("ApplyScoresTask[panel_ltr_xgboost]: scored %d tickers via alpha158%s",
                              len(rows), "+fund" if needs_fund else "")
         else:
+            # pipeline#250 rollout step 2: the plain snapshot path consumes
+            # ctx._panel_matrix (BuildFeatureMatrixJob output) directly —
+            # record the identical object (record-don't-raise).
+            from renquant_pipeline.serving_features import stage_serving_features  # noqa: PLC0415
+            stage_serving_features(ctx, X, scorer)
             try:
                 # 2026-06-02 Track C: ctx forwarded for ensemble dispatch.
                 scores: pd.Series = scorer.score(X, ctx=ctx)

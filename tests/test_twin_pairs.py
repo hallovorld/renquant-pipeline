@@ -33,10 +33,11 @@ def test_the_measured_shape_is_pinned():
     WIDENED 2026-07-31. They used to read 9 exports / 6 twins, because the scan
     selected `n.endswith("Task")` and matched `^class NAME` only. Both were
     enumerated scopes and both passed forever outside themselves. The real surface
-    is 51 exports with 19 kernel twins.
+    was 51 exports with 19 kernel twins; pipeline#250 rollout step 2 (2026-08-02)
+    added the 5 `.serving_features` exports (no kernel twins) → 56 / 19.
     """
     pairs = PINS["pairs"]
-    assert len(pairs) == 51
+    assert len(pairs) == 56
     assert sum(1 for v in pairs.values() if v.get("kernel_twin_file")) == 19
     sourced = [v for v in pairs.values() if "public_is_kernel" in v]
     assert sum(1 for v in sourced if v["public_is_kernel"]) == 0, (
