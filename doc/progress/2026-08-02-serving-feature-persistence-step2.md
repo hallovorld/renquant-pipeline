@@ -2,7 +2,13 @@
 
 STATUS: delivered — additive recorder wired at the kernel serving-transform
 sites + `serving_features` sidecar staged on the run-bundle-collected payload
-surface + 16 new tests + full-suite regression; PR open under review.
+surface + 18 new tests + full-suite regression; PR open under review.
+REVISED 2026-08-02 after codex CHANGES_REQUESTED (HIGH, reproduced): the
+`run_native_inference_snapshot` facade — the exact surface
+renquant-orchestrator's `native_live_inference` consumes — wrote
+`snapshot.to_runtime_payload()` without finalizing a staged matrix, so the
+advertised contract was not delivered on that real consumer path. Fixed +
+2 regression tests below.
 WHAT: implements rollout step 2 of the MERGED design
 `doc/design/2026-08-02-serving-feature-persistence.md` (pipeline#250). The
 kernel `ApplyScoresTask` now records the AS-SERVED feature matrix — the
@@ -130,3 +136,45 @@ decisions-unchanged test).
   failing-writer run and a control run.
 * **Absent-tolerance** — no staging ⇒ no payload key ⇒ payload byte-identical
   to pre-change (the additive idiom's standard test, same as wash-sale #251).
+
+## Revision 2 (same day): the facade coverage hole codex reproduced
+
+Codex CHANGES_REQUESTED on #252 with a probe on the head: a fake pipeline
+staged a matrix, then `run_native_inference_snapshot(..., output_json=...)`
+produced staged_present=true but snapshot/payload/parquet all FALSE — the
+facade (`src/renquant_pipeline/native_inference.py`) built
+`live_context_snapshot_from_live_context(ctx)` and wrote the payload
+WITHOUT the finalization step the `inference.py` writers got. Real hole:
+that facade is what renquant-orchestrator's `native_live_inference`
+consumes.
+
+Fix `[VERIFIED — tests below, 2026-08-02]`:
+
+* `native_inference.py`: when `output_json` is given, the facade now calls
+  `write_staged_serving_features(ctx, out.parent)` BEFORE building the
+  snapshot (payload parent = run output dir, identical to the inference.py
+  writers), so the snapshot AND the written payload carry the completed
+  block. Record-don't-raise semantics unchanged.
+* `serving_features.py`: a SUCCESSFUL write now consumes the staged copy
+  (`_serving_features_staged` → None) — idempotency becomes structural (a
+  second finalizer can only return the completed record, never write a
+  divergent second parquet); a FAILED write keeps the staged copy so a
+  later finalizer may retry.
+* 2 regression tests in `tests/test_native_inference.py`: the probe's four
+  false flags flipped true (snapshot block, payload block, parquet next to
+  output_json byte-equal to the staged matrix, recomputed sha256 match, +
+  staged-state consumed), and the no-staging control (no key, no parquet —
+  byte-identical facade output).
+
+Re-measured counts: new tests now **18** (16 + 2)
+`[VERIFIED — pytest -q tests/test_serving_feature_persistence.py
+tests/test_native_inference.py: 21 passed = 18 new + 3 pre-existing facade
+tests, 2026-08-02]`. Full suite on the revised head: **2365 collected;
+2355 passed, 9 skipped, 2 failed** — the same two pre-existing
+`test_replay_d6_conventions` pin-platform failures `[VERIFIED — make test,
+2026-08-02]`. Delta vs the pre-fix head 2353: +2 = exactly the two new
+facade tests `[DERIVED]`. Twin pins re-emitted for the moved un-twinned
+exports (`run_native_inference_snapshot`, the inference.py payload
+surfaces); verify AND `--diff-against` origin/main both clean — the
+ApplyScoresTask exception still binds (kernel digest unmoved this
+revision) `[VERIFIED — tools/twin_pairs.py, 2026-08-02]`.

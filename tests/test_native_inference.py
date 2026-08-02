@@ -64,3 +64,90 @@ def test_native_inference_facade_does_not_import_umbrella_runner() -> None:
     assert "live.runner" not in src
     assert "adapters.runner" not in src
     assert "RenQuant" not in src
+
+
+# ── pipeline#250 rollout step 2 (codex on #252): this facade is the surface
+# renquant-orchestrator's native_live_inference consumes — a staged serving
+# matrix must be finalized here, not dropped. ──────────────────────────────
+
+
+def test_run_native_inference_snapshot_finalizes_staged_serving_features(
+    tmp_path: Path,
+) -> None:
+    import datetime
+    import hashlib
+
+    import pandas as pd
+
+    from renquant_pipeline.serving_features import (
+        SERVING_FEATURES_BLOCK_KEY,
+        SERVING_FEATURES_FILENAME,
+        STAGED_ATTR,
+        stage_serving_features,
+    )
+
+    matrix = pd.DataFrame(
+        {"f1": [1.5, -2.0], "f2": [0.25, 4.0]}, index=["AAA", "BBB"],
+    )
+
+    class StagingPipeline(FakePipeline):
+        def run(self, ctx) -> None:  # noqa: ANN001
+            super().run(ctx)
+            scorer = SimpleNamespace(
+                feature_cols=["f1", "f2"],
+                metadata={"feature_preprocess_version": 2},
+            )
+            stage_serving_features(ctx, matrix, scorer)
+
+    ctx = _ctx()
+    ctx.today = datetime.date(2026, 8, 2)
+    output = tmp_path / "native-inference.json"
+
+    snapshot = run_native_inference_snapshot(
+        ctx, pipeline=StagingPipeline(), output_json=output,
+    )
+
+    # The codex probe's four false flags, flipped true:
+    # 1. the snapshot itself carries the completed block
+    assert snapshot.serving_features is not None
+    assert snapshot.serving_features["status"] == "written"
+    # 2. the written payload carries the block
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    block = payload[SERVING_FEATURES_BLOCK_KEY]
+    assert block["status"] == "written"
+    assert block["n_rows"] == 2 and block["n_cols"] == 2
+    assert block["feature_cutoff"] == "2026-08-02"
+    assert block["feature_builder_version"] == "2"
+    # 3. the parquet exists next to output_json and is the consumed matrix
+    parquet = output.parent / SERVING_FEATURES_FILENAME
+    assert parquet.exists()
+    assert block["path"] == str(parquet)
+    read_back = pd.read_parquet(parquet)
+    assert list(read_back.columns) == ["ticker", "f1", "f2"]
+    assert (
+        read_back[["f1", "f2"]].to_numpy().tobytes()
+        == matrix.to_numpy().tobytes()
+    )
+    # 4. the recorded sha256 matches the file bytes
+    assert block["sha256"] == hashlib.sha256(parquet.read_bytes()).hexdigest()
+    # and the staged state is consumed once the write completed
+    assert getattr(ctx, STAGED_ATTR, None) is None
+
+
+def test_run_native_inference_snapshot_without_staging_stays_byte_identical(
+    tmp_path: Path,
+) -> None:
+    from renquant_pipeline.serving_features import (
+        SERVING_FEATURES_BLOCK_KEY,
+        SERVING_FEATURES_FILENAME,
+    )
+
+    output = tmp_path / "native-inference.json"
+    snapshot = run_native_inference_snapshot(
+        _ctx(), pipeline=FakePipeline(), output_json=output,
+    )
+
+    assert snapshot.serving_features is None
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert SERVING_FEATURES_BLOCK_KEY not in payload
+    assert not (output.parent / SERVING_FEATURES_FILENAME).exists()

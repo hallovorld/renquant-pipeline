@@ -217,6 +217,17 @@ def write_staged_serving_features(
             "serving_features: persisted %s (%d rows × %d cols, sha256=%s…)",
             path, record["n_rows"], record["n_cols"], record["sha256"][:12],
         )
+        # Consume the staged state on success (codex on #252): the frozen
+        # copy's job is done once the bytes + digest are recorded, and
+        # clearing it makes idempotency structural — a second finalizer
+        # (the facade and a payload writer can both run on one path) can
+        # only return the completed record, never write a divergent second
+        # parquet. A FAILED write keeps the staged copy so a later
+        # finalizer may retry into its own output dir.
+        try:
+            setattr(ctx, STAGED_ATTR, None)
+        except Exception:  # noqa: BLE001 — clearing is best-effort
+            pass
         return _set_record(ctx, record)
     except Exception as exc:  # noqa: BLE001 — never raise into the decision path
         return _failure_record(ctx, exc, path=path, staged=staged)
