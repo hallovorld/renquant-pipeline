@@ -151,3 +151,44 @@ def test_run_native_inference_snapshot_without_staging_stays_byte_identical(
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert SERVING_FEATURES_BLOCK_KEY not in payload
     assert not (output.parent / SERVING_FEATURES_FILENAME).exists()
+
+
+def test_a_staged_matrix_with_NO_output_json_is_not_written_anywhere(tmp_path) -> None:
+    """The `out is None` branch of the round-1 fix, which nothing else reaches.
+
+    Both new tests pass `output_json`, so the path where a pipeline stages a matrix and
+    the caller asks for no payload was untested. There is no run directory in that case,
+    and the contract is that the matrix stays STAGED rather than landing somewhere the
+    caller did not choose — a future edit that defaults the run dir (to `cwd`, or to a
+    half-populated `ctx.run_output_dir`) would otherwise write outside the caller's
+    control with no test objecting.
+
+    Measured, not assumed: no record status and no sidecar block on the snapshot.
+    """
+    import datetime
+
+    import pandas as pd
+
+    from renquant_pipeline.serving_features import RECORD_ATTR, stage_serving_features
+
+    matrix = pd.DataFrame({"f1": [1.5, -2.0]}, index=["AAA", "BBB"])
+
+    class StagingPipeline(FakePipeline):
+        def run(self, ctx) -> None:  # noqa: ANN001
+            super().run(ctx)
+            stage_serving_features(
+                ctx, matrix,
+                SimpleNamespace(feature_cols=["f1"],
+                                metadata={"feature_preprocess_version": 2}),
+            )
+
+    ctx = _ctx()
+    ctx.today = datetime.date(2026, 8, 2)
+    before = set(Path(tmp_path).rglob("*"))
+    snapshot = run_native_inference_snapshot(ctx, pipeline=StagingPipeline())
+
+    assert snapshot.serving_features is None
+    record = getattr(ctx, RECORD_ATTR, None)
+    assert (record or {}).get("status") != "written"
+    assert set(Path(tmp_path).rglob("*")) == before, "something was written with no output_json"
+    assert not list(Path.cwd().glob("serving_features.parquet")), "wrote into the cwd"
