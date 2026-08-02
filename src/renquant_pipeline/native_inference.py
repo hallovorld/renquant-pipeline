@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .inference import LiveContextSnapshot, live_context_snapshot_from_live_context
+from .serving_features import write_staged_serving_features
 
 
 class _RunnablePipeline(Protocol):
@@ -33,10 +34,20 @@ def run_native_inference_snapshot(
     """
     runner = pipeline or _default_pipeline(sell_only=sell_only)
     runner.run(ctx)
-    snapshot = live_context_snapshot_from_live_context(ctx)
+    out: Path | None = None
     if output_json is not None:
         out = Path(output_json)
         out.parent.mkdir(parents=True, exist_ok=True)
+        # pipeline#250 rollout step 2 (codex on #252): this facade is the
+        # surface renquant-orchestrator's native_live_inference consumes, so
+        # it must finalize a staged serving-features write exactly like the
+        # inference.py payload writers do — the payload's parent dir IS the
+        # run output dir. Completed BEFORE the snapshot is built so both the
+        # snapshot and the written payload carry the sidecar block. No-op
+        # (None) when nothing was staged; never raises (record-don't-raise).
+        write_staged_serving_features(ctx, out.parent)
+    snapshot = live_context_snapshot_from_live_context(ctx)
+    if out is not None:
         out.write_text(
             json.dumps(snapshot.to_runtime_payload(), indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

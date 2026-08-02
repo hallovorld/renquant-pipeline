@@ -74,6 +74,17 @@ _LAZY = {
     "build_runtime_feature_frame": (
         ".runtime_features", "build_runtime_feature_frame"),
     "transform_feature_rows": (".runtime_features", "transform_feature_rows"),
+    # .serving_features (pipeline#250 rollout step 2; step 3 — the
+    # orchestrator-side bundle pickup — imports these)
+    "SERVING_FEATURES_BLOCK_KEY": (
+        ".serving_features", "SERVING_FEATURES_BLOCK_KEY"),
+    "SERVING_FEATURES_FILENAME": (
+        ".serving_features", "SERVING_FEATURES_FILENAME"),
+    "serving_features_bundle_block": (
+        ".serving_features", "serving_features_bundle_block"),
+    "stage_serving_features": (".serving_features", "stage_serving_features"),
+    "write_staged_serving_features": (
+        ".serving_features", "write_staged_serving_features"),
     # .selection
     "SelectAcceptedCandidatesTask": (
         ".selection", "SelectAcceptedCandidatesTask"),
@@ -162,6 +173,13 @@ if TYPE_CHECKING:  # static analysers see the eager surface unchanged
         SelectAcceptedCandidatesTask,
         SelectionJob,
         ValidateSelectionDoesNotPromoteTask,
+    )
+    from .serving_features import (
+        SERVING_FEATURES_BLOCK_KEY,
+        SERVING_FEATURES_FILENAME,
+        serving_features_bundle_block,
+        stage_serving_features,
+        write_staged_serving_features,
     )
     from .software_stops import (
         DEFAULT_MAX_STALENESS_MINUTES,

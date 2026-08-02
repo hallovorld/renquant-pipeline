@@ -78,7 +78,11 @@ def test_every_documented_export_appears_in_the_pin_file():
     pinned = json.loads(PINS.read_text(encoding="utf-8"))["pairs"]
     assert set(pinned) == set(rp.__all__)
     unsourceable = {k for k, v in pinned.items() if v.get("kind")}
-    assert unsourceable == {"ATTRIBUTION_VERSION", "DEFAULT_MAX_STALENESS_MINUTES"}
+    assert unsourceable == {
+        "ATTRIBUTION_VERSION", "DEFAULT_MAX_STALENESS_MINUTES",
+        # pipeline#250 rollout step 2: string constants of .serving_features
+        "SERVING_FEATURES_BLOCK_KEY", "SERVING_FEATURES_FILENAME",
+    }
 
 
 def test_the_thirteen_previously_invisible_twins_are_now_pinned():
@@ -107,5 +111,7 @@ def test_the_committed_pins_currently_hold():
 def test_the_twin_count_is_measured_not_asserted():
     pinned = json.loads(PINS.read_text(encoding="utf-8"))["pairs"]
     twins = [k for k, v in pinned.items() if v.get("kernel_twin_file")]
-    assert len(pinned) == 51
+    # 51 -> 56 with pipeline#250 rollout step 2 (5 .serving_features exports,
+    # none kernel-twinned)
+    assert len(pinned) == 56
     assert len(twins) == 19

@@ -17,6 +17,11 @@ from renquant_artifacts import validate_artifact_manifest
 from renquant_base_data import validate_data_manifest
 
 from .decision_trace import build_ticker_daily_state_rows
+from .serving_features import (
+    SERVING_FEATURES_BLOCK_KEY,
+    serving_features_bundle_block,
+    write_staged_serving_features,
+)
 
 
 @dataclass
@@ -51,10 +56,16 @@ class LiveContextSnapshot:
     blocked_by: dict[str, Any]
     pending_broker_tickers: list[str]
     buy_blocked: bool
+    # pipeline#250 rollout step 2: the additive serving_features sidecar
+    # block staged by the kernel panel-scoring recorder, or None when the
+    # recorder never fired (every pre-#250 context and every sequence-
+    # scorer run). None ⇒ the payload is byte-identical to before this
+    # surface existed — the wash-sale-records additive idiom.
+    serving_features: dict[str, Any] | None = None
 
     def to_runtime_payload(self) -> dict[str, Any]:
         """Return the native inference payload consumed by live-run tooling."""
-        return {
+        payload = {
             "schema_version": 1,
             "source": "renquant_pipeline.live_context_inference",
             "market_as_of": self.market_as_of,
@@ -67,6 +78,9 @@ class LiveContextSnapshot:
             "pending_broker_tickers": list(self.pending_broker_tickers),
             "buy_blocked": self.buy_blocked,
         }
+        if self.serving_features is not None:
+            payload[SERVING_FEATURES_BLOCK_KEY] = dict(self.serving_features)
+        return payload
 
 
 class ValidateRuntimeInputsTask(Task):
@@ -130,7 +144,7 @@ def _wash_sale_decision_records(ctx: Any) -> list[dict[str, Any]]:
 
 def runtime_inference_payload(ctx: InferenceContext) -> dict[str, Any]:
     """Return the JSON payload consumed by native live-bundle tooling."""
-    return {
+    payload = {
         "schema_version": 1,
         "source": "renquant_pipeline.runtime_inference",
         "market_as_of": ctx.market_snapshot.get("as_of"),
@@ -143,6 +157,12 @@ def runtime_inference_payload(ctx: InferenceContext) -> dict[str, Any]:
         "blocked_by": dict(ctx.blocked_by),
         "buy_blocked": bool(ctx.buy_blocked),
     }
+    # pipeline#250 rollout step 2: additive serving_features sidecar block.
+    # Absent recorder ⇒ key absent ⇒ payload byte-identical to before.
+    serving_block = serving_features_bundle_block(ctx)
+    if serving_block is not None:
+        payload[SERVING_FEATURES_BLOCK_KEY] = serving_block
+    return payload
 
 
 def _get_field(obj: Any, *names: str, default: Any = None) -> Any:
@@ -429,6 +449,7 @@ def live_context_snapshot_from_live_context(
         blocked_by=blocked_by,
         pending_broker_tickers=pending_broker_tickers,
         buy_blocked=bool(_get_field(ctx, "buy_blocked", default=False)),
+        serving_features=serving_features_bundle_block(ctx),
     )
 
 
@@ -456,6 +477,12 @@ def write_runtime_inference_payload_from_live_context(
     """Write a live-context runtime inference payload as deterministic JSON."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # pipeline#250 rollout step 2: the payload's parent dir is the run
+    # output dir (the decision_trace precedent) — complete any staged
+    # serving-features write there BEFORE building the payload so the
+    # sidecar block carries the final path + sha256. No-op (None) when
+    # nothing was staged; never raises (record-don't-raise).
+    write_staged_serving_features(ctx, out.parent)
     payload = runtime_inference_payload_from_live_context(
         ctx,
         strategy_config=strategy_config,
@@ -469,6 +496,9 @@ def write_runtime_inference_payload(ctx: InferenceContext, path: str | Path) -> 
     """Write the runtime inference payload as deterministic JSON."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    # pipeline#250 rollout step 2 — same deferred-write completion as the
+    # live-context writer above.
+    write_staged_serving_features(ctx, out.parent)
     out.write_text(
         json.dumps(runtime_inference_payload(ctx), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

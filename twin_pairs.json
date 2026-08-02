@@ -15,7 +15,7 @@
       "public_sha256": "6402d10d85c9ebd66a870007a237afe94ed53f1e7569b5a5e332848529f6816a"
     },
     "ApplyScoresTask": {
-      "kernel_sha256": "f7a73efa89d724ac071077f66bfb0cba69e3986a9c551a3405de901106344230",
+      "kernel_sha256": "5cf79a1be9706ea1d711630964eb32bc5c9e578c889ec201023811e8eddf58d2",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
@@ -61,7 +61,7 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "5a2ce8f1960180dd35fc3c8e47ab619407c5080cad5e760e27d555bba6f706a8"
+      "public_sha256": "088894b308dbf5b9364a5f1757518ec8b30c1756836593ce57cb86a9c0bf255e"
     },
     "LiveStateContract": {
       "kernel_twin_file": null,
@@ -107,6 +107,16 @@
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
       "public_sha256": "e29544b459c13270dc0e97083b5e23c2b905e2e0de5169b2d66dede9d30ccfee"
+    },
+    "SERVING_FEATURES_BLOCK_KEY": {
+      "kernel_twin_file": null,
+      "kind": "not-a-source-object",
+      "public_type": "str"
+    },
+    "SERVING_FEATURES_FILENAME": {
+      "kernel_twin_file": null,
+      "kind": "not-a-source-object",
+      "public_type": "str"
     },
     "SelectAcceptedCandidatesTask": {
       "kernel_twin_file": null,
@@ -222,7 +232,7 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "a75d4b8f10d22b562656e947f89e8964be6f2816e3a01a980031d630ca6c2e5f"
+      "public_sha256": "cc0757a795be58543cee717999d0963cadbeed8b9af828c584813c5a211e2507"
     },
     "live_state_legacy_path": {
       "kernel_sha256": "72de12e77b719d295576f838279e85a122b3628c8b617db732b04fe477665bee",
@@ -275,7 +285,7 @@
       "public_file": "renquant_pipeline/native_inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.native_inference",
-      "public_sha256": "8fe69b7af057c62eac4def3c98990f822e2ca0d11df9a0b06935df04a85bea9e"
+      "public_sha256": "c4f33f80a86985b1f2008a5782a069df13fc4d8a6665faae59798b871fca03da"
     },
     "runs_db_legacy_path": {
       "kernel_sha256": "fdf4d7298a2603183c9c934b7fdb95ac59034e0b46bd3b0bf755a4738feccfce",
@@ -298,7 +308,7 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "37dfd73c0ecbf524c52861f7444e911c8206400b4935e0f6b2bca94269e52668"
+      "public_sha256": "1d886a9c33a2d4aa6fc1de565fb0a401be8039a37001c3728b359adb57404f82"
     },
     "runtime_inference_payload_from_live_context": {
       "kernel_twin_file": null,
@@ -314,6 +324,20 @@
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.order_attribution",
       "public_sha256": "1c7bc8374305a10c06e536b0dac1246892bad322de57354a5ce87918f4c9c6a6"
+    },
+    "serving_features_bundle_block": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/serving_features.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.serving_features",
+      "public_sha256": "291ce96770820e53e48f119b3a2f56f9a067dafc0b14bd7e8564266ca5d6297a"
+    },
+    "stage_serving_features": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/serving_features.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.serving_features",
+      "public_sha256": "902bca5dd577280205f1757a910bee2d45387d66b828e5a82979ef28de1fe15b"
     },
     "stamp_order_attribution": {
       "kernel_sha256": "4fcefbba686011854a85726f2c740d4d6988e240fa07b165b8e28c5466de1e53",
@@ -364,14 +388,21 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "4e9d2162a70459452b9c428baa97f91d70ef3da6f51ccca33c7425c22d93f6ca"
+      "public_sha256": "dc12c29e65bd2a7e9a68f61e4bc38684fd2eb1a76998d74d5717a1463ab050d7"
     },
     "write_runtime_inference_payload_from_live_context": {
       "kernel_twin_file": null,
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "16172224472637ff9900b5277c42facc954e26aa35c857b41c758c03e7b22459"
+      "public_sha256": "580b3393e361c406bcb7bfabf24453489a8e722b955100a81169475c3cc08075"
+    },
+    "write_staged_serving_features": {
+      "kernel_twin_file": null,
+      "public_file": "renquant_pipeline/serving_features.py",
+      "public_is_kernel": false,
+      "public_module": "renquant_pipeline.serving_features",
+      "public_sha256": "d52d071405481de4c13d83d4ec3fbbec3ff6e26f4b4492f6a32ab1312b98f299"
     }
   },
   "schema_version": 1
