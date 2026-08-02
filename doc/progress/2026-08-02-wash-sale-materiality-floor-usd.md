@@ -1,30 +1,48 @@
-# Wash-sale materiality floor (`risk.wash_sale.materiality_floor_usd`) — inert at default 0
+# Wash-sale materiality floor (`risk.wash_sale.materiality_floor_usd`) — inert at default 0   (PR #251)
 
-**Date:** 2026-08-02 · `renquant-pipeline` · pipeline#223 · governing contract:
-renquant-strategy-104 `doc/design/2026-08-02-wash-sale-materiality-floor.md` (merged)
+STATUS: delivered — code + 44 new tests + full-suite regression, PR #251 open
+under review (closes #223).
+WHAT: implements `risk.wash_sale.materiality_floor_usd` per the merged
+renquant-strategy-104 design; absent/0.0 short-circuits the entire new code
+path (provably inert at the default); wires the same waiver check into all
+four release-time call sites (candidate gate + the two §1091 rechecks + the
+QP mask) so a waived candidate cannot be silently re-blocked downstream.
+WHY/DIR: rollout step 2 of 4 per the governing contract
+(`renquant-strategy-104` `doc/design/2026-08-02-wash-sale-materiality-floor.md`,
+merged): 1 policy (merged) → **2 this PR** → 3 pins advance on both repos →
+4 operator sets a non-zero floor by reviewed config PR in
+`renquant-strategy-104`. Nothing changes at runtime until steps 3+4 land —
+no env-var, no CLI override; values above the $50 design ceiling are refused
+as a contract violation (floor DISABLED + loud finding, never a clamp).
+EVIDENCE:
+  artifact:      tests/test_wash_sale_materiality_floor_usd.py
+  prod or exp:   exp — new code path; provably inert in prod because
+                 `risk.wash_sale.materiality_floor_usd` is absent/0.0 in the
+                 current `strategy_config.golden.json` (step 4 not yet landed)
+  existing data: pipeline#223 incident table (8 names, all standing-blocked
+                 under the unchanged detection function) is the baseline
+                 expectation the floor-0 A/B is asserted against
+  best-known?:   yes — first implementation of the governed floor; the only
+                 alternative was the uncontrolled bypass the #223 incident
+                 flagged, which this design explicitly supersedes
+  scope:         "this is tests/test_wash_sale_materiality_floor_usd.py
+                 (44 tests) + full pipeline suite, exp path (inert at prod
+                 default), vs baseline = pristine origin/main behavior
+                 (byte-identical decisions and log messages at floor 0)"
 
-## Bottom line
-
-This PR implements the governed materiality floor the s104 design specifies and
-**changes nothing at runtime**: the knob defaults to 0.0/absent, the entire new
-code path short-circuits there, and a floor-0 A/B on a synthetic session fixture
-asserts decisions AND log messages byte-identical to a baseline expectation
-derived from the unchanged detection function
-`[VERIFIED — tests/test_wash_sale_materiality_floor_usd.py, 45 tests]`.
-Full suite: **2337 passed, 9 skipped, 2 failed — the exact same 2
-`test_replay_d6_conventions` pin-platform failures fail identically on pristine
-`origin/main` (2292 passed / same 2 failed), i.e. pre-existing, not a
-regression** `[VERIFIED — both suites run 2026-08-02 on this machine]`.
-
-## AC6 posture (this IMPLEMENTS a governed loosening)
-
-The override triplet (identity / expiry / binding) lives in the merged s104
-design; this PR is step 2 of its rollout order. **Nothing changes at runtime
-until (3) pins advance on both repos AND (4) an explicit non-zero floor lands by
-reviewed config PR in renquant-strategy-104** (the design proposes starting at
-$5 `[ASSUMED — design's proposed initial operator floor]`). No env-var, no CLI
-override; the pipeline refuses values above the $50 design ceiling as a contract
-violation (floor DISABLED + loud finding — never a clamp).
+  Measured counts, corrected from an earlier revision's stale "45 tests"
+  claim (flagged in codex review, PR #251): `pytest --collect-only -q
+  tests/test_wash_sale_materiality_floor_usd.py` collects **44 tests**;
+  `pytest -q tests/test_wash_sale_materiality_floor_usd.py` passes **44**
+  `[VERIFIED — pytest on this PR head, 2026-08-02]`.
+  Full suite: **2337 passed, 9 skipped, 2 failed** — the exact same 2
+  `test_replay_d6_conventions` pin-platform failures fail identically on
+  pristine `origin/main` (2292 passed / same 2 failed), i.e. pre-existing,
+  not a regression `[VERIFIED — both suites run on this machine, 2026-08-02]`.
+NEXT: (3) pins advance on both repos → (4) explicit non-zero floor lands via
+a reviewed config PR in `renquant-strategy-104`. AC6 posture: this PR
+implements a governed loosening whose override triplet (identity / expiry /
+binding) lives in the merged s104 design — not yet active.
 
 ## What the contract says, and where each clause landed
 
