@@ -141,6 +141,49 @@ def compute_disposed_lot_tax(
     }
 
 
+def event_net_realized_pnl_from_disposed_lots(
+    sell_price: float,
+    sell_date: _dt.date,
+    disposed_lots: Iterable[Any],
+) -> float | None:
+    """Same-event NET realized P&L of one sell event, via the existing engine.
+
+    Consumer: the wash-sale materiality-floor estimator (s104 design
+    2026-08-02 / pipeline#223). The estimator's ``disallowed_loss_usd`` must
+    come from the SAME lot arithmetic the tax logic uses — including the
+    same-event netting shape fixed 2026-07-27 (pre-fix, gain lots were taxed
+    while same-event loss lots were ignored; that defect class must not be
+    inherited here as a losses-only "disallowed loss" sum). This routes
+    through :func:`compute_disposed_lot_tax` (rates 0 — only the per-bucket
+    gross P&L sums are consumed) rather than re-implementing lot math:
+    ``short_term_gross_pnl + long_term_gross_pnl`` is the event-net realized
+    P&L, gains offsetting losses within the one disposal.
+
+    Returns ``None`` when the inputs cannot support an estimate (non-finite
+    sell price, missing date, or no usable lot) — callers treat ``None`` as
+    estimate-unavailable and let the wash-sale block STAND.
+    """
+    if not math.isfinite(float(sell_price)) or sell_date is None:
+        return None
+    lots = list(disposed_lots or [])
+    # Availability pre-scan mirroring compute_disposed_lot_tax's skip
+    # conditions: with zero usable lots the engine returns all-zero splits,
+    # which would masquerade as a true $0.00 event. That must be None.
+    def _usable(lot: Any) -> bool:
+        shares = _coerce_finite_float(getattr(lot, "shares", None), default=0.0) or 0.0
+        price = _coerce_finite_float(getattr(lot, "price", None), default=0.0) or 0.0
+        date = getattr(lot, "date", None)
+        if isinstance(date, _dt.datetime):
+            date = date.date()
+        return shares > 0 and price > 0 and isinstance(date, _dt.date)
+    if not any(_usable(lot) for lot in lots):
+        return None
+    split = compute_disposed_lot_tax(
+        sell_price, sell_date, lots, short_term_rate=0.0, long_term_rate=0.0,
+    )
+    return float(split["short_term_gross_pnl"] + split["long_term_gross_pnl"])
+
+
 def compute_netted_capital_gains_tax(
     short_term_net: float,
     long_term_net: float,

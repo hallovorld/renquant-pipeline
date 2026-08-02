@@ -222,7 +222,7 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "85c6d9a695508fa9723f417ef12956cbdb4f0e5ad91cc582a4334fbe431d7f02"
+      "public_sha256": "a75d4b8f10d22b562656e947f89e8964be6f2816e3a01a980031d630ca6c2e5f"
     },
     "live_state_legacy_path": {
       "kernel_sha256": "72de12e77b719d295576f838279e85a122b3628c8b617db732b04fe477665bee",
@@ -298,7 +298,7 @@
       "public_file": "renquant_pipeline/inference.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.inference",
-      "public_sha256": "91eb97c6982925c30ef49766d082a1c2eafbdc9c612dad8ba3887980022abc72"
+      "public_sha256": "37dfd73c0ecbf524c52861f7444e911c8206400b4935e0f6b2bca94269e52668"
     },
     "runtime_inference_payload_from_live_context": {
       "kernel_twin_file": null,

@@ -74,6 +74,19 @@ class WashSaleFilterTask(Task):
                              the same default the other two buy-admission call
                              sites (task_joint_actions.py, task_rotation.py)
                              use when unconfigured.
+      risk.wash_sale.materiality_floor_usd / .assumed_marginal_rate — the
+                             GOVERNED materiality floor (s104 design
+                             2026-08-02; pipeline#223). Absent/0.0 ⇒ the
+                             floor path is inert and this task is
+                             byte-identical to today. floor > 0 ⇒ an
+                             already-blocked LOSS name whose estimated
+                             foregone tax benefit (event-net disallowed loss
+                             × assumed marginal rate, ceil'd to the cent) is
+                             <= the floor is WAIVED per-name with a
+                             decision-trace record; an unavailable estimate
+                             leaves the block standing, stamped
+                             `estimate_unavailable`. Detection logic
+                             (`is_wash_sale_blocked_with_cost`) is unchanged.
     """
 
     def run(self, tc: TickerInferenceContext) -> bool | None:
@@ -82,7 +95,9 @@ class WashSaleFilterTask(Task):
             resolve_validated_crypto_spot_pairs,
         )
         from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+            estimate_foregone_wash_sale_tax_benefit_usd,
             is_wash_sale_blocked_with_cost,
+            resolve_wash_sale_materiality_policy,
             resolve_wash_sale_min_material_npv,
         )
         wash_days = int(tc.config.get("wash_sale_days", 0))
@@ -108,9 +123,48 @@ class WashSaleFilterTask(Task):
             asset_class=resolve_asset_class(tc.config or {}),
             validated_crypto_pairs=resolve_validated_crypto_spot_pairs(tc.config or {}),
         )
+        # Governed materiality floor (s104 design 2026-08-02; pipeline#223).
+        # Resolution is a pure read — output-invariant on every path.
+        policy = resolve_wash_sale_materiality_policy(tc.config)
+        if policy.findings:
+            # Loud, never silent: an invalid configured VALUE disables the
+            # floor (nothing waives) AND the findings are recorded on the
+            # decision-record surface the run bundle collects
+            # (collect_wash_sale_decision_records aggregates + dedupes them).
+            tc.wash_sale_floor_findings = policy.finding_records()
         if blocked:
-            tc.blocked_by = f"wash_sale:{reason}"
-            log.info("DROP_WashSaleFilter [%s]: %s", tc.ticker, reason)
+            stamp = ""
+            if policy.floor_usd > 0.0:
+                # ZERO-FLOOR SHORT-CIRCUIT IS NORMATIVE (s104 design): this
+                # branch is entered ONLY when floor > 0. At floor == 0.0 the
+                # `estimate <= floor` comparison must NEVER be evaluated —
+                # a name whose estimate is exactly $0.00 still blocks.
+                est = estimate_foregone_wash_sale_tax_benefit_usd(
+                    (tc.last_sell_pls or {}).get(tc.ticker),
+                    assumed_marginal_rate=policy.assumed_marginal_rate,
+                )
+                if est is None:
+                    # Fail toward protection: no estimate ⇒ the block STANDS,
+                    # stamped so the trace shows the floor was consulted.
+                    stamp = " [estimate_unavailable]"
+                elif est <= policy.floor_usd:
+                    tc.wash_sale_waiver = {
+                        "gate": "wash_sale",
+                        "ticker": tc.ticker,
+                        "waived": True,
+                        "est_foregone_tax_usd": est,
+                        "floor_usd": policy.floor_usd,
+                        "config_fingerprint": policy.config_fingerprint,
+                    }
+                    log.info(
+                        "WAIVE_WashSaleFilter [%s]: est foregone tax $%.2f <= "
+                        "floor $%.2f — buy proceeds (block reason was: %s)",
+                        tc.ticker, est, policy.floor_usd, reason,
+                    )
+                    return None
+            reason_txt = f"{reason}{stamp}"
+            tc.blocked_by = f"wash_sale:{reason_txt}"
+            log.info("DROP_WashSaleFilter [%s]: %s", tc.ticker, reason_txt)
             return False
         # Not blocked but log the reason so the audit trail shows
         # whether we passed because of "gain sale" / "outside window" /
@@ -118,6 +172,48 @@ class WashSaleFilterTask(Task):
         if reason and "no recent sale" not in reason and "disabled" not in reason:
             log.debug("PASS_WashSaleFilter [%s]: %s (cost_npv=$%.2f)",
                       tc.ticker, reason, cost_npv)
+
+
+def collect_wash_sale_decision_records(ctx, tctxs) -> None:
+    """Aggregate per-name wash-sale waiver records + config findings onto
+    ``ctx.wash_sale_decision_records``.
+
+    That attribute is the surface the run-bundle builders collect
+    (``inference.runtime_inference_payload`` /
+    ``live_context_snapshot_from_live_context`` append it into
+    ``decision_trace``, which ``build_native_live_bundle`` requires) — the
+    AC6-binding surface named by the s104 design.
+
+    Inert at the default: with floor 0.0/absent and a valid config, no tc
+    carries a waiver or finding, the attribute is never created, and every
+    downstream byte is unchanged. Config findings are per-run facts stamped
+    on every ticker's tc; they are deduped here and logged loudly ONCE.
+    """
+    records: list[dict] = []
+    seen_findings: set[str] = set()
+    for tc in tctxs:
+        waiver = getattr(tc, "wash_sale_waiver", None)
+        if isinstance(waiver, dict):
+            records.append(dict(waiver))
+        for rec in getattr(tc, "wash_sale_floor_findings", None) or []:
+            if not isinstance(rec, dict):
+                continue
+            key = str(rec.get("finding"))
+            if key in seen_findings:
+                continue
+            seen_findings.add(key)
+            log.error(
+                "wash-sale materiality floor CONFIG FINDING "
+                "(floor DISABLED, nothing waived): %s", key,
+            )
+            records.append(dict(rec))
+    if not records:
+        return
+    existing = getattr(ctx, "wash_sale_decision_records", None)
+    if existing is None:
+        existing = []
+        ctx.wash_sale_decision_records = existing
+    existing.extend(records)
 
 
 class SectorMapGateTask(Task):
