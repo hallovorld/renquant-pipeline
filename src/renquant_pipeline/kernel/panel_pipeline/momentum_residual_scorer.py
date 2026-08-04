@@ -197,11 +197,26 @@ class MomentumResidualScorer:
     The v0 construction is cross-sectional and frozen at the artifact's
     cutoff: serving-date scoring is a per-ticker LOOKUP into the verified
     score set — no feature matrix, no history panel (``scores_by_ticker``
-    is the capability flag ``ApplyShadowScoringTask`` dispatches on)."""
+    is the capability flag ``ApplyShadowScoringTask`` dispatches on).
+
+    PRIMARY-SCORER SURFACE (2026-08-03, pipeline#258). The class also
+    implements the ``PanelScorer`` serving contract every primary call site
+    assumes — ``feature_cols`` / ``seq_len`` / ``score(feature_matrix)`` —
+    so a readonly e2e lane can run the momentum model as its primary and
+    produce sized shadow orders (the operator's explicit ask; the previous
+    state crashed LoadScorerTask's logging line on the missing attribute).
+    ``feature_cols`` is EMPTY by construction: scoring is a lookup, so the
+    feature-matrix builder has nothing to assemble and ``score`` reads only
+    the matrix INDEX (tickers). Names outside the frozen universe come back
+    NaN — the primary path's "scoring ran but produced no score" marker —
+    rather than being silently omitted, mirroring BlendPanelScorer's
+    unscored-name contract."""
 
     kind = "momentum_residual"
     requires_history = False
     scores_by_ticker = True
+    feature_cols: list[str] = []
+    seq_len = 1
 
     def __init__(self, *, scores: Mapping[str, float],
                  metadata: Mapping[str, Any]) -> None:
@@ -219,6 +234,19 @@ class MomentumResidualScorer:
         counts them against ``coverage_frac`` instead of serving a guess)."""
         out = {t: self._scores[t] for t in tickers if t in self._scores}
         return pd.Series(out, dtype=float)
+
+    def score(self, feature_matrix: pd.DataFrame, ctx: Any = None) -> pd.Series:
+        """PanelScorer-contract entry: lookup by the matrix's ticker index.
+
+        ``ctx`` accepted-but-ignored for signature uniformity (same as
+        BlendPanelScorer). The matrix's COLUMNS are irrelevant by design
+        (``feature_cols`` is empty); only its index is read. Unscored names
+        return NaN so the caller's own unscored accounting applies — the
+        shadow path's omit-and-count-coverage convention would silently
+        shrink the primary cross-section instead."""
+        del ctx
+        tickers = [str(t) for t in feature_matrix.index]
+        return self.score_tickers(tickers).reindex(tickers)
 
 
 def load_momentum_residual_scorer(ledger_path: str | Path,

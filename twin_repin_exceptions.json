@@ -3,12 +3,20 @@
   "_comment": "Justifications for ONE-SIDED twin re-pins (renquant-pipeline#232). An entry suppresses the CI finding for exactly one pair moving from one exact digest tuple to one exact digest tuple, and it REMAINS VALID for as long as the pins still sit at its new_* tuple -- it is an audit record of a movement that happened, not a token consumed by one diff. It is reported SUPERSEDED the moment either side moves again, because it then describes a state that no longer exists and would pre-authorise a movement nobody justified. It cannot be written in advance. `reason` must be non-empty: a justification with no justification is a rubber stamp. Required keys per entry: pair, old_public_sha256, old_kernel_sha256, new_public_sha256, new_kernel_sha256, reason.",
   "exceptions": [
     {
+      "pair": "LoadScorerTask",
+      "old_public_sha256": "18f9277a6cec414ea97df11cd13595f72fc9b596a7737729f0ec2bd10cf0fb06",
+      "old_kernel_sha256": "869272ff155c256fd9c55b38281e8a8d0025d11855f666ddf2495c6e76263908",
+      "new_public_sha256": "18f9277a6cec414ea97df11cd13595f72fc9b596a7737729f0ec2bd10cf0fb06",
+      "new_kernel_sha256": "ef0f915648a6f067c9903529ceba2d7048dcfb4011f81b3f43285c76fa155092",
+      "reason": "pipeline#258 momentum-primary surface: the kernel copy gains a kind-aware config-consistency branch (kind=momentum_residual compares the artifact's own momentum-<ver>-<16hex> stamp against a profile-pinned expected_config_fingerprint, fail-closed when the pin is absent or mismatched; the generic XGB-recipe comparison is meaningless for a lookup artifact \u2014 measured 2026-08-03, every compared field stored=None on a healthy lane). The public twin has no scorer loading, no registry dispatch and no consistency machinery to receive this branch \u2014 it validates an artifact-manifest contract on ctx and never constructs a scorer, so there is no call site for the momentum comparison there. (review round 2, codex on #259: fail-closed hardening \u2014 non-empty-string fingerprint fields with native equality; matrix-less only on an EXPLICIT empty feature contract \u2014 kernel-only for the same structural reasons)"
+    },
+    {
       "pair": "ApplyScoresTask",
       "old_public_sha256": "f520e3aa565ff685a2be954a06fcb7f11ec91e584a28f00cccaefd4bc277e7ff",
-      "old_kernel_sha256": "f7a73efa89d724ac071077f66bfb0cba69e3986a9c551a3405de901106344230",
+      "old_kernel_sha256": "5cf79a1be9706ea1d711630964eb32bc5c9e578c889ec201023811e8eddf58d2",
       "new_public_sha256": "f520e3aa565ff685a2be954a06fcb7f11ec91e584a28f00cccaefd4bc277e7ff",
-      "new_kernel_sha256": "5cf79a1be9706ea1d711630964eb32bc5c9e578c889ec201023811e8eddf58d2",
-      "reason": "pipeline#250 serving-feature-persistence rollout step 2: the kernel copy gains three stage_serving_features() calls at its serving-transform sites (post transform_feature_frame / at the exact scorer.score consumption points). Those sites exist ONLY in the kernel copy -- the public twin scores a caller-supplied dict matrix (ctx.panel_feature_matrix) and never runs the serving transform the #250 design names, so there is no as-served matrix object to record there. The recorder is additive and record-don't-raise; no admission behaviour changes on either side (pinned by tests/test_serving_feature_persistence.py decisions-unchanged test)."
+      "new_kernel_sha256": "3b5f35bd86375b060f26bde399d6b4f86f67077c84a51bb5b33104bb7d58992d",
+      "reason": "(supersedes the pipeline#250 entry, whose 5cf79a1be970 state this movement departs from) pipeline#258 momentum-primary surface: the kernel copy's matrix guard now delegates to the shared matrix_usable predicate (tasks_feature_matrix), which admits a 0-column frame WITH rows for a matrix-less scorer (feature_cols == [], the momentum lookup) \u2014 pandas .empty is True on 0 columns and fail-closed a healthy lane (measured 2026-08-03: X.shape=(88,0) \u2192 panel_score_matrix_missing). The public twin scores a caller-supplied dict matrix (ctx.panel_feature_matrix), builds no inference frame, and its feature-contract check deliberately BLOCKS on an empty contract \u2014 a matrix-less scorer is not servable there by design, so the guard change has no public call site. No admission behaviour changes for feature scorers on either side (matrix_usable requires columns for any scorer with a non-empty feature contract)."
     }
   ]
 }
