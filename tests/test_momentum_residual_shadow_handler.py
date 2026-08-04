@@ -801,3 +801,77 @@ def test_matrix_usable_scorer_with_None_feature_cols_fails_closed():
         feature_cols = None
 
     assert matrix_usable(_NoneContract(), pd.DataFrame(index=["AAPL"])) is False
+
+
+# ── pipeline#262: the as-of verified loader (orch#783's provider boundary) ──
+
+from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (  # noqa: E402
+    load_momentum_artifact_as_of,
+)
+
+
+def test_as_of_loader_selects_time_safely(tmp_path):
+    """A row appended AFTER the session cutoff must not serve that session,
+    even with an eligible cutoff_date; the identity triplet names the row."""
+    root = _momentum_root(tmp_path)
+    a1 = _publish(root, PREV_CUTOFF, seed=7)
+    a2 = _publish(root, CUTOFF, seed=9)   # appended later (real append order)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    # rewrite appended_at: row0 early, row1 mid-window — reseal shas
+    rows = [json.loads(l) for l in ledger.read_text().strip().splitlines()]
+    rows[0]["appended_at_utc"] = "2026-07-25T12:00:00+00:00"
+    rows[1]["appended_at_utc"] = "2026-08-06T12:00:00+00:00"
+    prev = None
+    for r in rows:
+        r["prev_row_sha"] = prev
+        from renquant_model_momentum.ledger import row_sha256_of
+        r["row_sha"] = row_sha256_of(r)   # the package's own sealing
+        prev = r["row_sha"]
+    ledger.write_text("".join(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n" for r in rows),
+                      encoding="utf-8")
+
+    # session 2026-08-02: cutoff before row1's append -> row0 serves
+    got = load_momentum_artifact_as_of(
+        ledger, session_date="2026-08-02",
+        session_cutoff_utc="2026-08-02T20:00:00+00:00")
+    assert got is not None
+    scores, ident = got
+    assert ident["row_index"] == 0
+    assert ident["artifact_content_sha256"] == a1["content_sha256"]
+    assert scores == _finite_scores(a1)
+    # session 2026-08-07: after row1's append -> row1 serves
+    got2 = load_momentum_artifact_as_of(
+        ledger, session_date="2026-08-07",
+        session_cutoff_utc="2026-08-07T20:00:00+00:00")
+    assert got2 is not None and got2[1]["row_index"] == 1
+    assert got2[1]["artifact_content_sha256"] == a2["content_sha256"]
+
+
+def test_as_of_loader_refuses_contract_failures_as_none(tmp_path):
+    """Absent ledger, empty ledger, tampered chain, and a tampered dated
+    artifact all yield None — the readout counts coverage, never guesses."""
+    root = _momentum_root(tmp_path)
+    missing = load_momentum_artifact_as_of(
+        root / "momentum_artifact_ledger.jsonl",
+        session_date=CUTOFF, session_cutoff_utc=f"{CUTOFF}T20:00:00+00:00")
+    assert missing is None
+
+    artifact = _publish(root, CUTOFF)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    # tamper the dated artifact (self-sha stale) -> steps 3-6 refuse -> None
+    dated = root / CUTOFF / MOMENTUM_DATED_ARTIFACT_BASENAME
+    doc = json.loads(dated.read_text()); doc["scores"]["AAA"] = 9.99
+    dated.write_text(json.dumps(doc), encoding="utf-8")
+    got = load_momentum_artifact_as_of(
+        ledger, session_date=CUTOFF, session_cutoff_utc=f"{CUTOFF}T23:59:59+00:00")
+    assert got is None
+
+
+def test_as_of_loader_no_qualifying_row_is_none(tmp_path):
+    root = _momentum_root(tmp_path)
+    _publish(root, CUTOFF)  # appended today, cutoff today
+    got = load_momentum_artifact_as_of(
+        root / "momentum_artifact_ledger.jsonl",
+        session_date="2026-07-01",  # before any cutoff
+        session_cutoff_utc="2026-07-01T20:00:00+00:00")
+    assert got is None

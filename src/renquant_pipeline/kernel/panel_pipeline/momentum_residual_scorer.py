@@ -249,6 +249,131 @@ class MomentumResidualScorer:
         return self.score_tickers(tickers).reindex(tickers)
 
 
+def _verified_row_scores(ledger: Path, row: Mapping[str, Any], mm, composite_scores):
+    """Steps 3-6 of the serving contract for ONE ledger row: dated-artifact
+    load, content identity both directions, row-artifact cross-field parity,
+    and golden reproduction. Extracted VERBATIM from the serving loader so
+    the as-of loader (pipeline#262) shares the exact contract instead of
+    duplicating it. Returns (artifact, scores, params)."""
+    # 3) DATED ARTIFACT beside the ledger, per the tail row's cutoff. Also a
+    #    single read: parse once, verify over the parsed object (the package
+    #    recomputes the canonical-JSON sha of exactly what was consumed), so
+    #    no check/use divergence is possible for the dated file either. The
+    #    dated file is immutable by the append-only store contract; its
+    #    row-pin check below is what enforces that.
+    dated = ledger.parent / str(row["cutoff_date"]) / MOMENTUM_DATED_ARTIFACT_BASENAME
+    try:
+        artifact = json.loads(dated.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise ValueError(
+            f"dated_artifact_missing: ledger tail row {row['row_index']} "
+            f"(cutoff {row['cutoff_date']}, artifact sha "
+            f"{str(row['artifact_content_sha256'])[:12]}…) has no dated "
+            f"artifact at {dated}")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"dated_artifact_unparseable: {dated}: {exc}") from exc
+
+    # 4) CONTENT IDENTITY, both directions: the artifact's self-carried sha
+    #    recomputes (package verifier), AND it is the exact artifact the
+    #    append-only row pinned.
+    try:
+        mm.verify_artifact_content_sha(artifact)
+    except ValueError as exc:
+        raise ValueError(f"artifact_content_sha_mismatch: {dated}: {exc}") from exc
+    if artifact.get("content_sha256") != row["artifact_content_sha256"]:
+        raise ValueError(
+            f"ledger_row_artifact_sha_mismatch: {dated} self-verifies as "
+            f"{str(artifact.get('content_sha256'))[:12]}… but the ledger tail "
+            f"row pinned {str(row['artifact_content_sha256'])[:12]}… — the "
+            "dated file is not the artifact the append-only ledger recorded")
+
+    # 5) ROW ↔ ARTIFACT cross-field parity (identity ≠ validity).
+    if artifact.get("kind") != row["kind"]:
+        raise ValueError(
+            f"artifact_kind_mismatch: row says {row['kind']!r}, artifact says "
+            f"{artifact.get('kind')!r}")
+    if artifact.get("cutoff_date") != row["cutoff_date"]:
+        raise ValueError(
+            f"artifact_cutoff_mismatch: row says {row['cutoff_date']!r}, "
+            f"artifact says {artifact.get('cutoff_date')!r}")
+    params = artifact.get("params") if isinstance(artifact.get("params"), Mapping) else {}
+    if params.get("params_version") != row["params_version"]:
+        raise ValueError(
+            f"artifact_params_version_mismatch: row says "
+            f"{row['params_version']!r}, artifact says "
+            f"{params.get('params_version')!r}")
+    min_features = params.get("min_features")
+    if isinstance(min_features, bool) or not isinstance(min_features, int):
+        raise ValueError(
+            "artifact_params_version_mismatch: params carry no integer "
+            f"'min_features' (got {min_features!r}) — cannot reproduce the "
+            "declared construction")
+
+    # 6) GOLDEN REPRODUCTION — the package's construction over the stored
+    #    features must reproduce the stored scores; serve the reconstruction.
+    scores = _reconstruct_scores(artifact, composite_scores,
+                                 min_features=min_features)
+    return artifact, scores, params
+
+
+def load_momentum_artifact_as_of(ledger_path: str | Path, *,
+                                 session_date: str,
+                                 session_cutoff_utc: str,
+                                 ) -> "tuple[dict[str, float], dict[str, Any]] | None":
+    """AS-OF verified artifact loader (pipeline#262, for orch#783's S2
+    readout): the serving row for ``session_date`` selected TIME-SAFELY —
+    the LAST chain-verified ledger row with ``cutoff_date <= session_date``
+    AND ``appended_at_utc <= session_cutoff_utc`` — then the FULL serving
+    contract on that row via the same extracted steps the live loader runs
+    (dated artifact, content sha both directions, row-artifact parity,
+    golden reproduction; nothing duplicated downstream).
+
+    Returns ``(scores, identity)`` where identity carries the frozen
+    triplet (row_index, row_sha, artifact_content_sha256) plus
+    cutoff_date/params_version, or ``None`` when no qualifying row exists,
+    the ledger is absent/empty, the chain fails, or the selected row's
+    artifact fails ANY contract step — the readout counts that session
+    against coverage; it never needs a reason string to act on.
+    Single-read discipline identical to the serving loader.
+    """
+    mm, composite_scores = _import_momentum_construction()
+    ledger = Path(ledger_path)
+    try:
+        raw = ledger.read_bytes()
+    except OSError:
+        return None
+    try:
+        with tempfile.TemporaryDirectory(prefix="momentum-ledger-asof-") as td:
+            snap = Path(td) / "momentum_artifact_ledger.jsonl"
+            snap.write_bytes(raw)
+            rows = mm.load_and_verify_ledger(snap)
+    except mm.LedgerIntegrityError:
+        return None
+    qualifying = [
+        r for r in rows
+        if str(r["cutoff_date"]) <= session_date
+        and str(r["appended_at_utc"]) <= session_cutoff_utc
+    ]
+    if not qualifying:
+        return None
+    row = qualifying[-1]
+    try:
+        artifact, scores, params = _verified_row_scores(
+            ledger, row, mm, composite_scores)
+    except (ValueError, ShadowNotYetPublished):
+        return None
+    finite = {str(t): float(v) for t, v in scores.items()
+              if not math.isnan(_as_float(v))}
+    identity = {
+        "row_index": row["row_index"],
+        "row_sha": row["row_sha"],
+        "artifact_content_sha256": row["artifact_content_sha256"],
+        "cutoff_date": row["cutoff_date"],
+        "params_version": params.get("params_version"),
+    }
+    return finite, identity
+
+
 def load_momentum_residual_scorer(ledger_path: str | Path,
                                   config: Mapping[str, Any] | None = None,
                                   ) -> MomentumResidualScorer:
@@ -308,65 +433,8 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
             "the weekly train job has not published its first artifact yet")
     row = rows[-1]
 
-    # 3) DATED ARTIFACT beside the ledger, per the tail row's cutoff. Also a
-    #    single read: parse once, verify over the parsed object (the package
-    #    recomputes the canonical-JSON sha of exactly what was consumed), so
-    #    no check/use divergence is possible for the dated file either. The
-    #    dated file is immutable by the append-only store contract; its
-    #    row-pin check below is what enforces that.
-    dated = ledger.parent / str(row["cutoff_date"]) / MOMENTUM_DATED_ARTIFACT_BASENAME
-    try:
-        artifact = json.loads(dated.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        raise ValueError(
-            f"dated_artifact_missing: ledger tail row {row['row_index']} "
-            f"(cutoff {row['cutoff_date']}, artifact sha "
-            f"{str(row['artifact_content_sha256'])[:12]}…) has no dated "
-            f"artifact at {dated}")
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(f"dated_artifact_unparseable: {dated}: {exc}") from exc
-
-    # 4) CONTENT IDENTITY, both directions: the artifact's self-carried sha
-    #    recomputes (package verifier), AND it is the exact artifact the
-    #    append-only row pinned.
-    try:
-        mm.verify_artifact_content_sha(artifact)
-    except ValueError as exc:
-        raise ValueError(f"artifact_content_sha_mismatch: {dated}: {exc}") from exc
-    if artifact.get("content_sha256") != row["artifact_content_sha256"]:
-        raise ValueError(
-            f"ledger_row_artifact_sha_mismatch: {dated} self-verifies as "
-            f"{str(artifact.get('content_sha256'))[:12]}… but the ledger tail "
-            f"row pinned {str(row['artifact_content_sha256'])[:12]}… — the "
-            "dated file is not the artifact the append-only ledger recorded")
-
-    # 5) ROW ↔ ARTIFACT cross-field parity (identity ≠ validity).
-    if artifact.get("kind") != row["kind"]:
-        raise ValueError(
-            f"artifact_kind_mismatch: row says {row['kind']!r}, artifact says "
-            f"{artifact.get('kind')!r}")
-    if artifact.get("cutoff_date") != row["cutoff_date"]:
-        raise ValueError(
-            f"artifact_cutoff_mismatch: row says {row['cutoff_date']!r}, "
-            f"artifact says {artifact.get('cutoff_date')!r}")
-    params = artifact.get("params") if isinstance(artifact.get("params"), Mapping) else {}
-    if params.get("params_version") != row["params_version"]:
-        raise ValueError(
-            f"artifact_params_version_mismatch: row says "
-            f"{row['params_version']!r}, artifact says "
-            f"{params.get('params_version')!r}")
-    min_features = params.get("min_features")
-    if isinstance(min_features, bool) or not isinstance(min_features, int):
-        raise ValueError(
-            "artifact_params_version_mismatch: params carry no integer "
-            f"'min_features' (got {min_features!r}) — cannot reproduce the "
-            "declared construction")
-
-    # 6) GOLDEN REPRODUCTION — the package's construction over the stored
-    #    features must reproduce the stored scores; serve the reconstruction.
-    scores = _reconstruct_scores(artifact, composite_scores,
-                                 min_features=min_features)
-
+    artifact, scores, params = _verified_row_scores(
+        ledger, row, mm, composite_scores)
     metadata: dict[str, Any] = {
         "kind": artifact["kind"],
         "cutoff_date": row["cutoff_date"],
@@ -412,6 +480,7 @@ def load_momentum_residual_scorer(ledger_path: str | Path,
 
 
 __all__ = [
+    "load_momentum_artifact_as_of",
     "MOMENTUM_DATED_ARTIFACT_BASENAME",
     "MomentumResidualScorer",
     "ShadowNotYetPublished",
