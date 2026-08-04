@@ -595,3 +595,160 @@ def test_ledger_deleted_between_certify_and_load_faults_load_failed(
     # … and the failed lane leaves NO cache entry behind.
     assert not [k for k in shadow_scoring._SCORER_CACHE
                 if k[0] == "momentum_residual"]
+
+
+# --- primary-scorer surface (2026-08-03, pipeline#258) ------------------------
+#
+# The operator asked to SEE the momentum model's orders; running the lane as a
+# readonly e2e PRIMARY crashed on the missing PanelScorer surface
+# (`LoadScorerTask` logging `len(scorer.feature_cols)` — AttributeError). These
+# pin the adapter: an empty feature contract plus index-lookup `score`.
+
+def _lookup_scorer():
+    from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (
+        MomentumResidualScorer,
+    )
+    return MomentumResidualScorer(
+        scores={"AAPL": 0.5, "MSFT": -0.25},
+        metadata={"kind": "momentum_residual"},
+    )
+
+
+def test_primary_surface_exists_with_an_empty_feature_contract():
+    s = _lookup_scorer()
+    assert s.feature_cols == []
+    assert s.seq_len == 1
+    assert s.requires_history is False
+
+
+def test_score_reads_only_the_matrix_index():
+    import pandas as pd
+    s = _lookup_scorer()
+    # columns are junk on purpose — a lookup scorer must not touch them
+    x = pd.DataFrame({"junk": [1.0, 2.0]}, index=["AAPL", "MSFT"])
+    out = s.score(x)
+    assert out.loc["AAPL"] == 0.5 and out.loc["MSFT"] == -0.25
+
+
+def test_unscored_names_come_back_NaN_not_omitted():
+    """The shadow path OMITS unknown names (coverage math counts them); the
+    primary path needs them PRESENT as NaN — silent omission would shrink the
+    cross-section without any unscored accounting."""
+    import math
+    import pandas as pd
+    s = _lookup_scorer()
+    x = pd.DataFrame(index=["AAPL", "ZZZC"])
+    out = s.score(x)
+    assert list(out.index) == ["AAPL", "ZZZC"]
+    assert out.loc["AAPL"] == 0.5 and math.isnan(out.loc["ZZZC"])
+
+
+def test_score_accepts_and_ignores_ctx():
+    import pandas as pd
+    s = _lookup_scorer()
+    out = s.score(pd.DataFrame(index=["MSFT"]), ctx=object())
+    assert out.loc["MSFT"] == -0.25
+
+
+# --- primary config-consistency: momentum's OWN fingerprint scheme ------------
+#
+# The generic check compares XGB-recipe fields the lookup artifact does not
+# carry (measured 2026-08-03: every field stored=None → a healthy lane
+# fail-closed). For kind=momentum_residual the contract is an exact match
+# between the artifact's own stamp and a pin the profile MUST declare;
+# an absent pin fails closed (an absent expectation is not a passed one).
+
+class _Ctx:
+    """The minimal ctx surface _fail_closed_panel_scoring touches."""
+    def __init__(self):
+        self.candidates = []
+        self.config = {}
+        self.skip_buys = False
+
+
+def _consistency(panel_cfg, fingerprint="momentum-v0-fd65161a20b29314"):
+    from renquant_pipeline.kernel.panel_pipeline import job_panel_scoring as jps
+    from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (
+        MomentumResidualScorer,
+    )
+    scorer = MomentumResidualScorer(
+        scores={"AAPL": 0.5},
+        metadata={"kind": "momentum_residual",
+                  "config_fingerprint": fingerprint},
+    )
+    ctx = _Ctx()
+    ok = jps.LoadScorerTask._assert_config_consistency(ctx, panel_cfg, scorer, None)
+    return ok, ctx
+
+
+def test_momentum_primary_with_matching_pin_passes():
+    ok, ctx = _consistency(
+        {"expected_config_fingerprint": "momentum-v0-fd65161a20b29314"})
+    assert ok is True and ctx.skip_buys is False
+
+
+def test_momentum_primary_with_NO_pin_fails_closed():
+    ok, ctx = _consistency({})
+    assert ok is False and ctx.skip_buys is True
+
+
+def test_momentum_primary_with_MISMATCHED_pin_fails_closed():
+    ok, ctx = _consistency(
+        {"expected_config_fingerprint": "momentum-v0-0000000000000000"})
+    assert ok is False and ctx.skip_buys is True
+
+
+def test_momentum_branch_does_not_touch_the_generic_xgb_path():
+    """A non-momentum scorer must still route to the generic recipe check —
+    proven by it NOT short-circuiting to the momentum branch's outcomes when
+    the momentum-only pin key is present."""
+    from renquant_pipeline.kernel.panel_pipeline import job_panel_scoring as jps
+
+    class _XgbLike:
+        kind = "panel_ltr_xgboost"
+        metadata = {"config_fingerprint": "sha256:f8fb2259b2bf1537"}
+
+    ctx = _Ctx()
+    # strict=False so the generic path degrades to a warning instead of
+    # requiring a full artifact fixture; the assertion is only that the
+    # momentum branch did not hijack the call.
+    ok = jps.LoadScorerTask._assert_config_consistency(
+        ctx, {"strict_config_consistency": False,
+              "expected_config_fingerprint": "momentum-v0-fd65161a20b29314"},
+        _XgbLike(), None)
+    assert ok is True and ctx.skip_buys is False
+
+
+# --- matrix_usable: the ONE shared usability predicate ------------------------
+
+def test_matrix_usable_lookup_scorer_accepts_zero_columns_with_rows():
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline.tasks_feature_matrix import (
+        matrix_usable,
+    )
+    s = _lookup_scorer()
+    assert matrix_usable(s, pd.DataFrame(index=["AAPL", "MSFT"])) is True
+
+
+def test_matrix_usable_rejects_zero_rows_for_everyone():
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline.tasks_feature_matrix import (
+        matrix_usable,
+    )
+    s = _lookup_scorer()
+    assert matrix_usable(s, pd.DataFrame()) is False
+    assert matrix_usable(s, None) is False
+
+
+def test_matrix_usable_feature_scorer_still_requires_columns():
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline.tasks_feature_matrix import (
+        matrix_usable,
+    )
+
+    class _FeatureScorer:
+        feature_cols = ["roc60"]
+
+    assert matrix_usable(_FeatureScorer(), pd.DataFrame(index=["AAPL"])) is False
+    ok = pd.DataFrame({"roc60": [1.0]}, index=["AAPL"])
+    assert matrix_usable(_FeatureScorer(), ok) is True

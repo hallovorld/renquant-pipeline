@@ -957,6 +957,34 @@ class LoadScorerTask(Task):
         path: Path | None,
     ) -> bool:
         strict = bool(panel_cfg.get("strict_config_consistency", True))
+        # Momentum primary (pipeline#258): the generic check below compares
+        # XGB-RECIPE fields (objective, lookahead_days, watchlist, sector maps)
+        # against the artifact — every one of which a momentum lookup artifact
+        # does not carry, so the comparison is apples-to-oranges and fails on
+        # a healthy lane (measured 2026-08-03: every field stored=None). The
+        # momentum kind carries its OWN fingerprint scheme
+        # (`momentum-<params_version>-<16hex>`, stamped by the trainer and
+        # re-derived by the serving loader); consistency for this kind is an
+        # exact match between that stamp and a pin the PROFILE must declare.
+        # No pin → fail closed (an absent expectation is not a passed one).
+        if getattr(scorer, "kind", None) == "momentum_residual":
+            expected = panel_cfg.get("expected_config_fingerprint")
+            actual = (getattr(scorer, "metadata", {}) or {}).get("config_fingerprint")
+            if not expected:
+                log.error(
+                    "LoadScorerTask: kind=momentum_residual as PRIMARY requires "
+                    "panel_scoring.expected_config_fingerprint (the artifact "
+                    "stamps %r) — refusing to serve an unpinned lookup artifact.",
+                    actual)
+                _fail_closed_panel_scoring(ctx, "panel_scorer_config_mismatch")
+                return False
+            if str(expected) != str(actual):
+                log.error(
+                    "LoadScorerTask: momentum config-fingerprint MISMATCH — "
+                    "profile pins %r, artifact stamps %r.", expected, actual)
+                _fail_closed_panel_scoring(ctx, "panel_scorer_config_mismatch")
+                return False
+            return True
         try:
             from renquant_common.config_consistency import (  # noqa: PLC0415
                 assert_consistent, ConfigModelMismatch,
@@ -1141,7 +1169,11 @@ class ApplyScoresTask(Task):
     def run(self, ctx: InferenceContext) -> bool | None:
         scorer: PanelScorer = getattr(ctx, "_panel_scorer", None)
         X = getattr(ctx, "_panel_matrix", None)
-        if scorer is None or X is None or X.empty:
+        # Shared predicate with AssembleInferenceMatrixTask (pipeline#258): a
+        # matrix-less scorer (feature_cols == [], momentum lookup) needs only
+        # ROWS; a 0-column frame is its designed input, not a missing matrix.
+        from .tasks_feature_matrix import matrix_usable  # noqa: PLC0415
+        if scorer is None or not matrix_usable(scorer, X):
             if getattr(ctx, "candidates", None):
                 reason = (
                     "panel_scorer_missing"

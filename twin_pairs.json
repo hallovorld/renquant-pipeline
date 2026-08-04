@@ -15,7 +15,7 @@
       "public_sha256": "6402d10d85c9ebd66a870007a237afe94ed53f1e7569b5a5e332848529f6816a"
     },
     "ApplyScoresTask": {
-      "kernel_sha256": "5cf79a1be9706ea1d711630964eb32bc5c9e578c889ec201023811e8eddf58d2",
+      "kernel_sha256": "3b5f35bd86375b060f26bde399d6b4f86f67077c84a51bb5b33104bb7d58992d",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
@@ -71,7 +71,7 @@
       "public_sha256": "d50d1881e1802b3620689e4101d71022186fa5af2070453cdc929710da43cb6a"
     },
     "LoadScorerTask": {
-      "kernel_sha256": "869272ff155c256fd9c55b38281e8a8d0025d11855f666ddf2495c6e76263908",
+      "kernel_sha256": "09cd019e41b7577ee45f0140dc2e15f72ca3364efcacb82fd565aa5e178f5601",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,

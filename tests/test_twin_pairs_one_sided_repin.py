@@ -203,16 +203,22 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
     """The mechanism shipped with an EMPTY list (a pre-populated allowlist would
     have defeated it). The first real entry landed with pipeline#250 rollout
     step 2 — a KERNEL-only ApplyScoresTask movement whose serving-transform
-    sites exist only in the kernel copy. This pin holds the file to exactly
-    the justified entries: every entry must carry both digest tuples and a
-    non-empty reason, and adding one means updating this list in the same
-    reviewed diff."""
+    sites exist only in the kernel copy; pipeline#258 (momentum primary
+    surface) superseded that entry with its own ApplyScoresTask movement (the
+    #250 record now describes a state that no longer exists — provenance in
+    git history, chained in the new entry's reason) and added a
+    LoadScorerTask movement (kind-aware momentum consistency, kernel-only —
+    the public twin has no scorer loading to receive it). This pin holds the
+    file to exactly the justified entries: every entry must carry both digest
+    tuples and a non-empty reason, and adding one means updating this list in
+    the same reviewed diff."""
     data = json.loads((REPO / "twin_repin_exceptions.json").read_text())
     assert data["schema_version"] == 1
     entries = data["exceptions"]
     assert [(e["pair"], e["old_kernel_sha256"][:12], e["new_kernel_sha256"][:12])
             for e in entries] == [
-        ("ApplyScoresTask", "f7a73efa89d7", "5cf79a1be970"),
+        ("LoadScorerTask", "869272ff155c", "09cd019e41b7"),
+        ("ApplyScoresTask", "5cf79a1be970", "3b5f35bd8637"),
     ]
     for e in entries:
         for key in ("pair", "old_public_sha256", "old_kernel_sha256",
