@@ -71,7 +71,7 @@
       "public_sha256": "d50d1881e1802b3620689e4101d71022186fa5af2070453cdc929710da43cb6a"
     },
     "LoadScorerTask": {
-      "kernel_sha256": "09cd019e41b7577ee45f0140dc2e15f72ca3364efcacb82fd565aa5e178f5601",
+      "kernel_sha256": "ef0f915648a6f067c9903529ceba2d7048dcfb4011f81b3f43285c76fa155092",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,

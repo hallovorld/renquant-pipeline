@@ -28,14 +28,18 @@ def matrix_usable(scorer, X) -> bool:
 
     The ONE shared predicate (pipeline#258) — both the assemble task and
     ApplyScoresTask must agree, or a frame one accepts fail-closes in the
-    other. A MATRIX-LESS scorer (``feature_cols == []``, e.g. the momentum
-    lookup) legitimately produces 0 columns and needs only ROWS (tickers to
-    look up); pandas calls a 0-column frame with 88 rows "empty", which
-    fail-closed a healthy lane. Feature scorers still require columns.
+    other. A MATRIX-LESS scorer (``feature_cols == []`` EXPLICITLY declared,
+    e.g. the momentum lookup) legitimately produces 0 columns and needs only
+    ROWS (tickers to look up); pandas calls a 0-column frame with 88 rows
+    "empty", which fail-closed a healthy lane. Feature scorers still require
+    columns — and so does a MALFORMED scorer with a missing or None
+    ``feature_cols`` [codex on pipeline#259]: absence of a feature contract
+    is not a declaration of emptiness, and before #258 such a scorer failed
+    closed on a 0-column frame; that behaviour is retained.
     """
     if X is None or len(X.index) == 0:
         return False
-    matrixless = not list(getattr(scorer, "feature_cols", []) or [])
+    matrixless = getattr(scorer, "feature_cols", None) == []
     return matrixless or not X.empty
 
 log = logging.getLogger("kernel.panel_pipeline.feature_matrix")

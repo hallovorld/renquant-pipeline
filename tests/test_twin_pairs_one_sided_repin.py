@@ -217,7 +217,7 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
     entries = data["exceptions"]
     assert [(e["pair"], e["old_kernel_sha256"][:12], e["new_kernel_sha256"][:12])
             for e in entries] == [
-        ("LoadScorerTask", "869272ff155c", "09cd019e41b7"),
+        ("LoadScorerTask", "869272ff155c", "ef0f915648a6"),
         ("ApplyScoresTask", "5cf79a1be970", "3b5f35bd8637"),
     ]
     for e in entries:

@@ -752,3 +752,52 @@ def test_matrix_usable_feature_scorer_still_requires_columns():
     assert matrix_usable(_FeatureScorer(), pd.DataFrame(index=["AAPL"])) is False
     ok = pd.DataFrame({"roc60": [1.0]}, index=["AAPL"])
     assert matrix_usable(_FeatureScorer(), ok) is True
+
+
+# --- codex on pipeline#259: fail-closed regressions -----------------------------
+
+def test_momentum_pin_of_the_STRING_None_never_matches_a_missing_fingerprint():
+    """str(expected)==str(actual) equated pin "None" with actual None."""
+    ok, ctx = _consistency({"expected_config_fingerprint": "None"},
+                           fingerprint=None)
+    assert ok is False and ctx.skip_buys is True
+
+
+def test_momentum_artifact_with_NO_fingerprint_fails_closed_even_with_a_pin():
+    ok, ctx = _consistency(
+        {"expected_config_fingerprint": "momentum-v0-fd65161a20b29314"},
+        fingerprint=None)
+    assert ok is False and ctx.skip_buys is True
+
+
+def test_momentum_NON_STRING_pin_fails_closed():
+    ok, ctx = _consistency({"expected_config_fingerprint": 123},
+                           fingerprint="momentum-v0-fd65161a20b29314")
+    assert ok is False and ctx.skip_buys is True
+
+
+def test_matrix_usable_scorer_with_NO_feature_cols_attribute_fails_closed():
+    """Absence of a feature contract is not a declaration of emptiness — a
+    malformed scorer with a 0-column frame failed closed before #258 and must
+    keep doing so."""
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline.tasks_feature_matrix import (
+        matrix_usable,
+    )
+
+    class _NoContract:
+        pass
+
+    assert matrix_usable(_NoContract(), pd.DataFrame(index=["AAPL"])) is False
+
+
+def test_matrix_usable_scorer_with_None_feature_cols_fails_closed():
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline.tasks_feature_matrix import (
+        matrix_usable,
+    )
+
+    class _NoneContract:
+        feature_cols = None
+
+    assert matrix_usable(_NoneContract(), pd.DataFrame(index=["AAPL"])) is False

@@ -970,15 +970,26 @@ class LoadScorerTask(Task):
         if getattr(scorer, "kind", None) == "momentum_residual":
             expected = panel_cfg.get("expected_config_fingerprint")
             actual = (getattr(scorer, "metadata", {}) or {}).get("config_fingerprint")
-            if not expected:
+            # NON-EMPTY STRINGS on both sides, native equality [codex on
+            # pipeline#259]: a str() comparison lets a profile pin of "None"
+            # accept an artifact with NO fingerprint — the exact green-over-
+            # malformed shape this branch exists to refuse.
+            if not (isinstance(expected, str) and expected):
                 log.error(
                     "LoadScorerTask: kind=momentum_residual as PRIMARY requires "
-                    "panel_scoring.expected_config_fingerprint (the artifact "
-                    "stamps %r) — refusing to serve an unpinned lookup artifact.",
-                    actual)
+                    "a non-empty string panel_scoring.expected_config_fingerprint "
+                    "(the artifact stamps %r) — refusing to serve an unpinned "
+                    "lookup artifact.", actual)
                 _fail_closed_panel_scoring(ctx, "panel_scorer_config_mismatch")
                 return False
-            if str(expected) != str(actual):
+            if not (isinstance(actual, str) and actual):
+                log.error(
+                    "LoadScorerTask: momentum artifact carries no usable "
+                    "config_fingerprint (got %r) — refusing an unstamped "
+                    "artifact against pin %r.", actual, expected)
+                _fail_closed_panel_scoring(ctx, "panel_scorer_config_mismatch")
+                return False
+            if expected != actual:
                 log.error(
                     "LoadScorerTask: momentum config-fingerprint MISMATCH — "
                     "profile pins %r, artifact stamps %r.", expected, actual)
