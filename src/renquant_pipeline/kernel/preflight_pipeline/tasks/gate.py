@@ -14,6 +14,9 @@ import json
 from renquant_pipeline.kernel.diagnostic_only_override import (
     evaluate_diagnostic_only_override,
 )
+from renquant_pipeline.kernel.rfc210_license import (
+    evaluate_freshness_fallback_license,
+)
 from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
@@ -101,7 +104,7 @@ class WfGateMetadataTask(PreflightTask):
             "run_at": wf.get("run_at"),
         }
         if passed is False:
-            return self._fail_with_evidence(wf, details, ctx.run_mode)
+            return self._fail_with_evidence(wf, details, ctx, payload)
         if passed is True:
             if wf.get("diagnostic_only") is True:
                 verdict = evaluate_diagnostic_only_override(
@@ -149,8 +152,9 @@ class WfGateMetadataTask(PreflightTask):
         )
 
     def _fail_with_evidence(self, wf: dict, details: dict,
-                            run_mode: str | None) -> PreflightCheck:
-        if _is_sell_only_run(run_mode):
+                            ctx: PreflightContext,
+                            payload: dict | None = None) -> PreflightCheck:
+        if _is_sell_only_run(ctx.run_mode):
             return PreflightCheck(
                 self.check_name, "soft", True,
                 "active panel artifact carries failed WF gate evidence; "
@@ -158,6 +162,21 @@ class WfGateMetadataTask(PreflightTask):
                 "until a WF-passing artifact is promoted.",
                 details=details,
             )
+        # RFC #210 (2026-08-04 incident): a freshness-fallback promotion stamps
+        # passed=False BY DESIGN. The license admits buys only while the
+        # artifact stays fresh; every other passed=False hard-fails below.
+        rfc210 = evaluate_freshness_fallback_license(payload, config=ctx.config)
+        if rfc210.served:
+            details["freshness_fallback_rfc210"] = rfc210.provenance
+            return PreflightCheck(
+                self.check_name, "hard", True,
+                f"active panel artifact is {rfc210.reason}; gate-fail evidence "
+                f"acknowledged (wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
+                f"reason={wf.get('wf_reason')}) — buys admitted while the "
+                "freshness license holds.",
+                details=details,
+            )
+        details["freshness_fallback_rfc210_refused"] = rfc210.reason
         return PreflightCheck(
             self.check_name, "hard", False,
             "active panel artifact carries failed WF gate evidence: "

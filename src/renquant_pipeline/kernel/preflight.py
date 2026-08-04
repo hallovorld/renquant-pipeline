@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact_resolver import locate_artifact
+from .rfc210_license import evaluate_freshness_fallback_license
 
 log = logging.getLogger("kernel.preflight")
 
@@ -553,6 +554,22 @@ def _check_wf_gate_metadata(
                 "until a WF-passing artifact is promoted.",
                 details=details,
             )
+        # RFC #210 (2026-08-04 incident): a freshness-fallback promotion stamps
+        # passed=False BY DESIGN — the gate rejected, the freshness governance
+        # served anyway. That license admits buys only while the artifact stays
+        # fresh; every other passed=False still hard-fails below.
+        rfc210 = evaluate_freshness_fallback_license(payload, config=config)
+        if rfc210.served:
+            details["freshness_fallback_rfc210"] = rfc210.provenance
+            return PreflightCheck(
+                "P-WF-GATE", "hard", True,
+                f"active panel artifact is {rfc210.reason}; gate-fail evidence "
+                f"acknowledged (wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
+                f"reason={wf.get('wf_reason')}) — buys admitted while the "
+                "freshness license holds.",
+                details=details,
+            )
+        details["freshness_fallback_rfc210_refused"] = rfc210.reason
         return PreflightCheck(
             "P-WF-GATE", "hard", False,
             "active panel artifact carries failed WF gate evidence: "
