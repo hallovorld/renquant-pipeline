@@ -680,3 +680,49 @@ class TestBlendBrokerTag:
 
         with pytest.raises(ValueError, match="Unknown broker_name"):
             mod.live_state_path(tmp_path, "alpaca_shadow_blend2")
+
+
+# ── pipeline#260: component kind dispatch (CI-runnable refusals) ─────────────
+# The mm-dependent momentum happy paths live in
+# tests/test_blend_momentum_component.py (importorskip on the model distro);
+# these three fire BEFORE any momentum loading, so they run everywhere.
+
+def test_unknown_component_kind_fails_closed(component_artifacts):
+    config, _, _ = component_artifacts
+    config["ranking"]["panel_scoring"]["components"][1]["kind"] = "future_kind"
+    with pytest.raises(ValueError, match="unknown kind 'future_kind'"):
+        load_blend_scorer(config)
+
+
+def test_momentum_component_refuses_content_pin(component_artifacts):
+    """An append-only ledger cannot carry a byte pin — refuse, never ignore."""
+    config, _, _ = component_artifacts
+    entry = config["ranking"]["panel_scoring"]["components"][1]
+    entry["kind"] = "momentum_residual"
+    # keeps its (now-illegal) expected_content_sha256 from the fixture
+    with pytest.raises(ValueError, match="must not carry expected_content_sha256"):
+        load_blend_scorer(config)
+
+
+def test_momentum_component_missing_fp_fails_closed(component_artifacts):
+    config, _, _ = component_artifacts
+    entry = config["ranking"]["panel_scoring"]["components"][1]
+    entry["kind"] = "momentum_residual"
+    del entry["expected_content_sha256"]
+    del entry["expected_config_fingerprint"]
+    with pytest.raises(ValueError, match="missing required key 'expected_config_fingerprint'"):
+        load_blend_scorer(config)
+
+
+def test_absent_kind_is_byte_identical_classic_path(component_artifacts):
+    """The certified z(prod)+z(clf) profile carries no `kind` keys — absent
+    and explicit "panel" must load identically (same composite fp)."""
+    config, _, _ = component_artifacts
+    plain = load_blend_scorer(config)
+    for entry in config["ranking"]["panel_scoring"]["components"]:
+        entry["kind"] = "panel"
+    explicit = load_blend_scorer(config)
+    assert (plain.metadata["config_fingerprint"]
+            == explicit.metadata["config_fingerprint"])
+    assert [c.identity() for c in plain.components] == \
+           [c.identity() for c in explicit.components]
