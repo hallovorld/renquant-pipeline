@@ -36,6 +36,29 @@ load, mirroring the #211 shadow-health digest rules):
   fingerprint. Compared VERBATIM, tolerant of both forms (with or without
   the ``sha256:`` prefix on either side); no abbreviation.
 
+Component ``kind`` dispatch (pipeline#260, GOAL-8 S1)::
+
+    {"kind": "momentum_residual",                       # ledger-pointer leg
+     "artifact_path": ".../momentum_artifact_ledger.jsonl",
+     "expected_config_fingerprint": "momentum-v0-<sha16>"}
+
+* Absent ``kind`` (or ``"panel"``) = the classic direct-artifact leg above —
+  byte-identical behavior; the certified z(prod)+z(clf) profile carries no
+  ``kind`` keys.
+* ``momentum_residual`` loads through ``load_momentum_residual_scorer``
+  (single-read snapshot → chain → tail dated artifact → sha both directions
+  → row↔artifact parity → golden reproduction). ``expected_content_sha256``
+  is REFUSED (append-only ledger = byte pin stale by design; the chain + the
+  tail row's artifact sha are the swap anchors) and
+  ``expected_config_fingerprint`` pins the RECIPE — the loader-stamped
+  ``momentum-<params_version>-<sha256(canonical params)[:16]>``, stable
+  across weekly publishes with unchanged frozen params.
+* Any other ``kind`` fails closed (inverted default, no fall-through).
+* Cross-section semantics UNCHANGED: a leg's unscored names stay NaN and
+  NaN propagates through the sum, so the composite scores the INTERSECTION
+  of the legs' scored universes. The S1 prereg freezes this semantic
+  explicitly before any run.
+
 Failure semantics:
 
 * Either component fails to LOAD (missing file, bad JSON, pin mismatch,
@@ -82,6 +105,18 @@ BLEND_KIND = "blend"
 REQUIRED_COMPONENT_KEYS = (
     "artifact_path",
     "expected_content_sha256",
+    "expected_config_fingerprint",
+)
+# pipeline#260 (GOAL-8 S1): per-component kind dispatch. Absent `kind` means
+# the classic direct-artifact leg — byte-identical behavior for the certified
+# z(prod)+z(clf) profile, whose config carries no `kind` keys. The momentum
+# leg loads through the ledger-chain loader instead and pins the RECIPE
+# (params fingerprint), never file bytes (append-only ledger = stale by
+# design; same refusal the umbrella candidate-pin gate enforces).
+PANEL_COMPONENT_KIND = "panel"
+MOMENTUM_COMPONENT_KIND = "momentum_residual"
+MOMENTUM_COMPONENT_REQUIRED_KEYS = (
+    "artifact_path",
     "expected_config_fingerprint",
 )
 N_COMPONENTS = 2
@@ -292,6 +327,76 @@ def _resolve_component_path(ref: str, strategy_dir: Any) -> Path:
     return resolved.path
 
 
+def _load_momentum_component(
+    i: int, entry: dict, strategy_dir: Any
+) -> BlendComponent:
+    """Load + pin-verify a ``kind: momentum_residual`` component.
+
+    The heavy verification (single-read ledger snapshot, chain, tail dated
+    artifact, content sha both directions, row↔artifact parity, golden
+    reproduction) is the ONE existing loader —
+    ``load_momentum_residual_scorer`` — never reimplemented here.
+
+    Identity contract differs from a classic leg BY DESIGN:
+
+    * ``expected_content_sha256`` is REFUSED: the ledger is append-only and
+      changes on every weekly publish, so a byte pin is stale by design (the
+      same refusal the umbrella candidate-pin gate enforces on ledger
+      pointers). The chain + the tail row's artifact sha are the
+      swap-detection anchors.
+    * ``expected_config_fingerprint`` is REQUIRED and pins the RECIPE: the
+      loader stamps ``momentum-<params_version>-<sha256(canonical params)[:16]>``
+      (recomputable from the artifact by any reader), stable across weekly
+      publishes with unchanged frozen params.
+
+    A chain-verified EMPTY ledger raises ``ShadowNotYetPublished`` from the
+    inner loader; for a blend PRIMARY that is fail-closed (the composite
+    cannot exist), matching the panel_scorer_load_failed funnel semantics.
+    """
+    from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (  # noqa: PLC0415
+        load_momentum_residual_scorer,
+    )
+
+    if entry.get("expected_content_sha256"):
+        raise ValueError(
+            f"blend component[{i}] (momentum_residual) must not carry "
+            "expected_content_sha256 — the append-only ledger changes on "
+            "every weekly publish, so a byte pin is stale by design; pin "
+            "expected_config_fingerprint (the params fingerprint) instead")
+    for key in MOMENTUM_COMPONENT_REQUIRED_KEYS:
+        if not entry.get(key):
+            raise ValueError(
+                f"blend component[{i}] (momentum_residual) missing required "
+                f"key {key!r} — the recipe pin is mandatory (fail-closed)")
+    path = _resolve_component_path(str(entry["artifact_path"]), strategy_dir)
+    scorer = load_momentum_residual_scorer(path)
+    meta = getattr(scorer, "metadata", {}) or {}
+    observed_fp = meta.get("config_fingerprint")
+    if not config_fp_pin_matches(
+            entry["expected_config_fingerprint"], observed_fp):
+        raise ValueError(
+            f"blend component[{i}] (momentum_residual) config_fingerprint "
+            f"MISMATCH for {path}: "
+            f"pinned={entry['expected_config_fingerprint']!r} "
+            f"observed={observed_fp!r}")
+    log.info(
+        "load_blend_scorer: component[%d] momentum_residual verified "
+        "(ledger tail row %s, cutoff %s, artifact %s, fp %s)",
+        i, meta.get("ledger_row_index"), meta.get("cutoff_date"),
+        str(meta.get("artifact_content_sha256"))[:19], observed_fp)
+    return BlendComponent(
+        scorer=scorer,
+        artifact_path=str(path),
+        # Observation, not a config pin: the served dated artifact's
+        # self-carried identity (pinned by the append-only LEDGER ROW; it
+        # legitimately changes every weekly publish).
+        content_sha256=str(meta.get("artifact_content_sha256")),
+        config_fingerprint=str(observed_fp),
+        trained_date=meta.get("trained_date"),
+        effective_train_cutoff_date=meta.get("effective_train_cutoff_date"),
+    )
+
+
 def load_blend_scorer(config: dict) -> BlendPanelScorer:
     """Load + pin-verify both components from config; fail closed on ANY gap.
 
@@ -312,6 +417,18 @@ def load_blend_scorer(config: dict) -> BlendPanelScorer:
     for i, entry in enumerate(comps_cfg):
         if not isinstance(entry, dict):
             raise ValueError(f"blend component[{i}] must be a dict, got {entry!r}")
+        comp_kind = entry.get("kind", PANEL_COMPONENT_KIND)
+        if comp_kind == MOMENTUM_COMPONENT_KIND:
+            loaded.append(_load_momentum_component(i, entry, strategy_dir))
+            continue
+        if comp_kind != PANEL_COMPONENT_KIND:
+            # Inverted default (never enumerate-and-fall-through): an
+            # unrecognized component kind is a refusal, not a classic leg.
+            raise ValueError(
+                f"blend component[{i}] declares unknown kind {comp_kind!r} — "
+                f"supported: {PANEL_COMPONENT_KIND!r} (default, direct "
+                f"artifact) or {MOMENTUM_COMPONENT_KIND!r} (ledger pointer); "
+                "fail-closed")
         for key in REQUIRED_COMPONENT_KEYS:
             if not entry.get(key):
                 raise ValueError(
@@ -357,6 +474,8 @@ def load_blend_scorer(config: dict) -> BlendPanelScorer:
 
 __all__ = [
     "BLEND_KIND",
+    "MOMENTUM_COMPONENT_KIND",
+    "PANEL_COMPONENT_KIND",
     "BlendComponent",
     "BlendPanelScorer",
     "composite_config_fingerprint",

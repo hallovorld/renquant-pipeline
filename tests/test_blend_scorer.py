@@ -680,3 +680,118 @@ class TestBlendBrokerTag:
 
         with pytest.raises(ValueError, match="Unknown broker_name"):
             mod.live_state_path(tmp_path, "alpaca_shadow_blend2")
+
+
+# ── pipeline#260: component kind dispatch (CI-runnable refusals) ─────────────
+# The mm-dependent momentum happy paths live in
+# tests/test_blend_momentum_component.py (importorskip on the model distro);
+# these three fire BEFORE any momentum loading, so they run everywhere.
+
+def test_unknown_component_kind_fails_closed(component_artifacts):
+    config, _, _ = component_artifacts
+    config["ranking"]["panel_scoring"]["components"][1]["kind"] = "future_kind"
+    with pytest.raises(ValueError, match="unknown kind 'future_kind'"):
+        load_blend_scorer(config)
+
+
+def test_momentum_component_refuses_content_pin(component_artifacts):
+    """An append-only ledger cannot carry a byte pin — refuse, never ignore."""
+    config, _, _ = component_artifacts
+    entry = config["ranking"]["panel_scoring"]["components"][1]
+    entry["kind"] = "momentum_residual"
+    # keeps its (now-illegal) expected_content_sha256 from the fixture
+    with pytest.raises(ValueError, match="must not carry expected_content_sha256"):
+        load_blend_scorer(config)
+
+
+def test_momentum_component_missing_fp_fails_closed(component_artifacts):
+    config, _, _ = component_artifacts
+    entry = config["ranking"]["panel_scoring"]["components"][1]
+    entry["kind"] = "momentum_residual"
+    del entry["expected_content_sha256"]
+    del entry["expected_config_fingerprint"]
+    with pytest.raises(ValueError, match="missing required key 'expected_config_fingerprint'"):
+        load_blend_scorer(config)
+
+
+def test_absent_kind_is_byte_identical_classic_path(component_artifacts):
+    """The certified z(prod)+z(clf) profile carries no `kind` keys — absent
+    and explicit "panel" must load identically (same composite fp)."""
+    config, _, _ = component_artifacts
+    plain = load_blend_scorer(config)
+    for entry in config["ranking"]["panel_scoring"]["components"]:
+        entry["kind"] = "panel"
+    explicit = load_blend_scorer(config)
+    assert (plain.metadata["config_fingerprint"]
+            == explicit.metadata["config_fingerprint"])
+    assert [c.identity() for c in plain.components] == \
+           [c.identity() for c in explicit.components]
+
+
+def test_momentum_dispatch_hermetic_success_path(component_artifacts, tmp_path, monkeypatch):
+    """[codex on pipeline#261] Hermetic CI-runnable SUCCESS path: the real
+    dispatch, late loader import, metadata→BlendComponent identity mapping,
+    recipe-pin comparison, and composite construction all execute on hosted
+    CI by monkeypatching the ONE momentum loader to return a minimal scorer
+    with stamped metadata. The real ledger-chain loader keeps its own
+    higher-fidelity coverage in tests/test_blend_momentum_component.py
+    (sibling model distro) — this test is about the blend-side plumbing."""
+    from renquant_pipeline.kernel.panel_pipeline import momentum_residual_scorer as mrs
+
+    ledger = tmp_path / "momentum" / "momentum_artifact_ledger.jsonl"
+    ledger.parent.mkdir(parents=True)
+    ledger.write_text("", encoding="utf-8")  # resolution needs existence only
+
+    momentum_fp = "momentum-v0-aaaaaaaaaaaaaaaa"
+    stamped = {
+        "kind": "momentum_residual",
+        "cutoff_date": "2026-07-31",
+        "effective_train_cutoff_date": "2026-07-31",
+        "trained_date": "2026-08-01",
+        "config_fingerprint": momentum_fp,
+        "artifact_content_sha256": "sha256:feedfacefeedface",
+        "ledger_row_index": 3,
+    }
+    seen_paths = []
+
+    def _fake_loader(path):
+        seen_paths.append(Path(path))
+        return mrs.MomentumResidualScorer(
+            scores={"AAA": 1.5, "BBB": -0.5, "CCC": 0.25}, metadata=stamped)
+
+    monkeypatch.setattr(mrs, "load_momentum_residual_scorer", _fake_loader)
+
+    config, _, _ = component_artifacts
+    entry = config["ranking"]["panel_scoring"]["components"][1]
+    entry.clear()
+    entry.update({
+        "kind": "momentum_residual",
+        "artifact_path": str(ledger),
+        "expected_config_fingerprint": momentum_fp,
+    })
+    scorer = load_blend_scorer(config)
+
+    # dispatch reached the ONE loader with the RESOLVED path
+    assert seen_paths == [ledger]
+    comp = scorer.components[1]
+    # metadata → BlendComponent identity mapping, field by field
+    assert comp.artifact_path == str(ledger)
+    assert comp.content_sha256 == "sha256:feedfacefeedface"
+    assert comp.config_fingerprint == momentum_fp
+    assert comp.trained_date == "2026-08-01"
+    assert comp.effective_train_cutoff_date == "2026-07-31"
+    # composite recipe over both stored fps verbatim
+    assert scorer.metadata["config_fingerprint"] == \
+        composite_config_fingerprint([PROD_FP, momentum_fp])
+    # the composite SCORES on CI: momentum leg is matrix-less (index lookup)
+    idx = ["AAA", "BBB", "CCC", "ZZZ"]
+    matrix = pd.DataFrame(
+        {"f1": [0.5, -0.5, 1.0, 0.0], "f2": [0.1, 0.2, -0.1, 0.3]}, index=idx)
+    out = scorer.score(matrix)
+    assert np.isfinite(out.loc[["AAA", "BBB", "CCC"]]).all()
+    assert np.isnan(out.loc["ZZZ"])  # intersection semantic
+
+    # recipe-pin mismatch refuses through the SAME hermetic path
+    entry["expected_config_fingerprint"] = "momentum-v0-bbbbbbbbbbbbbbbb"
+    with pytest.raises(ValueError, match="config_fingerprint MISMATCH"):
+        load_blend_scorer(config)
