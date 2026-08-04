@@ -182,6 +182,7 @@ OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
     "preflight_pipeline",
     "realized_pnl",
     "regime",
+    "rfc210_license",
     "regime_hmm",
     "regime_resolver",
     "rotation",
