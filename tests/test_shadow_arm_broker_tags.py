@@ -102,3 +102,31 @@ def test_kernel_reexport_sees_new_tags() -> None:
     assert exported is not None
     assert SHADOW_ARM_TAGS[0] in exported.ALLOWED_BROKERS
     assert SHADOW_ARM_TAGS[1] in exported.ALLOWED_BROKERS
+
+
+# --- GOAL-8 S1 momentum-blend lane tag (2026-08-04) -----------------------------
+#
+# Measured on S1 session 1: the daily Step-5b shadow-blend-mom run raised
+# ValueError from _safe_broker because 'alpaca_shadow_blend_mom' was never
+# added here when the lane's profile/rail landed (RQ#563) — the producer
+# gained a consumer the allowlist never learned. Same-day second instance of
+# that class (P-WF-GATE / RFC#210 was the first).
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+def test_blend_mom_tag_accepted_in_both_copies(mod, tmp_path) -> None:
+    assert "alpaca_shadow_blend_mom" in mod.ALLOWED_BROKERS
+    assert mod._safe_broker("alpaca_shadow_blend_mom") == "alpaca_shadow_blend_mom"
+
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+def test_blend_mom_state_disjoint_from_blend_and_legacy(mod, tmp_path) -> None:
+    tags = ("alpaca_shadow", "alpaca_shadow_blend", "alpaca_shadow_blend_mom")
+    state_files = {mod.live_state_path(tmp_path, t) for t in tags}
+    db_files = {mod.runs_db_path(tmp_path / "runs.db", t) for t in tags}
+    assert len(state_files) == 3
+    assert len(db_files) == 3
+    # no suffix-prefix confusion with the un-suffixed blend tag
+    assert mod.runs_db_path(tmp_path / "runs.db", "alpaca_shadow_blend_mom").name == (
+        "runs.alpaca_shadow_blend_mom.db")
+    assert mod.runs_db_path(tmp_path / "runs.db", "alpaca_shadow_blend").name == (
+        "runs.alpaca_shadow_blend.db")

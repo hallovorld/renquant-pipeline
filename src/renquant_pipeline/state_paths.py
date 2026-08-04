@@ -35,6 +35,7 @@ ALLOWED_BROKERS: frozenset[str] = frozenset({
     "alpaca_shadow_a",  # D6-§2a two-arm admission experiment, arm S-0.5
     "alpaca_shadow_b",  # D6-§2a two-arm admission experiment, arm S-1.0 (control)
     "alpaca_shadow_blend",  # 2026-07-27 shadow_blend lane (blend kind; umbrella#535 mirror)
+    "alpaca_shadow_blend_mom",  # 2026-08-04 GOAL-8 S1 momentum-blend shadow lane (RQ#563 Step 5b) — measured missing on session 1: state write raised ValueError
     "ibkr",
 })
 
