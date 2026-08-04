@@ -875,3 +875,23 @@ def test_as_of_loader_no_qualifying_row_is_none(tmp_path):
         session_date="2026-07-01",  # before any cutoff
         session_cutoff_utc="2026-07-01T20:00:00+00:00")
     assert got is None
+
+
+def test_as_of_loader_broken_chain_is_none(tmp_path):
+    """[codex on #262] The caller-facing failure mapping for a BAD LEDGER:
+    a chain whose row was edited without resealing (row_sha no longer
+    recomputes) yields None from the as-of loader — a coverage miss for
+    the readout, never an exception or a served guess."""
+    root = _momentum_root(tmp_path)
+    _publish(root, PREV_CUTOFF, seed=7)
+    _publish(root, CUTOFF, seed=9)
+    ledger = root / "momentum_artifact_ledger.jsonl"
+    rows = [json.loads(l) for l in ledger.read_text().strip().splitlines()]
+    rows[0]["cutoff_date"] = "2099-01-01"   # edited WITHOUT resealing
+    ledger.write_text(
+        "".join(json.dumps(r, sort_keys=True, separators=(",", ":")) + "\n" for r in rows),
+        encoding="utf-8")
+    got = load_momentum_artifact_as_of(
+        ledger, session_date=CUTOFF,
+        session_cutoff_utc=f"{CUTOFF}T23:59:59+00:00")
+    assert got is None
