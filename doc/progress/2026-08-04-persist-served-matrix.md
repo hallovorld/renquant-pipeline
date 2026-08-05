@@ -108,3 +108,21 @@ they agree; a failed parquet build leaves the previous pair byte-identical. No
 `.incoming` survives any branch.
 
 15 tests in this file · 2468 passed, 8 skipped.
+
+## Review round 3 (codex on #268) — two things I got wrong
+
+1. **A 3,064-line unrelated file was in this PR.** `persistence_backup_check.py`
+   was sitting untracked in the pipeline working tree and my `git add -A` swept it
+   in. It is not mine and has nothing to do with the served matrix. Removed from
+   the branch with `git rm --cached`, so it returns to being untracked exactly
+   where it was — nothing on disk is deleted. `git add -A` on a repo I did not
+   personally leave clean is the mistake; the lesson is to stage explicitly.
+2. **The one-sided twin re-pin needed a `twin_repin_exceptions.json` record**, not
+   just a note in `twin_pairs.json`. That is the reviewed surface for exactly this
+   case, and CI enforces it. Entry added binding both digest tuples
+   (`bdb3f75a…`/`bc1d082dd37b` → `bdb3f75a…`/`50e7bf4b0354`) with the asymmetry
+   rationale, plus the pinned entry list in
+   `test_twin_pairs_one_sided_repin.py` updated in the same diff — which is what
+   that pin exists to force.
+
+2468 passed, 8 skipped.

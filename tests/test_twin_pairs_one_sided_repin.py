@@ -219,6 +219,12 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
             for e in entries] == [
         ("LoadScorerTask", "869272ff155c", "ef0f915648a6"),
         ("ApplyScoresTask", "5cf79a1be970", "3b5f35bd8637"),
+        # orch#703: PersistServedMatrixTask is appended to the KERNEL
+        # PanelScoringJob only. The public twin is the intraday/frozen-score
+        # chain — no NGBoost/Kelly/QualityFloor stage to record, and its matrix
+        # is a dict of EMPTY per-ticker dicts, so mirroring the task would write
+        # a file that looks like served-input evidence and contains none.
+        ("PanelScoringJob", "bc1d082dd37b", "50e7bf4b0354"),
     ]
     for e in entries:
         for key in ("pair", "old_public_sha256", "old_kernel_sha256",

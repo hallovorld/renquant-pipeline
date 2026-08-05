@@ -17,6 +17,14 @@
       "new_public_sha256": "f520e3aa565ff685a2be954a06fcb7f11ec91e584a28f00cccaefd4bc277e7ff",
       "new_kernel_sha256": "3b5f35bd86375b060f26bde399d6b4f86f67077c84a51bb5b33104bb7d58992d",
       "reason": "(supersedes the pipeline#250 entry, whose 5cf79a1be970 state this movement departs from) pipeline#258 momentum-primary surface: the kernel copy's matrix guard now delegates to the shared matrix_usable predicate (tasks_feature_matrix), which admits a 0-column frame WITH rows for a matrix-less scorer (feature_cols == [], the momentum lookup) \u2014 pandas .empty is True on 0 columns and fail-closed a healthy lane (measured 2026-08-03: X.shape=(88,0) \u2192 panel_score_matrix_missing). The public twin scores a caller-supplied dict matrix (ctx.panel_feature_matrix), builds no inference frame, and its feature-contract check deliberately BLOCKS on an empty contract \u2014 a matrix-less scorer is not servable there by design, so the guard change has no public call site. No admission behaviour changes for feature scorers on either side (matrix_usable requires columns for any scorer with a non-empty feature contract)."
+    },
+    {
+      "pair": "PanelScoringJob",
+      "old_public_sha256": "bdb3f75a6307435ce97182691ccf567405f7f57b0b8f2ae57f8c6275b8923927",
+      "old_kernel_sha256": "bc1d082dd37b10b86114e572f4afe6d66e9e5a0e8e9bbd0c03b326410fd36e73",
+      "new_public_sha256": "bdb3f75a6307435ce97182691ccf567405f7f57b0b8f2ae57f8c6275b8923927",
+      "new_kernel_sha256": "50e7bf4b03545122b618e1af00c9f94465c1a446cdbce71fd322e27135d6023c",
+      "reason": "orch#703 adds PersistServedMatrixTask to the KERNEL PanelScoringJob only, and NOT to the public twin, deliberately. The public PanelScoringJob (renquant_pipeline/panel_scoring.py) is the intraday/frozen-score chain: it has no NGBoost/GlobalCalibration/Kelly/QualityFloor stage, so the surface the sink exists to record does not exist there; and its matrix lives at ctx.panel_feature_matrix, which _StubFrozenFeatureMatrixTask fills with EMPTY per-ticker dicts. Mirroring the task would write a file that looks like served-input evidence and contains none - strictly worse than not writing it. The asymmetry is the intended behaviour, not an oversight, and the sink SKIPS rather than writing an empty matrix if it is ever reached from there."
     }
   ]
 }
