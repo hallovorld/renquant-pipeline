@@ -1,0 +1,3064 @@
+"""SQLite-backed decision-trace persistence.
+
+Every InferencePipeline run (LEAN, live, sim) writes a structured trace
+to `data/runs.db` so future analysis can introspect *why* a decision was
+made without grepping JSON logs.
+
+Schema:
+
+  pipeline_runs      — one row per InferencePipeline.run() invocation
+  candidate_scores   — per-(run, ticker) score + blocker telemetry
+  trades             — executed buys/sells with pnl + exit reason + tax
+  rotations          — rotation pairs considered (swap/rejected + diagnostics)
+  training_runs      — FullTrainingPipeline artifact metadata
+
+All writes go through `record_*` functions. If `persistence.enabled = false`
+in config, every record_* becomes a no-op — nothing is written and no DB
+file is created. Default is off.
+
+Kept `common/`-free (self-contained stdlib + sqlite3) so it runs inside
+LEAN's Docker too.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import logging
+import math
+import sqlite3
+import uuid
+from pathlib import Path
+from typing import Any, Iterable
+
+from renquant_common import record_training_run as _record_training_run
+
+log = logging.getLogger("kernel.persistence")
+_ECON_ABS_TOL = 1e-6
+_ECON_REL_TOL = 1e-6
+
+
+# ── Fill-truth vocabulary (orchestrator #484 §8 item 8, 2026-07-11) ──────────
+# The canonical order-outcome states. ``submitted`` = an intent that reached
+# the broker but has no confirmed outcome yet (the state every *_pending
+# attempt row starts in); ``unknown`` = a broker state this vocabulary does
+# not recognize (Codex #190: it must be an EXPLICIT state that can never be
+# read as canceled or unfilled — the raw value is logged, never guessed
+# into a bucket); the rest are broker-confirmed partial/terminal outcomes.
+# Pre-contract rows carry NULL (= never reconciled), distinct from
+# ``unknown`` (= reconciled to an unrecognized broker state).
+FILL_STATUS_SUBMITTED = "submitted"
+FILL_STATUS_UNKNOWN = "unknown"
+FILL_STATUS_PARTIALLY_FILLED = "partially_filled"
+FILL_STATUS_FILLED = "filled"
+FILL_STATUS_CANCELED = "canceled"
+FILL_STATUS_REJECTED = "rejected"
+FILL_STATUS_EXPIRED = "expired"
+FILL_STATUSES = frozenset({
+    FILL_STATUS_SUBMITTED,
+    FILL_STATUS_UNKNOWN,
+    FILL_STATUS_PARTIALLY_FILLED,
+    FILL_STATUS_FILLED,
+    FILL_STATUS_CANCELED,
+    FILL_STATUS_REJECTED,
+    FILL_STATUS_EXPIRED,
+})
+
+# Broker-vocabulary aliases (Alpaca order lifecycle states) → canonical.
+_FILL_STATUS_ALIASES = {
+    "new": FILL_STATUS_SUBMITTED,
+    "accepted": FILL_STATUS_SUBMITTED,
+    "pending_new": FILL_STATUS_SUBMITTED,
+    "accepted_for_bidding": FILL_STATUS_SUBMITTED,
+    "held": FILL_STATUS_SUBMITTED,
+    "partial_fill": FILL_STATUS_PARTIALLY_FILLED,
+    "partially_filled": FILL_STATUS_PARTIALLY_FILLED,
+    "fill": FILL_STATUS_FILLED,
+    "cancelled": FILL_STATUS_CANCELED,
+    "pending_cancel": FILL_STATUS_CANCELED,
+    "canceled": FILL_STATUS_CANCELED,
+}
+
+# Monotonic transition ranks (Codex #190: out-of-order broker events must
+# not rewind truth). A LOWER-ranked event arriving after a higher-ranked
+# state is stale and ignored: a late submitted/accepted can never overwrite
+# partially_filled/filled; a cancel/reject can follow a partial fill (the
+# executed quantity/price are retained) but can never overwrite a full fill;
+# a confirmed fill outranks everything (a late fill event after a recorded
+# cancel is broker truth and applies).
+_FILL_STATUS_RANK = {
+    FILL_STATUS_SUBMITTED: 1,
+    FILL_STATUS_UNKNOWN: 1,
+    FILL_STATUS_PARTIALLY_FILLED: 2,
+    FILL_STATUS_CANCELED: 3,
+    FILL_STATUS_REJECTED: 3,
+    FILL_STATUS_EXPIRED: 3,
+    FILL_STATUS_FILLED: 4,
+}
+
+
+def _parse_event_ts(value: Any) -> datetime.datetime | None:
+    """Best-effort ISO-8601 parse of a broker event timestamp.
+
+    Used only to order same-rank fill-truth events (Codex #190 round 3):
+    when parsing fails (or the value is absent) callers fall back to a
+    lexicographic string comparison, which is still correct for the
+    common case of two timestamps in the same format."""
+    if not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def normalize_fill_status(value: Any) -> str | None:
+    """Broker/producer status text → canonical fill status (fail-soft).
+
+    Canonical values pass through; known broker aliases map; anything else
+    maps to the EXPLICIT ``unknown`` state (logged with the raw value —
+    Codex #190: an unrecognized broker state must never be interpretable as
+    canceled or unfilled, and must stay observable); empty/None stays None."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in FILL_STATUSES:
+        return text
+    if text in _FILL_STATUS_ALIASES:
+        return _FILL_STATUS_ALIASES[text]
+    log.warning("fill-truth: unrecognized broker order status %r -> 'unknown'", value)
+    return FILL_STATUS_UNKNOWN
+
+
+# ── Schema ────────────────────────────────────────────────────────────────────
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id           TEXT PRIMARY KEY,
+    run_date         DATE NOT NULL,
+    run_type         TEXT NOT NULL,
+    strategy         TEXT,
+    regime           TEXT,
+    confidence       REAL,
+    portfolio_value  REAL,
+    cash             REAL,
+    n_candidates     INTEGER,
+    n_exits          INTEGER,
+    n_rotations      INTEGER,
+    n_buys           INTEGER,
+    buy_blocked      INTEGER,
+    skip_buys        INTEGER,
+    bear_only        INTEGER,
+    counters_json    TEXT,
+    run_bundle_json  TEXT,
+    commit_sha       TEXT,
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_date ON pipeline_runs(run_date);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_strategy ON pipeline_runs(strategy);
+
+CREATE TABLE IF NOT EXISTS candidate_scores (
+    run_id         TEXT,
+    ticker         TEXT,
+    role           TEXT,
+    raw_score      REAL,
+    rank_score     REAL,
+    panel_score    REAL,
+    rs_score       REAL,
+    mu             REAL,
+    sigma          REAL,
+    selected       INTEGER,
+    blocked_by     TEXT,
+    -- Audit fix DB-DECISION-FACTORS (2026-04-26 round-5): per user spec
+    -- "每天的所有股票的 decision factor 都要记到数据库里". Capture
+    -- additional factors that drove this bar's decision so post-hoc
+    -- analysis can reconstruct WHY each ticker was selected/blocked.
+    expected_return    REAL,        -- calibrated ER (drives rotation)
+    expected_return_horizon_days INTEGER,
+    kelly_target_pct   REAL,        -- Kelly sizing target (μ/σ²)
+    model_type         TEXT,        -- selecting model: active panel scorer (e.g. 'hf_patchtst' | 'xgb') when panel scoring is on, else per-ticker model
+    active_scorer      TEXT,        -- ACTIVE panel scorer identity (2026-06-07 audit); NULL when panel scoring off
+    legacy_model_type  TEXT,        -- stale per-ticker label: 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
+    sector             TEXT,        -- from sector_map, easier than join
+    panel_ltr_artifact TEXT,        -- 'panel-ltr.json' filename or full path
+    mu_horizon_days    INTEGER,
+    qp_delta_w         REAL,        -- QP optimized delta weight for this ticker
+    qp_target_w        REAL,        -- QP optimized target weight for this ticker
+    qp_status          TEXT,        -- optimizer status attached to this row
+    PRIMARY KEY (run_id, ticker, role),
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_cand_ticker ON candidate_scores(ticker);
+
+CREATE TABLE IF NOT EXISTS trades (
+    run_id         TEXT,
+    trade_date     DATE,
+    ticker         TEXT,
+    action         TEXT,
+    shares         REAL,
+    price          REAL,
+    invest         REAL,
+    target_pct     REAL,
+    exit_reason    TEXT,
+    pnl_pct        REAL,
+    hold_days      INTEGER,
+    tax            REAL,
+    gross_pnl      REAL,
+    proceeds_basis REAL,
+    net_pnl_after_tax REAL,
+    tax_cash_debited REAL,
+    tax_cash_debit_mode TEXT,
+    tax_lot_method TEXT,
+    rank_score     REAL,
+    conviction     REAL,
+    sigma_mult     REAL,
+    mu             REAL,
+    mu_horizon_days INTEGER,
+    sigma          REAL,
+    panel_score    REAL,
+    rs_score       REAL,
+    expected_return REAL,
+    expected_return_horizon_days INTEGER,
+    kelly_target_pct REAL,
+    model_type     TEXT,
+    active_scorer  TEXT,
+    legacy_model_type TEXT,
+    sector         TEXT,
+    blocked_by     TEXT,
+    qp_delta_w     REAL,
+    qp_target_w    REAL,
+    qp_status      TEXT,
+    regime         TEXT,
+    confidence     REAL,
+    order_type     TEXT,
+    source         TEXT,
+    source_job     TEXT,
+    source_task    TEXT,
+    order_source   TEXT,
+    attribution_version TEXT,
+    score_snapshot_json  TEXT,
+    decision_inputs_json TEXT,
+    -- Fill-truth contract (orchestrator #484 §7.3 / §8 item 8, 2026-07-11).
+    -- The trades table records ORDER INTENTS (buy_pending / sell_pending
+    -- attempt rows) alongside executed rows, but pre-contract NOTHING
+    -- distinguished a canceled intent from a broker fill: the #484 forensics
+    -- found 5 ZM "buy_pending" rows and 0 broker fills — every DB consumer
+    -- systematically overcounted buys and basic facts required the broker
+    -- API. Additive columns; pre-contract rows read back with NULLs
+    -- (= outcome unknown, not "filled").
+    -- Round-3 addition (Codex #190 review): broker_order_id alone is not a
+    -- unique row identity (legitimately duplicated across runs/resubmits),
+    -- so canonical order identity for record_order_outcomes matching is the
+    -- pair (broker_account_id, broker_order_id). Additive/NULL for rows
+    -- written before this column existed, same as the rest of this block.
+    broker_account_id TEXT,      -- broker account id; part of canonical order identity
+    broker_order_id TEXT,        -- broker-assigned order id (Alpaca uuid)
+    fill_status     TEXT,        -- submitted|partially_filled|filled|canceled|rejected|expired
+    filled_qty      REAL,        -- broker-confirmed filled quantity
+    fill_price      REAL,        -- broker-confirmed average fill price
+    fill_updated_at TEXT,        -- ISO-8601 UTC of the last outcome update
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker);
+CREATE INDEX IF NOT EXISTS idx_trades_action ON trades(action);
+
+CREATE TABLE IF NOT EXISTS rotations (
+    run_id        TEXT,
+    cand_ticker   TEXT,
+    held_ticker   TEXT,
+    decision      TEXT,
+    cand_er       REAL,
+    held_er       REAL,
+    raw_adv       REAL,
+    net_adv       REAL,
+    tax_drag      REAL,
+    threshold     REAL,
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rotations_swap ON rotations(cand_ticker, held_ticker);
+
+-- Daily portfolio risk metrics — computed from pipeline_runs.portfolio_value
+-- time series. The user's goal is Sharpe=2.0 on the golden config; without
+-- tracking Sharpe over time we can't measure progress. Backfilled + updated
+-- by scripts/compute_portfolio_metrics.py. Supports both live + sim roles.
+CREATE TABLE IF NOT EXISTS portfolio_daily_metrics (
+    as_of_date      DATE NOT NULL,
+    run_type        TEXT NOT NULL,    -- 'live' | 'sim' | 'lean'
+    strategy        TEXT,
+    portfolio_value REAL,
+    daily_return    REAL,             -- one-day simple return
+    -- Rolling windows (trading days)
+    sharpe_21d      REAL,             -- 1-month rolling Sharpe (annualized)
+    sharpe_63d      REAL,             -- 3-month rolling Sharpe (annualized)
+    sharpe_252d     REAL,             -- 1-year rolling Sharpe (annualized)
+    realized_vol_21d REAL,            -- annualized stdev of daily returns, 21d
+    realized_vol_252d REAL,           -- annualized stdev, 252d
+    max_drawdown_252d REAL,           -- max peak-to-trough drawdown, 252d window
+    var_95_21d      REAL,             -- 95%-VaR (1-day), 21-day empirical
+    var_99_21d      REAL,             -- 99%-VaR
+    beta_spy_252d   REAL,             -- regression beta vs SPY over 252d
+    computed_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (as_of_date, run_type, strategy)
+);
+CREATE INDEX IF NOT EXISTS idx_pdm_date ON portfolio_daily_metrics(as_of_date);
+
+-- Plan S — per-bar snapshots of live_state.json for historical audit.
+-- The JSON file is the source of truth for live state (fast bootstrap, human-
+-- editable). These rows are an append-only audit trail: "what did live_state
+-- look like at the close of run R?". Indexed fields allow quick queries
+-- without parsing the blob.
+CREATE TABLE IF NOT EXISTS live_state_snapshots (
+    run_id          TEXT PRIMARY KEY,    -- FK to pipeline_runs.run_id
+    run_date        DATE NOT NULL,
+    strategy        TEXT,
+    regime          TEXT,
+    confidence      REAL,
+    high_water_mark REAL,
+    cash            REAL,
+    portfolio_value REAL,
+    n_holdings      INTEGER,
+    state_json      TEXT NOT NULL,       -- full state blob for later introspection
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES pipeline_runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS idx_lss_date ON live_state_snapshots(run_date);
+CREATE INDEX IF NOT EXISTS idx_lss_strategy ON live_state_snapshots(strategy);
+
+-- Plan AA — forward returns keyed by (date, ticker). Decoupled from the
+-- candidate_scores row so we can backfill out-of-band once N days have
+-- elapsed since the decision. Populated by `scripts/backfill_forward_returns.py`.
+CREATE TABLE IF NOT EXISTS ticker_forward_returns (
+    as_of_date  DATE NOT NULL,   -- decision date (matches pipeline_runs.run_date)
+    ticker      TEXT NOT NULL,
+    close_price REAL,            -- close on as_of_date (base for the % changes)
+    fwd_1d      REAL,            -- close[t+1]/close[t] - 1
+    fwd_5d      REAL,
+    fwd_10d     REAL,
+    fwd_20d     REAL,
+    fwd_60d     REAL,
+    updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (as_of_date, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_tfr_ticker ON ticker_forward_returns(ticker);
+
+CREATE TABLE IF NOT EXISTS training_runs (
+    run_id         TEXT PRIMARY KEY,
+    run_date       TIMESTAMP NOT NULL,
+    strategy       TEXT,
+    artifact_type  TEXT,
+    config_json    TEXT,
+    oos_mean_ic    REAL,
+    train_ic       REAL,
+    n_rows         INTEGER,
+    feature_cols   TEXT,
+    artifact_path  TEXT,
+    commit_sha     TEXT,
+    created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    -- Round 5 additions: explicit training-time metadata per user spec
+    elapsed_sec    REAL,
+    trigger        TEXT,         -- 'scheduled_weekly' | 'anomaly_spy_2pct' | 'anomaly_vix_5pct' | 'manual' | 'cadence_daily' | 'backtest'
+    n_tickers      INTEGER,
+    n_dates        INTEGER,
+    n_features     INTEGER,
+    device         TEXT,         -- 'mps' | 'cuda' | 'cpu' | 'n/a'
+    deterministic  INTEGER,      -- 0 = non-det, 1 = deterministic (determinstic mode is slower but bit-reproducible)
+    training_window_years REAL,  -- e.g. 5.0 when restricted to last-5-year window
+    notes          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_training_runs_date ON training_runs(run_date);
+
+-- Calibration score database (2026-04-26 round-5).
+-- Per user spec: "建立 calibrate 数据库, 这样才知道什么 score value 是 top 5%"
+-- Phase 1: collect score distribution per bar; phase 2 will use these
+-- to drive percentile-based admission in JointActionTask.
+--
+-- Each row is one (date, ticker) candidate scored by the panel scorer
+-- in PanelScoringJob. Holdings ARE included (they have rank_score too).
+-- Per-(date, ticker) DAILY DECISION SNAPSHOT for ALL watchlist tickers.
+-- Per user spec 2026-04-26 round-5: "每天所有股票的 decision factor
+-- 都要记到数据库里". Unlike `candidate_scores` (only cands + holdings),
+-- this table covers EVERY watchlist ticker per bar with its FULL
+-- context — even those filtered out by universe/broker-precheck/etc.
+-- Goal: post-hoc analysis can answer "what did we KNOW about XYZ on
+-- 2026-04-26 and WHY didn't we trade it?".
+CREATE TABLE IF NOT EXISTS ticker_daily_state (
+    run_id            TEXT NOT NULL,
+    date              TEXT NOT NULL,
+    ticker            TEXT NOT NULL,
+    -- Bar-level context (joined for query convenience, denormalized)
+    regime            TEXT,
+    confidence        REAL,
+    -- Universe / broker membership
+    in_watchlist      INTEGER,        -- 1 if ticker in strategy_config.watchlist
+    in_universe       INTEGER,        -- 1 if model passed universe floor (Sharpe etc.)
+    pending_at_broker INTEGER,        -- 1 if BROKER-PRECHECK excluded this bar
+    -- Position state
+    has_position      INTEGER,        -- 1 if currently held
+    position_qty      REAL,           -- shares held (NULL if not held)
+    position_pct      REAL,           -- pct of portfolio (NULL if not held)
+    -- Model identity (2026-06-07 audit: model_type = ACTIVE panel scorer
+    -- when panel scoring is on; legacy per-ticker label kept separately)
+    model_type        TEXT,           -- 'hf_patchtst' | 'xgb' | per-ticker label when panel scoring off
+    active_scorer     TEXT,           -- active panel scorer identity, NULL when off
+    legacy_model_type TEXT,           -- 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
+    model_action      TEXT,           -- 'buy' | 'hold' | 'sell'
+    sell_streak       INTEGER,        -- only meaningful when has_position=1
+    -- Panel scores (when computed)
+    panel_score       REAL,
+    rank_score        REAL,
+    expected_return   REAL,
+    expected_return_horizon_days INTEGER,
+    kelly_target_pct  REAL,
+    mu                REAL,
+    mu_horizon_days   INTEGER,
+    sigma             REAL,
+    -- Final decision
+    in_candidates     INTEGER,        -- 1 if reached ctx.candidates (per-ticker model said buy)
+    selected          INTEGER,        -- 1 if BUY order placed this bar
+    blocked_by        TEXT,           -- reason if blocked: 'sector_cap'|'corr'|'wash_sale'|'tier'|'universe_floor'|'broker_pending'|'no_model_signal'
+    sector            TEXT,
+    qp_delta_w        REAL,           -- QP optimized delta weight for this ticker
+    qp_target_w       REAL,           -- QP optimized target weight for this ticker
+    qp_status         TEXT,           -- optimizer status attached to this row
+    model_admission_ok INTEGER,       -- 1/0 if runtime model admission evaluated
+    model_admission_reason TEXT,      -- admission blocker reason when rejected
+    current_regime_admitted INTEGER,  -- 1/0 if current runtime regime admitted buys
+    current_regime_admission_reason TEXT,
+    admitted_regimes TEXT,            -- JSON list from runtime regime-admission gate
+    blocked_regimes TEXT,             -- JSON list from runtime regime-admission gate
+    PRIMARY KEY (run_id, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_tds_date ON ticker_daily_state(date);
+CREATE INDEX IF NOT EXISTS idx_tds_ticker ON ticker_daily_state(ticker);
+
+CREATE TABLE IF NOT EXISTS score_distribution (
+    run_id        TEXT NOT NULL,
+    date          TEXT NOT NULL,        -- YYYY-MM-DD (string for sqlite friendliness)
+    run_type      TEXT,                 -- live | sim | lean
+    ticker        TEXT NOT NULL,
+    raw_panel     REAL,                 -- pre-calibration scorer output (panel_score)
+    rank_score    REAL,                 -- post-calibration probability
+    expected_return_horizon_days INTEGER,
+    mu            REAL,                 -- NGBoost μ if active
+    mu_horizon_days INTEGER,
+    sigma         REAL,                 -- NGBoost σ if active
+    regime        TEXT,                 -- BULL_CALM / etc.
+    is_holding    INTEGER DEFAULT 0,    -- 0 = candidate, 1 = held
+    model_type    TEXT,
+    active_scorer TEXT,
+    legacy_model_type TEXT,
+    sector        TEXT,
+    blocked_by    TEXT,
+    PRIMARY KEY (run_id, ticker)
+);
+CREATE INDEX IF NOT EXISTS idx_score_dist_date ON score_distribution(date);
+
+-- Daily aggregated percentiles for fast threshold lookup.
+-- Computed at end of each bar from that day's score_distribution rows.
+-- Phase 2 JointAction reads this to convert "top X%" → absolute threshold.
+CREATE TABLE IF NOT EXISTS score_percentiles_daily (
+    run_id        TEXT PRIMARY KEY,
+    date          TEXT NOT NULL,
+    run_type      TEXT,
+    n_cands       INTEGER NOT NULL,
+    p01           REAL,
+    p05           REAL,
+    p10           REAL,
+    p25           REAL,
+    p50           REAL,
+    p75           REAL,
+    p85           REAL,                 -- "top 15%"
+    p90           REAL,                 -- "top 10%"
+    p95           REAL,                 -- "top 5%"
+    p99           REAL,
+    score_min     REAL,
+    score_max     REAL,
+    score_mean    REAL,
+    score_std     REAL,
+    regime        TEXT,
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_pctiles_date ON score_percentiles_daily(date);
+
+-- Calibrator drift tracking — 1 row per training run.
+-- Operator dashboard can plot pool_ic / scorer_oos_ic over time.
+CREATE TABLE IF NOT EXISTS score_distribution_meta (
+    date              TEXT PRIMARY KEY,
+    calibrator_pool_ic REAL,
+    scorer_oos_ic     REAL,
+    base_rate         REAL,
+    threshold         REAL,
+    n_features        INTEGER,
+    artifact_path     TEXT
+);
+
+-- Phase 4 (model-selection 2026-04-26): challenger / shadow-mode log.
+-- A row per (run_id, ticker, decision_date) when a challenger artifact
+-- is enabled. Stores both the challenger's hypothetical decision and the
+-- live runner's actual decision so `compare_window()` can compute
+-- agreement / score correlation / disagreement-on-buy after a shadow
+-- period. Wired into live runner / sim in Phase 4b — schema first so
+-- the production DB is ready.
+CREATE TABLE IF NOT EXISTS challenger_decisions (
+    decision_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id                 TEXT    NOT NULL,
+    decision_date          TEXT    NOT NULL,
+    ticker                 TEXT    NOT NULL,
+    challenger_name        TEXT    NOT NULL,
+    challenger_score       REAL,
+    challenger_rank_score  REAL,
+    challenger_action      TEXT,
+    actual_score           REAL,
+    actual_action          TEXT,
+    created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_challenger_run    ON challenger_decisions(run_id);
+CREATE INDEX IF NOT EXISTS idx_challenger_window ON challenger_decisions(challenger_name, decision_date);
+
+-- GateRegistry decision ledger (eng plan S2-PR4 / errata C, 2026-06-12).
+-- One APPEND-ONLY row per gate verdict submission: turns funnel
+-- forensics ("which gate blocked buys on date D and why") into a SQL
+-- query instead of log archaeology. inputs_json carries the values the
+-- gate decided on.
+CREATE TABLE IF NOT EXISTS gate_verdicts (
+    verdict_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT    NOT NULL,
+    run_date     TEXT    NOT NULL,
+    gate         TEXT    NOT NULL,
+    scope        TEXT    NOT NULL,      -- 'book' or a ticker symbol
+    verdict      TEXT    NOT NULL,      -- allow | halve | block
+    reason       TEXT,
+    inputs_json  TEXT,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_gate_verdicts_run  ON gate_verdicts(run_id);
+CREATE INDEX IF NOT EXISTS idx_gate_verdicts_date ON gate_verdicts(run_date, gate);
+
+-- Score-distribution drift audit log (eng plan L6 sidecar item 3,
+-- 2026-06-13). Append-only PSI history so 'when did the score
+-- distribution drift, and how far' is a query, not a re-computation.
+-- Severity bands match kernel.score_drift (INFO<0.10, WARN<0.25, CRITICAL).
+CREATE TABLE IF NOT EXISTS score_drift_audits (
+    audit_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT,
+    run_date     TEXT    NOT NULL,
+    psi          REAL,
+    severity     TEXT    NOT NULL,      -- INFO | WARN | CRITICAL
+    n_baseline   INTEGER,
+    n_current    INTEGER,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_score_drift_date ON score_drift_audits(run_date);
+
+-- Broker-reconciliation action log (eng plan §III.4, 2026-06-13). One
+-- APPEND-ONLY row per non-OK reconcile() action so 'when did a position
+-- vanish externally / get quarantined / force-covered' is a query. OK
+-- actions are not logged (they are the steady state). Mirrors
+-- gate_verdicts / score_drift_audits.
+CREATE TABLE IF NOT EXISTS reconciliation_actions (
+    action_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id       TEXT,
+    run_date     TEXT    NOT NULL,
+    kind         TEXT    NOT NULL,   -- EXT_SELL | QUARANTINE | ADOPT_QTY | FORCED_COVER
+    ticker       TEXT    NOT NULL,
+    detail       TEXT,
+    state_qty    REAL,
+    broker_qty   REAL,
+    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_date ON reconciliation_actions(run_date, kind);
+
+-- Alert incident book (eng plan §12.3 / L6 alert lifecycle, 2026-06-13).
+-- Persists the escalation state machine across restarts: WITHOUT this, a
+-- daily restart resets every incident to NEW and re-escalates — exactly
+-- the noise the lifecycle exists to prevent. PK = the dedup key.
+CREATE TABLE IF NOT EXISTS alert_incidents (
+    audit         TEXT NOT NULL,
+    scope         TEXT NOT NULL,
+    cause_hash    TEXT NOT NULL,
+    first_seen    TEXT NOT NULL,
+    last_seen     TEXT NOT NULL,
+    state         TEXT NOT NULL,    -- WARN | CRITICAL | RESOLVED
+    acked         INTEGER NOT NULL DEFAULT 0,
+    notifications INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (audit, scope, cause_hash)
+);
+
+-- Trade-evaluation table (roadmap §2026-04-26 Phase 1, shipped 2026-05-02).
+-- Re-evaluates every trade at multiple horizons (1d, 5d, 7d, 14d, 28d).
+-- Joining trades × ticker_forward_returns at horizon h gives the realized
+-- forward return; comparing against SPY's same-horizon return gives the
+-- benchmark-relative outcome. Populated by:
+--   * scripts/backfill_trade_evaluations.py (nightly cron, Phase 2)
+--   * record_trade_evaluations() helper for ad-hoc evaluation
+-- Each (run_id, ticker, action, horizon_days) is unique — primary-key
+-- guarantee prevents double-counting on backfill re-runs.
+CREATE TABLE IF NOT EXISTS trade_evaluations (
+    run_id           TEXT    NOT NULL,   -- FK to pipeline_runs.run_id (= trades.run_id)
+    ticker           TEXT    NOT NULL,
+    action           TEXT    NOT NULL,   -- 'buy' or 'sell'
+    horizon_days     INTEGER NOT NULL,   -- 1, 5, 7, 14, 28 (or any positive int)
+    fwd_return       REAL,                -- ticker's realized forward return at horizon
+    fwd_return_spy   REAL,                -- SPY's forward return on same date+horizon
+    relative_return  REAL,                -- fwd_return - fwd_return_spy (excess)
+    is_winner        INTEGER,             -- 1 if relative_return > 0 else 0; NULL if missing
+    n_trade_rows     INTEGER,             -- multiplicity in case of partial sells / top-ups
+    created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (run_id, ticker, action, horizon_days)
+);
+CREATE INDEX IF NOT EXISTS idx_trade_eval_ticker  ON trade_evaluations(ticker);
+CREATE INDEX IF NOT EXISTS idx_trade_eval_horizon ON trade_evaluations(horizon_days);
+CREATE INDEX IF NOT EXISTS idx_trade_eval_run     ON trade_evaluations(run_id);
+
+-- Conviction-gate decision outcomes VIEW (gate-validation prep, 2026-06-29).
+--
+-- Per Codex review on PR #152: the three source tables ALREADY hold every
+-- fact this needs — candidate_scores carries the per-name decision factors
+-- (raw_score / mu / expected_return / rank_score / selected / blocked_by) on
+-- EVERY run via record_candidate_scores(), pipeline_runs supplies
+-- (run_date, run_type, regime), and ticker_forward_returns backfills
+-- (as_of_date, ticker) -> fwd_1d/5d/20d/60d nightly. The only gap was an
+-- ad-hoc JOIN per analysis query, which is exactly what a VIEW fixes — with
+-- no second mutable copy that can diverge, no producer wiring (the view reads
+-- live candidate_scores rows that already exist), and no unvalidated label
+-- baked into persistence.
+--
+-- The view exposes, per (run_id, ticker, role):
+--   * the decision factors (raw_score, mu, expected_return, rank_score,
+--     selected, blocked_by) and context (run_date, run_type, regime);
+--   * the realized own forward return (fwd_Nd), NULL until ticker_forward_returns
+--     backfills that horizon — so each horizon (1d/5d/20d/60d) becomes
+--     available independently, no waiting on fwd_60d; and
+--   * the BENCHMARK-RELATIVE realized return (fwd_Nd MINUS SPY's fwd_Nd for the
+--     same as_of_date), since the conviction gate is documented as calibrated
+--     E[R - SPY]. The outcome is provided benchmark-relative; cost is applied
+--     in the query layer, not stored. NO binary winner label is persisted —
+--     all experiment/label logic lives in the validation query (per Codex).
+--
+-- run_type is carried through so analysis can EXCLUDE sim (sim is
+-- look-ahead-contaminated; IC grows with horizon) and filter to live.
+CREATE VIEW IF NOT EXISTS decision_outcomes AS
+SELECT
+    cs.run_id                       AS run_id,
+    pr.run_date                     AS run_date,
+    pr.run_type                     AS run_type,
+    pr.regime                       AS regime,
+    cs.ticker                       AS ticker,
+    cs.role                         AS role,
+    cs.raw_score                    AS raw_score,
+    cs.mu                           AS mu,
+    cs.expected_return              AS expected_return,
+    cs.rank_score                   AS rank_score,
+    cs.selected                     AS selected,
+    cs.blocked_by                   AS blocked_by,
+    tfr.fwd_1d                      AS fwd_1d,
+    tfr.fwd_5d                      AS fwd_5d,
+    tfr.fwd_20d                     AS fwd_20d,
+    tfr.fwd_60d                     AS fwd_60d,
+    -- Benchmark-relative realized return = own fwd_Nd - SPY fwd_Nd (same
+    -- as_of_date). NULL when either leg is unrealized.
+    (tfr.fwd_1d  - spy.fwd_1d)      AS rel_fwd_1d,
+    (tfr.fwd_5d  - spy.fwd_5d)      AS rel_fwd_5d,
+    (tfr.fwd_20d - spy.fwd_20d)     AS rel_fwd_20d,
+    (tfr.fwd_60d - spy.fwd_60d)     AS rel_fwd_60d
+FROM candidate_scores cs
+JOIN pipeline_runs pr
+  ON pr.run_id = cs.run_id
+LEFT JOIN ticker_forward_returns tfr
+  ON tfr.ticker     = cs.ticker
+ AND tfr.as_of_date = pr.run_date
+LEFT JOIN ticker_forward_returns spy
+  ON spy.ticker     = 'SPY'
+ AND spy.as_of_date = pr.run_date;
+"""
+
+
+# Idempotent column migrations for tables created before a column was added.
+# SQLite's `CREATE TABLE IF NOT EXISTS` is a no-op on pre-existing tables, so
+# any column added to _SCHEMA_SQL after first creation must also be listed here.
+_COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "pipeline_runs": [
+        ("buy_blocked",   "INTEGER"),
+        ("skip_buys",     "INTEGER"),
+        ("bear_only",     "INTEGER"),
+        ("counters_json", "TEXT"),
+        ("run_bundle_json", "TEXT"),
+    ],
+    "training_runs": [
+        ("elapsed_sec",           "REAL"),
+        ("trigger",               "TEXT"),
+        ("n_tickers",             "INTEGER"),
+        ("n_dates",               "INTEGER"),
+        ("n_features",            "INTEGER"),
+        ("device",                "TEXT"),
+        ("deterministic",         "INTEGER"),
+        ("training_window_years", "REAL"),
+        ("notes",                 "TEXT"),
+    ],
+    # Audit fix DB-DECISION-FACTORS (2026-04-26 round-5): migrate
+    # existing candidate_scores tables to add the new factor columns.
+    "candidate_scores": [
+        ("expected_return",    "REAL"),
+        ("expected_return_horizon_days", "INTEGER"),
+        ("kelly_target_pct",   "REAL"),
+        ("model_type",         "TEXT"),
+        ("sector",             "TEXT"),
+        ("panel_ltr_artifact", "TEXT"),
+        ("mu_horizon_days",    "INTEGER"),
+        ("qp_delta_w",         "REAL"),
+        ("qp_target_w",        "REAL"),
+        ("qp_status",          "TEXT"),
+        ("active_scorer",      "TEXT"),
+        ("legacy_model_type",  "TEXT"),
+    ],
+    "ticker_daily_state": [
+        ("qp_delta_w",         "REAL"),
+        ("qp_target_w",        "REAL"),
+        ("qp_status",          "TEXT"),
+        ("expected_return_horizon_days", "INTEGER"),
+        ("mu_horizon_days",    "INTEGER"),
+        ("model_admission_ok", "INTEGER"),
+        ("model_admission_reason", "TEXT"),
+        ("current_regime_admitted", "INTEGER"),
+        ("current_regime_admission_reason", "TEXT"),
+        ("admitted_regimes", "TEXT"),
+        ("blocked_regimes", "TEXT"),
+        ("active_scorer", "TEXT"),
+        ("legacy_model_type", "TEXT"),
+    ],
+    "score_distribution": [
+        ("run_type",                    "TEXT"),
+        ("expected_return_horizon_days", "INTEGER"),
+        ("mu_horizon_days",             "INTEGER"),
+        ("model_type",                  "TEXT"),
+        ("active_scorer",               "TEXT"),
+        ("legacy_model_type",           "TEXT"),
+        ("sector",                      "TEXT"),
+        ("blocked_by",                  "TEXT"),
+    ],
+    "score_percentiles_daily": [
+        ("run_type",                    "TEXT"),
+    ],
+    # 2026-05-22: persist the per-trade decision tree, not just scalar P&L.
+    # Buy orders already carry order-attribution fields at emission time;
+    # sell events carry exit diagnostics. These columns make the executed
+    # trade table replayable without joining back to JSON logs.
+    "trades": [
+        ("trade_date",            "DATE"),
+        ("order_type",            "TEXT"),
+        ("source",                "TEXT"),
+        ("source_job",            "TEXT"),
+        ("source_task",           "TEXT"),
+        ("order_source",          "TEXT"),
+        ("attribution_version",   "TEXT"),
+        ("score_snapshot_json",   "TEXT"),
+        ("decision_inputs_json",  "TEXT"),
+        ("gross_pnl",             "REAL"),
+        ("proceeds_basis",        "REAL"),
+        ("net_pnl_after_tax",     "REAL"),
+        ("tax_cash_debited",      "REAL"),
+        ("tax_cash_debit_mode",   "TEXT"),
+        ("tax_lot_method",        "TEXT"),
+        ("mu_horizon_days",       "INTEGER"),
+        ("panel_score",           "REAL"),
+        ("rs_score",              "REAL"),
+        ("expected_return",       "REAL"),
+        ("expected_return_horizon_days", "INTEGER"),
+        ("kelly_target_pct",      "REAL"),
+        ("model_type",            "TEXT"),
+        ("active_scorer",         "TEXT"),
+        ("legacy_model_type",     "TEXT"),
+        ("sector",                "TEXT"),
+        ("blocked_by",            "TEXT"),
+        ("qp_delta_w",            "REAL"),
+        ("qp_target_w",           "REAL"),
+        ("qp_status",             "TEXT"),
+        ("regime",                "TEXT"),
+        ("confidence",            "REAL"),
+        # Fill-truth contract (orchestrator #484 §8 item 8, 2026-07-11):
+        # additive — pre-existing DBs gain the columns; old rows stay
+        # readable with NULLs (= outcome unknown, never assumed filled).
+        ("broker_order_id",       "TEXT"),
+        ("fill_status",           "TEXT"),
+        ("filled_qty",            "REAL"),
+        ("fill_price",            "REAL"),
+        ("fill_updated_at",       "TEXT"),
+        # Round-3 (Codex #190): canonical order identity is
+        # (broker_account_id, broker_order_id), not broker_order_id alone.
+        ("broker_account_id",     "TEXT"),
+    ],
+    "ticker_forward_returns": [
+        ("fwd_60d",               "REAL"),
+    ],
+}
+
+
+def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return [r[1] for r in sorted((r for r in rows if int(r[5] or 0) > 0),
+                                 key=lambda r: int(r[5]))]
+
+
+def _has_table(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _finite_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def _sell_economics_are_valid(
+    gross_pnl: Any,
+    tax: Any,
+    net_pnl_after_tax: Any,
+) -> bool:
+    """Validate realized sell accounting invariants.
+
+    The trace DB is an audit surface, so sell rows must satisfy basic
+    accounting identities before downstream analysis trusts them:
+
+    ``net_pnl_after_tax == gross_pnl - tax``; tax is finite/non-negative;
+    losses do not carry positive tax; and tax cannot exceed positive gross
+    P&L. Annual netting may lower the eventual tax bill, but it cannot make an
+    event-level row internally inconsistent.
+    """
+    gross = _finite_float(gross_pnl)
+    tax_v = _finite_float(tax)
+    net = _finite_float(net_pnl_after_tax)
+    if gross is None or tax_v is None or net is None:
+        return False
+    scale = max(abs(gross), abs(tax_v), abs(net), 1.0)
+    tol = max(_ECON_ABS_TOL, _ECON_REL_TOL * scale)
+    if tax_v < -tol:
+        return False
+    if gross <= tol and tax_v > tol:
+        return False
+    if gross > tol and tax_v - gross > tol:
+        return False
+    return math.isclose(net, gross - tax_v, rel_tol=_ECON_REL_TOL, abs_tol=tol)
+
+
+def _legacy_run_id_expr(table: str) -> str:
+    cols = {r[1] for r in table_info_cache.get(table, [])}
+    if "run_id" in cols:
+        return "COALESCE(run_id, 'legacy-' || date)"
+    return "'legacy-' || date"
+
+
+table_info_cache: dict[str, list] = {}
+
+
+def _rebuild_ticker_daily_state_if_needed(conn: sqlite3.Connection) -> None:
+    """Migrate date-keyed ticker_daily_state to append-only run scope.
+
+    Pre-2026-05-21 schema keyed by (date, ticker), so a same-day e2e/gate
+    replay overwrote the real daily decision tree. Rebuild the table when the
+    primary key is not (run_id, ticker). Existing rows are preserved under
+    synthetic run_id='legacy-{date}'.
+    """
+    if not _has_table(conn, "ticker_daily_state"):
+        return
+    if _pk_columns(conn, "ticker_daily_state") == ["run_id", "ticker"]:
+        return
+
+    tmp = f"ticker_daily_state__old_{uuid.uuid4().hex[:8]}"
+    table_info_cache["ticker_daily_state"] = conn.execute(
+        "PRAGMA table_info(ticker_daily_state)"
+    ).fetchall()
+    old_cols = {r[1] for r in table_info_cache["ticker_daily_state"]}
+    def _old_col(name: str, default: str = "NULL") -> str:
+        return name if name in old_cols else default
+
+    run_expr = _legacy_run_id_expr("ticker_daily_state")
+    conn.execute(f"ALTER TABLE ticker_daily_state RENAME TO {tmp}")
+    conn.execute(
+        """CREATE TABLE ticker_daily_state (
+            run_id            TEXT NOT NULL,
+            date              TEXT NOT NULL,
+            ticker            TEXT NOT NULL,
+            regime            TEXT,
+            confidence        REAL,
+            in_watchlist      INTEGER,
+            in_universe       INTEGER,
+            pending_at_broker INTEGER,
+            has_position      INTEGER,
+            position_qty      REAL,
+            position_pct      REAL,
+            model_type        TEXT,
+            model_action      TEXT,
+            sell_streak       INTEGER,
+            panel_score       REAL,
+            rank_score        REAL,
+            expected_return   REAL,
+            expected_return_horizon_days INTEGER,
+            kelly_target_pct  REAL,
+            mu                REAL,
+            mu_horizon_days    INTEGER,
+            sigma             REAL,
+            in_candidates     INTEGER,
+            selected          INTEGER,
+            blocked_by        TEXT,
+            sector            TEXT,
+            qp_delta_w        REAL,
+            qp_target_w       REAL,
+            qp_status         TEXT,
+            model_admission_ok INTEGER,
+            model_admission_reason TEXT,
+            current_regime_admitted INTEGER,
+            current_regime_admission_reason TEXT,
+            admitted_regimes TEXT,
+            blocked_regimes TEXT,
+            PRIMARY KEY (run_id, ticker)
+        )"""
+    )
+    conn.execute(
+        f"""INSERT OR REPLACE INTO ticker_daily_state
+              (run_id, date, ticker, regime, confidence,
+               in_watchlist, in_universe, pending_at_broker,
+               has_position, position_qty, position_pct,
+               model_type, model_action, sell_streak,
+               panel_score, rank_score, expected_return,
+               expected_return_horizon_days, kelly_target_pct,
+               mu, mu_horizon_days, sigma,
+               in_candidates, selected, blocked_by, sector,
+               qp_delta_w, qp_target_w, qp_status,
+               model_admission_ok, model_admission_reason,
+               current_regime_admitted, current_regime_admission_reason,
+               admitted_regimes, blocked_regimes)
+            SELECT {run_expr}, date, ticker, regime, confidence,
+                   in_watchlist, in_universe, pending_at_broker,
+                   has_position, position_qty, position_pct,
+                   model_type, model_action, sell_streak,
+                   panel_score, rank_score, expected_return,
+                   {_old_col("expected_return_horizon_days")},
+                   kelly_target_pct,
+                   mu, {_old_col("mu_horizon_days")}, sigma,
+                   in_candidates, selected, blocked_by, sector,
+                   {_old_col("qp_delta_w")}, {_old_col("qp_target_w")},
+                   {_old_col("qp_status")},
+                   {_old_col("model_admission_ok")},
+                   {_old_col("model_admission_reason")},
+                   {_old_col("current_regime_admitted")},
+                   {_old_col("current_regime_admission_reason")},
+                   {_old_col("admitted_regimes")},
+                   {_old_col("blocked_regimes")}
+              FROM {tmp}"""
+    )
+    conn.execute(f"DROP TABLE {tmp}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_date ON ticker_daily_state(date)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_ticker ON ticker_daily_state(ticker)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_run ON ticker_daily_state(run_id)")
+
+
+def _rebuild_score_tables_if_needed(conn: sqlite3.Connection) -> None:
+    """Migrate score distribution tables from date scope to run scope."""
+    if _has_table(conn, "score_distribution") and _pk_columns(conn, "score_distribution") != ["run_id", "ticker"]:
+        tmp = f"score_distribution__old_{uuid.uuid4().hex[:8]}"
+        table_info_cache["score_distribution"] = conn.execute(
+            "PRAGMA table_info(score_distribution)"
+        ).fetchall()
+        old_cols = {r[1] for r in table_info_cache["score_distribution"]}
+        def _old_col(name: str, default: str = "NULL") -> str:
+            return name if name in old_cols else default
+        run_expr = _legacy_run_id_expr("score_distribution")
+        conn.execute(f"ALTER TABLE score_distribution RENAME TO {tmp}")
+        conn.execute(
+            """CREATE TABLE score_distribution (
+                run_id        TEXT NOT NULL,
+                date          TEXT NOT NULL,
+                run_type      TEXT,
+                ticker        TEXT NOT NULL,
+                raw_panel     REAL,
+                rank_score    REAL,
+                expected_return_horizon_days INTEGER,
+                mu            REAL,
+                mu_horizon_days INTEGER,
+                sigma         REAL,
+                regime        TEXT,
+                is_holding    INTEGER DEFAULT 0,
+                model_type    TEXT,
+                sector        TEXT,
+                blocked_by    TEXT,
+                PRIMARY KEY (run_id, ticker)
+            )"""
+        )
+        conn.execute(
+            f"""INSERT OR REPLACE INTO score_distribution
+                  (run_id, date, run_type, ticker, raw_panel, rank_score,
+                   expected_return_horizon_days, mu, mu_horizon_days, sigma,
+                   regime, is_holding, model_type, sector, blocked_by)
+                SELECT {run_expr}, date, {_old_col("run_type")}, ticker,
+                       raw_panel, rank_score,
+                       {_old_col("expected_return_horizon_days")},
+                       mu, {_old_col("mu_horizon_days")}, sigma, regime,
+                       is_holding, {_old_col("model_type")},
+                       {_old_col("sector")}, {_old_col("blocked_by")}
+                  FROM {tmp}"""
+        )
+        conn.execute(f"DROP TABLE {tmp}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_date ON score_distribution(date)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_run ON score_distribution(run_id)")
+
+    if _has_table(conn, "score_percentiles_daily") and _pk_columns(conn, "score_percentiles_daily") != ["run_id"]:
+        tmp = f"score_percentiles_daily__old_{uuid.uuid4().hex[:8]}"
+        table_info_cache["score_percentiles_daily"] = conn.execute(
+            "PRAGMA table_info(score_percentiles_daily)"
+        ).fetchall()
+        old_cols = {r[1] for r in table_info_cache["score_percentiles_daily"]}
+        def _old_col(name: str, default: str = "NULL") -> str:
+            return name if name in old_cols else default
+        run_expr = _legacy_run_id_expr("score_percentiles_daily")
+        conn.execute(f"ALTER TABLE score_percentiles_daily RENAME TO {tmp}")
+        conn.execute(
+            """CREATE TABLE score_percentiles_daily (
+                run_id        TEXT PRIMARY KEY,
+                date          TEXT NOT NULL,
+                run_type      TEXT,
+                n_cands       INTEGER NOT NULL,
+                p01           REAL,
+                p05           REAL,
+                p10           REAL,
+                p25           REAL,
+                p50           REAL,
+                p75           REAL,
+                p85           REAL,
+                p90           REAL,
+                p95           REAL,
+                p99           REAL,
+                score_min     REAL,
+                score_max     REAL,
+                score_mean    REAL,
+                score_std     REAL,
+                regime        TEXT,
+                created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        conn.execute(
+            f"""INSERT OR REPLACE INTO score_percentiles_daily
+                  (run_id, date, run_type, n_cands, p01, p05, p10, p25, p50, p75,
+                   p85, p90, p95, p99, score_min, score_max, score_mean,
+                   score_std, regime)
+                SELECT {run_expr}, date, {_old_col("run_type")},
+                       n_cands, p01, p05, p10, p25, p50, p75,
+                       p85, p90, p95, p99, score_min, score_max, score_mean,
+                       score_std, regime
+                  FROM {tmp}"""
+        )
+        conn.execute(f"DROP TABLE {tmp}")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_pctiles_date ON score_percentiles_daily(date)")
+
+
+def _apply_column_migrations(conn: sqlite3.Connection) -> None:
+    for table, columns in _COLUMN_MIGRATIONS.items():
+        existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue   # CREATE TABLE IF NOT EXISTS just handled the fresh case
+        for name, typ in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(_SCHEMA_SQL)
+    _apply_column_migrations(conn)
+    _rebuild_ticker_daily_state_if_needed(conn)
+    _rebuild_score_tables_if_needed(conn)
+    # Rebuilds recreate legacy-shaped tables from their historical column
+    # list; re-apply (idempotent) so later-added columns exist again.
+    _apply_column_migrations(conn)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_date ON trades(trade_date)")
+    # After _apply_column_migrations — a legacy trades table only gains
+    # broker_order_id via the migration, so the index must come second.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_broker_order "
+        "ON trades(broker_order_id)"
+    )
+    # Round-3 (Codex #190): the canonical match key for record_order_outcomes
+    # is (broker_account_id, broker_order_id), not broker_order_id alone.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trades_broker_account_order "
+        "ON trades(broker_account_id, broker_order_id)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tds_run ON ticker_daily_state(run_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_score_dist_run ON score_distribution(run_id)")
+    conn.commit()
+
+
+# ── Connection management ─────────────────────────────────────────────────────
+
+def _is_enabled(config: dict) -> bool:
+    return bool(config.get("persistence", {}).get("enabled", False))
+
+
+def _db_path(
+    config:       dict,
+    strategy_dir: Path | None = None,
+    role:         str = "live",
+) -> Path:
+    """Resolve the SQLite file path for this adapter role.
+
+    Roles (user-driven architecture 2026-04-24):
+      * ``"live"``  — permanent production data (live runner + LEAN).
+                       Path: ``persistence.db_path`` (default ``data/runs.db``).
+      * ``"sim"``   — ephemeral notebook sim data. TRUNCATEd at start
+                       of every ``run_backtest()`` via ``clear_sim_tables()``,
+                       so the 100th sim of the day is the only one that
+                       remains.
+                       Path: ``persistence.sim_db_path`` (default
+                       ``data/sim_runs.db``).
+
+    The split prevents notebook experimentation from polluting live
+    decision-audit statistics: AA analysis defaults to reading the
+    live DB as the source-of-truth.
+    """
+    persistence = config.get("persistence", {})
+    if role == "sim":
+        raw = persistence.get("sim_db_path", "data/sim_runs.db")
+    else:
+        raw = persistence.get("db_path", "data/runs.db")
+    p = Path(raw)
+    if not p.is_absolute():
+        if strategy_dir is not None:
+            # Resolve relative to repo root: strategy_dir = backtesting/renquant_104 → .../../
+            repo_root = Path(strategy_dir).parent.parent
+            p = repo_root / p
+        else:
+            p = Path.cwd() / p
+    return p
+
+
+def get_connection(
+    config:       dict,
+    strategy_dir: Path | None = None,
+    *,
+    role:         str = "live",
+) -> sqlite3.Connection | None:
+    """Open (or create) the SQLite DB configured in config. Returns None when disabled.
+
+    See :func:`_db_path` for the live-vs-sim role semantics.
+    """
+    if not _is_enabled(config):
+        return None
+    path = _db_path(config, strategy_dir, role=role)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path, isolation_level=None)   # autocommit
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA journal_mode = WAL;")
+    ensure_schema(conn)
+    return conn
+
+
+# Tables that carry per-run decision state — wiped at start of each
+# notebook sim via `clear_sim_tables`. Forward returns and training
+# audit are DERIVED data (historical prices, retrain metadata) and
+# survive the reset.
+_SIM_RESET_TABLES = [
+    "candidate_scores",
+    "score_distribution",
+    "score_percentiles_daily",
+    "ticker_daily_state",
+    "trades",
+    "rotations",
+    "live_state_snapshots",
+    "pipeline_runs",   # last — has FKs into the other tables above
+]
+
+
+def clear_sim_tables(conn: sqlite3.Connection | None) -> int:
+    """TRUNCATE the decision-trace tables on a sim DB.
+
+    Called from :func:`sim.runner.run_backtest` before a fresh notebook
+    sim populates its rows. Leaves derived tables (`ticker_forward_returns`,
+    `training_runs`) intact — they're reused across sim sessions.
+
+    Returns the total number of rows deleted.
+    """
+    if conn is None:
+        return 0
+    deleted = 0
+    for table in _SIM_RESET_TABLES:
+        cur = conn.execute(f"DELETE FROM {table}")
+        deleted += cur.rowcount
+    conn.commit()
+    return deleted
+
+
+# ── Commit SHA helper (for provenance) ────────────────────────────────────────
+
+# Round-3 audit (#R3-82 #R3-52): cache once per process so a 700-bar sim
+# doesn't fork git 700 times. Resolved at first call; survives the
+# process. (If the user rewrites history mid-sim, the cached SHA is
+# slightly stale — acceptable.)
+_COMMIT_SHA_RESOLVED: bool = False
+_COMMIT_SHA_VALUE: "str | None" = None
+
+
+def _commit_sha() -> str | None:
+    global _COMMIT_SHA_RESOLVED, _COMMIT_SHA_VALUE
+    if _COMMIT_SHA_RESOLVED:
+        return _COMMIT_SHA_VALUE
+    try:
+        import subprocess
+        sha = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        ).stdout.strip()
+        _COMMIT_SHA_VALUE = sha or None
+    except Exception:
+        _COMMIT_SHA_VALUE = None
+    _COMMIT_SHA_RESOLVED = True
+    return _COMMIT_SHA_VALUE
+
+
+def _default_training_jsonl_dir(conn: sqlite3.Connection | None) -> Path:
+    """Resolve the plain-text training audit path from the SQLite DB path.
+
+    Production writes to ``data/runs.db`` and should mirror to the repo-level
+    ``logs/training`` directory. Temporary/test DBs should keep JSONL output
+    beside the temp DB, so test runs cannot pollute the operator audit stream.
+    """
+    if conn is None:
+        return Path("logs/training")
+    try:
+        db_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_path = next((r[2] for r in db_rows if r[1] == "main"), "")
+    except Exception:
+        main_path = ""
+    if not main_path:
+        return Path("logs/training")
+    db_path = Path(main_path)
+    root = db_path.parent.parent if db_path.parent.name == "data" else db_path.parent
+    return root / "logs" / "training"
+
+
+# ── Recording helpers ─────────────────────────────────────────────────────────
+
+def record_pipeline_run(
+    conn: sqlite3.Connection | None,
+    *,
+    run_type: str,                      # "lean" | "live" | "sim"
+    run_date: datetime.date,
+    strategy: str = "",
+    regime: str | None = None,
+    confidence: float | None = None,
+    portfolio_value: float | None = None,
+    cash: float | None = None,
+    n_candidates: int = 0,
+    n_exits: int = 0,
+    n_rotations: int = 0,
+    n_buys: int = 0,
+    buy_blocked: bool | None = None,
+    skip_buys: bool | None = None,
+    bear_only: bool | None = None,
+    counters: dict[str, Any] | None = None,
+    run_bundle: dict[str, Any] | None = None,
+    run_id: str | None = None,
+) -> str | None:
+    """Insert a pipeline_runs row and return the generated run_id."""
+    if conn is None:
+        return None
+    run_id = run_id or f"{run_date.isoformat()}-{run_type}-{uuid.uuid4().hex[:8]}"
+    conn.execute(
+        """INSERT OR REPLACE INTO pipeline_runs
+              (run_id, run_date, run_type, strategy, regime, confidence,
+               portfolio_value, cash, n_candidates, n_exits, n_rotations, n_buys,
+               buy_blocked, skip_buys, bear_only, counters_json, run_bundle_json,
+               commit_sha)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (run_id, run_date.isoformat(), run_type, strategy, regime, confidence,
+         portfolio_value, cash, n_candidates, n_exits, n_rotations, n_buys,
+         None if buy_blocked is None else int(bool(buy_blocked)),
+         None if skip_buys is None else int(bool(skip_buys)),
+         None if bear_only is None else int(bool(bear_only)),
+         json.dumps(counters or {}, sort_keys=True, default=str),
+         json.dumps(run_bundle or {}, sort_keys=True, default=str),
+         _commit_sha()),
+    )
+    return run_id
+
+
+def record_candidate_scores(
+    conn: sqlite3.Connection | None,
+    run_id: str | None,
+    candidates: Iterable[Any],
+    holdings: dict[str, Any],
+    selected_tickers: set[str],
+    blocked_map: dict[str, str] | None = None,
+    *,
+    sector_map:    dict[str, str] | None = None,
+    model_types:   dict[str, str] | None = None,
+    active_scorer: str | None = None,
+    panel_artifact: str | None = None,
+    qp_delta_by_ticker: dict[str, float] | None = None,
+    qp_target_by_ticker: dict[str, float] | None = None,
+    qp_status: str | None = None,
+    excluded_holding_tickers: set[str] | None = None,
+) -> None:
+    """Insert one row per candidate + one per holding.
+
+    `candidates`:  iterable of CandidateResult-like objects (must have
+                   .ticker, .raw_score, .rank_score, .rs_score, .panel_score,
+                   .mu, .sigma, and optional horizon-day fields)
+    `holdings`:    dict of ticker → HoldingState (only rank_score / panel_score /
+                   mu / sigma attributes are read; other fields ignored)
+    `selected_tickers`: set of candidate tickers that ended up in orders this run
+    `blocked_map`: optional dict of ticker → reason ("sector_cap", "correlation",
+                   "wash_sale", "below_threshold", etc.)
+    `active_scorer`: ACTIVE panel scorer identity (e.g. "hf_patchtst"). When
+                   provided it is stamped as `model_type` (the model that
+                   actually selected/ranked rows — 2026-06-07 audit) while the
+                   per-ticker label is preserved as `legacy_model_type`.
+    """
+    if conn is None or run_id is None:
+        return
+    blocked_map = blocked_map or {}
+    rows = []
+    # Audit fix PR-1/PR-2 (Round 9, 2026-04-25): pre-fix, raw_score /
+    # rank_score / rs_score went through `float(... or 0.0)` which
+    # preserved NaN (Python `bool(NaN) = True`, so `NaN or 0.0` = NaN),
+    # while panel_score/mu/sigma already used `_none_or_float`. NaN
+    # raw_scores got persisted into a numeric DB column while NaN
+    # μ/σ was stored as NULL — inconsistent, and analytics queries
+    # (median, percentile) silently broke on the rows with NaN raw_score.
+    # Now: every numeric score uses `_none_or_float` which returns None
+    # on missing/NaN/inf, persisting as SQL NULL. Analytics that want a
+    # display default must COALESCE explicitly so missing evidence is never
+    # confused with a real zero score.
+    sector_map = sector_map or {}
+    model_types = model_types or {}
+    qp_delta_by_ticker = qp_delta_by_ticker or {}
+    qp_target_by_ticker = qp_target_by_ticker or {}
+    excluded_holding_keys = {str(t).upper() for t in (excluded_holding_tickers or set())}
+
+    def _sector_for(ticker: str) -> str | None:
+        value = sector_map.get(ticker)
+        if isinstance(value, str) and value:
+            return value
+        value = sector_map.get(str(ticker).upper())
+        return value if isinstance(value, str) and value else None
+
+    def _model_fields(obj: Any, ticker: str) -> tuple[str | None, str | None, str | None]:
+        # 2026-06-07 audit: model_type carries the model that actually
+        # selected this row. Panel-annotated objects already carry the
+        # active scorer on .model_type; the stale per-ticker label is
+        # preserved as legacy_model_type.
+        obj_model_type = getattr(obj, "model_type", None)
+        obj_active = getattr(obj, "active_scorer", None)
+        legacy = (
+            getattr(obj, "legacy_model_type", None)
+            or model_types.get(ticker)
+            or (obj_model_type if not active_scorer else None)
+        )
+        inferred_active = (
+            active_scorer
+            or (obj_active if isinstance(obj_active, str) and obj_active else None)
+            or (
+                obj_model_type
+                if (
+                    isinstance(obj_model_type, str)
+                    and obj_model_type
+                    and getattr(obj, "legacy_model_type", None)
+                )
+                else None
+            )
+        )
+        model_type = inferred_active or obj_model_type or model_types.get(ticker)
+        return model_type, inferred_active, legacy
+
+    for c in candidates:
+        selected = c.ticker in selected_tickers
+        role = str(getattr(c, "trace_role", None) or "candidate")
+        c_model_type, c_active, c_legacy = _model_fields(c, c.ticker)
+        rows.append((
+            run_id, c.ticker, role,
+            _none_or_float(getattr(c, "raw_score",  None)),
+            _none_or_float(getattr(c, "rank_score", None)),
+            _none_or_float(getattr(c, "panel_score", None)),
+            _none_or_float(getattr(c, "rs_score",   None)),
+            _none_or_float(getattr(c, "mu",    None)),
+            _none_or_float(getattr(c, "sigma", None)),
+            1 if selected else 0,
+            None if selected else blocked_map.get(c.ticker, "candidate_not_selected"),
+            # New decision-factor columns
+            _none_or_float(getattr(c, "expected_return", None)),
+            _none_or_int(getattr(c, "expected_return_horizon_days", None)),
+            _none_or_float(getattr(c, "kelly_target_pct", None)),
+            c_model_type,
+            c_active,
+            c_legacy,
+            _sector_for(c.ticker),
+            panel_artifact,
+            _none_or_int(getattr(c, "mu_horizon_days", None)),
+            _none_or_float(qp_delta_by_ticker.get(c.ticker)),
+            _none_or_float(qp_target_by_ticker.get(c.ticker)),
+            qp_status,
+        ))
+    for ticker, hs in holdings.items():
+        if str(ticker).upper() in excluded_holding_keys:
+            continue
+        h_model_type, h_active, h_legacy = _model_fields(hs, ticker)
+        rows.append((
+            run_id, ticker, "holding",
+            None,
+            _none_or_float(getattr(hs, "rank_score", None)),
+            _none_or_float(getattr(hs, "panel_score", None)),
+            None,
+            _none_or_float(getattr(hs, "mu",    None)),
+            _none_or_float(getattr(hs, "sigma", None)),
+            0,
+            None,
+            _none_or_float(getattr(hs, "expected_return", None)),
+            _none_or_int(getattr(hs, "expected_return_horizon_days", None)),
+            _none_or_float(getattr(hs, "kelly_target_pct", None)),
+            h_model_type,
+            h_active,
+            h_legacy,
+            _sector_for(ticker),
+            panel_artifact,
+            _none_or_int(getattr(hs, "mu_horizon_days", None)),
+            _none_or_float(qp_delta_by_ticker.get(ticker)),
+            _none_or_float(qp_target_by_ticker.get(ticker)),
+            qp_status,
+        ))
+    if rows:
+        conn.executemany(
+            """INSERT OR REPLACE INTO candidate_scores
+                  (run_id, ticker, role, raw_score, rank_score, panel_score, rs_score,
+                   mu, sigma, selected, blocked_by,
+                   expected_return, expected_return_horizon_days,
+                   kelly_target_pct, model_type, active_scorer,
+                   legacy_model_type, sector,
+                   panel_ltr_artifact, mu_horizon_days,
+                   qp_delta_w, qp_target_w, qp_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+
+def record_trades(
+    conn: sqlite3.Connection | None,
+    run_id: str | None,
+    trade_events: Iterable[dict],
+) -> None:
+    """Insert rows into trades from a list of trade dicts.
+
+    Expected keys (all optional except ticker + action):
+      ticker, action ('buy'|'sell'|'short_open'|'short_cover'), shares, price,
+      invest, target_pct,
+      exit_reason, pnl_pct, hold_days, tax, gross_pnl, proceeds_basis,
+      net_pnl_after_tax, tax_cash_debited, tax_cash_debit_mode,
+      tax_lot_method, rank_score, conviction, sigma_mult, mu,
+      mu_horizon_days, sigma, panel_score, rs_score, expected_return,
+      expected_return_horizon_days, kelly_target_pct, model_type,
+      active_scorer, legacy_model_type, sector,
+      blocked_by, qp_delta_w, qp_target_w, qp_status, regime, confidence,
+      order_type/source/source_job/source_task/
+      order_source/attribution_version, score_snapshot, decision_inputs.
+
+    Fill-truth fields (orchestrator #484 §8 item 8): ``broker_order_id``
+    (fallbacks: event ``order_id``, then ``decision_inputs.order_id`` — the
+    key live attempt rows already carry), ``fill_status`` (normalized via
+    :func:`normalize_fill_status`; when absent, ``*_pending`` actions are
+    stamped ``submitted`` because that is what a pending attempt row IS),
+    ``filled_qty``, ``fill_price`` (fallback ``filled_avg_price``), and
+    ``fill_updated_at`` (fallback ``filled_at``). Confirmed outcomes are
+    written post-execution via :func:`record_order_outcomes`.
+    """
+    if conn is None or run_id is None:
+        return
+
+    def _json_or_none(value: Any) -> str | None:
+        if value is None:
+            return None
+        return json.dumps(value, sort_keys=True, default=str)
+
+    def _score_snapshot_or_none(t: dict) -> dict[str, Any] | None:
+        snap = t.get("score_snapshot")
+        if isinstance(snap, dict):
+            return snap
+        keys = (
+            "rank_score", "panel_score", "rs_score", "mu", "sigma",
+            "mu_horizon_days", "kelly_target_pct", "expected_return",
+            "expected_return_horizon_days", "confidence", "regime",
+            "model_type", "active_scorer", "legacy_model_type",
+            "sector", "blocked_by",
+        )
+        fallback = {k: t.get(k) for k in keys if k in t and t.get(k) is not None}
+        if fallback:
+            return fallback
+        if t.get("ticker") or t.get("action"):
+            return {
+                "attribution_missing": True,
+                "ticker": t.get("ticker"),
+                "action": t.get("action"),
+            }
+        return None
+
+    def _decision_inputs_or_none(t: dict) -> dict[str, Any] | None:
+        raw = t.get("decision_inputs")
+        if isinstance(raw, dict) and raw:
+            return raw
+        fallback = {
+            k: t.get(k)
+            for k in (
+                "ticker", "action", "order_type", "order_source",
+                "source_job", "source_task", "exit_reason", "target_pct",
+                "shares", "price", "invest",
+            )
+            if t.get(k) is not None
+        }
+        if fallback:
+            fallback.setdefault(
+                "acceptance_reason",
+                t.get("exit_reason")
+                or t.get("order_source")
+                or t.get("order_type")
+                or "recorded_trade",
+            )
+            if raw == {}:
+                fallback["attribution_missing"] = True
+            return fallback
+        return None
+
+    def _broker_order_id(t: dict) -> str | None:
+        value = t.get("broker_order_id") or t.get("order_id")
+        if not value:
+            inputs = t.get("decision_inputs")
+            if isinstance(inputs, dict):
+                value = inputs.get("order_id")
+        return str(value) if value else None
+
+    def _broker_account_id(t: dict) -> str | None:
+        # Round-3 (Codex #190): canonical order identity is
+        # (broker_account_id, broker_order_id). Lifted the same way
+        # broker_order_id is — direct key, then decision_inputs fallback —
+        # so intent rows carry it whenever a caller supplies it.
+        value = t.get("broker_account_id") or t.get("account_id")
+        if not value:
+            inputs = t.get("decision_inputs")
+            if isinstance(inputs, dict):
+                value = inputs.get("broker_account_id") or inputs.get("account_id")
+        return str(value) if value else None
+
+    def _fill_status(t: dict) -> str | None:
+        explicit = normalize_fill_status(t.get("fill_status"))
+        if explicit is not None:
+            return explicit
+        action = str(t.get("action") or "")
+        if action.endswith("_pending"):
+            return FILL_STATUS_SUBMITTED
+        return None
+
+    rows = []
+    for t in trade_events:
+        rows.append((
+            run_id,
+            str(t.get("date") or t.get("trade_date") or "") or None,
+            t.get("ticker"),
+            t.get("action"),
+            _none_or_float(t.get("shares")),
+            _none_or_float(t.get("price")),
+            _none_or_float(t.get("invest")),
+            _none_or_float(t.get("target_pct")),
+            t.get("exit_reason"),
+            _none_or_float(t.get("pnl_pct")),
+            _none_or_int(t.get("hold_days")),
+            _none_or_float(t.get("tax")),
+            _none_or_float(t.get("gross_pnl")),
+            _none_or_float(t.get("proceeds_basis")),
+            _none_or_float(t.get("net_pnl_after_tax")),
+            _none_or_float(t.get("tax_cash_debited")),
+            t.get("tax_cash_debit_mode"),
+            t.get("tax_lot_method"),
+            _none_or_float(t.get("rank_score")),
+            _none_or_float(t.get("conviction")),
+            _none_or_float(t.get("sigma_mult")),
+            _none_or_float(t.get("mu")),
+            _none_or_int(t.get("mu_horizon_days")),
+            _none_or_float(t.get("sigma")),
+            _none_or_float(t.get("panel_score")),
+            _none_or_float(t.get("rs_score")),
+            _none_or_float(t.get("expected_return")),
+            _none_or_int(t.get("expected_return_horizon_days")),
+            _none_or_float(t.get("kelly_target_pct")),
+            t.get("model_type"),
+            t.get("active_scorer"),
+            t.get("legacy_model_type"),
+            t.get("sector"),
+            t.get("blocked_by"),
+            _none_or_float(t.get("qp_delta_w")),
+            _none_or_float(t.get("qp_target_w")),
+            t.get("qp_status"),
+            t.get("regime"),
+            _none_or_float(t.get("confidence")),
+            t.get("order_type"),
+            t.get("source"),
+            t.get("source_job"),
+            t.get("source_task"),
+            t.get("order_source"),
+            t.get("attribution_version"),
+            _json_or_none(_score_snapshot_or_none(t)),
+            _json_or_none(_decision_inputs_or_none(t)),
+            _broker_order_id(t),
+            _fill_status(t),
+            _none_or_float(t.get("filled_qty")),
+            _none_or_float(t.get("fill_price") or t.get("filled_avg_price")),
+            t.get("fill_updated_at") or t.get("filled_at"),
+            _broker_account_id(t),
+        ))
+    if rows:
+        conn.executemany(
+            """INSERT INTO trades
+                  (run_id, trade_date, ticker, action, shares, price, invest, target_pct,
+                   exit_reason, pnl_pct, hold_days, tax,
+                   gross_pnl, proceeds_basis, net_pnl_after_tax,
+                   tax_cash_debited, tax_cash_debit_mode, tax_lot_method,
+                   rank_score, conviction, sigma_mult, mu, mu_horizon_days, sigma,
+                   panel_score, rs_score, expected_return,
+                   expected_return_horizon_days, kelly_target_pct,
+                   model_type, active_scorer, legacy_model_type,
+                   sector, blocked_by,
+                   qp_delta_w, qp_target_w, qp_status,
+                   regime, confidence,
+                   order_type, source, source_job, source_task, order_source,
+                   attribution_version, score_snapshot_json, decision_inputs_json,
+                   broker_order_id, fill_status, filled_qty, fill_price,
+                   fill_updated_at, broker_account_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+
+def _record_outcome_unmatched(
+    conn: sqlite3.Connection,
+    outcome: dict,
+    reason: str,
+    run_id: str | None,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Append an ORDER_OUTCOME_UNMATCHED audit row (never guess a match).
+
+    Codex #190: an outcome that cannot be bound to a row by canonical order
+    identity — round 3: ``(broker_account_id, broker_order_id)`` — is left
+    as an explicit unreconciled record with an audit entry — silent loss of
+    reconciliation is the failure mode this contract exists to remove. Rows
+    land in the existing append-only ``reconciliation_actions`` audit
+    table. ``extra`` merges additional detail (e.g. the conflicting rowids
+    for an ``ambiguous_match``)."""
+    detail = {
+        "reason": reason,
+        "broker_account_id": outcome.get("broker_account_id") or outcome.get("account_id"),
+        "broker_order_id": outcome.get("broker_order_id") or outcome.get("order_id"),
+        "fill_status": outcome.get("fill_status") or outcome.get("status"),
+        "filled_qty": outcome.get("filled_qty"),
+        "trade_date": outcome.get("trade_date"),
+    }
+    if extra:
+        detail.update(extra)
+    log.warning("fill-truth: order outcome UNMATCHED (%s): %s", reason, detail)
+    conn.execute(
+        """INSERT INTO reconciliation_actions
+              (run_id, run_date, kind, ticker, detail)
+           VALUES (?, ?, 'ORDER_OUTCOME_UNMATCHED', ?, ?)""",
+        (
+            run_id,
+            datetime.date.today().isoformat(),
+            str(outcome.get("ticker") or "?"),
+            json.dumps(detail, sort_keys=True, default=str),
+        ),
+    )
+
+
+def record_order_outcomes(
+    conn: sqlite3.Connection | None,
+    outcomes: Iterable[dict],
+    *,
+    run_id: str | None = None,
+) -> dict[str, int]:
+    """Write broker-confirmed order outcomes back onto trades rows.
+
+    The post-execution half of the fill-truth contract (orchestrator #484
+    §8 item 8): attempt rows are recorded at submission time with
+    ``fill_status='submitted'``; whoever observes the broker outcome (the
+    live runner's broker sync / pre-open cancel gate, where the fill info
+    already exists) calls this with one outcome dict per order:
+
+      ``broker_account_id`` (or ``account_id``) + ``broker_order_id`` (or
+      ``order_id``) — MANDATORY canonical match key (Codex #190 round 3):
+      ``broker_order_id`` alone is not a unique row identity — the same id
+      can legitimately be logged on more than one ``trades`` row (a
+      resubmission, or a logging duplicate across runs), so matching by
+      order id alone risks mass-mutating rows that were never all the same
+      real order. The pair ``(broker_account_id, broker_order_id)`` is the
+      canonical identity; a ticker+date fallback is never used (multiple
+      same-ticker attempts/cancels in one day are indistinguishable that
+      way). Outcomes missing either half of the identity, matching no row,
+      or matching MORE THAN ONE row after narrowing by this identity, are
+      recorded as explicit ``ORDER_OUTCOME_UNMATCHED`` audit entries (with
+      reasons ``no_broker_account_id`` / ``no_broker_order_id`` /
+      ``no_matching_row`` / ``ambiguous_match`` respectively) — never
+      guessed, and an ambiguous match never mutates any of the conflicting
+      rows. An optional ``run_id`` further narrows the match (useful when a
+      caller knows which run's attempt row an outcome belongs to).
+      ``fill_status`` — required; normalized via :func:`normalize_fill_status`
+      (unrecognized vocabulary becomes the explicit ``unknown`` state);
+      ``filled_qty`` / ``fill_price`` — optional; ``fill_updated_at`` —
+      optional ISO timestamp (default: now UTC) — this is the broker's own
+      event timestamp when supplied, not just our write time.
+
+    MONOTONIC transitions (out-of-order/replayed broker events cannot rewind
+    truth): a lower-ranked status arriving after a higher-ranked state is
+    counted ``stale`` and ignored (late submitted never overwrites
+    partially_filled/filled; cancel/reject never overwrites filled). A
+    SAME-ranked event with an ``fill_updated_at`` OLDER than what is already
+    recorded is also counted ``stale`` and ignored outright — Codex #190
+    round 3: an out-of-order same-rank event carries no new information and
+    must not clobber a possibly-different price/status a newer same-rank
+    event already set; this check runs BEFORE the quantity-regression clamp
+    below so an old event is rejected wholesale, not partially applied.
+    ``filled_qty`` never decreases — clamped to the prior value (never
+    applied) when an event at the SAME or a higher rank reports a smaller
+    quantity (e.g. a duplicated/misordered partial-fill event), and this is
+    counted ``qty_regressed`` + logged rather than silently clamped (Codex
+    #190: a qty decrease must be an observable anomaly, not just a no-op);
+    ``fill_price`` is retained when the event omits it (a partial fill
+    followed by a cancel keeps the executed quantity and price). Replaying
+    the identical event is idempotent.
+
+    ATOMICITY (Codex #190 round 3): :func:`get_connection` opens connections
+    in autocommit mode (``isolation_level=None``), so there is no implicit
+    transaction for a read-then-write pattern to ride on — two connections
+    against the same on-disk DB could otherwise both read a stale status
+    before either writes. Each outcome's match-and-apply is therefore
+    wrapped in an explicit ``BEGIN IMMEDIATE`` / ``COMMIT``/``ROLLBACK``:
+    ``BEGIN IMMEDIATE`` acquires SQLite's RESERVED lock up front (before the
+    SELECT), which blocks any other connection from starting its own write
+    transaction until this one finishes — closing the read-then-write race
+    window. If the lock cannot be acquired, ``sqlite3.OperationalError``
+    ("database is locked") propagates to the caller rather than being
+    swallowed as an ordinary stale/skip outcome — legitimate contention is
+    the caller's to retry, not something this function should silently
+    absorb (the Python driver's own default busy-timeout already retries
+    briefly before this can happen).
+
+    Returns ``{"updated": n, "stale": n, "unmatched": n, "skipped": n,
+    "qty_regressed": n, "ambiguous": n}``. Fail-soft: disabled persistence
+    returns all-zero counts; nothing here raises on malformed outcomes —
+    but every non-applied outcome, and every clamped regression, is
+    OBSERVABLE (counted, logged, and audited when unmatched/ambiguous).
+    """
+    counts = {
+        "updated": 0, "stale": 0, "unmatched": 0, "skipped": 0,
+        "qty_regressed": 0, "ambiguous": 0,
+    }
+    if conn is None:
+        return counts
+    for outcome in outcomes:
+        if not isinstance(outcome, dict):
+            counts["skipped"] += 1
+            log.warning("fill-truth: non-dict order outcome skipped: %r", outcome)
+            continue
+        status = normalize_fill_status(
+            outcome.get("fill_status") or outcome.get("status")
+        )
+        if status is None:
+            counts["skipped"] += 1
+            log.warning("fill-truth: outcome without a status skipped: %s", outcome)
+            continue
+        broker_order_id = outcome.get("broker_order_id") or outcome.get("order_id")
+        if not broker_order_id:
+            counts["unmatched"] += 1
+            _record_outcome_unmatched(conn, outcome, "no_broker_order_id", run_id)
+            continue
+        broker_account_id = outcome.get("broker_account_id") or outcome.get("account_id")
+        if not broker_account_id:
+            counts["unmatched"] += 1
+            _record_outcome_unmatched(conn, outcome, "no_broker_account_id", run_id)
+            continue
+
+        where = "broker_account_id = ? AND broker_order_id = ?"
+        params: list[Any] = [str(broker_account_id), str(broker_order_id)]
+        if run_id is not None:
+            where += " AND run_id = ?"
+            params.append(run_id)
+
+        stamped_at = str(
+            outcome.get("fill_updated_at")
+            or outcome.get("filled_at")
+            or datetime.datetime.now(datetime.timezone.utc).isoformat(
+                timespec="seconds"
+            )
+        )
+        event_qty = _none_or_float(outcome.get("filled_qty"))
+        event_price = _none_or_float(
+            outcome.get("fill_price")
+            if outcome.get("fill_price") is not None
+            else outcome.get("filled_avg_price")
+        )
+        new_rank = _FILL_STATUS_RANK.get(status, 1)
+
+        # BEGIN IMMEDIATE up front: acquire the write lock BEFORE the read,
+        # closing the TOCTOU window between the SELECT and the UPDATE below
+        # (Codex #190 round 3, point 2). Left outside the try/finally: if it
+        # fails, no transaction was ever opened, so there is nothing to roll
+        # back — propagate immediately rather than treating contention as a
+        # data-level outcome.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError:
+            log.warning(
+                "fill-truth: could not acquire write lock for order "
+                "account=%s id=%s -- propagating to caller rather than "
+                "silently treating contention as stale/skipped",
+                broker_account_id, broker_order_id,
+            )
+            raise
+
+        try:
+            rows = conn.execute(
+                f"SELECT rowid, fill_status, filled_qty, fill_price, "
+                f"fill_updated_at FROM trades WHERE {where}",
+                params,
+            ).fetchall()
+
+            if not rows:
+                conn.execute("ROLLBACK")
+                counts["unmatched"] += 1
+                _record_outcome_unmatched(conn, outcome, "no_matching_row", run_id)
+                continue
+
+            if len(rows) > 1:
+                # Codex #190 round 3: the canonical identity still names more
+                # than one row (e.g. a resubmission or a logging duplicate
+                # legitimately sharing the same broker order). Update NONE of
+                # them — a broker event that can't be bound to exactly one
+                # row is not fill truth for any of them.
+                ambiguous_rowids = [r[0] for r in rows]
+                conn.execute("ROLLBACK")
+                counts["ambiguous"] += 1
+                _record_outcome_unmatched(
+                    conn, outcome, "ambiguous_match", run_id,
+                    extra={"ambiguous_rowids": ambiguous_rowids},
+                )
+                continue
+
+            rowid, cur_status, cur_qty, cur_price, cur_updated_at = rows[0]
+            cur_rank = _FILL_STATUS_RANK.get(cur_status, 0)
+
+            if new_rank < cur_rank:
+                conn.execute("ROLLBACK")
+                counts["stale"] += 1
+                log.info(
+                    "fill-truth: stale event %r ignored for order %s "
+                    "(row already %r)",
+                    status, broker_order_id, cur_status,
+                )
+                continue
+
+            if new_rank == cur_rank:
+                # Same-rank event: only an OLDER origin timestamp than what
+                # is already recorded is out-of-order (an equal timestamp is
+                # a replay and must stay idempotent-applied). Parse when
+                # possible; fall back to lexicographic string comparison for
+                # unparsable/mixed formats.
+                incoming_ts = _parse_event_ts(stamped_at)
+                recorded_ts = _parse_event_ts(cur_updated_at)
+                if incoming_ts is not None and recorded_ts is not None:
+                    is_older = incoming_ts < recorded_ts
+                else:
+                    is_older = bool(
+                        cur_updated_at and stamped_at
+                        and str(stamped_at) < str(cur_updated_at)
+                    )
+                if is_older:
+                    conn.execute("ROLLBACK")
+                    counts["stale"] += 1
+                    log.info(
+                        "fill-truth: same-rank out-of-order event %r ignored "
+                        "for order %s (event ts %s older than recorded %s)",
+                        status, broker_order_id, stamped_at, cur_updated_at,
+                    )
+                    continue
+
+            # filled_qty never decreases; price retained when event omits it.
+            if event_qty is None:
+                new_qty = cur_qty
+            elif cur_qty is None:
+                new_qty = event_qty
+            else:
+                new_qty = max(cur_qty, event_qty)
+                if event_qty < cur_qty:
+                    # Same-or-higher-rank event but a SMALLER quantity: the
+                    # decrease is clamped (never applied) — but per Codex
+                    # #190 that must be an observable anomaly, not a silent
+                    # no-op, so it's counted + logged distinctly from a
+                    # plain rank-stale event.
+                    counts["qty_regressed"] += 1
+                    log.warning(
+                        "fill-truth: filled_qty regression ignored for "
+                        "order %s (status %r): event reports %.6g, "
+                        "retaining recorded %.6g",
+                        broker_order_id, status, event_qty, cur_qty,
+                    )
+            new_price = event_price if event_price is not None else cur_price
+            conn.execute(
+                "UPDATE trades SET fill_status = ?, filled_qty = ?, "
+                "fill_price = ?, fill_updated_at = ? WHERE rowid = ?",
+                (status, new_qty, new_price, stamped_at, rowid),
+            )
+            conn.execute("COMMIT")
+            counts["updated"] += 1
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    return counts
+
+
+def _field(obj: Any, *names: str) -> Any:
+    for name in names:
+        if isinstance(obj, dict):
+            value = obj.get(name)
+        else:
+            value = getattr(obj, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _rotation_key_from_order(order: Any) -> tuple[str, str] | None:
+    if not isinstance(order, dict):
+        return None
+    ticker = order.get("ticker")
+    inputs = order.get("decision_inputs")
+    if isinstance(inputs, dict):
+        sell = inputs.get("sell_ticker") or inputs.get("held_ticker")
+        buy = inputs.get("buy_ticker") or inputs.get("cand_ticker") or ticker
+        if sell and buy:
+            return str(sell), str(buy)
+    detail = str(order.get("detail") or "")
+    if "rotation" in detail and "←" in detail and ticker:
+        sell = detail.split("←", 1)[1].split()[0]
+        if sell:
+            return sell, str(ticker)
+    return None
+
+
+def _rotation_key_from_block(blocked: Any) -> tuple[str, str] | None:
+    sell = _field(blocked, "sell_ticker", "held_ticker", "sell", "held")
+    buy = _field(blocked, "buy_ticker", "cand_ticker", "buy", "candidate")
+    if sell and buy:
+        return str(sell), str(buy)
+    return None
+
+
+def _rotation_key_from_pair(pair: Any) -> tuple[str, str] | None:
+    sell = _field(pair, "sell_ticker", "held_ticker", "sell", "held")
+    buy = _field(pair, "buy_ticker", "cand_ticker", "buy", "candidate")
+    if sell and buy:
+        return str(sell), str(buy)
+    return None
+
+
+def _rotation_row(
+    run_id: str,
+    item: Any,
+    *,
+    decision: str,
+    fallback_key: tuple[str, str] | None = None,
+) -> tuple:
+    key = _rotation_key_from_pair(item) or _rotation_key_from_block(item) or fallback_key
+    sell, buy = key if key is not None else (None, None)
+    return (
+        run_id,
+        buy,
+        sell,
+        decision,
+        _none_or_float(_field(item, "buy_er", "cand_er", "candidate_er")),
+        _none_or_float(_field(item, "sell_er", "held_er")),
+        _none_or_float(_field(item, "raw_advantage", "raw_adv")),
+        _none_or_float(_field(item, "net_advantage", "net_adv")),
+        _none_or_float(_field(item, "tax_drag")),
+        _none_or_float(_field(item, "threshold")),
+    )
+
+
+def record_rotations(
+    conn: sqlite3.Connection | None,
+    run_id: str | None,
+    ctx_or_pairs: Any,
+    blocked: Iterable[Any] | None = None,
+) -> None:
+    """Persist rotation decisions from sim/live/LEAN.
+
+    ``ctx_or_pairs`` may be an InferenceContext-like object or an iterable of
+    RotationPair-like objects. Accepted swaps are inferred from rotation buy
+    orders, because ``ctx.rotations`` can still contain proposed pairs that
+    were later suppressed by buy gates, Kelly/cash sizing, or broker execution.
+    """
+    if conn is None or run_id is None:
+        return
+    if hasattr(ctx_or_pairs, "rotations"):
+        ctx = ctx_or_pairs
+        pairs = list(getattr(ctx, "rotations", []) or [])
+        blocked_items = list(
+            blocked if blocked is not None
+            else getattr(ctx, "rotations_blocked", []) or []
+        )
+        accepted_keys = {
+            key for key in (
+                _rotation_key_from_order(order)
+                for order in (getattr(ctx, "orders", []) or [])
+            )
+            if key is not None
+        }
+    else:
+        pairs = list(ctx_or_pairs or [])
+        blocked_items = list(blocked or [])
+        accepted_keys = {_rotation_key_from_pair(pair) for pair in pairs}
+        accepted_keys.discard(None)
+
+    blocked_by_key: dict[tuple[str, str], Any] = {}
+    for item in blocked_items:
+        key = _rotation_key_from_block(item)
+        if key is not None:
+            blocked_by_key[key] = item
+
+    rows = []
+    seen: set[tuple[str, str]] = set()
+    for pair in pairs:
+        key = _rotation_key_from_pair(pair)
+        if key is None:
+            continue
+        seen.add(key)
+        blocked_item = blocked_by_key.get(key)
+        if key in accepted_keys:
+            decision = "accepted"
+        elif blocked_item is not None:
+            reason = _field(blocked_item, "reason", "decision", "blocked_by")
+            decision = f"blocked:{reason or 'unknown'}"
+        else:
+            decision = "proposed_not_emitted"
+        rows.append(_rotation_row(run_id, pair, decision=decision))
+
+    for item in blocked_items:
+        key = _rotation_key_from_block(item)
+        if key is None or key in seen:
+            continue
+        reason = _field(item, "reason", "decision", "blocked_by")
+        rows.append(_rotation_row(
+            run_id,
+            item,
+            decision=f"blocked:{reason or 'unknown'}",
+            fallback_key=key,
+        ))
+
+    if rows:
+        conn.executemany(
+            """INSERT INTO rotations
+                  (run_id, cand_ticker, held_ticker, decision, cand_er,
+                   held_er, raw_adv, net_adv, tax_drag, threshold)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+
+
+def record_training_run(
+    conn: sqlite3.Connection | None,
+    *,
+    run_date: datetime.datetime | None = None,
+    strategy: str = "",
+    artifact_type: str = "",              # 'panel-ltr' | 'ngboost-head' | 'tournament' | 'panel-transformer'
+    config_snapshot: dict | None = None,
+    oos_mean_ic: float | None = None,
+    train_ic: float | None = None,
+    n_rows: int | None = None,
+    feature_cols: list[str] | None = None,
+    artifact_path: str | None = None,
+    # Round 5 additions
+    elapsed_sec: float | None = None,
+    trigger: str | None = None,
+    n_tickers: int | None = None,
+    n_dates: int | None = None,
+    n_features: int | None = None,
+    device: str | None = None,
+    deterministic: bool | None = None,
+    training_window_years: float | None = None,
+    notes: str | None = None,
+    also_log_jsonl: bool = True,
+    jsonl_dir: Path | None = None,
+) -> str | None:
+    """Compatibility wrapper around ``renquant_common.record_training_run``."""
+    return _record_training_run(
+        conn,
+        run_date=run_date,
+        strategy=strategy,
+        artifact_type=artifact_type,
+        config_snapshot=config_snapshot,
+        oos_mean_ic=oos_mean_ic,
+        train_ic=train_ic,
+        n_rows=n_rows,
+        feature_cols=feature_cols,
+        artifact_path=artifact_path,
+        elapsed_sec=elapsed_sec,
+        trigger=trigger,
+        n_tickers=n_tickers,
+        n_dates=n_dates,
+        n_features=n_features,
+        device=device,
+        deterministic=deterministic,
+        training_window_years=training_window_years,
+        notes=notes,
+        also_log_jsonl=also_log_jsonl,
+        jsonl_dir=jsonl_dir,
+    )
+
+
+def record_live_state_snapshot(
+    conn: sqlite3.Connection | None,
+    run_id: str | None,
+    *,
+    run_date: datetime.date,
+    strategy: str = "",
+    state: dict | None = None,
+    cash: float | None = None,
+    portfolio_value: float | None = None,
+    n_holdings: int | None = None,
+) -> None:
+    """Append one row to live_state_snapshots (Plan S).
+
+    `state` is the full dict serialised to `live_state.json`. Common
+    query fields (regime / confidence / high_water_mark) are denormalized
+    into columns; the full blob is stored as JSON for later introspection.
+    """
+    if conn is None or run_id is None:
+        return
+    state = state or {}
+    conn.execute(
+        """INSERT OR REPLACE INTO live_state_snapshots
+              (run_id, run_date, strategy, regime, confidence,
+               high_water_mark, cash, portfolio_value, n_holdings, state_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            run_date.isoformat(),
+            strategy,
+            state.get("regime"),
+            _none_or_float(state.get("regime_confidence")),
+            _none_or_float(state.get("high_water_mark")),
+            _none_or_float(cash),
+            _none_or_float(portfolio_value),
+            _none_or_int(n_holdings),
+            json.dumps(state, default=str),
+        ),
+    )
+
+
+def load_latest_live_state(
+    conn: sqlite3.Connection | None,
+    *,
+    strategy: str = "",
+    max_age_days: int | None = None,
+) -> dict | None:
+    """Load the most recent live_state_snapshots row as a dict (#144).
+
+    Returns the JSON-decoded `state_json` blob (suitable for writing
+    back to live_state.json) or None if no snapshot exists / db is
+    missing / snapshot is older than `max_age_days`.
+
+    Per user spec 2026-04-26: "live state json应该至少备份在db里" —
+    db is now the canonical store; live_state.json is a fast cache.
+    On startup, if the JSON file is missing or stale, the runner
+    falls back to db via this function.
+
+    Args:
+        conn: open sqlite connection (may be None — degrades to None return)
+        strategy: filter by strategy name (e.g. "renquant_104"); empty
+            means any
+        max_age_days: if set, return None when snapshot is older than
+            this many days (defensive — prevents resurrecting ancient
+            state). None = no age check.
+
+    Returns:
+        dict from state_json column, OR None.
+    """
+    if conn is None:
+        return None
+    try:
+        if strategy:
+            row = conn.execute(
+                """SELECT state_json, run_date FROM live_state_snapshots
+                   WHERE strategy = ? ORDER BY run_date DESC, created_at DESC
+                   LIMIT 1""",
+                (strategy,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """SELECT state_json, run_date FROM live_state_snapshots
+                   ORDER BY run_date DESC, created_at DESC LIMIT 1""",
+            ).fetchone()
+    except sqlite3.OperationalError:
+        # Table missing (fresh db) → no snapshot to load.
+        return None
+    if row is None:
+        return None
+    state_json, run_date_str = row
+    if max_age_days is not None and run_date_str:
+        try:
+            run_date = datetime.date.fromisoformat(str(run_date_str))
+            age = (datetime.date.today() - run_date).days
+            if age > max_age_days:
+                return None
+        except (ValueError, TypeError):
+            pass   # bad date format → fail open (return what we have)
+    try:
+        return json.loads(state_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def record_portfolio_metrics(
+    conn: sqlite3.Connection | None,
+    rows: Iterable[dict],
+) -> int:
+    """Upsert portfolio_daily_metrics rows (APY=1.41/Sharpe=2 goal tracker).
+
+    Each row: `{as_of_date, run_type, strategy, portfolio_value, daily_return,
+    sharpe_21d, sharpe_63d, sharpe_252d, realized_vol_21d, realized_vol_252d,
+    max_drawdown_252d, var_95_21d, var_99_21d, beta_spy_252d}`.
+    """
+    if conn is None:
+        return 0
+    payload = []
+    for r in rows:
+        payload.append((
+            r["as_of_date"] if isinstance(r["as_of_date"], str)
+            else r["as_of_date"].isoformat(),
+            r.get("run_type", "sim"),
+            r.get("strategy", ""),
+            _none_or_float(r.get("portfolio_value")),
+            _none_or_float(r.get("daily_return")),
+            _none_or_float(r.get("sharpe_21d")),
+            _none_or_float(r.get("sharpe_63d")),
+            _none_or_float(r.get("sharpe_252d")),
+            _none_or_float(r.get("realized_vol_21d")),
+            _none_or_float(r.get("realized_vol_252d")),
+            _none_or_float(r.get("max_drawdown_252d")),
+            _none_or_float(r.get("var_95_21d")),
+            _none_or_float(r.get("var_99_21d")),
+            _none_or_float(r.get("beta_spy_252d")),
+        ))
+    if not payload:
+        return 0
+    conn.executemany(
+        """INSERT INTO portfolio_daily_metrics
+              (as_of_date, run_type, strategy, portfolio_value, daily_return,
+               sharpe_21d, sharpe_63d, sharpe_252d,
+               realized_vol_21d, realized_vol_252d, max_drawdown_252d,
+               var_95_21d, var_99_21d, beta_spy_252d)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(as_of_date, run_type, strategy) DO UPDATE SET
+              portfolio_value    = COALESCE(excluded.portfolio_value,    portfolio_value),
+              daily_return       = COALESCE(excluded.daily_return,       daily_return),
+              sharpe_21d         = COALESCE(excluded.sharpe_21d,         sharpe_21d),
+              sharpe_63d         = COALESCE(excluded.sharpe_63d,         sharpe_63d),
+              sharpe_252d        = COALESCE(excluded.sharpe_252d,        sharpe_252d),
+              realized_vol_21d   = COALESCE(excluded.realized_vol_21d,   realized_vol_21d),
+              realized_vol_252d  = COALESCE(excluded.realized_vol_252d,  realized_vol_252d),
+              max_drawdown_252d  = COALESCE(excluded.max_drawdown_252d,  max_drawdown_252d),
+              var_95_21d         = COALESCE(excluded.var_95_21d,         var_95_21d),
+              var_99_21d         = COALESCE(excluded.var_99_21d,         var_99_21d),
+              beta_spy_252d      = COALESCE(excluded.beta_spy_252d,      beta_spy_252d),
+              computed_at        = CURRENT_TIMESTAMP""",
+        payload,
+    )
+    return len(payload)
+
+
+def record_ticker_daily_state(
+    conn: sqlite3.Connection | None,
+    *,
+    run_date: datetime.date,
+    rows: Iterable[dict],
+    run_id: str | None = None,
+) -> int:
+    """Upsert ticker_daily_state rows — one per watchlist ticker per bar.
+
+    Per user spec round-5 (2026-04-26): every watchlist ticker gets a row
+    every bar, including those filtered by universe floor / broker
+    pre-check / no-model-signal — so post-hoc analysis can answer "what
+    did we KNOW about XYZ on this date and WHY didn't we trade it?".
+
+    Each row dict supports: regime, confidence, in_watchlist, in_universe,
+    pending_at_broker, has_position, position_qty, position_pct,
+    model_type, active_scorer, legacy_model_type,
+    model_action, sell_streak, panel_score, rank_score,
+    expected_return, expected_return_horizon_days, kelly_target_pct,
+    mu, mu_horizon_days, sigma, in_candidates, selected, blocked_by,
+    sector, qp_delta_w, qp_target_w, qp_status, model_admission_ok,
+    model_admission_reason, current_regime_admitted,
+    current_regime_admission_reason, admitted_regimes, blocked_regimes.
+    `ticker` required.
+    """
+    if conn is None:
+        return 0
+    payload = []
+    rd_str = run_date.isoformat() if hasattr(run_date, "isoformat") else str(run_date)
+    rid = run_id or f"{rd_str}-unscoped"
+    for r in rows:
+        if not r.get("ticker"):
+            continue
+        selected = bool(_none_or_int(r.get("selected")))
+        payload.append((
+            rid,
+            rd_str,
+            r["ticker"],
+            r.get("regime"),
+            _none_or_float(r.get("confidence")),
+            _none_or_int(r.get("in_watchlist")),
+            _none_or_int(r.get("in_universe")),
+            _none_or_int(r.get("pending_at_broker")),
+            _none_or_int(r.get("has_position")),
+            _none_or_float(r.get("position_qty")),
+            _none_or_float(r.get("position_pct")),
+            r.get("model_type"),
+            r.get("active_scorer"),
+            r.get("legacy_model_type"),
+            r.get("model_action"),
+            _none_or_int(r.get("sell_streak")),
+            _none_or_float(r.get("panel_score")),
+            _none_or_float(r.get("rank_score")),
+            _none_or_float(r.get("expected_return")),
+            _none_or_int(r.get("expected_return_horizon_days")),
+            _none_or_float(r.get("kelly_target_pct")),
+            _none_or_float(r.get("mu")),
+            _none_or_int(r.get("mu_horizon_days")),
+            _none_or_float(r.get("sigma")),
+            _none_or_int(r.get("in_candidates")),
+            _none_or_int(r.get("selected")),
+            None if selected else r.get("blocked_by"),
+            r.get("sector"),
+            _none_or_float(r.get("qp_delta_w")),
+            _none_or_float(r.get("qp_target_w")),
+            r.get("qp_status"),
+            _none_or_int(r.get("model_admission_ok")),
+            r.get("model_admission_reason"),
+            _none_or_int(r.get("current_regime_admitted")),
+            r.get("current_regime_admission_reason"),
+            r.get("admitted_regimes"),
+            r.get("blocked_regimes"),
+        ))
+    if not payload:
+        return 0
+    conn.executemany(
+        """INSERT OR REPLACE INTO ticker_daily_state
+              (run_id, date, ticker, regime, confidence,
+               in_watchlist, in_universe, pending_at_broker,
+               has_position, position_qty, position_pct,
+               model_type, active_scorer, legacy_model_type,
+               model_action, sell_streak,
+               panel_score, rank_score, expected_return,
+               expected_return_horizon_days, kelly_target_pct,
+               mu, mu_horizon_days, sigma,
+               in_candidates, selected, blocked_by, sector,
+               qp_delta_w, qp_target_w, qp_status,
+               model_admission_ok, model_admission_reason,
+               current_regime_admitted, current_regime_admission_reason,
+               admitted_regimes, blocked_regimes)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        payload,
+    )
+    return len(payload)
+
+
+def decision_trace_integrity_report(
+    conn: sqlite3.Connection | None,
+    run_id: str,
+    *,
+    expected_watchlist: Iterable[str] | None = None,
+) -> dict[str, Any]:
+    """Return per-run decision-trace invariant counts for audit gates."""
+    if conn is None:
+        return {}
+    expected = {str(t) for t in (expected_watchlist or [])}
+    rows = conn.execute(
+        "SELECT ticker FROM ticker_daily_state WHERE run_id = ?",
+        (run_id,),
+    ).fetchall()
+    recorded = {str(r[0]) for r in rows}
+    trade_rows_for_tickers = conn.execute(
+        "SELECT ticker FROM trades WHERE run_id = ? AND ticker IS NOT NULL",
+        (run_id,),
+    ).fetchall()
+    trade_tickers = {str(r[0]) for r in trade_rows_for_tickers}
+    extra_tickers = recorded - expected if expected else set()
+    unexplained_extra_tickers = extra_tickers - trade_tickers
+    selected_blockers = conn.execute(
+        """SELECT COUNT(*) FROM ticker_daily_state
+           WHERE run_id = ? AND selected = 1 AND blocked_by IS NOT NULL""",
+        (run_id,),
+    ).fetchone()[0]
+    candidate_selected_blockers = conn.execute(
+        """SELECT COUNT(*) FROM candidate_scores
+           WHERE run_id = ? AND selected = 1 AND blocked_by IS NOT NULL""",
+        (run_id,),
+    ).fetchone()[0]
+    candidate_reason_gaps = conn.execute(
+        """SELECT COUNT(*) FROM candidate_scores
+           WHERE run_id = ?
+             AND role = 'candidate'
+             AND COALESCE(selected, 0) = 0
+             AND blocked_by IS NULL""",
+        (run_id,),
+    ).fetchone()[0]
+    decision_reason_gaps = conn.execute(
+        """SELECT COUNT(*) FROM ticker_daily_state
+           WHERE run_id = ?
+             AND COALESCE(selected, 0) = 0
+             AND blocked_by IS NULL""",
+        (run_id,),
+    ).fetchone()[0]
+    trade_payload_gaps = conn.execute(
+        """SELECT COUNT(*) FROM trades
+           WHERE run_id = ?
+             AND (
+               score_snapshot_json IS NULL
+               OR decision_inputs_json IS NULL
+               OR score_snapshot_json IN ('{}', 'null')
+               OR decision_inputs_json IN ('{}', 'null')
+             )""",
+        (run_id,),
+    ).fetchone()[0]
+    model_type_gaps = conn.execute(
+        """SELECT COUNT(*) FROM ticker_daily_state
+           WHERE run_id = ?
+             AND COALESCE(in_universe, 0) = 1
+             AND model_type IS NULL""",
+        (run_id,),
+    ).fetchone()[0]
+    selected_sector_gaps = conn.execute(
+        """SELECT COUNT(*) FROM ticker_daily_state
+           WHERE run_id = ?
+             AND COALESCE(selected, 0) = 1
+             AND (sector IS NULL OR TRIM(sector) = '')""",
+        (run_id,),
+    ).fetchone()[0]
+    candidate_selected_sector_gaps = conn.execute(
+        """SELECT COUNT(*) FROM candidate_scores
+           WHERE run_id = ?
+             AND role = 'candidate'
+             AND COALESCE(selected, 0) = 1
+             AND (sector IS NULL OR TRIM(sector) = '')""",
+        (run_id,),
+    ).fetchone()[0]
+    candidate_horizon_gaps = conn.execute(
+        """SELECT COUNT(*) FROM candidate_scores
+           WHERE run_id = ?
+             AND (
+               (expected_return IS NOT NULL AND expected_return_horizon_days IS NULL)
+               OR (mu IS NOT NULL AND mu_horizon_days IS NULL)
+             )""",
+        (run_id,),
+    ).fetchone()[0]
+    decision_horizon_gaps = conn.execute(
+        """SELECT COUNT(*) FROM ticker_daily_state
+           WHERE run_id = ?
+             AND (
+               (expected_return IS NOT NULL AND expected_return_horizon_days IS NULL)
+               OR (mu IS NOT NULL AND mu_horizon_days IS NULL)
+             )""",
+        (run_id,),
+    ).fetchone()[0]
+    trade_horizon_gaps = conn.execute(
+        """SELECT COUNT(*) FROM trades
+           WHERE run_id = ?
+             AND (
+               (expected_return IS NOT NULL AND expected_return_horizon_days IS NULL)
+               OR (mu IS NOT NULL AND mu_horizon_days IS NULL)
+             )""",
+        (run_id,),
+    ).fetchone()[0]
+
+    trade_rows = conn.execute(
+        """SELECT action, shares, gross_pnl, tax, net_pnl_after_tax,
+                  source_job, source_task, order_source,
+                  score_snapshot_json, decision_inputs_json
+             FROM trades
+            WHERE run_id = ?""",
+        (run_id,),
+    ).fetchall()
+    sell_share_gaps = 0
+    sell_economic_gaps = 0
+    fallback_trade_attribution_gaps = 0
+    qp_trade_attribution_gaps = 0
+    qp_buy_horizon_gaps = 0
+    for (
+        action,
+        shares,
+        gross_pnl,
+        tax,
+        net_pnl_after_tax,
+        source_job,
+        source_task,
+        order_source,
+        score_json,
+        inputs_json,
+    ) in trade_rows:
+        action_l = str(action or "").lower()
+        if action_l in {"sell", "short_cover"}:
+            try:
+                sh = float(shares)
+            except (TypeError, ValueError):
+                sh = 0.0
+            if sh <= 0:
+                sell_share_gaps += 1
+            if not _sell_economics_are_valid(gross_pnl, tax, net_pnl_after_tax):
+                sell_economic_gaps += 1
+        try:
+            score_snapshot = json.loads(score_json) if score_json else {}
+        except Exception:  # noqa: BLE001
+            score_snapshot = {}
+        try:
+            decision_inputs = json.loads(inputs_json) if inputs_json else {}
+        except Exception:  # noqa: BLE001
+            decision_inputs = {}
+        if isinstance(score_snapshot, dict) and score_snapshot.get("attribution_missing"):
+            fallback_trade_attribution_gaps += 1
+        if isinstance(decision_inputs, dict) and decision_inputs.get("attribution_missing"):
+            fallback_trade_attribution_gaps += 1
+
+        merged_source = " ".join(
+            str(v or "")
+            for v in (
+                source_job,
+                source_task,
+                order_source,
+                decision_inputs.get("source_job") if isinstance(decision_inputs, dict) else "",
+                decision_inputs.get("source_task") if isinstance(decision_inputs, dict) else "",
+                decision_inputs.get("order_source") if isinstance(decision_inputs, dict) else "",
+                decision_inputs.get("acceptance_reason") if isinstance(decision_inputs, dict) else "",
+            )
+        ).lower()
+        if "qp" in merged_source or "jointportfolioqpjob" in merged_source:
+            required = ("delta_w", "target_w", "solver_status")
+            if not isinstance(decision_inputs, dict) or any(
+                decision_inputs.get(k) is None for k in required
+            ):
+                qp_trade_attribution_gaps += 1
+            if str(action or "").lower() == "buy":
+                if (
+                    not isinstance(score_snapshot, dict)
+                    or not _json_finite(score_snapshot.get("expected_return"))
+                    or not _json_positive_int(
+                        score_snapshot.get("expected_return_horizon_days")
+                    )
+                    or not _json_positive_int(score_snapshot.get("mu_horizon_days"))
+                    or not isinstance(decision_inputs, dict)
+                    or not _json_positive_int(
+                        decision_inputs.get("expected_return_horizon_days")
+                    )
+                    or not _json_positive_int(decision_inputs.get("mu_horizon_days"))
+                ):
+                    qp_buy_horizon_gaps += 1
+    return {
+        "run_id": run_id,
+        "ticker_daily_state_rows": len(recorded),
+        "expected_watchlist_rows": len(expected) if expected else None,
+        "missing_watchlist_tickers": sorted(expected - recorded),
+        "extra_tickers": sorted(extra_tickers) if expected else [],
+        "unexplained_extra_tickers": (
+            sorted(unexplained_extra_tickers) if expected else []
+        ),
+        "selected_blocked_rows": int(selected_blockers or 0),
+        "candidate_selected_blocked_rows": int(candidate_selected_blockers or 0),
+        "candidate_reason_gaps": int(candidate_reason_gaps or 0),
+        "decision_reason_gaps": int(decision_reason_gaps or 0),
+        "trade_payload_gaps": int(trade_payload_gaps or 0),
+        "fallback_trade_attribution_gaps": int(fallback_trade_attribution_gaps),
+        "sell_share_gaps": int(sell_share_gaps),
+        "sell_economic_gaps": int(sell_economic_gaps),
+        "qp_trade_attribution_gaps": int(qp_trade_attribution_gaps),
+        "qp_buy_horizon_gaps": int(qp_buy_horizon_gaps),
+        "model_type_gaps": int(model_type_gaps or 0),
+        "selected_sector_gaps": int(selected_sector_gaps or 0),
+        "candidate_selected_sector_gaps": int(candidate_selected_sector_gaps or 0),
+        "candidate_horizon_gaps": int(candidate_horizon_gaps or 0),
+        "decision_horizon_gaps": int(decision_horizon_gaps or 0),
+        "trade_horizon_gaps": int(trade_horizon_gaps or 0),
+        "ok": (
+            (
+                not expected
+                or (expected <= recorded and not unexplained_extra_tickers)
+            )
+            and int(selected_blockers or 0) == 0
+            and int(candidate_selected_blockers or 0) == 0
+            and int(candidate_reason_gaps or 0) == 0
+            and int(decision_reason_gaps or 0) == 0
+            and int(trade_payload_gaps or 0) == 0
+            and int(fallback_trade_attribution_gaps) == 0
+            and int(sell_share_gaps) == 0
+            and int(sell_economic_gaps) == 0
+            and int(qp_trade_attribution_gaps) == 0
+            and int(qp_buy_horizon_gaps) == 0
+            and int(model_type_gaps or 0) == 0
+            and int(selected_sector_gaps or 0) == 0
+            and int(candidate_selected_sector_gaps or 0) == 0
+            and int(candidate_horizon_gaps or 0) == 0
+            and int(decision_horizon_gaps or 0) == 0
+            and int(trade_horizon_gaps or 0) == 0
+        ),
+    }
+
+
+def _json_finite(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _json_positive_int(value: Any) -> bool:
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def validate_decision_trace_integrity(
+    conn: sqlite3.Connection | None,
+    run_id: str | None,
+    config: dict,
+    *,
+    context: str = "decision_trace",
+) -> dict[str, Any]:
+    """Validate the just-written decision trace and optionally fail closed.
+
+    The persistence layer is only useful if every run can be replayed from DB
+    rows. This helper is called by sim/live/LEAN adapters immediately after
+    they write candidate_scores, trades, and ticker_daily_state.
+    """
+    if conn is None or run_id is None:
+        return {}
+    from renquant_pipeline.kernel.pipeline.task_benchmark_sleeve import decision_trace_tickers  # noqa: PLC0415
+
+    report = decision_trace_integrity_report(
+        conn,
+        run_id,
+        expected_watchlist=decision_trace_tickers(config),
+    )
+    if report.get("ok", False):
+        log.info("%s: decision trace integrity OK (run_id=%s)", context, run_id)
+        return report
+
+    msg = (
+        f"{context}: decision trace integrity failed for run_id={run_id}: "
+        f"{json.dumps(report, sort_keys=True, default=str)}"
+    )
+    strict = bool(
+        (config.get("persistence", {}) or {})
+        .get("strict_decision_trace_integrity", True)
+    )
+    if strict:
+        raise RuntimeError(msg)
+    log.warning(msg)
+    return report
+
+
+def record_forward_returns(
+    conn: sqlite3.Connection | None,
+    rows: Iterable[dict],
+) -> int:
+    """Upsert ticker_forward_returns rows (Plan AA).
+
+    Each row: `{as_of_date, ticker, close_price, fwd_1d, fwd_5d,
+    fwd_10d, fwd_20d, fwd_60d}`.
+    Any field except (as_of_date, ticker) can be None. Returns number of rows written.
+    """
+    if conn is None:
+        return 0
+    payload = []
+    for r in rows:
+        payload.append((
+            r["as_of_date"] if isinstance(r["as_of_date"], str)
+            else r["as_of_date"].isoformat(),
+            r["ticker"],
+            _none_or_float(r.get("close_price")),
+            _none_or_float(r.get("fwd_1d")),
+            _none_or_float(r.get("fwd_5d")),
+            _none_or_float(r.get("fwd_10d")),
+            _none_or_float(r.get("fwd_20d")),
+            _none_or_float(r.get("fwd_60d")),
+        ))
+    if not payload:
+        return 0
+    conn.executemany(
+        """INSERT INTO ticker_forward_returns
+              (as_of_date, ticker, close_price, fwd_1d, fwd_5d, fwd_10d, fwd_20d, fwd_60d)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(as_of_date, ticker) DO UPDATE SET
+              close_price = COALESCE(excluded.close_price, close_price),
+              fwd_1d      = COALESCE(excluded.fwd_1d, fwd_1d),
+              fwd_5d      = COALESCE(excluded.fwd_5d, fwd_5d),
+              fwd_10d     = COALESCE(excluded.fwd_10d, fwd_10d),
+              fwd_20d     = COALESCE(excluded.fwd_20d, fwd_20d),
+              fwd_60d     = COALESCE(excluded.fwd_60d, fwd_60d),
+              updated_at  = CURRENT_TIMESTAMP""",
+        payload,
+    )
+    return len(payload)
+
+
+def record_trade_evaluations(
+    conn: sqlite3.Connection | None,
+    rows: Iterable[dict],
+) -> int:
+    """Upsert trade_evaluations rows (roadmap §2026-04-26 Phase 1).
+
+    Each row: ``{run_id, ticker, action, horizon_days, fwd_return,
+    fwd_return_spy, relative_return, is_winner, n_trade_rows}``.
+
+    `is_winner` is computed by the caller (1 / 0 / None) so we don't
+    silently re-derive it from `relative_return` here — the caller's
+    intent (e.g. relative-to-benchmark vs absolute) stays explicit.
+
+    On conflict we REPLACE the row — backfill is idempotent. The
+    primary-key (run_id, ticker, action, horizon_days) prevents
+    double-counting when the same (trade, horizon) pair gets re-evaluated.
+
+    Returns the number of rows attempted (not necessarily inserted —
+    SQLite's INSERT OR REPLACE returns 1 for both insert + update).
+    """
+    if conn is None:
+        return 0
+    payload = []
+    for r in rows:
+        try:
+            run_id  = str(r["run_id"])
+            ticker  = str(r["ticker"])
+            action  = str(r["action"])
+            horizon = int(r["horizon_days"])
+        except (KeyError, ValueError, TypeError) as exc:
+            log.warning(
+                "record_trade_evaluations: skipping row missing required "
+                "key (run_id/ticker/action/horizon_days): %s — %s", r, exc,
+            )
+            continue
+        if action not in ("buy", "sell"):
+            log.warning(
+                "record_trade_evaluations: skipping row with invalid action=%r"
+                " (must be 'buy' or 'sell')", action,
+            )
+            continue
+        if horizon <= 0:
+            log.warning(
+                "record_trade_evaluations: skipping row with non-positive "
+                "horizon_days=%r", horizon,
+            )
+            continue
+        payload.append((
+            run_id, ticker, action, horizon,
+            _none_or_float(r.get("fwd_return")),
+            _none_or_float(r.get("fwd_return_spy")),
+            _none_or_float(r.get("relative_return")),
+            _none_or_int(r.get("is_winner")),
+            _none_or_int(r.get("n_trade_rows")),
+        ))
+    if not payload:
+        return 0
+    conn.executemany(
+        """INSERT INTO trade_evaluations
+              (run_id, ticker, action, horizon_days,
+               fwd_return, fwd_return_spy, relative_return,
+               is_winner, n_trade_rows)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(run_id, ticker, action, horizon_days) DO UPDATE SET
+              fwd_return       = COALESCE(excluded.fwd_return,       fwd_return),
+              fwd_return_spy   = COALESCE(excluded.fwd_return_spy,   fwd_return_spy),
+              relative_return  = COALESCE(excluded.relative_return,  relative_return),
+              is_winner        = COALESCE(excluded.is_winner,        is_winner),
+              n_trade_rows     = COALESCE(excluded.n_trade_rows,     n_trade_rows),
+              created_at       = CURRENT_TIMESTAMP""",
+        payload,
+    )
+    return len(payload)
+
+
+# ── Small helpers ─────────────────────────────────────────────────────────────
+
+def _none_or_float(v: Any) -> float | None:
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        # Round-3 audit (#R3-45): also filter ±inf. SQLite stores them as
+        # REAL but later analytics queries (median, percentile) silently
+        # break. Treat as missing.
+        import math
+        if not math.isfinite(f):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+
+def _none_or_int(v: Any) -> int | None:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def lookup_candidate_scores_on_date(
+    conn,
+    tickers: "list[str]",
+    as_of: "datetime.date",
+    role: str = "candidate",
+) -> dict[str, dict]:
+    """Return {ticker: {rank_score, panel_score, mu, sigma}} for the
+    snapshot recorded on `as_of` with the given `role`.
+
+    Used by Rotation V4 (thesis_symmetric) to look up B's score on A's
+    entry date. Joins candidate_scores × pipeline_runs to find the run
+    that executed on `as_of` and pulls each ticker's scores.
+
+    Round-3 audit (#R3-46): added `role` filter (default "candidate") so
+    the lookup doesn't accidentally pick up a holding-side snapshot when
+    both exist for the same ticker on the same date. Holdings have
+    `raw_score=NULL` (line 418 in record_candidate_scores), which would
+    silently mis-rank rotation pairs.
+
+    Returns an empty dict if no run landed on that date (sim hasn't
+    processed it yet, or it was pre-sim-start). Callers should treat
+    absence as "skip this pair" rather than "signal=0".
+    """
+    if not tickers:
+        return {}
+    placeholders = ",".join("?" * len(tickers))
+    cur = conn.execute(
+        f"""
+        SELECT cs.ticker, cs.rank_score, cs.panel_score, cs.mu, cs.sigma
+        FROM candidate_scores cs
+        JOIN pipeline_runs pr ON cs.run_id = pr.run_id
+        WHERE pr.run_date = ?
+          AND cs.role     = ?
+          AND cs.ticker IN ({placeholders})
+        """,
+        (str(as_of), role, *tickers),
+    )
+    out: dict[str, dict] = {}
+    for row in cur:
+        out[row[0]] = {
+            "rank_score":  row[1],
+            "panel_score": row[2],
+            "mu":          row[3],
+            "sigma":       row[4],
+        }
+    return out
+
+
+__all__ = [
+    "ensure_schema",
+    "get_connection",
+    "clear_sim_tables",
+    "record_pipeline_run",
+    "record_candidate_scores",
+    "record_trades",
+    "record_order_outcomes",
+    "normalize_fill_status",
+    "FILL_STATUSES",
+    "FILL_STATUS_SUBMITTED",
+    "FILL_STATUS_UNKNOWN",
+    "FILL_STATUS_PARTIALLY_FILLED",
+    "FILL_STATUS_FILLED",
+    "FILL_STATUS_CANCELED",
+    "FILL_STATUS_REJECTED",
+    "FILL_STATUS_EXPIRED",
+    "record_training_run",
+    "record_forward_returns",
+    "record_live_state_snapshot",
+    "load_latest_live_state",
+    "record_portfolio_metrics",
+    "record_ticker_daily_state",
+    "decision_trace_integrity_report",
+    "validate_decision_trace_integrity",
+    "lookup_candidate_scores_on_date",
+]
+
+
+def record_gate_verdicts(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    registry,
+) -> int:
+    """Append the run's GateRegistry submissions to gate_verdicts.
+
+    eng plan S2-PR4 / errata C: every decision writes a ledger row.
+    ``registry`` is a kernel.gate_registry.GateRegistry (duck-typed via
+    ledger_rows so the umbrella's lazy-import path works). No-op when
+    persistence is disabled, run_id is missing, or no verdicts were
+    submitted. Append-only by construction — no upsert.
+    """
+    if conn is None or run_id is None or registry is None:
+        return 0
+    rows = registry.ledger_rows(run_id=run_id)
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO gate_verdicts
+              (run_id, run_date, gate, scope, verdict, reason, inputs_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        [
+            (
+                r["run_id"],
+                run_date.isoformat(),
+                r["gate"],
+                r["scope"],
+                r["verdict"],
+                r["reason"],
+                json.dumps(r["inputs"], sort_keys=True, default=str),
+            )
+            for r in rows
+        ],
+    )
+    return len(rows)
+
+
+def record_score_drift_audit(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    report,
+) -> int:
+    """Append one score_drift_audits row from a DriftReport (L6 item 3).
+
+    ``report`` is a kernel.score_drift.DriftReport (duck-typed on .psi /
+    .severity / .n_baseline / .n_current). No-op when persistence is
+    disabled or there is no report. Append-only — drift history accrues.
+    Returns 1 on write, else 0.
+    """
+    if conn is None or report is None:
+        return 0
+    psi_val = getattr(report, "psi", None)
+    conn.execute(
+        """INSERT INTO score_drift_audits
+              (run_id, run_date, psi, severity, n_baseline, n_current)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (
+            run_id,
+            run_date.isoformat(),
+            None if psi_val is not None and psi_val != psi_val else psi_val,  # NaN→NULL
+            report.severity,
+            getattr(report, "n_baseline", None),
+            getattr(report, "n_current", None),
+        ),
+    )
+    return 1
+
+
+def save_alert_book(conn: sqlite3.Connection | None, book) -> int:
+    """Persist every incident in an AlertBook (kernel.alert_lifecycle).
+
+    Upsert keyed on (audit, scope, cause_hash) — the escalation state
+    machine survives restarts so a daily run continues an incident
+    instead of re-raising it as NEW. No-op when persistence is disabled.
+    Returns the number of incidents written.
+    """
+    if conn is None or book is None:
+        return 0
+    rows = [
+        (a.audit, a.scope, a.cause_hash, a.first_seen.isoformat(),
+         a.last_seen.isoformat(), a.state, 1 if a.acked else 0,
+         int(a.notifications))
+        for a in book.alerts.values()
+    ]
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO alert_incidents
+              (audit, scope, cause_hash, first_seen, last_seen, state,
+               acked, notifications)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(audit, scope, cause_hash) DO UPDATE SET
+              first_seen=excluded.first_seen, last_seen=excluded.last_seen,
+              state=excluded.state, acked=excluded.acked,
+              notifications=excluded.notifications""",
+        rows,
+    )
+    return len(rows)
+
+
+def load_alert_book(conn: sqlite3.Connection | None,
+                    *, escalate_after_days: int = 5):
+    """Rebuild an AlertBook from alert_incidents. Returns an empty book
+    when persistence is disabled or the table is empty."""
+    from renquant_pipeline.kernel.alert_lifecycle import (  # noqa: PLC0415
+        Alert, AlertBook,
+    )
+
+    book = AlertBook(escalate_after_days=escalate_after_days)
+    if conn is None:
+        return book
+    try:
+        cur = conn.execute(
+            "SELECT audit, scope, cause_hash, first_seen, last_seen, state, "
+            "acked, notifications FROM alert_incidents")
+    except sqlite3.OperationalError:
+        return book  # table not created yet
+    for (audit, scope, cause_hash, first_seen, last_seen, state,
+         acked, notifications) in cur.fetchall():
+        a = Alert(
+            audit=audit, scope=scope, cause_hash=cause_hash,
+            first_seen=datetime.date.fromisoformat(first_seen),
+            last_seen=datetime.date.fromisoformat(last_seen),
+            state=state, acked=bool(acked), notifications=int(notifications),
+        )
+        book.alerts[a.key] = a
+    return book
+
+
+def record_reconciliation_actions(
+    conn: sqlite3.Connection | None,
+    *,
+    run_id: str | None,
+    run_date: datetime.date,
+    actions,
+) -> int:
+    """Append a broker-reconciliation run's NON-OK actions to
+    reconciliation_actions (eng plan §III.4).
+
+    ``actions`` is the list from kernel.broker_reconciliation.reconcile()
+    (duck-typed on .kind/.ticker/.detail/.state_qty/.broker_qty). OK
+    actions are skipped (steady state). No-op when persistence is
+    disabled, run_id is missing, or there are no non-OK actions.
+    Append-only by construction.
+    """
+    if conn is None or run_id is None or not actions:
+        return 0
+    rows = [
+        (run_id, run_date.isoformat(), a.kind, a.ticker, a.detail,
+         a.state_qty, a.broker_qty)
+        for a in actions if a.kind != "OK"
+    ]
+    if not rows:
+        return 0
+    conn.executemany(
+        """INSERT INTO reconciliation_actions
+              (run_id, run_date, kind, ticker, detail, state_qty, broker_qty)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        rows,
+    )
+    return len(rows)
