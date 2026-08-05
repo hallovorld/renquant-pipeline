@@ -192,9 +192,12 @@ def build_records(ctx: Any) -> tuple[list[dict], dict]:
 def write_served_matrix(out_dir: Path, rows: list[dict], manifest: dict) -> Path:
     """Write ``<out_dir>/<date>/<lane>__<run_id>.{parquet,json}``; return the parquet.
 
-    Both files are written via a temp sibling + ``os.replace`` so a reader never
-    sees a half-written matrix, and the JSON lands LAST so its presence means
-    the pair is complete.
+    PAIR ATOMICITY. Both temps are materialised before anything is swapped;
+    then the stale sidecar is dropped, the parquet is replaced, and the sidecar
+    is replaced last. The only intermediate state a reader can observe is
+    "parquet present, sidecar absent" — which the contract defines as
+    INCOMPLETE. A reader must therefore treat a parquet with no sidecar as
+    unusable, and never sees a NEW parquet paired with an OLD sidecar.
     """
     import os  # noqa: PLC0415
     import pandas as pd  # noqa: PLC0415
@@ -209,20 +212,26 @@ def write_served_matrix(out_dir: Path, rows: list[dict], manifest: dict) -> Path
     day_dir.mkdir(parents=True, exist_ok=True)
 
     parquet = day_dir / f"{stem}.parquet"
-    tmp_parquet = parquet.with_suffix(".parquet.incoming")
-    try:
-        pd.DataFrame(rows).to_parquet(tmp_parquet, index=False)
-        os.replace(tmp_parquet, parquet)
-    finally:
-        Path(tmp_parquet).unlink(missing_ok=True)
-
     sidecar = day_dir / f"{stem}.json"
+    tmp_parquet = parquet.with_suffix(".parquet.incoming")
     tmp_json = sidecar.with_suffix(".json.incoming")
     try:
+        # BOTH temps are fully materialised BEFORE anything is swapped, so a
+        # failure while building either one cannot touch what is already served.
+        pd.DataFrame(rows).to_parquet(tmp_parquet, index=False)
         tmp_json.write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str),
                             encoding="utf-8")
+        # [codex on orch#268] Swapping the parquet first left a REWRITE of the
+        # same <lane>__<run_id> incoherent if the sidecar swap then failed: a new
+        # parquet paired with the PREVIOUS run's sidecar — a mismatched pair that
+        # reads as evidence. Dropping the stale sidecar first makes the only
+        # reachable intermediate state "parquet present, sidecar absent", which
+        # the contract already defines as INCOMPLETE.
+        sidecar.unlink(missing_ok=True)
+        os.replace(tmp_parquet, parquet)
         os.replace(tmp_json, sidecar)
     finally:
+        Path(tmp_parquet).unlink(missing_ok=True)
         Path(tmp_json).unlink(missing_ok=True)
     return parquet
 

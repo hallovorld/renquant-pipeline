@@ -159,3 +159,96 @@ def test_it_runs_LAST_in_the_panel_scoring_chain():
     assert names[-1] == "PersistServedMatrixTask"
     for earlier in ("ApplyGlobalCalibrationTask", "ApplyNGBoostTask", "ApplyKellySizingTask"):
         assert names.index(earlier) < names.index("PersistServedMatrixTask"), earlier
+
+
+class TestPairAtomicity:
+    """[codex on orch#268] A REWRITE of the same <lane>__<run_id> must never
+    leave a NEW parquet paired with an OLD sidecar. A mismatched pair is worse
+    than no pair: it reads as evidence."""
+
+    def test_a_failed_sidecar_BUILD_leaves_the_previous_pair_COHERENT(
+        self, tmp_path, monkeypatch
+    ):
+        """Both temps are materialised before anything is swapped, so a failure
+        while BUILDING the sidecar cannot disturb what is already served."""
+        PersistServedMatrixTask().run(_ctx(tmp_path))
+        day = tmp_path / "logs" / "served_matrix" / "2026-08-04"
+        before = len(pd.read_parquet(next(day.glob("*.parquet"))))
+
+        real_write = Path.write_text
+
+        def boom(self, *a, **k):
+            if self.name.endswith(".json.incoming"):
+                raise OSError("no space left on device")
+            return real_write(self, *a, **k)
+
+        monkeypatch.setattr(Path, "write_text", boom)
+        ctx = _ctx(tmp_path)
+        ctx._panel_matrix = ctx._panel_matrix.reindex(["NVDA", "SPG"])
+        assert PersistServedMatrixTask().run(ctx) is None
+        monkeypatch.setattr(Path, "write_text", real_write)
+
+        m = json.loads(next(day.glob("*.json")).read_text())
+        assert len(pd.read_parquet(next(day.glob("*.parquet")))) == before == m["n_rows"]
+        assert not list(day.glob("*.incoming"))
+
+    def test_a_failed_sidecar_SWAP_leaves_no_MISMATCHED_pair(
+        self, tmp_path, monkeypatch
+    ):
+        """The only remaining window: the parquet is already swapped in when the
+        sidecar swap fails. The stale sidecar was dropped first, so a reader sees
+        parquet-without-sidecar (INCOMPLETE by contract) and NEVER a new parquet
+        paired with the previous run's sidecar."""
+        import os as _os
+
+        PersistServedMatrixTask().run(_ctx(tmp_path))
+        day = tmp_path / "logs" / "served_matrix" / "2026-08-04"
+        real_replace = _os.replace
+
+        def boom(src, dst, *a, **k):
+            if str(dst).endswith(".json"):
+                raise OSError("replace failed")
+            return real_replace(src, dst, *a, **k)
+
+        monkeypatch.setattr(_os, "replace", boom)
+        ctx = _ctx(tmp_path)
+        ctx._panel_matrix = ctx._panel_matrix.reindex(["NVDA", "SPG"])
+        assert PersistServedMatrixTask().run(ctx) is None
+        monkeypatch.setattr(_os, "replace", real_replace)
+
+        assert list(day.glob("*.parquet")), "the new parquet may survive"
+        assert not list(day.glob("*.json")), (
+            "a stale sidecar must NOT survive next to a NEW parquet — "
+            "parquet-without-sidecar reads as INCOMPLETE, a mismatched pair "
+            "reads as evidence")
+        assert not list(day.glob("*.incoming"))
+
+    def test_a_successful_rewrite_replaces_BOTH(self, tmp_path):
+        PersistServedMatrixTask().run(_ctx(tmp_path))
+        ctx = _ctx(tmp_path)
+        ctx._panel_matrix = ctx._panel_matrix.reindex(["NVDA", "SPG"])
+        PersistServedMatrixTask().run(ctx)
+        day = tmp_path / "logs" / "served_matrix" / "2026-08-04"
+        m = json.loads(next(day.glob("*.json")).read_text())
+        df = pd.read_parquet(next(day.glob("*.parquet")))
+        assert m["n_rows"] == len(df) == 2, "sidecar and parquet must agree"
+
+    def test_a_failed_parquet_rewrite_leaves_the_PREVIOUS_pair_intact(
+        self, tmp_path, monkeypatch
+    ):
+        """Failing while BUILDING a temp must not disturb what is served."""
+        PersistServedMatrixTask().run(_ctx(tmp_path))
+        day = tmp_path / "logs" / "served_matrix" / "2026-08-04"
+        before_rows = len(pd.read_parquet(next(day.glob("*.parquet"))))
+        before_json = next(day.glob("*.json")).read_text()
+
+        monkeypatch.setattr(pd.DataFrame, "to_parquet",
+                            lambda self, path, *a, **k: (_ for _ in ()).throw(
+                                OSError("disk error")))
+        ctx = _ctx(tmp_path)
+        ctx._panel_matrix = ctx._panel_matrix.reindex(["NVDA"])
+        assert PersistServedMatrixTask().run(ctx) is None
+
+        assert len(pd.read_parquet(next(day.glob("*.parquet")))) == before_rows
+        assert next(day.glob("*.json")).read_text() == before_json
+        assert not list(day.glob("*.incoming"))

@@ -74,3 +74,37 @@ of accumulation before it can run. This PR buys the first day of it; it does not
 make any claim about the models.
 
 Suites: 11 new tests · 2464 passed, 8 skipped (full pipeline).
+
+## Review round 2 (codex on #268) — pair atomicity
+
+Codex cleared the fail-open and API-reality checks (`broker_name`, `candidates`,
+`holdings`, `_panel_matrix`, `run_id`, `kelly_target_pct` all real; the twin
+re-pin honest) and blocked on durability, with a reproduction:
+
+> write one good pair, then force the SECOND write's `.json.incoming` to raise
+> after the parquet replace → `parquet_rows=2` with `json_n_rows=1`, no
+> `.incoming` left behind.
+
+Correct, and worse than "not atomic": a **new parquet paired with the previous
+run's sidecar is a mismatched pair that reads as evidence**. A missing sidecar
+reads as incomplete; a wrong one reads as true.
+
+Fixed by making the swap order the invariant:
+
+1. materialise BOTH temps — a failure while building either cannot touch what is
+   already served;
+2. `unlink` the stale sidecar;
+3. replace the parquet;
+4. replace the sidecar.
+
+The only intermediate state a reader can observe is **parquet present, sidecar
+absent** — which the contract already defines as INCOMPLETE. Documented on
+`write_served_matrix` so a reader knows to treat that state as unusable.
+
+Four durability tests: a failed sidecar BUILD leaves the previous pair coherent
+(parquet rows == sidecar `n_rows`); a failed sidecar SWAP leaves the new parquet
+with NO sidecar and never a stale one; a successful rewrite replaces both and
+they agree; a failed parquet build leaves the previous pair byte-identical. No
+`.incoming` survives any branch.
+
+15 tests in this file · 2468 passed, 8 skipped.
