@@ -119,7 +119,12 @@ MOMENTUM_COMPONENT_REQUIRED_KEYS = (
     "artifact_path",
     "expected_config_fingerprint",
 )
-N_COMPONENTS = 2
+# GOAL-9 (orch#794 AC3, decided 2026-08-04): the combination rule is an
+# unweighted sum of per-component cross-sectional z-scores and the scoring
+# loop is N-ready; the certified 2-component construction generalizes
+# VERBATIM to N >= 2. Per-component weights are deliberately NOT introduced
+# here — weighting is the MoE stage's own preregistered change (AC5).
+MIN_COMPONENTS = 2
 # Below this many hex chars a content pin is rejected outright — a too-short
 # prefix stops being an identity claim.
 MIN_CONTENT_PIN_HEX = 8
@@ -228,9 +233,9 @@ class BlendPanelScorer:
     seq_len = 1
 
     def __init__(self, components: list[BlendComponent]):
-        if len(components) != N_COMPONENTS:
+        if len(components) < MIN_COMPONENTS:
             raise ValueError(
-                f"BlendPanelScorer needs exactly {N_COMPONENTS} components, "
+                f"BlendPanelScorer needs at least {MIN_COMPONENTS} components, "
                 f"got {len(components)}")
         self.components = list(components)
         feat: set[str] = set()
@@ -408,10 +413,10 @@ def load_blend_scorer(config: dict) -> BlendPanelScorer:
 
     panel_cfg = (config or {}).get("ranking", {}).get("panel_scoring", {})
     comps_cfg = panel_cfg.get("components")
-    if not isinstance(comps_cfg, list) or len(comps_cfg) != N_COMPONENTS:
+    if not isinstance(comps_cfg, list) or len(comps_cfg) < MIN_COMPONENTS:
         raise ValueError(
             "blend config requires ranking.panel_scoring.components as a "
-            f"list of exactly {N_COMPONENTS} entries, got: {comps_cfg!r}")
+            f"list of at least {MIN_COMPONENTS} entries, got: {comps_cfg!r}")
     strategy_dir = (config or {}).get("_strategy_dir")
     loaded: list[BlendComponent] = []
     for i, entry in enumerate(comps_cfg):

@@ -236,13 +236,66 @@ class TestPinVerification:
         with pytest.raises(ValueError, match="content_sha256 MISMATCH"):
             load_blend_scorer(config)
 
-    @pytest.mark.parametrize("n", [0, 1, 3])
-    def test_component_count_enforced(self, component_artifacts, n):
+    @pytest.mark.parametrize("n", [0, 1])
+    def test_component_count_floor_enforced(self, component_artifacts, n):
+        """GOAL-9 N-generalization (orch#794 AC3, 2026-08-04): the floor is
+        >= 2; fewer still fails closed with the new message."""
         config, _, _ = component_artifacts
         comps = config["ranking"]["panel_scoring"]["components"]
         config["ranking"]["panel_scoring"]["components"] = (comps * 2)[:n]
-        with pytest.raises(ValueError, match="exactly 2"):
+        with pytest.raises(ValueError, match="at least 2"):
             load_blend_scorer(config)
+
+    def test_three_components_score_is_exact_unweighted_zsum(self, component_artifacts):
+        """N=3 numerical contract (codex on pipeline#267): with THREE
+        IDENTICAL legs the unweighted z-sum is exactly 1.5x the TWO-identical-
+        leg sum (3*z0 vs 2*z0). Any normalization/mean aggregation sneaking in
+        breaks this equality — the direct AC3 regression guard. (A mixed
+        duplicated-first-leg construction does NOT satisfy 1.5x — s3 = s2 +
+        z0 with z0 != z1 — which is why the identical-legs form is the
+        numeric probe; the first draft of this test claimed 1.5x for the
+        mixed form and was wrong.)"""
+        import numpy as np
+        import pandas as pd
+
+        config, _, _ = component_artifacts
+        comps = config["ranking"]["panel_scoring"]["components"]
+        X = pd.DataFrame(
+            {"f1": [1.0, 2.0, 3.0, 4.0], "f2": [1.0, 1.0, 2.0, 4.0]},
+            index=["AAA", "BBB", "CCC", "DDD"],
+        )
+        config["ranking"]["panel_scoring"]["components"] = [
+            dict(comps[0]), dict(comps[0])]
+        s2 = load_blend_scorer(config).score(X)
+        config["ranking"]["panel_scoring"]["components"] = [
+            dict(comps[0]), dict(comps[0]), dict(comps[0])]
+        three = load_blend_scorer(config)
+        assert len(three.components) == 3
+        s3 = three.score(X)
+        np.testing.assert_allclose(s3.to_numpy(), 1.5 * s2.to_numpy(), rtol=1e-12)
+
+    def test_three_components_mixed_legs_load_with_order_bearing_fp(self, component_artifacts):
+        """Mixed N=3 (the real F1/F3 shape) loads, scores finitely, and the
+        composite fp covers all three legs in config order."""
+        import numpy as np
+        import pandas as pd
+
+        config, _, _ = component_artifacts
+        comps = config["ranking"]["panel_scoring"]["components"]
+        X = pd.DataFrame(
+            {"f1": [1.0, 2.0, 3.0, 4.0], "f2": [1.0, 1.0, 2.0, 4.0]},
+            index=["AAA", "BBB", "CCC", "DDD"],
+        )
+        config["ranking"]["panel_scoring"]["components"] = comps + [dict(comps[0])]
+        three = load_blend_scorer(config)
+        s3 = three.score(X)
+        assert np.isfinite(s3.to_numpy()).all()
+        fps = [c.config_fingerprint for c in three.components]
+        from renquant_pipeline.kernel.panel_pipeline.blend_scorer import (
+            composite_config_fingerprint,
+        )
+        assert three.metadata["config_fingerprint"] == composite_config_fingerprint(fps)
+        assert len(fps) == 3 and fps[0] == fps[2] and fps[0] != fps[1]
 
     def test_unresolvable_component_fails_closed(self, component_artifacts, tmp_path):
         config, _, _ = component_artifacts
