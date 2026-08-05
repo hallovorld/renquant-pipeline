@@ -133,20 +133,14 @@ def _as_float(value: Any) -> float:
     return float(value)
 
 
-def _params_fingerprint(params: Mapping[str, Any]) -> str:
-    """Deterministic training-config identity derived from the artifact's own
-    params block: ``momentum-<params_version>-<sha256(canonical params)[:16]>``.
-
-    The momentum artifact carries no ``config_fingerprint`` field (s104#77
-    F-2: its identity fields are ``trained_at_utc`` / ``cutoff_date`` /
-    ``content_sha256``), but the health contract requires one — this stamps
-    the honest equivalent: the params block IS the training config, and the
-    fingerprint is recomputable from the artifact by any reader."""
-    canon = json.dumps(dict(params), sort_keys=True, separators=(",", ":"),
-                       allow_nan=False)
-    digest = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
-    version = str(params.get("params_version", "unversioned"))
-    return f"momentum-{version}-{digest}"
+# RQ#574 r3: the recipe moved to the dependency-light PUBLIC contract
+# renquant_pipeline.momentum_identity (stdlib-only) so the umbrella's
+# pinned-path gate can validate ledger components without pandas. The
+# private alias stays so every existing caller/stamp site is unchanged;
+# there is exactly ONE implementation.
+from renquant_pipeline.momentum_identity import (  # noqa: E402
+    params_fingerprint as _params_fingerprint,
+)
 
 
 def _reconstruct_scores(artifact: Mapping[str, Any], composite_scores,
