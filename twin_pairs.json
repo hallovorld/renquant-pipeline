@@ -86,7 +86,8 @@
       "public_sha256": "10b58be68c7286d58f45ebe6087a4040361667602fe6c68bc9843941ba4f4af6"
     },
     "PanelScoringJob": {
-      "kernel_sha256": "bc1d082dd37b10b86114e572f4afe6d66e9e5a0e8e9bbd0c03b326410fd36e73",
+      "_repin_2026_08_04": "orch#703: PersistServedMatrixTask added to the KERNEL chain only, and DELIBERATELY not to the public twin. The public PanelScoringJob is the intraday/frozen-score chain (renquant105): it has no NGBoost/Kelly/QualityFloor stage, and its matrix lives at ctx.panel_feature_matrix \u2014 a dict that _StubFrozenFeatureMatrixTask fills with EMPTY per-ticker dicts. Persisting there would write a file that looks like served-input evidence and contains none. #703 is about the DAILY served matrix; this pair stays intentionally asymmetric.",
+      "kernel_sha256": "50e7bf4b03545122b618e1af00c9f94465c1a446cdbce71fd322e27135d6023c",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,

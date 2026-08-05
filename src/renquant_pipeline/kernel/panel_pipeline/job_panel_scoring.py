@@ -4309,6 +4309,9 @@ class PanelScoringJob(Job):
         # ApplyScoresTask (which writes primary scores). Lazy-imported to
         # avoid forcing import cost on configs that don't use shadow.
         from renquant_pipeline.kernel.panel_pipeline.shadow_scoring import ApplyShadowScoringTask  # noqa: PLC0415
+        from renquant_pipeline.kernel.panel_pipeline.task_persist_served_matrix import (  # noqa: PLC0415
+            PersistServedMatrixTask,
+        )
         return [
             LoadScorerTask(),
             BuildFeatureMatrixTask(),
@@ -4347,4 +4350,9 @@ class PanelScoringJob(Job):
             # All gates default OFF — bit-for-bit parity preserved.
             # See doc/components/buy-logic-design.md for theory.
             QualityFloorTask(),
+            # orch#703 (2026-08-04): persist the SERVED matrix + the final
+            # decision surface. LAST on purpose — the raw scorer output alone
+            # does not explain a buy; rank_score after calibration, mu/sigma
+            # after NGBoost and the Kelly target do. Fail-open logging path.
+            PersistServedMatrixTask(),
         ]
