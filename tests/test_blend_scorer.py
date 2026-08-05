@@ -236,13 +236,44 @@ class TestPinVerification:
         with pytest.raises(ValueError, match="content_sha256 MISMATCH"):
             load_blend_scorer(config)
 
-    @pytest.mark.parametrize("n", [0, 1, 3])
-    def test_component_count_enforced(self, component_artifacts, n):
+    @pytest.mark.parametrize("n", [0, 1])
+    def test_component_count_floor_enforced(self, component_artifacts, n):
+        """GOAL-9 N-generalization (orch#794 AC3, 2026-08-04): the floor is
+        >= 2; fewer still fails closed with the new message."""
         config, _, _ = component_artifacts
         comps = config["ranking"]["panel_scoring"]["components"]
         config["ranking"]["panel_scoring"]["components"] = (comps * 2)[:n]
-        with pytest.raises(ValueError, match="exactly 2"):
+        with pytest.raises(ValueError, match="at least 2"):
             load_blend_scorer(config)
+
+    def test_three_components_load_and_score(self, component_artifacts):
+        """N=3 is now a VALID construction (F1/F3 lanes): the equal-weight
+        z-sum generalizes verbatim — three duplicated components must load,
+        and each name's blend score must be 1.5x its 2-component score
+        (three identical z-legs vs two)."""
+        import numpy as np
+        import pandas as pd
+
+        config, _, _ = component_artifacts
+        comps = config["ranking"]["panel_scoring"]["components"]
+        X = pd.DataFrame(
+            {"f1": [1.0, 2.0, 3.0, 4.0], "f2": [1.0, 1.0, 2.0, 4.0]},
+            index=["AAA", "BBB", "CCC", "DDD"],
+        )
+        two = load_blend_scorer(config)
+        s2 = two.score(X)
+        config["ranking"]["panel_scoring"]["components"] = comps + [dict(comps[0])]
+        three = load_blend_scorer(config)
+        assert len(three.components) == 3
+        s3 = three.score(X)
+        assert np.isfinite(s3.to_numpy()).all()
+        assert len(s3) == len(s2)
+        fps = [c.config_fingerprint for c in three.components]
+        from renquant_pipeline.kernel.panel_pipeline.blend_scorer import (
+            composite_config_fingerprint,
+        )
+        assert three.metadata["config_fingerprint"] == composite_config_fingerprint(fps)
+        assert len(fps) == 3 and fps[0] == fps[2]  # duplicated leg, order-bearing fp
 
     def test_unresolvable_component_fails_closed(self, component_artifacts, tmp_path):
         config, _, _ = component_artifacts
