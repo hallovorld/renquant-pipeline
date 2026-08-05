@@ -36,6 +36,14 @@ ALLOWED_BROKERS: frozenset[str] = frozenset({
     "alpaca_shadow_b",  # D6-§2a two-arm admission experiment, arm S-1.0 (control)
     "alpaca_shadow_blend",  # 2026-07-27 shadow_blend lane (blend kind; umbrella#535 mirror)
     "alpaca_shadow_blend_mom",  # 2026-08-04 GOAL-8 S1 momentum-blend shadow lane (RQ#563 Step 5b) — measured missing on session 1: state write raised ValueError
+    # GOAL-9 fleet lanes (orch#794 AC2) — registered AT BIRTH, before any rail
+    # lands, applying the #793 consumer-checklist lesson mechanically instead
+    # of by incident. F2 is buildable now (2 components); F1/F3 wait on the
+    # BlendPanelScorer N-generalization but their tags are reserved here so
+    # the allowlist is never the trailing consumer again.
+    "alpaca_shadow_blend_mom_fast",  # F2: zblend(reversal + FAST momentum); dormant until the first fast artifact 2026-08-08
+    "alpaca_shadow_blend_rb_mom",    # F1: zblend(reversal-blend[prod+clf] + slow momentum); needs 3-component scorer
+    "alpaca_shadow_blend_rb_fast",   # F3: zblend(reversal-blend[prod+clf] + FAST momentum); needs 3-component scorer
     "ibkr",
 })
 

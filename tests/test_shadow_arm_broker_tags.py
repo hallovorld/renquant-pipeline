@@ -130,3 +130,29 @@ def test_blend_mom_state_disjoint_from_blend_and_legacy(mod, tmp_path) -> None:
         "runs.alpaca_shadow_blend_mom.db")
     assert mod.runs_db_path(tmp_path / "runs.db", "alpaca_shadow_blend").name == (
         "runs.alpaca_shadow_blend.db")
+
+
+# --- GOAL-9 fleet tags (orch#794 AC2): registered AT BIRTH -----------------------
+
+FLEET_TAGS = ("alpaca_shadow_blend_mom_fast",
+              "alpaca_shadow_blend_rb_mom",
+              "alpaca_shadow_blend_rb_fast")
+
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+@pytest.mark.parametrize("tag", FLEET_TAGS)
+def test_fleet_tags_accepted_in_both_copies(mod, tag, tmp_path) -> None:
+    assert tag in mod.ALLOWED_BROKERS
+    assert mod._safe_broker(tag) == tag
+
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+def test_fleet_state_files_all_disjoint(mod, tmp_path) -> None:
+    tags = ("alpaca_shadow", "alpaca_shadow_blend", "alpaca_shadow_blend_mom") + FLEET_TAGS
+    state_files = {mod.live_state_path(tmp_path, t) for t in tags}
+    db_files = {mod.runs_db_path(tmp_path / "runs.db", t) for t in tags}
+    assert len(state_files) == len(tags)
+    assert len(db_files) == len(tags)
+    # the _mom prefix must not swallow the _mom_fast tag
+    assert mod.runs_db_path(tmp_path / "runs.db", "alpaca_shadow_blend_mom_fast").name == (
+        "runs.alpaca_shadow_blend_mom_fast.db")
