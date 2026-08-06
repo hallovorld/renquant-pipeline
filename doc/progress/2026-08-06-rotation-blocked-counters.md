@@ -76,12 +76,11 @@ rather than raising.
 3. **Whether the 4 blocked swaps would have been profitable.** Not estimated,
    and not the point.
 
-## NEXT
-
-With `blocked` non-zero, a chronic-block condition becomes detectable from the
-run summary alone. Wiring an ops-audit member on it is a separate change and
-should wait until at least one real run has produced a non-zero value, so the
-detector is written against a measured shape rather than an expected one.
+NEXT:     With `blocked` non-zero, a chronic-block condition becomes detectable
+          from the run summary alone. Wiring an ops-audit member on it is a
+          separate change and should wait until at least one real run has
+          produced a non-zero value, so the detector is written against a
+          measured shape rather than an expected one.
 
 ## REVERT
 
