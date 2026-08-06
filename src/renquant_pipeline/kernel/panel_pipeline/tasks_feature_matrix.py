@@ -302,9 +302,17 @@ class PersistFeatureSnapshotTask(Task):
     Reads:  ctx._panel_matrix, ctx._panel_scorer.feature_cols, ctx._fm_inputs
     Writes: nothing on ctx; a JSON file when a destination is configured
 
-    Placed LAST so it observes the matrix after RowCoverageGate and DriftGuard,
-    i.e. the exact object the scorer receives. Persisting the pre-gate matrix
-    would produce a snapshot whose rows were never scored.
+    Placed LAST so it observes the matrix after RowCoverageGate and DriftGuard
+    — the exact object the scorer receives, for scorer kinds that consume
+    ``ctx._panel_matrix`` as-is. It is NOT the served surface for every kind:
+    ``panel_linear`` / ``panel_ltr_xgboost`` / ``blend`` rebuild alpha158
+    features from raw OHLCV afterward in ``ApplyScoresTask``, and
+    ``requires_history`` scorers (PatchTST / hf_patchtst) bypass this matrix
+    entirely via ``score_with_history()``. ``persist_from_context`` refuses to
+    write for those kinds rather than label a matrix the scorer never saw as
+    AS-SERVED (codex HIGH, pipeline#273 review round 3). Persisting the
+    pre-gate matrix would additionally produce a snapshot whose rows were
+    never scored.
 
     Disabled unless ``ranking.panel_scoring.feature_snapshot_dir`` or
     ``$RQ_FEATURE_SNAPSHOT_DIR`` is set, and fail-open in every path — this runs

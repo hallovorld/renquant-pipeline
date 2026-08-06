@@ -211,6 +211,43 @@ def test_scorer_absent_refuses_to_write(tmp_path, monkeypatch):
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.parametrize("kind", ["panel_linear", "panel_ltr_xgboost", "blend"])
+def test_alpha158_rebuild_kind_refuses_to_write(tmp_path, monkeypatch, kind):
+    # codex HIGH (pipeline#273 review round 3): these kinds discard
+    # ctx._panel_matrix and rebuild alpha158 features from raw OHLCV inside
+    # ApplyScoresTask (job_panel_scoring.py compute_alpha158_at). The matrix
+    # here is the pre-rebuild 21-col XGB shape — writing it would label a
+    # matrix the scorer never scored as the AS-SERVED snapshot.
+    monkeypatch.setenv(ENV_DIR, str(tmp_path))
+    ctx = _Ctx(_matrix())
+    ctx._panel_scorer.metadata = {"kind": kind}
+    assert persist_from_context(ctx) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_requires_history_scorer_refuses_to_write(tmp_path, monkeypatch):
+    # Sequence scorers (PatchTST / hf_patchtst — the production primary,
+    # CLAUDE.md §2) bypass ctx._panel_matrix entirely via
+    # scorer.score_with_history(panel_history, target_tickers); panel_history
+    # is a separately-built long-format frame, not this matrix.
+    monkeypatch.setenv(ENV_DIR, str(tmp_path))
+    ctx = _Ctx(_matrix())
+    ctx._panel_scorer.requires_history = True
+    assert persist_from_context(ctx) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_non_rebuild_kind_still_writes(tmp_path, monkeypatch):
+    # Guardrail against over-broad refusal: a scorer kind that consumes
+    # ctx._panel_matrix as-is (e.g. panel_lgbm — not in the alpha158-rebuild
+    # list, not requires_history) must still get a real snapshot.
+    monkeypatch.setenv(ENV_DIR, str(tmp_path))
+    ctx = _Ctx(_matrix())
+    ctx._panel_scorer.metadata = {"kind": "panel_lgbm"}
+    assert persist_from_context(ctx) is not None
+    assert len(list(tmp_path.iterdir())) == 1
+
+
 # ── atomicity ──────────────────────────────────────────────────────────────
 
 def test_no_temp_file_survives_a_successful_write(tmp_path):

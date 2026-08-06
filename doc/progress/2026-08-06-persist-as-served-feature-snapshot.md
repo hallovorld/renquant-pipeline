@@ -1,9 +1,31 @@
 # 2026-08-06 — Persist the as-served feature matrix (unblocks rq105 shadow serving)
 
-STATUS:   READY FOR REVIEW. Code + 27 new tests; full suite 2495 passed / 8
-          skipped / 0 failed. **Default OFF** — no behaviour change until a
-          destination is configured. Not yet enabled anywhere; enabling is a
-          separate orchestrator-side change (see NEXT).
+STATUS:   READY FOR REVIEW. Code + 32 tests (27 original + 5 added in this
+          fix pass); focused suite (writer + panel-scoring consumers) 100
+          passed / 1 skipped / 0 failed. **Default OFF** — no behaviour
+          change until a destination is configured. Not yet enabled
+          anywhere; enabling is a separate orchestrator-side change (see
+          NEXT).
+
+          **Scope narrowed in this fix pass (codex HIGH, review round 3):**
+          `persist_from_context` now REFUSES to write for scorer kinds where
+          `ctx._panel_matrix` is not the surface actually scored —
+          `panel_linear` / `panel_ltr_xgboost` / `blend` (rebuild alpha158
+          from raw OHLCV afterward) and any `requires_history` scorer
+          (PatchTST / **hf_patchtst — the current production primary**,
+          bypasses this matrix via `score_with_history()`). Confirmed
+          `panel_lgbm` and other non-rebuild, non-history kinds are
+          unaffected and still write. **Consequence: as written, this task
+          currently writes NOTHING for the live production lane** (hf_patchtst)
+          **or the XGBoost shadow/rollback lane** (panel_ltr_xgboost) — the
+          two scorer kinds CLAUDE.md §2 names as active. It still closes the
+          structural gap safely (no mislabelled snapshot can reach rq105) but
+          does NOT yet unblock rq105 shadow serving off the prod lane as
+          originally scoped; that needs a follow-up hooking the actual
+          per-branch served surface inside `ApplyScoresTask` (`panel_history`
+          for history scorers, `X_aligned` for alpha158/XGB — the latter
+          already staged by `stage_serving_features()` in `serving_features.py`,
+          merged separately in #268).
 
 WHAT:     Adds `PersistFeatureSnapshotTask` as the last task of
           `BuildFeatureMatrixJob`, writing the surviving inference matrix to
@@ -54,9 +76,17 @@ prod or exp:   **prod code path** (the live order-placing scoring pipeline), but
                existing run takes the same `return None` and writes nothing.
 existing data: live `logs/daily_104/2026-08-06.log:430` —
                `AssembleInferenceMatrixTask: X.shape=(94, 172)  ff_sub=94`
-               `[VERIFIED]`. That is the object now persisted.
-best-known?:   yes — this is the only source of a genuinely as-served snapshot;
-               every alternative reconstructs.
+               `[VERIFIED]`. **Correction (this fix pass):** that 172-col
+               shape matches hf_patchtst's `feature_cols`, but hf_patchtst is
+               `requires_history=True` — the fix added here makes the writer
+               refuse to persist this exact matrix for that scorer, since
+               `score_with_history()` never consumes it. It is NOT the object
+               persisted for the current production lane.
+best-known?:   yes for scorer kinds that consume `ctx._panel_matrix` as-is
+               (e.g. `panel_lgbm`); NOT yet for `hf_patchtst` (prod) or
+               `panel_ltr_xgboost`/`panel_linear`/`blend` (shadow/rollback) —
+               those refuse rather than reconstruct, per the scope-narrowing
+               above.
 scope:         `BuildFeatureMatrixJob` only. No scoring, sizing, admission, or
                order logic touched.
 
@@ -89,9 +119,12 @@ dropped.
 
 ## NOT ESTABLISHED
 
-1. **That rq105 will produce useful decisions once wired.** This removes the
-   structural blocker only. Whether the shadow lane's output is informative is
-   untested and separate.
+1. **That rq105 will produce useful decisions once wired.** This removes part
+   of the structural blocker only — and, after this fix pass, not yet the
+   part that matters for the prod lane (see the scope-narrowing note in
+   STATUS above; a follow-up PR is still required before rq105 can source
+   from hf_patchtst). Whether the shadow lane's output is informative once
+   that follow-up lands is untested and separate.
 2. **That the snapshot is sufficient for score attribution.** It captures the
    matrix; reproducing a score also needs the scorer artifact, which is
    identified but not copied here.
@@ -99,18 +132,23 @@ dropped.
    comment refutes three of four; only `session-scheduler` remains
    unestablished, and this change does not address it.
 
-NEXT:     Enabling is deliberately NOT in this PR. It needs
-          `$RQ_FEATURE_SNAPSHOT_DIR` (or the config key) pointed at
-          `data/rq105/` for the **prod** lane — rq105 sources from the run
-          that placed the day's real orders. The env-var path exists so that
-          can be done in the reviewed launchd wrapper in
-          `renquant-orchestrator`, without an agent PR writing a production
-          `strategy_config.json` — the surface Codex blocked on
-          strategy-104#94 the same day.
+NEXT:     Enabling is deliberately NOT in this PR. **Superseded by the
+          scope-narrowing above:** pointing `$RQ_FEATURE_SNAPSHOT_DIR` at
+          `data/rq105/` for the **prod** lane alone no longer unblocks
+          rq105 — the prod scorer (hf_patchtst) now refuses to write. Before
+          that env var is wired anywhere, a follow-up PR must hook the
+          persist call to the actual per-branch served surface inside
+          `ApplyScoresTask` (`panel_history` cross-section for history
+          scorers; `X_aligned` for alpha158/XGB, reusing the pattern
+          `stage_serving_features()` already establishes in
+          `serving_features.py`, #268). Only once that follow-up lands does
+          "point the wrapper at `data/rq105/`" apply.
 
-Order: merge this → point the daily-104 wrapper at `data/rq105/` → the next
-daily-full emits the snapshot → `run_shadow_serving.sh` stops skipping. Only
-after a real snapshot has been served should orch#621 be re-scoped or closed.
+Order: merge this (safety-narrowed, writes nothing on the two active scorer
+kinds today) → follow-up PR hooks the real per-branch surface → point the
+daily-104 wrapper at `data/rq105/` → the next daily-full emits the snapshot →
+`run_shadow_serving.sh` stops skipping. Only after a real snapshot has been
+served should orch#621 be re-scoped or closed.
 
 ## REVERT
 

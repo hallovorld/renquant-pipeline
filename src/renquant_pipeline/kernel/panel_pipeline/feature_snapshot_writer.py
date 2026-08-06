@@ -72,6 +72,13 @@ ENV_DIR = "RQ_FEATURE_SNAPSHOT_DIR"
 
 BUILDER_NAME = "renquant_pipeline.kernel.panel_pipeline.feature_matrix"
 
+#: Scorer kinds that discard ``ctx._panel_matrix`` and rebuild alpha158
+#: features from raw OHLCV inside ``ApplyScoresTask`` (job_panel_scoring.py:
+#: "BuildFeatureMatrixJob builds the 21-feature matrix; alpha158 models
+#: expect 158 features computed from raw OHLCV"). Identical set to the one
+#: ``DriftGuardTask`` in tasks_feature_matrix.py already skips for.
+_REBUILDS_FEATURES_POST_MATRIX = ("panel_linear", "panel_ltr_xgboost", "blend")
+
 
 def resolve_output_dir(config: Any) -> str | None:
     """Destination directory, or None when snapshot writing is disabled.
@@ -221,6 +228,27 @@ def persist_from_context(ctx: Any) -> str | None:
             # empty list — a mislabelled snapshot, not an absent one. Refuse,
             # same as the missing-cutoff case above.
             log.warning("feature snapshot: no panel scorer on context — refusing to write")
+            return None
+        scorer_kind = (scorer.metadata.get("kind") if hasattr(scorer, "metadata") else None)
+        if scorer_kind in _REBUILDS_FEATURES_POST_MATRIX:
+            # codex HIGH (pipeline#273 review round 3): for these kinds,
+            # ctx._panel_matrix at this point is the pre-alpha158-rebuild
+            # 21-col XGB shape, not what the scorer scores — ApplyScoresTask
+            # rebuilds X from raw OHLCV via compute_alpha158_at() afterward.
+            # Writing it here would label a matrix the scorer never saw as
+            # the AS-SERVED snapshot. Refuse rather than substitute.
+            log.info("feature snapshot: scorer kind %r rebuilds features "
+                      "after this matrix — refusing to write a stale snapshot",
+                      scorer_kind)
+            return None
+        if getattr(scorer, "requires_history", False):
+            # Sequence scorers (PatchTST / hf_patchtst) bypass
+            # ctx._panel_matrix entirely — they call score_with_history() on
+            # a separately-built panel_history frame. Same substitution risk
+            # as above.
+            log.info("feature snapshot: scorer requires_history — bypasses "
+                      "ctx._panel_matrix via score_with_history(), refusing "
+                      "to write")
             return None
         feature_cols = getattr(scorer, "feature_cols", []) or []
         inputs = getattr(ctx, "_fm_inputs", None) or {}
