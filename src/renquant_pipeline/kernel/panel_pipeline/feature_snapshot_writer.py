@@ -214,6 +214,14 @@ def persist_from_context(ctx: Any) -> str | None:
             log.info("feature snapshot: no matrix on context (gated to None) — skipped")
             return None
         scorer = getattr(ctx, "_panel_scorer", None)
+        if scorer is None:
+            # Without a scorer we cannot state which columns were actually part
+            # of its contract; falling back to feature_cols=[] would still write
+            # the matrix's real columns under a builder_version hashed from an
+            # empty list — a mislabelled snapshot, not an absent one. Refuse,
+            # same as the missing-cutoff case above.
+            log.warning("feature snapshot: no panel scorer on context — refusing to write")
+            return None
         feature_cols = getattr(scorer, "feature_cols", []) or []
         inputs = getattr(ctx, "_fm_inputs", None) or {}
         cutoff = str(inputs.get("today_ts") or "").strip()

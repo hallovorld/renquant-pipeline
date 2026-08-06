@@ -200,11 +200,15 @@ def test_context_missing_every_attribute_does_not_raise(tmp_path, monkeypatch):
     assert persist_from_context(Bare()) is None
 
 
-def test_scorer_absent_does_not_raise(tmp_path, monkeypatch):
+def test_scorer_absent_refuses_to_write(tmp_path, monkeypatch):
     monkeypatch.setenv(ENV_DIR, str(tmp_path))
     ctx = _Ctx(_matrix())
     ctx._panel_scorer = None
-    assert persist_from_context(ctx) is not None  # still writes; cols degrade to []
+    # Without a scorer, feature_cols would degrade to [] and the written
+    # builder_version would misrepresent the matrix's real columns — refuse
+    # rather than write a mislabelled snapshot (same policy as a missing cutoff).
+    assert persist_from_context(ctx) is None
+    assert list(tmp_path.iterdir()) == []
 
 
 # ── atomicity ──────────────────────────────────────────────────────────────

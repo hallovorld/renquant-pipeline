@@ -99,14 +99,14 @@ dropped.
    comment refutes three of four; only `session-scheduler` remains
    unestablished, and this change does not address it.
 
-## NEXT
-
-Enabling is deliberately NOT in this PR. It needs `$RQ_FEATURE_SNAPSHOT_DIR` (or
-the config key) pointed at `data/rq105/` for the **prod** lane — rq105 sources
-from the run that placed the day's real orders. The env-var path exists so that
-can be done in the reviewed launchd wrapper in `renquant-orchestrator`, without
-an agent PR writing a production `strategy_config.json` — the surface Codex
-blocked on strategy-104#94 the same day.
+NEXT:     Enabling is deliberately NOT in this PR. It needs
+          `$RQ_FEATURE_SNAPSHOT_DIR` (or the config key) pointed at
+          `data/rq105/` for the **prod** lane — rq105 sources from the run
+          that placed the day's real orders. The env-var path exists so that
+          can be done in the reviewed launchd wrapper in
+          `renquant-orchestrator`, without an agent PR writing a production
+          `strategy_config.json` — the surface Codex blocked on
+          strategy-104#94 the same day.
 
 Order: merge this → point the daily-104 wrapper at `data/rq105/` → the next
 daily-full emits the snapshot → `run_shadow_serving.sh` stops skipping. Only
