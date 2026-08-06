@@ -95,11 +95,9 @@ and a test pins the correction.
    this change is behaviour-preserving; making it mandatory is a separate
    decision with its own blast radius.
 
-## NEXT
-
-Point the WF/QP replay entry points at the pinned `strategy_config.json` so
-`0.30` (strategy-104#94) becomes replay-verifiable. That is a caller change in
-`renquant-backtesting`/`renquant-orchestrator`, not here.
+NEXT:     Point the WF/QP replay entry points at the pinned `strategy_config.json`
+          so `0.30` (strategy-104#94) becomes replay-verifiable. That is a caller
+          change in `renquant-backtesting`/`renquant-orchestrator`, not here.
 
 ## REVERT
 
