@@ -81,12 +81,11 @@ back to Kelly and re-couple the two in one direction. A test pins that.
    cap the operator sets and has never been separately reviewed. Untouched
    here, and it is the larger of the two remaining multiplicands.
 
-## NEXT
-
-Enabling is a separate config decision (`ranking.top_up.enabled: true` in
-strategy-104) with its own evidence and its own review — deliberately not
-bundled, because a code change that silently starts deploying live cash is the
-shape this repo's contracts exist to prevent.
+NEXT: enabling is a separate config decision
+(`ranking.top_up.enabled: true` in strategy-104) with its own evidence and its
+own review — deliberately not bundled, because a code change that silently
+starts deploying live cash is the shape this repo's contracts exist to
+prevent.
 
 ## REVERT
 
