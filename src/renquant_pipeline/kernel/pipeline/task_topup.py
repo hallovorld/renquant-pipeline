@@ -102,6 +102,53 @@ def _stamp_qp_owned_topup_blocks(ctx: InferenceContext, top_up_thresh: float) ->
             blocked[ticker] = "topup_owned_by_qp"
 
 
+def resolve_topup_enablement(config) -> tuple[bool, dict, str]:
+    """Is top-up on, which knobs govern it, and WHERE that was decided.
+
+    Top-up is the only path that can put cash into a position the book ALREADY
+    holds — every other buy path needs a free slot. Until now its only gate was
+    ``ranking.kelly_sizing.enabled``, so it lived or died with Kelly.
+
+    Measured 2026-08-06: Kelly is ``enabled=false``, disabled on 2026-08-04 for
+    a reason that has nothing to do with top-up. The config says so in its own
+    note — ``use_calibrator_mu`` wires Kelly's mu from the calibrator, and the
+    z-blend switch turned ``global_calibration`` off, so that INPUT ceased to
+    exist. Top-up was collateral damage: its own conviction test reads
+    ``rank_score`` (``topup_conviction_floor``), which the blend produces
+    normally. Nothing top-up needs went away.
+
+    The cost is arithmetic. With ``max_position_pct`` 0.12 and
+    ``confidence_to_size_multiplier`` 0.57 the per-position ceiling is 6.84%,
+    so 8 slots cap deployment at 54.7% — a hard ~45% cash floor no sequence of
+    good trades can cross, and top-up is the one lever that could raise EXISTING
+    weights rather than needing a ninth slot. The live book sat at 46.6%
+    invested / 53.4% cash with that lever switched off for an unrelated reason.
+
+    Resolution, and it is deliberately backward-compatible:
+      1. ``ranking.top_up.enabled`` — the independent flag, when present;
+      2. otherwise ``ranking.kelly_sizing.enabled`` — today's behaviour.
+    A config that has not adopted the new section behaves byte-identically, so
+    this change decouples the two WITHOUT turning top-up on anywhere. Enabling
+    it is a separate, deliberate config decision with its own evidence.
+
+    Knobs follow the same order: ``ranking.top_up.*`` wins, else the
+    ``kelly_sizing`` values, so an operator can run top-up on its own
+    thresholds without editing Kelly's.
+
+    Returns ``(enabled, knobs, source)``. ``source`` is logged so a future
+    reader never has to guess which section decided — the ambiguity this
+    function exists to end.
+    """
+    ranking = (config or {}).get("ranking") or {}
+    kelly = ranking.get("kelly_sizing") or {}
+    topup = ranking.get("top_up") or {}
+    if isinstance(topup, dict) and "enabled" in topup:
+        knobs = {**kelly, **{k: v for k, v in topup.items() if not str(k).startswith("_")}}
+        return bool(topup.get("enabled")), knobs, "ranking.top_up.enabled"
+    return (bool(kelly.get("enabled", False)), dict(kelly),
+            "ranking.kelly_sizing.enabled (legacy coupling — no ranking.top_up section)")
+
+
 class TopUpHeldTask(Task):
     """Emit additional BUY orders for held positions whose Kelly target
     exceeds their current weight by `top_up_threshold`."""
@@ -126,9 +173,11 @@ class TopUpHeldTask(Task):
             )
             return
         kelly_cfg = ctx.config.get("ranking", {}).get("kelly_sizing", {})
-        if not kelly_cfg.get("enabled", False):
+        enabled, knobs, src = resolve_topup_enablement(ctx.config)
+        if not enabled:
+            log.info("TopUpHeldTask: disabled (source=%s)", src)
             return
-        top_up_thresh = float(kelly_cfg.get("top_up_threshold", 0.05))
+        top_up_thresh = float(knobs.get("top_up_threshold", 0.05))
         if top_up_thresh <= 0:
             return
         if _joint_qp_owns_topups(ctx):
@@ -227,7 +276,7 @@ class TopUpHeldTask(Task):
         # panel hasn't scored the holding yet (None / NaN), fail-CLOSED:
         # don't add. This gate sits BEFORE the Kelly-delta math so
         # TopUp can only act when both the model AND Kelly agree.
-        topup_floor = float(kelly_cfg.get("topup_conviction_floor", 0.20))
+        topup_floor = float(knobs.get("topup_conviction_floor", 0.20))
 
         for ticker, hs in ctx.holdings.items():
             if ticker in already_buying or ticker in already_selling \
@@ -286,7 +335,7 @@ class TopUpHeldTask(Task):
                 continue
 
             # Multi-entry accumulation — cap top-up delta at per_session_buy_cap.
-            per_session_cap = kelly_cfg.get("per_session_buy_cap")
+            per_session_cap = knobs.get("per_session_buy_cap")
             bought_delta = delta
             if per_session_cap is not None:
                 cap = float(per_session_cap)
