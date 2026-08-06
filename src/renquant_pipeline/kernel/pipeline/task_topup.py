@@ -172,7 +172,6 @@ class TopUpHeldTask(Task):
                 "sizing this session (governor_owns_sizing=True)"
             )
             return
-        kelly_cfg = ctx.config.get("ranking", {}).get("kelly_sizing", {})
         enabled, knobs, src = resolve_topup_enablement(ctx.config)
         if not enabled:
             log.info("TopUpHeldTask: disabled (source=%s)", src)

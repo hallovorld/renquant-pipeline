@@ -1,8 +1,13 @@
 # 2026-08-06 — Top-up is no longer gated by Kelly's enable flag (cash-drag P0)
 
-STATUS:   READY FOR REVIEW. 17 new tests; full suite 2485 passed / 8 skipped /
-          0 failed. **Turns top-up on nowhere.** No config in the tree carries a
-          `ranking.top_up` section, so every lane resolves exactly as before.
+STATUS:   READY FOR REVIEW. 21 new tests (17 decoupling + 4 preflight-gate
+          fail-closed regression); full suite 2481 passed / 9 skipped / 0
+          failed on this head (2 unrelated pre-existing failures in
+          `tests/test_replay_d6_conventions.py` reproduce identically on
+          `origin/main` with this branch's changes stashed out — not
+          introduced here). **Turns top-up on nowhere.** No config in the
+          tree carries a `ranking.top_up` section, so every lane resolves
+          exactly as before.
 
 WHAT:     `TopUpHeldTask` resolved its enable check and its knobs straight out
           of `ranking.kelly_sizing`. It now goes through
@@ -10,6 +15,21 @@ WHAT:     `TopUpHeldTask` resolved its enable check and its knobs straight out
           `ranking.top_up.enabled` when that key is PRESENT and otherwise falls
           back to `ranking.kelly_sizing.enabled` — today's behaviour, byte for
           byte.
+
+          2026-08-06 fix pass (Codex MED, 23:18:09Z review): the
+          `P-SIZING-GATE-KEYS` preflight check
+          (`kernel/preflight.py::_check_sizing_gate_keys`) armed the
+          `topup_conviction_floor` divergent-default slot off raw
+          `kelly_sizing.enabled`, unaware of the new independent top-up path.
+          A config shaped `{kelly_sizing: {enabled: false}, top_up: {enabled:
+          true}}` passed the gate as "disarmed" while the runtime (now armed
+          via `resolve_topup_enablement`) would silently use the
+          `topup_conviction_floor` default 0.20 instead of prod's 0.55 — the
+          exact silent-flip class P-SIZING-GATE-KEYS exists to catch,
+          reproduced by the reviewer via `_check_sizing_gate_keys(...) ->
+          ok=True` on that shape. Fixed by threading `resolve_topup_enablement`
+          into the gate itself (single source of truth, §7.5) so "armed" and
+          "present" both reflect the same resolution the runtime uses.
 
 WHY/DIR:  Operator P0 2026-08-06: "解决 money drag 的问题".
 
@@ -45,7 +65,9 @@ live book: 46.6% invested / 53.4% cash, 7 of 8 slots used
           Nothing top-up needs went away.
 
 EVIDENCE:
-artifact:      `kernel/pipeline/task_topup.py`, `tests/test_topup_enablement.py`
+artifact:      `kernel/pipeline/task_topup.py`, `kernel/preflight.py`,
+               `tests/test_topup_enablement.py`,
+               `tests/test_sizing_gate_keys_preflight.py`
 prod or exp:   **prod code path**, behaviour-preserving. The gate moves behind a
                resolver whose fallback is the existing expression; no config
                opts in, so no lane changes.
@@ -91,4 +113,9 @@ prevent.
 
 Delete `resolve_topup_enablement`, restore the three lines at the old gate
 (`kelly_cfg.get("enabled", False)` and the two `kelly_cfg.get(...)` knob reads),
-and delete `tests/test_topup_enablement.py`. No other file changes.
+and delete `tests/test_topup_enablement.py`. Also revert
+`kernel/preflight.py::_check_sizing_gate_keys`'s `topup_conviction_floor` slot
+to `kelly_on` / `"topup_conviction_floor" in kelly_cfg`, drop the `top_up`
+entry from its `details["armed"]` dict, and delete the four
+`test_topup_conviction_floor_*` cases in
+`tests/test_sizing_gate_keys_preflight.py`. No other file changes.

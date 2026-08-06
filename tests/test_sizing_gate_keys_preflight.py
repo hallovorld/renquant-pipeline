@@ -172,6 +172,64 @@ def test_tax_lot_method_required_even_with_joint_actions_disabled() -> None:
         result.details["missing_armed_keys"])
 
 
+# ── top-up armed independently of kelly_sizing.enabled (2026-08-06) ────────
+# renquant-pipeline#277 decoupled top-up from Kelly via
+# ``ranking.top_up.enabled`` / ``task_topup.resolve_topup_enablement``. The
+# conviction-floor slot must arm off THAT resolution, not raw kelly_on, or a
+# config with kelly off / top_up on passes this gate while the runtime falls
+# back to topup_conviction_floor's default (0.20 vs prod 0.55).
+
+def test_topup_conviction_floor_armed_when_topup_on_independent_of_kelly() -> None:
+    cfg = _prod_shaped_config()
+    cfg["ranking"]["kelly_sizing"] = {"enabled": False}
+    cfg["ranking"]["top_up"] = {"enabled": True}
+
+    result = _check_sizing_gate_keys(cfg)
+
+    assert result.ok is False
+    assert result.severity == "hard"
+    assert "ranking.kelly_sizing.topup_conviction_floor" in (
+        result.details["missing_armed_keys"])
+    assert result.details["armed"]["top_up"] is True
+    assert result.details["armed"]["kelly_sizing"] is False
+
+
+def test_topup_conviction_floor_passes_when_set_in_top_up_section() -> None:
+    cfg = _prod_shaped_config()
+    cfg["ranking"]["kelly_sizing"] = {"enabled": False}
+    cfg["ranking"]["top_up"] = {"enabled": True, "topup_conviction_floor": 0.55}
+
+    result = _check_sizing_gate_keys(cfg)
+
+    assert result.ok is True
+
+
+def test_topup_conviction_floor_inherited_from_kelly_section_still_passes() -> None:
+    """An operator enabling top-up via the new flag but keeping the floor on
+    the (now-disabled) kelly_sizing section must not have to restate it."""
+    cfg = _prod_shaped_config()
+    cfg["ranking"]["kelly_sizing"] = {
+        "enabled": False, "topup_conviction_floor": 0.55,
+    }
+    cfg["ranking"]["top_up"] = {"enabled": True}
+
+    result = _check_sizing_gate_keys(cfg)
+
+    assert result.ok is True
+
+
+def test_topup_conviction_floor_exempt_when_both_kelly_and_topup_off() -> None:
+    cfg = _prod_shaped_config()
+    cfg["ranking"]["kelly_sizing"] = {"enabled": False}
+
+    result = _check_sizing_gate_keys(cfg)
+
+    assert result.ok is True
+    assert result.details["armed"]["top_up"] is False
+    assert "ranking.kelly_sizing.topup_conviction_floor" in (
+        result.details["absent_but_disarmed_keys"])
+
+
 # ── documented fallbacks / aliases satisfy the gate ─────────────────────────
 
 def test_qp_mu_contract_legacy_alias_satisfies_horizon_contract() -> None:
