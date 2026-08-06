@@ -20,6 +20,7 @@ from renquant_pipeline.kernel.pipeline.context import InferenceContext
 from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .feature_matrix import build_inference_matrix
+from .feature_snapshot_writer import persist_from_context
 from .panel_scorer import PanelScorer
 
 
@@ -293,6 +294,30 @@ class DriftGuardTask(Task):
         return out
 
 
+# ── 5. As-served snapshot ──────────────────────────────────────────────────
+
+class PersistFeatureSnapshotTask(Task):
+    """Write the surviving matrix as a materialized feature snapshot.
+
+    Reads:  ctx._panel_matrix, ctx._panel_scorer.feature_cols, ctx._fm_inputs
+    Writes: nothing on ctx; a JSON file when a destination is configured
+
+    Placed LAST so it observes the matrix after RowCoverageGate and DriftGuard,
+    i.e. the exact object the scorer receives. Persisting the pre-gate matrix
+    would produce a snapshot whose rows were never scored.
+
+    Disabled unless ``ranking.panel_scoring.feature_snapshot_dir`` or
+    ``$RQ_FEATURE_SNAPSHOT_DIR`` is set, and fail-open in every path — this runs
+    inside the live order-placing pipeline, so an observability artifact must
+    never be able to fail a trading run. Always returns None (advisory task).
+    """
+    name = "PersistFeatureSnapshotTask"
+
+    def run(self, ctx: InferenceContext) -> bool | None:
+        persist_from_context(ctx)
+        return None
+
+
 # ── Job orchestrator ───────────────────────────────────────────────────────
 
 class BuildFeatureMatrixJob(Job):
@@ -306,6 +331,7 @@ class BuildFeatureMatrixJob(Job):
             AssembleInferenceMatrixTask(),
             RowCoverageGateTask(),
             DriftGuardTask(),
+            PersistFeatureSnapshotTask(),
         ]
 
 
@@ -314,5 +340,6 @@ __all__ = [
     "AssembleInferenceMatrixTask",
     "RowCoverageGateTask",
     "DriftGuardTask",
+    "PersistFeatureSnapshotTask",
     "BuildFeatureMatrixJob",
 ]
