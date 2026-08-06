@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifact_resolver import locate_artifact
+from .pipeline.task_topup import resolve_topup_enablement
 from .rfc210_license import evaluate_freshness_fallback_license
 
 log = logging.getLogger("kernel.preflight")
@@ -1665,7 +1666,10 @@ def _check_sizing_gate_keys(
       ranking.kelly_sizing.fractional            0.3→0.25   armed: kelly on
       ranking.kelly_sizing.max_concentration     0.12→0.35  armed: kelly on
                                                  (~3x looser concentration cap)
-      ranking.kelly_sizing.topup_conviction_floor 0.55→0.20 armed: kelly on
+      ranking.kelly_sizing.topup_conviction_floor 0.55→0.20 armed: top-up on
+                                                 (task_topup.resolve_topup_enablement —
+                                                 ranking.top_up.enabled when present,
+                                                 else ranking.kelly_sizing.enabled)
                                                  (topup admission bar collapses)
       model_staleness_days                       60→0 = staleness admission
                                                  gate silently OFF; ALWAYS armed
@@ -1702,6 +1706,13 @@ def _check_sizing_gate_keys(
     kelly_on = bool(kelly_cfg.get("enabled", False))
     rotation_on = bool(rotation_cfg.get("enabled", False))
     joint_on = bool(joint_cfg.get("enabled", False))
+    # 2026-08-06: top-up can now be armed independently of kelly_sizing.enabled
+    # via `ranking.top_up.enabled` (task_topup.resolve_topup_enablement). The
+    # conviction floor must be gated on THAT resolution, not raw kelly_on, or
+    # a config with kelly off / top_up on passes this gate while the runtime
+    # silently falls back to topup_conviction_floor's default (0.20 vs prod
+    # 0.55) — the exact silent-flip class this gate exists to catch.
+    topup_on, topup_knobs, _topup_src = resolve_topup_enablement(config)
 
     # (key path, armed, present, silent flip on key loss)
     slots: list[tuple[str, bool, bool, str]] = [
@@ -1712,7 +1723,7 @@ def _check_sizing_gate_keys(
          kelly_on, "max_concentration" in kelly_cfg,
          "concentration cap silently loosens to 0.35 (prod 0.12, ~3x)"),
         ("ranking.kelly_sizing.topup_conviction_floor",
-         kelly_on, "topup_conviction_floor" in kelly_cfg,
+         topup_on, "topup_conviction_floor" in topup_knobs,
          "topup admission bar silently collapses to 0.20 (prod 0.55)"),
         ("model_staleness_days",
          True, "model_staleness_days" in config,
@@ -1741,8 +1752,8 @@ def _check_sizing_gate_keys(
     exempt = [key for key, armed, present, flip in slots
               if not armed and not present]
     details = {
-        "armed": {"kelly_sizing": kelly_on, "rotation": rotation_on,
-                  "joint_actions": joint_on},
+        "armed": {"kelly_sizing": kelly_on, "top_up": topup_on,
+                  "rotation": rotation_on, "joint_actions": joint_on},
         "missing_armed_keys": [key for key, _ in missing],
         "absent_but_disarmed_keys": exempt,
     }
