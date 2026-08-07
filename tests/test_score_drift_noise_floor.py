@@ -15,7 +15,6 @@ noise; the drift is real. The floor makes that legible instead of arguable.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from renquant_pipeline.kernel import score_drift as SD
 
@@ -44,17 +43,19 @@ def test_a_real_shift_stands_well_above_the_floor():
 
 def test_the_floor_rises_as_the_current_sample_shrinks():
     """The whole point: the SAME model looks worse at a smaller n."""
-    big = SD.null_psi_floor(1509, 1509)
-    small = SD.null_psi_floor(1509, 83)
+    base = np.random.default_rng(3).normal(size=1509)
+    big = SD.null_psi_floor(base, 1509)
+    small = SD.null_psi_floor(base, 83)
     assert small > 5 * big, (small, big)
 
 
-def test_the_floor_depends_only_on_shape_and_is_cached():
+def test_the_floor_is_deterministic_for_the_same_baseline_and_is_cached():
     SD._NULL_FLOOR_CACHE.clear()
-    a = SD.null_psi_floor(1509, 83)
-    b = SD.null_psi_floor(1509, 83)
+    base = np.random.default_rng(5).normal(size=1509)
+    a = SD.null_psi_floor(base, 83)
+    b = SD.null_psi_floor(base, 83)
     assert a == b
-    assert (1509, 83, 10, SD._NULL_TRIALS, 20260807) in SD._NULL_FLOOR_CACHE
+    assert len(SD._NULL_FLOOR_CACHE) == 1
 
 
 def test_a_different_trials_or_seed_is_not_served_the_stale_cached_value():
@@ -63,12 +64,13 @@ def test_a_different_trials_or_seed_is_not_served_the_stale_cached_value():
     varying `seed` for a robustness check silently got back the first call's
     estimate at that shape instead of a fresh one."""
     SD._NULL_FLOOR_CACHE.clear()
-    first = SD.null_psi_floor(1509, 83, trials=50, seed=1)
-    same_process_cached = SD.null_psi_floor(1509, 83, trials=50, seed=1)
+    base = np.random.default_rng(9).normal(size=1509)
+    first = SD.null_psi_floor(base, 83, trials=50, seed=1)
+    same_process_cached = SD.null_psi_floor(base, 83, trials=50, seed=1)
     assert same_process_cached == first
 
-    different_trials = SD.null_psi_floor(1509, 83, trials=500, seed=1)
-    different_seed = SD.null_psi_floor(1509, 83, trials=50, seed=2)
+    different_trials = SD.null_psi_floor(base, 83, trials=500, seed=1)
+    different_seed = SD.null_psi_floor(base, 83, trials=50, seed=2)
     assert different_trials != first
     assert different_seed != first
 
@@ -76,15 +78,40 @@ def test_a_different_trials_or_seed_is_not_served_the_stale_cached_value():
 def test_the_floor_is_deterministic_across_processes():
     """A seeded estimate, so two readers comparing notes see one number."""
     SD._NULL_FLOOR_CACHE.clear()
-    a = SD.null_psi_floor(1000, 90)
+    base = np.random.default_rng(13).normal(size=1000)
+    a = SD.null_psi_floor(base, 90)
     SD._NULL_FLOOR_CACHE.clear()
-    b = SD.null_psi_floor(1000, 90)
+    b = SD.null_psi_floor(base, 90)
     assert a == b
 
 
-@pytest.mark.parametrize("nb,nc", [(5, 83), (1509, 0)])
-def test_degenerate_shapes_give_nan_not_a_number(nb, nc):
-    assert np.isnan(SD.null_psi_floor(nb, nc))
+def test_a_tied_baseline_floor_is_conditioned_on_the_real_distribution():
+    """AUDIT REGRESSION GUARD (PR #279 review, P1, repeated across 3 rounds):
+    `psi()` bins on `np.quantile(expected, ...)`, so a tied/discrete baseline
+    collapses those edges into fewer effective bins. A shape-only Gaussian
+    simulation of the same SIZE does not see the collapse and overstates the
+    floor. Reviewer's own repro on `np.repeat(np.arange(5), 300)`: shape-only
+    ~0.1189 vs the real-baseline-conditioned ~0.0370 — resampling from the
+    baseline itself must land near the low, correct value, not the inflated
+    shape-only one."""
+    SD._NULL_FLOOR_CACHE.clear()
+    tied = np.repeat(np.arange(5, dtype=float), 300)
+    conditioned = SD.null_psi_floor(tied, 83)
+
+    rng = np.random.default_rng(20260807)
+    shape_only_gaussian = float(np.median([
+        SD.psi(rng.standard_normal(tied.size), rng.standard_normal(83), bins=10)
+        for _ in range(SD._NULL_TRIALS)
+    ]))
+    assert conditioned < shape_only_gaussian / 2, (conditioned, shape_only_gaussian)
+
+
+def test_small_baseline_gives_nan_not_a_number():
+    assert np.isnan(SD.null_psi_floor(np.zeros(5), 83))
+
+
+def test_zero_current_gives_nan_not_a_number():
+    assert np.isnan(SD.null_psi_floor(np.random.default_rng(1).normal(size=1509), 0))
 
 
 def test_a_degenerate_report_still_carries_the_fields():

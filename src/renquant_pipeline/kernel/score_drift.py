@@ -54,49 +54,64 @@ def severity(value: float) -> str:
 #: the estimate is reported, never used as a gate.
 _NULL_TRIALS = 200
 
-#: Cache keyed on (n_baseline, n_current, bins, trials, seed). The null floor
-#: depends only on the SHAPE of the comparison, not on the values, so a day's
-#: repeated audits at the same sizes/trials/seed pay for it once. `trials` and
-#: `seed` are part of the key (not just the shape) because a caller raising
-#: precision or varying the RNG for a robustness check must get a fresh
-#: estimate, not a stale one from the first call at that shape.
-_NULL_FLOOR_CACHE: dict[tuple[int, int, int, int, int], float] = {}
+#: Cache keyed on the BASELINE's identity plus (n_current, bins, trials, seed).
+#: The null is conditional on the baseline's actual distribution — size alone is
+#: NOT a sufficient key, which was the defect codex caught on #279. `trials` and
+#: `seed` are in the key because a caller raising precision or varying the RNG
+#: for a robustness check must get a fresh estimate, not a stale one.
+_NULL_FLOOR_CACHE: dict[tuple, float] = {}
 
 
-def null_psi_floor(n_baseline: int, n_current: int, bins: int = 10,
+def _baseline_key(baseline: np.ndarray) -> tuple:
+    """Identity for a baseline, in terms of what `psi()` actually consumes.
+
+    `psi()` touches the baseline only through `np.quantile(expected, ...)` and
+    the resulting histogram, so two baselines with the same size and the same
+    quantile grid produce the same bin edges by construction. Keying on that
+    grid is therefore exact for this purpose and costs one quantile call,
+    where hashing the raw bytes would copy the whole array on every lookup.
+    """
+    qs = np.quantile(baseline, np.linspace(0, 1, 21))
+    return (int(baseline.size), tuple(np.round(qs, 12)))
+
+
+def null_psi_floor(baseline: np.ndarray, n_current: int, bins: int = 10,
                    *, trials: int = _NULL_TRIALS, seed: int = 20260807) -> float:
-    """Median PSI when `current` is drawn from the SAME law as `baseline`.
+    """Median PSI when `current` is RESAMPLED FROM THE BASELINE ITSELF.
 
     WHY THIS IS REPORTED ALONGSIDE EVERY PSI (measured 2026-08-07). The bands
-    below are the textbook cut-offs, and they assume the two samples are
-    comparably sized. In production they are not: over 1,082 live audits,
-    `n_baseline` ran ~1,500 while `n_current` was **under 100 every single
-    time** (median 83) — a multi-day accumulated pool against one day's
-    cross-section. At that shape the ZERO-DRIFT median PSI is already ~0.118,
-    about 7x the ~0.016 it would be at matched sizes, because `psi()` floors an
-    empty bin at 1e-6 and one empty bin alone contributes ~1.15 — 4.6x the
-    whole CRITICAL threshold. Empty bins are common when 83 names fall into 10
-    quantile bins.
+    below are the textbook cut-offs and assume comparably sized samples. In
+    production they are not: over 1,082 live audits `n_baseline` ran ~1,500
+    while `n_current` was **under 100 every single time** (median 83). At that
+    shape the zero-drift median PSI is already far above zero, because `psi()`
+    floors an empty bin at 1e-6 and one empty bin alone contributes ~1.15 —
+    4.6x the whole CRITICAL threshold. Empty bins are common when 83 names fall
+    into 10 quantile bins.
 
-    So `CRITICAL` (>=0.25) sits barely 2x above where a perfectly stable model
-    lands, and 83% of live audits fire it. That is NOT proof the alarm is
-    meaningless: a placebo at n=83 fires CRITICAL only 6% of the time, so
-    sample size explains the raised floor, not the 83%. The live median 0.345
-    is 2.9x the floor and the excess is real and undiagnosed.
+    WHY THE BASELINE ARRAY AND NOT JUST ITS SIZE (codex on #279). A first cut
+    estimated the null from Gaussian draws keyed on
+    `(n_baseline, n_current, bins)`, i.e. shape only. `psi()` is NOT shape-only:
+    it builds bin edges from `np.quantile(expected, ...)`, so a baseline with
+    ties collapses those edges and changes the effective bin count. Repro:
+    with `base = np.repeat(np.arange(5), 300)` the shape-only estimate is
+    0.1189 while resampling from that baseline gives 0.0370 — **3.2x
+    overstated**. Resampling with replacement from the real baseline conditions
+    the null on the distribution actually in play, ties and all, and removes a
+    Gaussian assumption I had flagged as unverified in my own write-up and then
+    not verified.
 
-    This function changes no verdict. It exists so a reader can see how far
-    above the noise floor a value actually sits, which is the difference
-    between "0.345, CRITICAL" and "0.345 against a 0.118 floor".
+    Reported, never gated on: `severity` remains `severity(psi)`.
     """
-    key = (int(n_baseline), int(n_current), int(bins), int(trials), int(seed))
+    baseline = np.asarray(baseline, dtype=float)
+    n_current = int(n_current)
+    if baseline.size < bins or n_current <= 0:
+        return float("nan")
+    key = (_baseline_key(baseline), n_current, int(bins), int(trials), int(seed))
     hit = _NULL_FLOOR_CACHE.get(key)
     if hit is not None:
         return hit
-    if n_baseline < bins or n_current <= 0:
-        return float("nan")
     rng = np.random.default_rng(seed)
-    base = rng.standard_normal(int(n_baseline))
-    vals = [psi(base, rng.standard_normal(int(n_current)), bins=bins)
+    vals = [psi(baseline, rng.choice(baseline, size=n_current, replace=True), bins=bins)
             for _ in range(int(trials))]
     out = float(np.median(vals))
     _NULL_FLOOR_CACHE[key] = out
@@ -110,8 +125,8 @@ class DriftReport:
     n_baseline: int
     n_current: int
     ok: bool          # True for INFO; WARN/CRITICAL are findings
-    #: Median PSI under zero drift at THIS comparison's sizes. Reported, never
-    #: gated on — see `null_psi_floor`.
+    #: Median PSI under zero drift, resampled from THIS comparison's actual
+    #: baseline. Reported, never gated on — see `null_psi_floor`.
     null_floor: float = float("nan")
     #: psi / null_floor. >1 means "above the noise this shape produces on its
     #: own"; ~1 means the value is what a stable model looks like here.
@@ -133,7 +148,7 @@ def score_drift_report(baseline: np.ndarray, current: np.ndarray,
                            n_current=int(current.size), ok=False)
     v = psi(baseline, current, bins=bins)
     sev = severity(v)
-    floor = null_psi_floor(baseline.size, current.size, bins=bins)
+    floor = null_psi_floor(baseline, current.size, bins=bins)
     excess = (v / floor) if (floor and np.isfinite(floor) and floor > 0) else float("nan")
     return DriftReport(psi=v, severity=sev, n_baseline=int(baseline.size),
                        n_current=int(current.size), ok=(sev == "INFO"),
