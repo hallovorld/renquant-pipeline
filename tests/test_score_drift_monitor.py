@@ -204,6 +204,30 @@ class TestOnlyCandidateRowsAreScored:
         assert not rep.run_id.startswith("2026-08-09"), rep.run_id
 
 
+def test_persisted_role_filtered_row_is_scored_by_the_read_only_audit(tmp_path):
+    """End-to-end regression (PR #281 review, P1): the audit script had its
+    own unfiltered `_load_full_runs` query while `load_score_drift_from_db`
+    filtered to candidate rows only. A monitor persisting `n_baseline` from
+    the candidate-only population would then hit the audit script's
+    candidate+holding reconstruction, which either fails the size-parity
+    check (marked unreconstructable) or, if counts happened to coincide,
+    silently scores the wrong mixed population. Proves --persist on a
+    mixed-role DB is reconstructed and scored using the SAME candidate-only
+    baseline the monitor used."""
+    db = tmp_path / "roled.db"
+    conn = _roled_db(db, _two_role_runs(n_runs=5))
+    conn.close()
+
+    code, reports = monitor([str(db)], persist=True)
+    assert code == 1 and reports[0]["persisted"] is True
+    assert reports[0]["n_baseline"] == 4 * 60  # candidate rows only
+
+    result = audit(str(db))
+    assert result["n_rows"] == 1
+    assert result["n_unreconstructable"] == 0
+    assert result["n_scored"] == 1
+
+
 def test_a_db_without_the_role_column_still_works(tmp_path):
     """The column is optional. Older runs DBs and every minimal fixture create
     `candidate_scores(run_id, rank_score)`; an unconditional filter raises

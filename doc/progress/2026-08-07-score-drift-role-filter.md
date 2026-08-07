@@ -1,12 +1,26 @@
 # score_drift: score the candidate population, not a mixture of two units
 
-STATUS:    Implemented, 12 tests green in the touched file, full suite 2545 passed.
+STATUS:    Implemented, 14 tests green in the touched file, full suite 2546 passed.
            Does NOT reduce the standing CRITICAL — see EVIDENCE.
 
 WHAT:      `load_score_drift_from_db` now restricts to `role='candidate'` (plus
            `role IS NULL` for pre-role-column rows), and probes for the column so
            a DB without it degrades to the old pooled behaviour instead of
            raising `OperationalError`.
+
+           Round 2 (Codex review, P1): the role-filtered query is factored out
+           into `load_candidate_scores_by_run()` and
+           `scripts/audit_score_drift_excess.py::_load_full_runs()` (which had
+           its own unfiltered copy) now calls the same shared function. Before
+           this, `load_score_drift_from_db()` persisted `n_baseline` from the
+           candidate-only population while the read-only audit reconstructed
+           baselines from candidates+holdings — a size mismatch that marked
+           every fresh, provenance-tagged monitor row unreconstructable, or (if
+           counts coincided) silently scored the wrong mixed population.
+           Added `test_persisted_role_filtered_row_is_scored_by_the_read_only_audit`:
+           `monitor(..., persist=True)` on a mixed-role DB, then `audit()` must
+           reconstruct and score that row from the identical candidate-only
+           baseline the monitor used. `[VERIFIED — pytest, 2026-08-07]`
 
 WHY/DIR:   `candidate_scores` holds two populations whose `rank_score` is not the
            same quantity. Within ONE live run, measured 2026-08-07:
@@ -26,8 +40,9 @@ WHY/DIR:   `candidate_scores` holds two populations whose `rank_score` is not th
 
 EVIDENCE:  artifact:      `tests/test_score_drift_monitor.py::TestOnlyCandidateRowsAreScored`
                           (3 cases) + `test_a_db_without_the_role_column_still_works`
-           prod-or-exp:   prod kernel, monitoring path only; emits no orders
-           existing-data: `python3 -m pytest tests/ -q` -> 2545 passed, 9 skipped,
+                          + `test_persisted_role_filtered_row_is_scored_by_the_read_only_audit`
+           prod or exp:   prod kernel, monitoring path only; emits no orders
+           existing data: `python3 -m pytest tests/ -q` -> 2546 passed, 9 skipped,
                           2 failed. Both failures are
                           `test_replay_d6_conventions.py::TestDefaultModeUnchanged`,
                           which reproduce on unmodified `origin/main` and are a
