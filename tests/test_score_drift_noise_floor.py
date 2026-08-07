@@ -54,7 +54,23 @@ def test_the_floor_depends_only_on_shape_and_is_cached():
     a = SD.null_psi_floor(1509, 83)
     b = SD.null_psi_floor(1509, 83)
     assert a == b
-    assert (1509, 83, 10) in SD._NULL_FLOOR_CACHE
+    assert (1509, 83, 10, SD._NULL_TRIALS, 20260807) in SD._NULL_FLOOR_CACHE
+
+
+def test_a_different_trials_or_seed_is_not_served_the_stale_cached_value():
+    """AUDIT REGRESSION GUARD (PR #279 review finding 1): the cache used to key
+    on (n_baseline, n_current, bins) only, so a caller raising `trials` or
+    varying `seed` for a robustness check silently got back the first call's
+    estimate at that shape instead of a fresh one."""
+    SD._NULL_FLOOR_CACHE.clear()
+    first = SD.null_psi_floor(1509, 83, trials=50, seed=1)
+    same_process_cached = SD.null_psi_floor(1509, 83, trials=50, seed=1)
+    assert same_process_cached == first
+
+    different_trials = SD.null_psi_floor(1509, 83, trials=500, seed=1)
+    different_seed = SD.null_psi_floor(1509, 83, trials=50, seed=2)
+    assert different_trials != first
+    assert different_seed != first
 
 
 def test_the_floor_is_deterministic_across_processes():

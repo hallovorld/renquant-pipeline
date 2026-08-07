@@ -1,7 +1,11 @@
 # 2026-08-07 — Report the zero-drift floor beside every PSI; it shows the drift is REAL
 
-STATUS:   READY FOR REVIEW. 10 new tests; drift suite 34 passed
-          `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full suite green
+STATUS:   FIXED (2026-08-07, both CHANGES_REQUESTED findings addressed). 14
+          new tests; drift suite 38 passed, 1 skipped
+          `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full suite 2530
+          passed / 9 skipped / 2 pre-existing unrelated failures in
+          `tests/test_replay_d6_conventions.py` (reproduced identically on
+          the unmodified pre-fix head)
           `[VERIFIED — python3 -m pytest tests/ -q]`. **Changes no verdict** —
           `severity` still comes from `psi` alone.
 
@@ -10,8 +14,12 @@ WHAT:     Adds `null_psi_floor(n_baseline, n_current, bins)` and two reported
           THIS comparison's sizes) and `excess_over_floor` (`psi / floor`).
 
 WHY/DIR:  The bands are the textbook PSI cut-offs and assume comparably sized
-          samples. Production never had them `[VERIFIED — 2026-08-07, all 1,082
-          rows of score_drift_audits]`: `n_baseline` ~1,500 against `n_current`
+          samples. Production never had them
+          `[VERIFIED — sqlite3 data/runs.alpaca.db "SELECT COUNT(*), AVG(n_baseline),
+          MAX(n_current) FROM score_drift_audits"` → `1082, 1524.0, 94`; median via
+          `"SELECT n_current FROM score_drift_audits ORDER BY n_current LIMIT 1
+          OFFSET (SELECT COUNT(*)/2 FROM score_drift_audits)"` → `83]`:
+          `n_baseline` ~1,500 against `n_current`
           **under 100 every single time** (median 83). At that shape the
           zero-drift median PSI is **~0.118**, ~7x the ~0.016 of a matched
           comparison, because `psi()` floors an empty bin at `1e-6` and one
@@ -25,7 +33,7 @@ WHY/DIR:  The bands are the textbook PSI cut-offs and assume comparably sized
 ## WHAT THE FLOOR REVEALED — and how it corrects ME, twice
 
 Re-banding all 1,082 live audits by `excess = psi / floor`
-`[VERIFIED — 2026-08-07]`:
+`[VERIFIED — python3 scripts/audit_score_drift_excess.py --db data/runs.alpaca.db]`:
 
 ```
 excess < 1.0  (below the zero-drift floor)    35    3.2%
@@ -65,12 +73,14 @@ best-known?:   yes for the floor at these shapes. **No** for what the drift IS �
                see NOT ESTABLISHED.
 scope:         one function, two dataclass fields, one call site.
 
-The estimate is seeded and cached on `(n_baseline, n_current, bins)`, since the
-floor depends only on the SHAPE of the comparison, not on the values. Two
-readers comparing notes therefore see the same number, and a day of repeated
-audits at one shape pays for it once. `excess` is NaN — never `inf` — when the
-floor is unusable, because `inf` sorts to the top of any "worst first" list and
-would hijack triage.
+The estimate is seeded and cached on `(n_baseline, n_current, bins, trials,
+seed)`, since the floor depends only on the SHAPE of the comparison, not on
+the values, but a caller raising precision or varying the RNG must still get a
+fresh estimate rather than the first call's stale one (fix below). Two readers
+comparing notes at the same `trials`/`seed` therefore see the same number, and
+a day of repeated audits at one shape pays for it once. `excess` is NaN —
+never `inf` — when the floor is unusable, because `inf` sorts to the top of
+any "worst first" list and would hijack triage.
 
 NEXT:     Surface `null_floor` / `excess_over_floor` in the drift alert text and
           in `score_drift_audits`, so the 17 unacked incidents can be ranked by
@@ -89,8 +99,47 @@ NEXT:     Surface `null_floor` / `excess_over_floor` in the drift alert text and
    from Gaussian draws. If real score distributions are far from Gaussian the
    floor is approximate — it is a scale marker, not a p-value.
 
+## Fix (2026-08-07, review findings addressed)
+
+WHAT:      Finding 1 (MED) — `_NULL_FLOOR_CACHE` keyed only on
+           `(n_baseline, n_current, bins)`, so a call with a different
+           `trials` or `seed` after the first call at a given shape silently
+           returned the first call's cached value instead of recomputing.
+           Widened the key to `(n_baseline, n_current, bins, trials, seed)`
+           (`src/renquant_pipeline/kernel/score_drift.py`).
+           Finding 2 (MED) — the two `[VERIFIED]` tags on the 1,082-row /
+           median-83 claim and the excess re-banding table cited a date and
+           a table name instead of a runnable command/file (LONG #10). Reran
+           both against the live `data/runs.alpaca.db` and replaced the tags
+           with the exact `sqlite3` queries and a new read-only reproduction
+           script, `scripts/audit_score_drift_excess.py`, that recomputes the
+           excess table from `null_psi_floor` directly.
+EVIDENCE:  artifact:      `tests/test_score_drift_noise_floor.py::
+                          test_a_different_trials_or_seed_is_not_served_the_stale_cached_value`,
+                          `tests/test_audit_score_drift_excess.py`
+           prod or exp:   prod code path (cache-key fix), verdict-preserving;
+                          the new script is read-only tooling, no config/pin
+                          change
+           existing data: reran the excess re-banding against the live DB —
+                          `python3 scripts/audit_score_drift_excess.py --db
+                          data/runs.alpaca.db` reproduces the PR's table
+                          exactly: 35/106/73/370/498 rows per band, median
+                          2.49x, max 94.4x, 0 CRITICAL rows below the floor
+                          `[VERIFIED — python3 scripts/audit_score_drift_excess.py
+                          --db data/runs.alpaca.db]`. Drift suite 38 passed, 1
+                          skipped; full suite 2530 passed / 9 skipped / 2
+                          pre-existing unrelated failures (confirmed identical
+                          on the unmodified pre-fix head via `git stash`).
+           best-known?:   yes — closes both reviewer-identified gaps
+           scope:         "cache-key widening + one new read-only script +
+                          regression tests only; no config/pin/artifact
+                          change, no verdict change"
+NEXT:      none — addresses both CHANGES_REQUESTED findings on this PR.
+
 ## REVERT
 
 Delete `null_psi_floor`, `_NULL_TRIALS`, `_NULL_FLOOR_CACHE`, the two
-`DriftReport` fields and their computation in `score_drift_report`, and
-`tests/test_score_drift_noise_floor.py`. No other file changes.
+`DriftReport` fields and their computation in `score_drift_report`,
+`scripts/audit_score_drift_excess.py`, and
+`tests/test_score_drift_noise_floor.py` /
+`tests/test_audit_score_drift_excess.py`. No other file changes.

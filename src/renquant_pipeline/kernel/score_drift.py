@@ -54,10 +54,13 @@ def severity(value: float) -> str:
 #: the estimate is reported, never used as a gate.
 _NULL_TRIALS = 200
 
-#: Cache keyed on (n_baseline, n_current, bins). The null floor depends only on
-#: the SHAPE of the comparison, not on the values, so a day's repeated audits at
-#: the same sizes pay for it once.
-_NULL_FLOOR_CACHE: dict[tuple[int, int, int], float] = {}
+#: Cache keyed on (n_baseline, n_current, bins, trials, seed). The null floor
+#: depends only on the SHAPE of the comparison, not on the values, so a day's
+#: repeated audits at the same sizes/trials/seed pay for it once. `trials` and
+#: `seed` are part of the key (not just the shape) because a caller raising
+#: precision or varying the RNG for a robustness check must get a fresh
+#: estimate, not a stale one from the first call at that shape.
+_NULL_FLOOR_CACHE: dict[tuple[int, int, int, int, int], float] = {}
 
 
 def null_psi_floor(n_baseline: int, n_current: int, bins: int = 10,
@@ -85,7 +88,7 @@ def null_psi_floor(n_baseline: int, n_current: int, bins: int = 10,
     above the noise floor a value actually sits, which is the difference
     between "0.345, CRITICAL" and "0.345 against a 0.118 floor".
     """
-    key = (int(n_baseline), int(n_current), int(bins))
+    key = (int(n_baseline), int(n_current), int(bins), int(trials), int(seed))
     hit = _NULL_FLOOR_CACHE.get(key)
     if hit is not None:
         return hit
