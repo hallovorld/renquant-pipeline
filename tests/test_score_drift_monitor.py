@@ -130,3 +130,88 @@ class TestPersist:
             "SELECT name FROM sqlite_master WHERE type='table'")}
         conn.close()
         assert "score_drift_audits" not in tables  # read-only path untouched
+
+
+# --- role filter (orch#899) --------------------------------------------------
+
+def _roled_db(path, runs):
+    """A runs DB WITH the role column, as every live DB has had since it landed."""
+    conn = sqlite3.connect(str(path))
+    conn.execute("CREATE TABLE candidate_scores "
+                 "(run_id TEXT, rank_score REAL, role TEXT)")
+    for rid, scores, role in runs:
+        conn.executemany("INSERT INTO candidate_scores VALUES (?, ?, ?)",
+                         [(rid, s, role) for s in scores])
+    conn.commit()
+    return conn
+
+
+def _two_role_runs(n_runs=5, n_cand=60, n_hold=60, cand=0.0, hold=100.0):
+    import numpy as np
+    rng = np.random.default_rng(7)
+    out = []
+    for i in range(n_runs):
+        rid = f"2026-08-{i + 1:02d}-live-x"
+        out.append((rid, list(rng.normal(cand, 1.0, n_cand)), "candidate"))
+        out.append((rid, list(rng.normal(hold, 1.0, n_hold)), "holding"))
+    return out
+
+
+class TestOnlyCandidateRowsAreScored:
+    """`candidate_scores` holds two populations whose `rank_score` is not the
+    same quantity: candidates carry the scorer's z-composite, holdings carry
+    `calibrate_probability(panel_score)`. Measured live 2026-08-07, one run spans
+    [-2.667, 3.050] on the candidate side and [0.104, 0.340] on the hold side —
+    pooling them is a PSI over a mixture of two units."""
+
+    def test_holdings_are_excluded_from_both_windows(self, tmp_path):
+        from renquant_pipeline.kernel.score_drift import load_score_drift_from_db
+        conn = _roled_db(tmp_path / "a.db", _two_role_runs())
+        rep = load_score_drift_from_db(conn)
+        assert rep is not None
+        assert rep.n_current == 60, (
+            f"120 rows per run, 60 of them holdings: {rep.n_current}")
+        assert rep.n_baseline == 4 * 60, rep.n_baseline
+
+    def test_the_exclusion_is_by_ROLE_not_by_value(self, tmp_path):
+        """Anti-vacuity. Holdings on the SAME scale as candidates must be dropped
+        too — otherwise this suite would pass on a filter that merely trimmed
+        outliers."""
+        from renquant_pipeline.kernel.score_drift import load_score_drift_from_db
+        far = load_score_drift_from_db(
+            _roled_db(tmp_path / "far.db", _two_role_runs(hold=100.0)))
+        near = load_score_drift_from_db(
+            _roled_db(tmp_path / "near.db", _two_role_runs(hold=0.0)))
+        assert far is not None and near is not None
+        assert far.n_current == near.n_current == 60
+        assert far.n_baseline == near.n_baseline
+
+    def test_a_bar_that_is_full_only_because_of_holdings_is_not_the_latest_run(
+            self, tmp_path):
+        """Live this dropped exactly one run of 95: it cleared MIN_SCORES_PER_RUN
+        only because holding rows padded it past 30. Counting a sell-only bar as
+        a full scoring run because positions were persisted alongside it is the
+        same category error the role filter exists to remove."""
+        from renquant_pipeline.kernel.score_drift import (
+            load_score_drift_from_db, MIN_SCORES_PER_RUN)
+        runs = [(f"2026-08-{i + 1:02d}-live-x",
+                 [0.5 + 0.001 * i] * (MIN_SCORES_PER_RUN + 5), "candidate")
+                for i in range(4)]
+        runs.append(("2026-08-09-live-x", [0.5] * 5, "candidate"))
+        runs.append(("2026-08-09-live-x", [0.5] * MIN_SCORES_PER_RUN, "holding"))
+        rep = load_score_drift_from_db(_roled_db(tmp_path / "p.db", runs))
+        assert rep is not None
+        assert not rep.run_id.startswith("2026-08-09"), rep.run_id
+
+
+def test_a_db_without_the_role_column_still_works(tmp_path):
+    """The column is optional. Older runs DBs and every minimal fixture create
+    `candidate_scores(run_id, rank_score)`; an unconditional filter raises
+    `OperationalError: no such column: role` and takes the monitor down."""
+    from renquant_pipeline.kernel.score_drift import load_score_drift_from_db
+    p = tmp_path / "legacy.db"
+    _make_db(p, [(f"2026-08-{i + 1:02d}-live-x", [0.4 + 0.001 * i] * 40)
+                 for i in range(5)])
+    rep = load_score_drift_from_db(sqlite3.connect(str(p)))
+    assert rep is not None
+    assert rep.n_current == 40 and rep.n_baseline == 160
