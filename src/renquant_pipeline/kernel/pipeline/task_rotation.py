@@ -636,6 +636,35 @@ class BuildPairsTask(Task):
         log.info("BuildPairsTask: %d rotation pair(s) proposed", len(pairs))
 
 
+def record_rotation_block(ctx, pair, reason: str) -> None:
+    """Record a rejected rotation pair on ``ctx.rotations_blocked``.
+
+    Every guard rejection in :class:`ValidatePairsTask` used to be a bare
+    ``log.info(ROTATION_REJECT ...)`` + ``continue``. The pair then vanished:
+    ``ctx.rotations`` is overwritten with the survivors, and nothing else
+    recorded the rejection — so the run summary reported
+    ``rotations_emitted=0 (considered=0 blocked=0)`` on a run that considered a
+    swap and blocked it.
+
+    Measured 2026-08-06 on the production lane: BOTH of the day's runs logged a
+    ``ROTATION_REJECT ... reason=correlation_guard`` and BOTH reported
+    ``considered=0 blocked=0``. Over 23 sessions with rotation evaluation the
+    tree selected 4 swaps and all 4 were rejected, while the counters read zero
+    every time — the one number a monitor would look at says "nothing to do"
+    precisely on the days something was tried and stopped.
+
+    Shape matches the one :class:`EmitRotationsTask` already writes, so the
+    persistence layer (``kernel/persistence.py``) needs no change.
+    """
+    if not hasattr(ctx, "rotations_blocked"):
+        ctx.rotations_blocked = []
+    ctx.rotations_blocked.append({
+        "sell": pair.sell_ticker,
+        "buy": pair.buy_ticker,
+        "reason": reason,
+    })
+
+
 class ValidatePairsTask(Task):
     """Drop pairs whose buy ticker fails wash-sale, sector, or corr guards."""
 
@@ -704,6 +733,7 @@ class ValidatePairsTask(Task):
             if blocked:
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=wash_sale (%s)",
                          pair.sell_ticker, pair.buy_ticker, ws_reason)
+                record_rotation_block(ctx, pair, "wash_sale")
                 continue
 
             virtual_held = (
@@ -718,6 +748,7 @@ class ValidatePairsTask(Task):
             ):
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=sector_cap",
                          pair.sell_ticker, pair.buy_ticker)
+                record_rotation_block(ctx, pair, "sector_cap")
                 continue
 
             if not passes_correlation_guard(
@@ -726,10 +757,17 @@ class ValidatePairsTask(Task):
             ):
                 log.info("ROTATION_REJECT  swap=%s→%s  reason=correlation_guard",
                          pair.sell_ticker, pair.buy_ticker)
+                record_rotation_block(ctx, pair, "correlation_guard")
                 continue
 
             validated.append(pair)
 
+        # Preserve what was CONSIDERED before the survivors overwrite it: the
+        # summary counter read len(ctx.rotations) AFTER this line, i.e. the
+        # survivor count, and printed it as "considered".
+        ctx.rotations_considered = (
+            int(getattr(ctx, "rotations_considered", 0) or 0) + len(ctx.rotations)
+        )
         ctx.rotations = validated
         log.info("ValidatePairsTask: %d pair(s) survived guards", len(validated))
 
