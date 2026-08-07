@@ -182,17 +182,68 @@ def score_drift_report(baseline: np.ndarray, current: np.ndarray,
                        baseline_run_ids=baseline_run_ids, run_id=run_id)
 
 
+def load_candidate_scores_by_run(conn) -> dict[str, list[float]]:
+    """run_id -> rank_score list, CANDIDATE ROWS ONLY, for every run still
+    holding raw scores in a runs DB's ``candidate_scores`` table.
+
+    CANDIDATE ROWS ONLY (orch#899). `candidate_scores` holds two populations
+    whose `rank_score` is not the same quantity, measured 2026-08-07 on
+    `data/runs.alpaca.db`: within a single run, candidates span
+    ``[-2.667, 3.050]`` (the z-composite the scorer emits) while holdings span
+    ``[0.104, 0.340]`` — `ApplyGlobalCalibrationTask` writes the hold side as
+    ``cal.calibrate_probability(panel_score)``, a bounded probability, on every
+    run. Pooling them makes this a PSI over a mixture of two incommensurable
+    units, which is not a distribution statistic about anything.
+
+    `role IS NULL` is admitted for pre-role-column rows: the column was added
+    later, and excluding legacy rows would silently shorten historical baselines
+    rather than leaving them as they were.
+
+    The `role` COLUMN itself is optional. Older runs DBs — and every minimal
+    test fixture — create `candidate_scores(run_id, rank_score)` with no `role`
+    at all, and an unconditional filter turns those into
+    ``OperationalError: no such column: role``. The column is probed rather than
+    assumed, and its absence degrades to the pre-fix pooled behaviour instead of
+    crashing a monitor.
+
+    Shared by every consumer of the drift population (orch#899 review, P1):
+    `load_score_drift_from_db` below and `scripts/audit_score_drift_excess.py`
+    both call this so a persisted ``n_baseline``/``baseline_run_ids`` and the
+    read-only audit's reconstruction always agree on which rows count.
+    """
+    has_role = any(
+        str(r[1]) == "role"
+        for r in conn.execute("PRAGMA table_info(candidate_scores)").fetchall()
+    )
+    role_clause = " AND (role IS NULL OR role = 'candidate')" if has_role else ""
+    rows = conn.execute(
+        "SELECT run_id, rank_score FROM candidate_scores "
+        "WHERE rank_score IS NOT NULL" + role_clause).fetchall()
+    by_run: dict[str, list[float]] = {}
+    for run_id, score in rows:
+        by_run.setdefault(str(run_id), []).append(float(score))
+    return by_run
+
+
 def load_score_drift_from_db(conn, *, trailing: int = 20,
                              bins: int = 10) -> DriftReport | None:
     """Build a DriftReport from a runs DB's candidate_scores table:
     latest full scoring run vs the prior ``trailing`` full runs. Returns
-    None when there are too few full runs to baseline. Read-only."""
-    rows = conn.execute(
-        "SELECT run_id, rank_score FROM candidate_scores "
-        "WHERE rank_score IS NOT NULL").fetchall()
-    by_run: dict[str, list[float]] = {}
-    for run_id, score in rows:
-        by_run.setdefault(str(run_id), []).append(float(score))
+    None when there are too few full runs to baseline. Read-only.
+
+    Candidate rows only — see `load_candidate_scores_by_run`.
+
+    This does NOT quiet the alarm, and that is not what it is for: on the live
+    DB the same window moves 3.5956 -> 4.6600 once holdings are dropped, because
+    the probability-scale rows were diluting the z-scale ones rather than
+    inflating them.
+
+    It also drops ONE run from the 95 that previously qualified as "full": a run
+    that cleared `MIN_SCORES_PER_RUN` only because holding rows padded it past
+    30. Counting a sell-only bar as a full scoring run because positions were
+    persisted alongside it is the same error in a different place.
+    """
+    by_run = load_candidate_scores_by_run(conn)
     full = sorted(rid for rid, vals in by_run.items()
                   if len(vals) >= MIN_SCORES_PER_RUN)  # run_id is date-prefixed
     if len(full) < 3:

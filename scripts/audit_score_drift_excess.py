@@ -48,21 +48,11 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from renquant_pipeline.kernel.score_drift import null_psi_floor  # noqa: E402
+from renquant_pipeline.kernel.score_drift import (  # noqa: E402
+    load_candidate_scores_by_run, null_psi_floor)
 
 _BANDS = [("<1.0", 0.0, 1.0), ("1.0-1.5", 1.0, 1.5), ("1.5-2.0", 1.5, 2.0),
           ("2.0-3.0", 2.0, 3.0), (">=3.0", 3.0, float("inf"))]
-
-
-def _load_full_runs(conn) -> dict[str, list[float]]:
-    """run_id -> rank_score list, for every run still holding raw scores."""
-    rows = conn.execute(
-        "SELECT run_id, rank_score FROM candidate_scores "
-        "WHERE rank_score IS NOT NULL").fetchall()
-    by_run: dict[str, list[float]] = {}
-    for run_id, score in rows:
-        by_run.setdefault(str(run_id), []).append(float(score))
-    return by_run
 
 
 def _reconstruct_baseline(by_run: dict[str, list[float]],
@@ -95,7 +85,7 @@ def audit(db_path: str) -> dict:
                   "run_id, psi, severity, n_baseline, n_current")
         rows = conn.execute(
             f"SELECT {select} FROM score_drift_audits").fetchall()
-        by_run = _load_full_runs(conn)
+        by_run = load_candidate_scores_by_run(conn)
     finally:
         conn.close()
     counts = {label: 0 for label, _, _ in _BANDS}
