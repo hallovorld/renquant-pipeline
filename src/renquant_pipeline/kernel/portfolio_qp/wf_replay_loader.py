@@ -34,10 +34,14 @@ the offline A/B replay to the same hard-constraint family the prod QP
 sees. Sector / correlation caps are deliberately omitted (follow-up
 work — see CLAUDE.md §3.5 single-source-of-truth on sector data).
 
-- ``max_position_pct`` — 0.15 in ``BULL_CALM``, 0.20 elsewhere. Mirrors
-  the per-regime conviction cap range used by prod (golden config
-  ``regime_params.<R>.long_short.max_position_pct``) without binding
-  to any specific run.
+- ``max_position_pct`` — 0.15 in ``BULL_CALM``, 0.20 elsewhere **when no
+  ``strategy_config`` is supplied**. This used to claim it "mirrors the
+  per-regime conviction cap range used by prod"; measured 2026-08-06, it
+  never did — prod ``BULL_CALM`` was 0.12 against 0.15 here, and ``CHOPPY``
+  (0.15) and ``BEAR`` (0.0) both fall through to the 0.20 default because
+  neither appears in the dict. Pass ``strategy_config=`` to size a replay
+  like the live book; omit it and every bar logs the cap it actually used
+  and where the number came from (#271).
 - ``cash_reserve`` — 0.05 (5%). Same as the prod default floor.
 - ``dw_max`` — per-asset 0.10 (10% per-bar slippage cap). Wide enough
   that the replay rarely binds; cap-violation accounting is the
@@ -71,19 +75,35 @@ References
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
 from renquant_pipeline.kernel.portfolio_qp.allocator_replay import AllocatorReplayBar
 from renquant_pipeline.kernel.portfolio_qp.constraint_snapshot import ConstraintSnapshot
 
+log = logging.getLogger("kernel.portfolio_qp.wf_replay_loader")
+
 
 # Sensible per-regime caps. NOT prod constraints — they bound the
 # offline A/B replay's hard-constraint family. The prod golden config
 # is the source of truth for live sizing; this is replay defaults.
+#
+# 2026-08-06 (#271): that separation is right as a DESIGN and was wrong as a
+# SILENT default. These values have never matched production — BULL_CALM sat at
+# 0.15 here against a prod 0.12 — and the fallback 0.20 is what BULL_VOLATILE
+# (0.20, a coincidental match), CHOPPY (0.15, wrong) and BEAR (0.0, badly wrong:
+# the config says hold nothing while replay sizes at 20%) all resolve to, since
+# none of them appears in the dict. Nothing surfaced the gap, so a replay run
+# used to justify a sizing change measured a different book than the live one
+# and said nothing about it.
+#
+# Callers may now pass `strategy_config` and get the real per-regime cap.
+# Omitting it still works and still uses these defaults — but says so out loud
+# instead of resembling a measurement of production.
 _MAX_POSITION_PCT_BY_REGIME: dict[str, float] = {
     "BULL_CALM": 0.15,
 }
@@ -103,11 +123,78 @@ _FWD_HORIZON_COLUMNS: dict[int, str] = {
 }
 
 
-def _max_position_pct_for_regime(regime: Optional[str]) -> float:
-    """Per-regime hard cap (§1 PRIME DIRECTIVE — regime-conditional)."""
-    if regime is None:
-        return _DEFAULT_MAX_POSITION_PCT
-    return _MAX_POSITION_PCT_BY_REGIME.get(regime, _DEFAULT_MAX_POSITION_PCT)
+#: What production falls back to when a regime carries no `max_position_pct`.
+#: NOT chosen here — measured from the six live read sites, every one of which
+#: is a bare `regime_params.get("max_position_pct", 0.15)`:
+#: task_selection.py:159,233,763 · task_rotation.py:791 ·
+#: task_joint_actions.py:289 · governor_sizing.py:165  [VERIFIED 2026-08-06]
+_PROD_MAX_POSITION_PCT_FALLBACK = 0.15
+
+
+def _max_position_pct_for_regime(
+    regime: Optional[str],
+    strategy_config: Optional[dict] = None,
+) -> float:
+    """Per-regime hard cap (§1 PRIME DIRECTIVE — regime-conditional).
+
+    With `strategy_config`, mirrors what PRODUCTION actually does — measured,
+    not assumed. Every live read site is a bare
+    `regime_params[<regime>].get("max_position_pct", 0.15)`; none of them calls
+    `resolve_regime_knob`, and none of them consults
+    `position_sizing.max_position_pct`. That key is dead: the 0.15 it holds is
+    not consulted, and the 0.15 that *does* apply is a literal repeated at six
+    call sites. A first cut of this function routed through the resolver and
+    honoured `position_sizing`, which would have made replay diverge from
+    production in a NEW way while claiming to fix the old one.
+
+    Without a config, returns the replay defaults exactly as before — the
+    behaviour every existing caller already has — but logs the value and its
+    origin so a replay result is never mistaken for a measurement of the live
+    book.
+    """
+    if strategy_config:
+        rp = (strategy_config or {}).get("regime_params") or {}
+        entry = rp.get(regime) if isinstance(rp, dict) else None
+        if isinstance(entry, dict) and "max_position_pct" in entry:
+            raw = entry["max_position_pct"]
+            try:
+                cap = float(raw)
+            except (TypeError, ValueError):
+                log.warning(
+                    "replay cap: regime=%s has a non-numeric max_position_pct "
+                    "%r — falling back to the replay default", regime, raw,
+                )
+            else:
+                # 0.0 is meaningful (BEAR: hold nothing) and must survive. Any
+                # truthiness test here turns it back into the 0.20 fallback,
+                # which is the exact defect being fixed.
+                log.info("replay cap: regime=%s max_position_pct=%.4f "
+                         "[source=strategy_config]", regime, cap)
+                return cap
+        elif isinstance(rp, dict) and regime in rp:
+            # The regime exists but declares no cap — production would take its
+            # hardcoded 0.15 here, so replay does too rather than inventing one.
+            log.info("replay cap: regime=%s declares no max_position_pct — "
+                     "using the production fallback %.4f",
+                     regime, _PROD_MAX_POSITION_PCT_FALLBACK)
+            return _PROD_MAX_POSITION_PCT_FALLBACK
+        else:
+            log.warning(
+                "replay cap: regime=%s absent from the supplied "
+                "strategy_config — using the replay default; this bar is NOT "
+                "sized like production", regime,
+            )
+
+    cap = (
+        _DEFAULT_MAX_POSITION_PCT if regime is None
+        else _MAX_POSITION_PCT_BY_REGIME.get(regime, _DEFAULT_MAX_POSITION_PCT)
+    )
+    log.warning(
+        "replay cap: regime=%s max_position_pct=%.4f [source=REPLAY DEFAULT, "
+        "not production] — pass strategy_config to size this replay like the "
+        "live book (#271)", regime, cap,
+    )
+    return cap
 
 
 def _build_sector_matrix(
@@ -148,6 +235,7 @@ def _build_snapshot(
     *,
     sector_map: Optional[dict] = None,
     max_per_sector: int = 0,
+    strategy_config: Optional[dict] = None,
 ) -> ConstraintSnapshot:
     """Build a long-only :class:`ConstraintSnapshot` with replay defaults.
 
@@ -160,7 +248,7 @@ def _build_snapshot(
     pre-Step-4h behavior, preserved for callers that pass nothing).
     """
     n = len(tickers)
-    cap = _max_position_pct_for_regime(regime)
+    cap = _max_position_pct_for_regime(regime, strategy_config)
     w_upper = np.full(n, cap, dtype=float)
     sector_indicator = sector_cap_vec = sector_names = None
     if sector_map and max_per_sector > 0:
@@ -210,6 +298,7 @@ def load_replay_bars_from_sim_db(
     cost_per_trade_bps: float = 5.0,
     sector_map: Optional[dict] = None,
     max_per_sector: int = 0,
+    strategy_config: Optional[dict] = None,
 ) -> list[AllocatorReplayBar]:
     """Build a list of :class:`AllocatorReplayBar` from the sim decision trace.
 
@@ -309,6 +398,7 @@ def load_replay_bars_from_sim_db(
         snap = _build_snapshot(
             tickers, regime_at_date,
             sector_map=sector_map, max_per_sector=max_per_sector,
+            strategy_config=strategy_config,
         )
         bars.append(
             AllocatorReplayBar(
