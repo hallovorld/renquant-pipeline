@@ -19,6 +19,7 @@ adapter. Read-only by construction: this module never writes a decision.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 
 import numpy as np
@@ -54,25 +55,32 @@ def severity(value: float) -> str:
 #: the estimate is reported, never used as a gate.
 _NULL_TRIALS = 200
 
-#: Cache keyed on the BASELINE's identity plus (n_current, bins, trials, seed).
-#: The null is conditional on the baseline's actual distribution — size alone is
-#: NOT a sufficient key, which was the defect codex caught on #279. `trials` and
-#: `seed` are in the key because a caller raising precision or varying the RNG
-#: for a robustness check must get a fresh estimate, not a stale one.
+#: Cache keyed on the BASELINE's exact content (a content digest) plus
+#: (n_current, bins, trials, seed). The null is conditional on the baseline's
+#: actual distribution and on what `psi()` reads from it at the requested
+#: `bins` — size alone was NOT a sufficient key (codex on #279 review 1), and
+#: neither was a fixed 21-point quantile grid (codex on #279 review 5): two
+#: distinct baselines can share that coarse grid while producing different
+#: bin edges/counts once `psi()` bins them — with ties straddling a quantile
+#: boundary, or simply because `bins > 20` reads finer edges the 21-point grid
+#: never captured — so the second lookup would silently reuse the first
+#: baseline's floor. `trials` and `seed` are in the key because a caller
+#: raising precision or varying the RNG for a robustness check must get a
+#: fresh estimate, not a stale one.
 _NULL_FLOOR_CACHE: dict[tuple, float] = {}
 
 
-def _baseline_key(baseline: np.ndarray) -> tuple:
-    """Identity for a baseline, in terms of what `psi()` actually consumes.
+def _baseline_key(baseline: np.ndarray) -> bytes:
+    """Exact identity for a baseline's content.
 
-    `psi()` touches the baseline only through `np.quantile(expected, ...)` and
-    the resulting histogram, so two baselines with the same size and the same
-    quantile grid produce the same bin edges by construction. Keying on that
-    grid is therefore exact for this purpose and costs one quantile call,
-    where hashing the raw bytes would copy the whole array on every lookup.
+    A coarse summary (size + a fixed quantile grid) is not a sufficient key
+    for what `psi()` actually reads from the baseline at an arbitrary `bins`
+    — see the `_NULL_FLOOR_CACHE` note. Hashing the content is exact by
+    construction regardless of `bins` or how ties are distributed, and at
+    these array sizes (single-digit thousands of floats) the copy this
+    forces is negligible next to the `trials` resampling loop it's guarding.
     """
-    qs = np.quantile(baseline, np.linspace(0, 1, 21))
-    return (int(baseline.size), tuple(np.round(qs, 12)))
+    return hashlib.sha256(np.ascontiguousarray(baseline, dtype=np.float64).tobytes()).digest()
 
 
 def null_psi_floor(baseline: np.ndarray, n_current: int, bins: int = 10,

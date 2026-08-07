@@ -1,12 +1,13 @@
 # 2026-08-07 — Report the zero-drift floor beside every PSI; it shows the drift is REAL
 
 STATUS:   FIXED (2026-08-07, both CHANGES_REQUESTED findings addressed, then
-          the P1 calibration finding fixed below). Drift suite 40 passed, 1
-          skipped `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full
-          suite 2532 passed / 9 skipped / 2 pre-existing unrelated failures in
+          the P1 calibration finding fixed, then a 5th-round cache-key
+          exactness finding fixed below). Drift suite 41 passed, 1 skipped
+          `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full suite
+          2533 passed / 9 skipped / 2 pre-existing unrelated failures in
           `tests/test_replay_d6_conventions.py` (confirmed unrelated — that
-          file is untouched by this PR; same 2 failures the prior fix round
-          already reproduced on the unmodified pre-fix head via `git stash`)
+          file is untouched by this PR; same 2 failures reproduce identically
+          on the unmodified pre-fix head via `git stash`)
           `[VERIFIED — python3 -m pytest tests/ -q]`. **Changes no verdict** —
           `severity` still comes from `psi` alone.
 
@@ -228,6 +229,54 @@ NEXT:      none — closes the P1 finding. Going forward every new audit's
            baseline is written fresh to `candidate_scores` before the floor
            is computed, so future re-banding does not have this gap; only
            the already-pruned historical tail is permanently unreconstructable.
+
+## Fix (2026-08-07, cache-key exactness — 5th review round)
+
+WHAT:      P1: `_baseline_key()` identified a baseline by a fixed 21-point
+           (5%) quantile grid, independent of the requested `bins`. Two
+           distinct baselines can share that coarse grid while `psi()` —
+           which bins on the ACTUAL requested `bins`, not on 21 fixed points
+           — reads different edges/counts from them: with ties straddling a
+           quantile boundary, or simply whenever `bins > 20` reads finer
+           edges the 21-point grid never captured. The old key would then
+           silently serve one baseline's cached floor to a query for the
+           other. Reproduced exactly on this head with a constructed pair
+           sharing the 21-point grid but differing at `bins=30`: the second
+           baseline's query returned the first baseline's cached floor
+           (1.46) instead of its own (2.96) — confirmed by temporarily
+           reinstating the old key function and rerunning the new test.
+           Replaced `_baseline_key()` with a content digest
+           (`hashlib.sha256` of the baseline's bytes) — exact by
+           construction for any `bins` or tie pattern, at negligible cost
+           next to the `trials`-loop resampling it guards
+           (`src/renquant_pipeline/kernel/score_drift.py`).
+EVIDENCE:  artifact:      `tests/test_score_drift_noise_floor.py::
+                          test_a_baseline_that_shares_the_old_21point_grid_gets_its_own_floor`
+           prod or exp:   prod code path (cache-key fix only), verdict-
+                          preserving — `severity` is still `severity(psi)`;
+                          no change to the floor's estimation method (that
+                          was the P1 fix above), only to how it is cached.
+           existing data: n/a — this is a cache-correctness fix, not a new
+                          measurement; the live-DB excess numbers (median
+                          4.14x, 0 CRITICAL below floor) are unaffected
+                          because production baselines rarely collide on a
+                          21-point grid — the defect was a latent
+                          correctness bug, not one shown to have fired on
+                          logged data.
+           best-known?:   yes — closes the 5th-round finding; the key is now
+                          an exact digest of what `psi()` actually reads
+           scope:         "one function's cache-key implementation + one
+                          import + regression test only; no config/pin/
+                          artifact change, no verdict change. Drift suite 41
+                          passed, 1 skipped
+                          `[VERIFIED — python3 -m pytest tests/ -q -k drift]`;
+                          full suite 2533 passed / 9 skipped / 2 pre-existing
+                          unrelated failures in
+                          `tests/test_replay_d6_conventions.py` (confirmed
+                          identical on the unmodified pre-fix head via `git
+                          stash`) `[VERIFIED — python3 -m pytest tests/ -q]`.
+                          `ruff check` clean on both changed files."
+NEXT:      none — closes the 5th-round finding.
 
 ## REVERT
 

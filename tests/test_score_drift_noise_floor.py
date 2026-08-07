@@ -106,6 +106,49 @@ def test_a_tied_baseline_floor_is_conditioned_on_the_real_distribution():
     assert conditioned < shape_only_gaussian / 2, (conditioned, shape_only_gaussian)
 
 
+def test_a_baseline_that_shares_the_old_21point_grid_gets_its_own_floor():
+    """AUDIT REGRESSION GUARD (PR #279 review, 5th round): `_baseline_key()`
+    used to identify a baseline by a fixed 21-point (5%) quantile grid,
+    independent of `bins`. Two distinct baselines can share that coarse grid
+    while `psi()` — which bins on the REQUESTED `bins`, not on a fixed 21
+    points — reads different edges/counts from them, especially once
+    `bins > 20`. The old key would then silently serve baseline A's cached
+    floor to a query for baseline B.
+
+    Construct exactly that pair (61 elements so `bins=30` ranks are also
+    exact integers, no interpolation to reason about): fix the 21
+    ventile-defining points identically across both, and vary everything
+    else so `bins=30` reads different content.
+    """
+    a, b = [], []
+    for k in range(20):
+        a += [float(k), float(k), float(k)]
+        b += [float(k), k + 0.3, k + 0.6]
+    a.append(20.0)
+    b.append(20.0)
+    a, b = np.array(a), np.array(b)
+    assert a.size == b.size == 61
+
+    ventiles = np.linspace(0, 1, 21)
+    assert np.allclose(np.quantile(a, ventiles), np.quantile(b, ventiles)), (
+        "test premise: a and b must share the old fixed 21-point key")
+    thirty_bin_edges = np.linspace(0, 1, 31)
+    assert not np.allclose(np.quantile(a, thirty_bin_edges), np.quantile(b, thirty_bin_edges)), (
+        "test premise: a and b must differ at the bins=30 resolution psi() actually reads")
+
+    SD._NULL_FLOOR_CACHE.clear()
+    floor_a_first = SD.null_psi_floor(a, 40, bins=30)
+    floor_b_after_a = SD.null_psi_floor(b, 40, bins=30)
+    SD._NULL_FLOOR_CACHE.clear()
+    floor_b_fresh = SD.null_psi_floor(b, 40, bins=30)
+
+    assert floor_b_after_a == floor_b_fresh, (
+        "b's result right after a must equal a cache-cleared call for b alone "
+        "— the old key would have failed this by returning a's floor",
+        floor_a_first, floor_b_after_a, floor_b_fresh)
+    assert floor_b_after_a != floor_a_first, "a and b are genuinely different baselines"
+
+
 def test_small_baseline_gives_nan_not_a_number():
     assert np.isnan(SD.null_psi_floor(np.zeros(5), 83))
 
