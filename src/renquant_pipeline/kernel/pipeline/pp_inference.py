@@ -731,7 +731,22 @@ class InferencePipeline:
         # not "pairs EMITTED to broker". Iter3 produced rotations=1 in the log
         # while EmitRotationsTask actually skipped the pair (Kelly=0). Now
         # log both — counters["rotations"] is incremented per EMITTED pair.
-        n_considered = len(ctx.rotations)
+        #
+        # 2026-08-06: `len(ctx.rotations)` was still wrong in the OTHER
+        # direction. ValidatePairsTask overwrites ctx.rotations with the
+        # survivors, so by the time this line runs it is the survivor count, not
+        # the considered count — and every guard rejection was a bare log line
+        # that recorded nothing, leaving rotations_blocked empty. Both of that
+        # day's production runs logged a ROTATION_REJECT and both printed
+        # `considered=0 blocked=0`; across 23 sessions the tree selected 4 swaps,
+        # all 4 were rejected, and this line read zero every time. Prefer the
+        # count ValidatePairsTask preserves; fall back to the old expression for
+        # a context that never reached that task.
+        n_considered = int(
+            getattr(ctx, "rotations_considered", None)
+            if getattr(ctx, "rotations_considered", None) is not None
+            else len(ctx.rotations)
+        )
         n_emitted    = int(ctx.counters.get("rotations", 0))
         n_blocked    = len(getattr(ctx, "rotations_blocked", []) or [])
         log.info(
