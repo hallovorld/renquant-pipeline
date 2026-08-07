@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 
 from renquant_pipeline.kernel.persistence import (
     get_connection,
@@ -68,3 +69,22 @@ class TestRecord:
                                        report=None) == 0
         assert record_score_drift_audit(conn, run_id="r", run_date=RUN_DATE,
                                        report=None) == 0
+
+    def test_records_baseline_run_ids(self, tmp_path):
+        conn = _conn(tmp_path)
+        r = DriftReport(psi=0.52, severity="CRITICAL", n_baseline=80,
+                        n_current=85, ok=False,
+                        baseline_run_ids=("run0", "run1"))
+        record_score_drift_audit(conn, run_id="r1", run_date=RUN_DATE, report=r)
+        raw = conn.execute("SELECT baseline_run_ids_json FROM score_drift_audits "
+                           "WHERE run_id='r1'").fetchone()[0]
+        assert json.loads(raw) == ["run0", "run1"]
+
+    def test_no_baseline_run_ids_stored_as_null(self, tmp_path):
+        conn = _conn(tmp_path)
+        r = DriftReport(psi=0.1, severity="INFO", n_baseline=100,
+                        n_current=50, ok=True)
+        record_score_drift_audit(conn, run_id="r2", run_date=RUN_DATE, report=r)
+        raw = conn.execute("SELECT baseline_run_ids_json FROM score_drift_audits "
+                           "WHERE run_id='r2'").fetchone()[0]
+        assert raw is None

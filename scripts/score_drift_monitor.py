@@ -58,8 +58,22 @@ def _persist_audit(path: str, report: DriftReport) -> None:
             "audit_id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT, "
             "run_date TEXT NOT NULL, psi REAL, severity TEXT NOT NULL, "
             "n_baseline INTEGER, n_current INTEGER, "
+            "baseline_run_ids_json TEXT, "
             "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-        record_score_drift_audit(conn, run_id=None,
+        # A DB whose table predates baseline_run_ids_json (added PR #280
+        # review, P1) needs the column added explicitly — CREATE TABLE IF
+        # NOT EXISTS is a no-op once the table already exists.
+        existing = {r[1] for r in conn.execute(
+            "PRAGMA table_info(score_drift_audits)")}
+        if "baseline_run_ids_json" not in existing:
+            conn.execute(
+                "ALTER TABLE score_drift_audits ADD COLUMN "
+                "baseline_run_ids_json TEXT")
+        # report.run_id is the CURRENT run this measurement is about (set by
+        # load_score_drift_from_db) — persisting it (not None) is what lets
+        # audit_score_drift_excess.py's `run_id IS NOT NULL` check ever score
+        # a monitor-persisted row (PR #280 review, P1 round 3).
+        record_score_drift_audit(conn, run_id=report.run_id,
                                  run_date=_dt.date.today(), report=report)
         conn.commit()
     finally:

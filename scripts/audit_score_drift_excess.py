@@ -1,31 +1,43 @@
 #!/usr/bin/env python3
 """Excess-over-floor audit for a runs DB's `score_drift_audits` log.
 
-Re-bands every historical row whose baseline can still be reconstructed from
-`candidate_scores` by `excess = psi / null_psi_floor(baseline, n_current)`.
-Written as the runnable reproduction for the `[VERIFIED]` claims in
-doc/progress/2026-08-07-score-drift-noise-floor.md (PR #279 review finding 2
-— those tags cited a date/table name instead of a runnable command/file).
+Re-bands every historical row whose baseline can be proven identical to the
+one it was originally audited against by `excess = psi / null_psi_floor(baseline,
+n_current)`. Written as the runnable reproduction for the `[VERIFIED]` claims
+in doc/progress/2026-08-07-score-drift-noise-floor.md (PR #279 review finding
+2 — those tags cited a date/table name instead of a runnable command/file).
 
-`null_psi_floor` now conditions the null on the REAL baseline array (PR #279
+`null_psi_floor` conditions the null on the REAL baseline array (PR #279
 review, P1): `psi()` bins on `np.quantile(expected, ...)`, so a tied baseline
 collapses those edges and a same-size Gaussian floor is not that statistic's
-null. `score_drift_audits` only ever persisted `n_baseline`/`n_current`
-counts, never the raw scores, so this script rebuilds each row's baseline
-from `candidate_scores` (keyed by `run_id`, same trailing-window logic as
-`kernel.score_drift.load_score_drift_from_db`). `candidate_scores` is pruned
-over time, so older rows' raw scores are gone; those are reported as
-`n_unreconstructable` rather than silently reusing the old, now-known-wrong
-shape-only approximation.
+null. `score_drift_audits` did not persist the raw baseline scores until PR
+#280 added `baseline_run_ids_json` (the exact `run_id`s that made up the
+baseline, in trailing-window order — see `kernel.score_drift.DriftReport
+.baseline_run_ids`); before that this script inferred the window by taking
+whatever prefix of currently-surviving full runs matched the stored
+`n_baseline` *count*. That count-only check is NOT sufficient proof (PR #280
+review, P1): `candidate_scores` prunes whole runs over time, and when an
+original trailing run is pruned while an older, un-pruned run happens to
+hold the same number of scores, the count-based reconstruction silently
+substitutes the wrong run into the window and still reports a "verified"
+match. This script now only scores a row when EVERY `run_id` in its
+persisted `baseline_run_ids_json` still has raw scores in
+`candidate_scores` — an exact identity match, not an inferred one — with the
+resulting size checked against the stored `n_baseline` as a final sanity
+backstop. Rows written before `baseline_run_ids_json` existed carry no
+provenance at all and are `n_unreconstructable` unconditionally; there is no
+way to retroactively prove which runs backed them. Coverage grows only as
+new audits accrue under the new schema.
 
 Read-only: opens the DB with mode=ro and never writes.
 
-Usage:
-  audit_score_drift_excess.py --db data/runs.alpaca.db
+Usage (the runs DB lives in the umbrella repo, not this one):
+  audit_score_drift_excess.py --db /Users/renhao/git/github/RenQuant/data/runs.alpaca.db
 """
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import statistics
 import sys
@@ -36,9 +48,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
-from renquant_pipeline.kernel.score_drift import (  # noqa: E402
-    MIN_SCORES_PER_RUN, null_psi_floor,
-)
+from renquant_pipeline.kernel.score_drift import null_psi_floor  # noqa: E402
 
 _BANDS = [("<1.0", 0.0, 1.0), ("1.0-1.5", 1.0, 1.5), ("1.5-2.0", 1.5, 2.0),
           ("2.0-3.0", 2.0, 3.0), (">=3.0", 3.0, float("inf"))]
@@ -55,41 +65,54 @@ def _load_full_runs(conn) -> dict[str, list[float]]:
     return by_run
 
 
-def _reconstruct_baseline(by_run: dict[str, list[float]], full_sorted: list[str],
-                          run_id: str, *, trailing: int = 20) -> np.ndarray | None:
-    """The trailing-N-full-run baseline `load_score_drift_from_db` would have
-    built when `run_id` was the latest run. None when `run_id` itself isn't a
-    full run still on disk, or it has no preceding full runs left."""
-    if run_id not in full_sorted:
+def _reconstruct_baseline(by_run: dict[str, list[float]],
+                          baseline_run_ids: list[str] | None) -> np.ndarray | None:
+    """The exact baseline a row was audited against, from its persisted
+    `baseline_run_ids_json`. None when the row has no persisted provenance
+    (predates PR #280), or any one of its constituent runs has since been
+    pruned from `candidate_scores` — a partial or substitute reconstruction
+    is not accepted (PR #280 review, P1)."""
+    if not baseline_run_ids:
         return None
-    idx = full_sorted.index(run_id)
-    baseline_ids = full_sorted[max(0, idx - trailing):idx]
-    if not baseline_ids:
+    if not all(rid in by_run for rid in baseline_run_ids):
         return None
-    return np.array([s for rid in baseline_ids for s in by_run[rid]])
+    return np.array([s for rid in baseline_run_ids for s in by_run[rid]])
 
 
-def audit(db_path: str, *, trailing: int = 20) -> dict:
+def audit(db_path: str) -> dict:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
+        # A DB opened mode=ro that predates PR #280's migration has no
+        # baseline_run_ids_json column at all — this script never writes,
+        # so it cannot ALTER TABLE to add it. Every row on such a DB has no
+        # provenance and is unreconstructable; degrade the query instead of
+        # crashing on "no such column".
+        has_provenance = any(
+            r[1] == "baseline_run_ids_json"
+            for r in conn.execute("PRAGMA table_info(score_drift_audits)"))
+        select = ("run_id, psi, severity, n_baseline, n_current, "
+                  "baseline_run_ids_json" if has_provenance else
+                  "run_id, psi, severity, n_baseline, n_current")
         rows = conn.execute(
-            "SELECT run_id, psi, severity, n_current "
-            "FROM score_drift_audits").fetchall()
+            f"SELECT {select} FROM score_drift_audits").fetchall()
         by_run = _load_full_runs(conn)
     finally:
         conn.close()
-    full_sorted = sorted(rid for rid, vals in by_run.items()
-                         if len(vals) >= MIN_SCORES_PER_RUN)
     counts = {label: 0 for label, _, _ in _BANDS}
     excesses: list[float] = []
     critical_below_floor = 0
     n_unreconstructable = 0
-    for run_id, psi_val, severity, n_current in rows:
+    for row in rows:
+        if has_provenance:
+            run_id, psi_val, severity, n_baseline, n_current, baseline_ids_json = row
+        else:
+            run_id, psi_val, severity, n_baseline, n_current = row
+            baseline_ids_json = None
         if psi_val is None or n_current is None or run_id is None:
             continue
-        baseline = _reconstruct_baseline(by_run, full_sorted, str(run_id),
-                                         trailing=trailing)
-        if baseline is None:
+        baseline_run_ids = json.loads(baseline_ids_json) if baseline_ids_json else None
+        baseline = _reconstruct_baseline(by_run, baseline_run_ids)
+        if baseline is None or n_baseline is None or baseline.size != int(n_baseline):
             n_unreconstructable += 1
             continue
         floor = null_psi_floor(baseline, int(n_current))

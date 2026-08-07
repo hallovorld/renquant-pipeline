@@ -139,10 +139,27 @@ class DriftReport:
     #: psi / null_floor. >1 means "above the noise this shape produces on its
     #: own"; ~1 means the value is what a stable model looks like here.
     excess_over_floor: float = float("nan")
+    #: The exact run_ids that made up `baseline`, in trailing-window order.
+    #: Persisted alongside the row (PR #280 review, P1) so a later re-banding
+    #: tool can prove it reconstructed the SAME baseline rather than a
+    #: same-sized substitute after `candidate_scores` pruning — see
+    #: scripts/audit_score_drift_excess.py. Empty when the caller didn't
+    #: supply it (e.g. a report built directly from arrays in a test).
+    baseline_run_ids: tuple[str, ...] = ()
+    #: The run_id of the CURRENT run this report measured (i.e. `latest` in
+    #: `load_score_drift_from_db`) — NOT a member of `baseline_run_ids`.
+    #: Lets a persist-only caller (scripts/score_drift_monitor.py) record
+    #: which run an audit row is about instead of writing `run_id=None`,
+    #: which made every monitor-persisted row permanently unscorable by
+    #: audit_score_drift_excess.py's `run_id IS NOT NULL` check (PR #280
+    #: review, P1 round 3). None when the caller didn't supply it.
+    run_id: str | None = None
 
 
 def score_drift_report(baseline: np.ndarray, current: np.ndarray,
-                       bins: int = 10) -> DriftReport:
+                       bins: int = 10, *,
+                       baseline_run_ids: tuple[str, ...] = (),
+                       run_id: str | None = None) -> DriftReport:
     """PSI + banded verdict for two score arrays.
 
     Degenerate inputs (either side too small to bin) return a WARN
@@ -153,14 +170,16 @@ def score_drift_report(baseline: np.ndarray, current: np.ndarray,
     if baseline.size < bins or current.size == 0:
         return DriftReport(psi=float("nan"), severity="WARN",
                            n_baseline=int(baseline.size),
-                           n_current=int(current.size), ok=False)
+                           n_current=int(current.size), ok=False,
+                           baseline_run_ids=baseline_run_ids, run_id=run_id)
     v = psi(baseline, current, bins=bins)
     sev = severity(v)
     floor = null_psi_floor(baseline, current.size, bins=bins)
     excess = (v / floor) if (floor and np.isfinite(floor) and floor > 0) else float("nan")
     return DriftReport(psi=v, severity=sev, n_baseline=int(baseline.size),
                        n_current=int(current.size), ok=(sev == "INFO"),
-                       null_floor=floor, excess_over_floor=float(excess))
+                       null_floor=floor, excess_over_floor=float(excess),
+                       baseline_run_ids=baseline_run_ids, run_id=run_id)
 
 
 def load_score_drift_from_db(conn, *, trailing: int = 20,
@@ -182,4 +201,6 @@ def load_score_drift_from_db(conn, *, trailing: int = 20,
     baseline_ids = full[-(trailing + 1):-1]
     baseline = np.array([s for rid in baseline_ids for s in by_run[rid]])
     current = np.array(by_run[latest])
-    return score_drift_report(baseline, current, bins=bins)
+    return score_drift_report(baseline, current, bins=bins,
+                              baseline_run_ids=tuple(baseline_ids),
+                              run_id=latest)
