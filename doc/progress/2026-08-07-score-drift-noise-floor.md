@@ -2,9 +2,10 @@
 
 STATUS:   FIXED (2026-08-07, both CHANGES_REQUESTED findings addressed, then
           the P1 calibration finding fixed, then a 5th-round cache-key
-          exactness finding fixed below). Drift suite 41 passed, 1 skipped
+          exactness finding fixed, then a 6th-round baseline-parity finding
+          fixed below). Drift suite 42 passed, 1 skipped
           `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full suite
-          2533 passed / 9 skipped / 2 pre-existing unrelated failures in
+          2534 passed / 9 skipped / 2 pre-existing unrelated failures in
           `tests/test_replay_d6_conventions.py` (confirmed unrelated — that
           file is untouched by this PR; same 2 failures reproduce identically
           on the unmodified pre-fix head via `git stash`)
@@ -38,29 +39,32 @@ WHY/DIR:  The bands are the textbook PSI cut-offs and assume comparably sized
 `score_drift_audits` only ever persisted `n_baseline`/`n_current` counts, not
 the raw scores, and `candidate_scores` (the source of the raw scores) is
 pruned over time. So re-banding history now only covers the runs whose raw
-baseline is still on disk — the corrected floor needs the actual baseline
-array, not just its size (see the P1 fix below). Of the 1,082 logged audits,
-37 still have a reconstructable baseline
+baseline is both still on disk AND reconstructs to exactly the size the row
+was originally audited against (see the P1 and 6th-round fixes below). Of
+the 1,082 logged audits, 27 pass that parity check
 `[VERIFIED — python3 scripts/audit_score_drift_excess.py --db data/runs.alpaca.db]`:
 
 ```
-n_rows=1082 n_unreconstructable=1045 n_scored=37
-excess < 1.0  (below the zero-drift floor)      1    2.7%
-excess 1.0-1.5                                  3    8.1%
-excess 1.5-2.0                                  5   13.5%
-excess 2.0-3.0                                  6   16.2%
-excess >= 3.0                                  22   59.5%
-median 4.14x    max 107.8x
+n_rows=1082 n_unreconstructable=1055 n_scored=27
+excess < 1.0  (below the zero-drift floor)      1    3.7%
+excess 1.0-1.5                                  2    7.4%
+excess 1.5-2.0                                  3   11.1%
+excess 2.0-3.0                                  6   22.2%
+excess >= 3.0                                  15   55.6%
+median 3.41x    max 107.8x
 CRITICAL rows sitting below the floor:          0
 ```
 
 **Zero CRITICAL rows sit below the correctly-conditioned floor, and the
-median excess is 4.14x (vs the earlier shape-only estimate of 2.49x on the
-larger, uncorrected sample) — the drift is real, on a smaller but honestly
-scoped sample.** The 1,045 unreconstructable rows are not silently dropped
-from the reported total; `n_unreconstructable` is a first-class field in the
-script's output specifically so a reader sees the coverage gap, not just the
-37 that could be verified.
+median excess is 3.41x — the drift is real, on a smaller but honestly
+scoped sample.** The sample shrank further from the P1 fix's 37 rows to 27
+once the 6th-round fix (below) required the reconstructed baseline to match
+the row's stored `n_baseline` exactly, rather than accepting any surviving
+prefix of prior runs; the direction of the verdict is unchanged. The 1,055
+unreconstructable rows are not silently dropped from the reported total;
+`n_unreconstructable` is a first-class field in the script's output
+specifically so a reader sees the coverage gap, not just the 27 that could
+be verified.
 
 That refutes two framings I published earlier today, both erring toward "nothing
 is wrong", which is the more dangerous direction:
@@ -82,9 +86,11 @@ prod or exp:   **prod code path**, verdict-preserving. `severity` is still
                `severity(psi)`; the two new fields are reported and never gated
                on. Existing callers that ignore them are unaffected (both have
                defaults).
-existing data: `runs.alpaca.db::score_drift_audits`, 1,082 rows logged; 37
-               with a still-reconstructable baseline (`candidate_scores`
-               pruning — see the P1 fix below).
+existing data: `runs.alpaca.db::score_drift_audits`, 1,082 rows logged; 27
+               with a still-reconstructable baseline that also passes the
+               exact-parity check against the row's stored `n_baseline`
+               (`candidate_scores` pruning — see the P1 and 6th-round fixes
+               below).
 best-known?:   yes for the floor, conditioned on the real baseline (P1 fix
                below). **No** for what the drift IS — see NOT ESTABLISHED.
 scope:         one function, two dataclass fields, one call site.
@@ -113,8 +119,10 @@ NEXT:     Surface `null_floor` / `excess_over_floor` in the drift alert text and
    fix below.** The floor is no longer a same-size Gaussian draw; it is
    resampled from the real baseline array, so it is conditioned on the
    baseline's actual distribution (ties included), not an assumed normal law.
-   Residual: only the 37 audits whose raw baseline is still on disk in
-   `candidate_scores` can be verified this way (see WHAT THE FLOOR REVEALED).
+   Residual: only the 27 audits whose raw baseline is both still on disk in
+   `candidate_scores` and reconstructs to exactly the row's stored
+   `n_baseline` can be verified this way (see WHAT THE FLOOR REVEALED and the
+   6th-round fix below).
 
 ## Fix (2026-08-07, review findings addressed)
 
@@ -277,6 +285,69 @@ EVIDENCE:  artifact:      `tests/test_score_drift_noise_floor.py::
                           stash`) `[VERIFIED — python3 -m pytest tests/ -q]`.
                           `ruff check` clean on both changed files."
 NEXT:      none — closes the 5th-round finding.
+
+## Fix (2026-08-07, baseline parity — 6th review round)
+
+WHAT:      MED: `audit()` selected `n_current` but never `n_baseline` from
+           `score_drift_audits`, and `_reconstruct_baseline()` accepted any
+           surviving prefix of prior full runs as "the" baseline — even one
+           shorter than what the row was actually audited against, when
+           only some of its trailing runs have since been pruned from
+           `candidate_scores`. Reviewer's synthetic repro: a row logged with
+           `n_baseline=80` but only one of its two original trailing runs
+           (40 scores) still on disk — `audit()` returned
+           `n_unreconstructable=0, n_scored=1`, silently scoring the row off
+           half the baseline it was logged against.
+           Fixed by selecting `n_baseline` in the query and requiring
+           `baseline.size == int(n_baseline)` exactly before scoring a row;
+           rows that reconstruct to any other size now count toward
+           `n_unreconstructable` instead of being silently scored
+           (`scripts/audit_score_drift_excess.py`). Re-ran against the live
+           DB — see WHAT THE FLOOR REVEALED above for the corrected 27-row
+           re-banding (median 3.41x, 0 CRITICAL rows below floor, unchanged
+           verdict; sample shrank from the P1 fix's 37 rows because several
+           of those had a partially-pruned baseline that passed the old
+           "reconstructs to something" check but not this exact-parity one).
+           Two existing tests hardcoded a placeholder `n_baseline=1509`
+           unrelated to their fixture's actual trailing-run count; updated
+           both to the value their fixture actually reconstructs to (800 and
+           40 respectively) so they exercise parity rather than accidentally
+           depending on the check being absent.
+EVIDENCE:  artifact:      `tests/test_audit_score_drift_excess.py::
+                          test_a_row_whose_baseline_was_partially_pruned_is_not_silently_scored`
+           prod or exp:   read-only tooling only (`scripts/
+                          audit_score_drift_excess.py`); no change to
+                          `kernel/score_drift.py`, so the prod code path and
+                          `severity` computation are untouched — this fix is
+                          entirely to historical re-banding accuracy
+           existing data: `python3 scripts/audit_score_drift_excess.py --db
+                          data/runs.alpaca.db` → `n_rows=1082
+                          n_unreconstructable=1055 n_scored=27`, bands
+                          1/2/3/6/15, median 3.41x, max 107.8x, 0 CRITICAL
+                          rows below floor
+                          `[VERIFIED — python3 scripts/audit_score_drift_excess.py
+                          --db data/runs.alpaca.db]`. Drift suite 42 passed, 1
+                          skipped `[VERIFIED — python3 -m pytest tests/ -q -k
+                          drift]`; full suite 2534 passed / 9 skipped / 2
+                          pre-existing unrelated failures in
+                          `tests/test_replay_d6_conventions.py` (confirmed
+                          identical on the unmodified pre-fix head via `git
+                          stash`) `[VERIFIED — python3 -m pytest tests/ -q]`.
+                          `ruff check` clean on both changed files.
+           best-known?:   yes — closes the 6th-round finding; the script now
+                          only scores a row when the reconstruction is
+                          provably the same baseline the row was audited
+                          against, not merely "something reconstructed"
+           scope:         "one script's query + reconstruction-acceptance
+                          check, two test fixtures corrected, one new
+                          regression test — no config/pin/artifact change, no
+                          change to the prod `null_psi_floor`/`score_drift_report`
+                          path. The historical evidentiary sample shrank
+                          further (37 -> 27 rows); median excess moved
+                          4.14x -> 3.41x; the direction of the verdict (drift
+                          is real, zero false positives below floor) is
+                          unchanged."
+NEXT:      none — closes the 6th-round finding.
 
 ## REVERT
 

@@ -40,10 +40,14 @@ def test_bands_and_counts_a_mixed_population(tmp_path):
     for rid in run_ids[:-1]:
         candidate_rows += _full_run(rid, 40, rng)      # 21 trailing-eligible runs
     candidate_rows += _full_run(run_ids[-1], 83, rng)  # the "current" run
+    # trailing=20 default -> baseline is the 20 runs preceding the current one,
+    # 40 scores each = 800; must match what audit() reconstructs, or the new
+    # parity check (PR #279 review, 6th round) reports these unreconstructable.
+    n_baseline = 800
     _make_db(db, [
-        (run_ids[-1], 0.02, "INFO", 1509, 83),       # near the floor: excess ~1x
-        (run_ids[-1], 0.50, "CRITICAL", 1509, 83),   # well above the floor
-        (run_ids[-1], 0.60, "CRITICAL", 1509, 83),
+        (run_ids[-1], 0.02, "INFO", n_baseline, 83),       # near the floor: excess ~1x
+        (run_ids[-1], 0.50, "CRITICAL", n_baseline, 83),   # well above the floor
+        (run_ids[-1], 0.60, "CRITICAL", n_baseline, 83),
     ], candidate_rows)
     result = audit(str(db))
     assert result["n_rows"] == 3 and result["n_scored"] == 3
@@ -77,10 +81,29 @@ def test_rows_whose_baseline_was_pruned_are_reported_not_silently_scored(tmp_pat
 def test_rows_with_an_unusable_floor_are_excluded_not_counted_as_zero(tmp_path):
     rng = np.random.default_rng(2)
     db = tmp_path / "runs.db"
-    # baseline reconstructs fine (base0 precedes run1); the stored
-    # n_current=0 is the degenerate part that makes the floor unusable.
+    # baseline reconstructs fine (base0 precedes run1, matching the stored
+    # n_baseline=40 exactly); the stored n_current=0 is the degenerate part
+    # that makes the floor unusable.
     candidate_rows = _full_run("base0", 40, rng) + _full_run("run1", 40, rng)
-    _make_db(db, [("run1", 0.30, "CRITICAL", 1509, 0)], candidate_rows)
+    _make_db(db, [("run1", 0.30, "CRITICAL", 40, 0)], candidate_rows)
     result = audit(str(db))
     assert result["n_rows"] == 1 and result["n_scored"] == 0
     assert result["n_unreconstructable"] == 0
+
+
+def test_a_row_whose_baseline_was_partially_pruned_is_not_silently_scored(tmp_path):
+    """Reviewer repro (PR #279, 6th round): a row logged with n_baseline=80
+    (two trailing full runs of 40 each) but only one of those two runs still
+    has raw scores in candidate_scores. `_reconstruct_baseline` happily
+    returns the one surviving run (size 40) instead of failing outright, so
+    without a parity check against the stored n_baseline the row would be
+    silently scored off a baseline half the size of the one it was actually
+    audited against."""
+    rng = np.random.default_rng(3)
+    db = tmp_path / "runs.db"
+    candidate_rows = _full_run("base_survivor", 40, rng) + _full_run("run1", 40, rng)
+    _make_db(db, [("run1", 0.30, "CRITICAL", 80, 40)], candidate_rows)
+    result = audit(str(db))
+    assert result["n_rows"] == 1
+    assert result["n_unreconstructable"] == 1
+    assert result["n_scored"] == 0

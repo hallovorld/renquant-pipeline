@@ -14,9 +14,16 @@ null. `score_drift_audits` only ever persisted `n_baseline`/`n_current`
 counts, never the raw scores, so this script rebuilds each row's baseline
 from `candidate_scores` (keyed by `run_id`, same trailing-window logic as
 `kernel.score_drift.load_score_drift_from_db`). `candidate_scores` is pruned
-over time, so older rows' raw scores are gone; those are reported as
-`n_unreconstructable` rather than silently reusing the old, now-known-wrong
-shape-only approximation.
+over time, so older rows' raw scores are gone; a run-window reconstruction
+can then silently return a *shorter* baseline than the one the row was
+actually audited against (some of its trailing runs pruned, some still on
+disk). This script only scores a row when the reconstructed baseline's size
+exactly matches the row's stored `n_baseline` (PR #279 review, 6th round) —
+that parity is the only cheap proof the reconstruction recovered the same
+run window, not a truncated stand-in for it. Rows that fail parity, or whose
+baseline can't be reconstructed at all, are reported as `n_unreconstructable`
+rather than silently reusing the old, now-known-wrong shape-only
+approximation or scoring off a partial baseline.
 
 Read-only: opens the DB with mode=ro and never writes.
 
@@ -73,7 +80,7 @@ def audit(db_path: str, *, trailing: int = 20) -> dict:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         rows = conn.execute(
-            "SELECT run_id, psi, severity, n_current "
+            "SELECT run_id, psi, severity, n_baseline, n_current "
             "FROM score_drift_audits").fetchall()
         by_run = _load_full_runs(conn)
     finally:
@@ -84,12 +91,12 @@ def audit(db_path: str, *, trailing: int = 20) -> dict:
     excesses: list[float] = []
     critical_below_floor = 0
     n_unreconstructable = 0
-    for run_id, psi_val, severity, n_current in rows:
+    for run_id, psi_val, severity, n_baseline, n_current in rows:
         if psi_val is None or n_current is None or run_id is None:
             continue
         baseline = _reconstruct_baseline(by_run, full_sorted, str(run_id),
                                          trailing=trailing)
-        if baseline is None:
+        if baseline is None or n_baseline is None or baseline.size != int(n_baseline):
             n_unreconstructable += 1
             continue
         floor = null_psi_floor(baseline, int(n_current))
