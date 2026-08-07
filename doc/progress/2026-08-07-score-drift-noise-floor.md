@@ -4,10 +4,12 @@ STATUS:   FIXED (2026-08-07, both CHANGES_REQUESTED findings addressed, then
           the P1 calibration finding fixed, then a 5th-round cache-key
           exactness finding fixed, then a 6th-round baseline-parity finding
           fixed, then a 7th round that found the 6th round's own parity
-          check was still not proof — see CORRECTION below). Drift suite 47
-          passed, 1 skipped
+          check was still not proof — see CORRECTION below — then an 8th
+          round that found the 7th round's own new provenance column was
+          unreachable through the monitor's `--persist` entry point — see
+          Fix (8th review round) below). Drift suite 49 passed, 1 skipped
           `[VERIFIED — python3 -m pytest tests/ -q -k drift]`; full suite
-          2539 passed / 9 skipped / 2 pre-existing unrelated failures in
+          2541 passed / 9 skipped / 2 pre-existing unrelated failures in
           `tests/test_replay_d6_conventions.py` (confirmed unrelated — that
           file is untouched by this PR; same 2 failures reproduce identically
           on the unmodified pre-fix head via `git stash`)
@@ -557,6 +559,88 @@ NEXT:      none for this finding. The historical evidentiary gap it opens
            that; re-running the script periodically is enough to observe
            coverage grow.
 
+## Fix (2026-08-07, forward-coverage entry point — 8th review round)
+
+WHAT:      P1 — the 7th round's "coverage grows forward-only" claim is dead
+           through `scripts/score_drift_monitor.py`'s `--persist` entry
+           point specifically (the standalone monitor CLI, as opposed to
+           `kernel.score_audit.run_score_drift_audit`, which already took an
+           explicit `run_id` and was never affected). `_persist_audit()`
+           called `record_score_drift_audit(conn, run_id=None, ...)`
+           unconditionally, and `scripts/audit_score_drift_excess.py::audit()`
+           skips every row with `run_id is None` before it ever looks at
+           `baseline_run_ids_json`. So a fresh `--persist` audit got the new
+           provenance column written correctly, then was permanently
+           excluded from scoring by the `run_id` check regardless — the new
+           column and the read path never actually connected for this entry
+           point.
+           Fixed by propagating the real run_id instead of removing the
+           `audit()` check (removing it would let a row with no run
+           identity at all masquerade as reconstructable, which is the same
+           class of bug the earlier rounds fixed for the baseline side).
+           `kernel.score_drift.DriftReport` gained a `run_id: str | None`
+           field — the CURRENT run's id (`latest` in
+           `load_score_drift_from_db`, NOT a `baseline_run_ids` member) —
+           threaded through `score_drift_report()`'s new `run_id=` keyword
+           and populated by `load_score_drift_from_db()`.
+           `scripts/score_drift_monitor.py::_persist_audit()` now passes
+           `run_id=report.run_id` instead of the hardcoded `None`.
+           Added an end-to-end regression,
+           `tests/test_score_drift_monitor.py::TestPersist::
+           test_persisted_row_is_scored_by_the_read_only_audit`, that runs
+           `monitor(..., persist=True)` then the read-only `audit()` and
+           asserts the freshly persisted row is `n_scored=1`,
+           `n_unreconstructable=0` — the exact scenario the reviewer asked
+           for, since a unit test on `DriftReport.run_id` alone would not
+           have caught the entry-point mismatch (the field existing does not
+           prove the CLI wires it through). Also added
+           `tests/test_score_drift.py::TestDbLoader::
+           test_run_id_is_the_current_run_not_a_baseline_member`.
+EVIDENCE:  artifact:      `tests/test_score_drift_monitor.py::TestPersist::
+                          test_persisted_row_is_scored_by_the_read_only_audit`,
+                          `tests/test_score_drift.py::TestDbLoader::
+                          test_run_id_is_the_current_run_not_a_baseline_member`
+           prod or exp:   prod code path — `kernel/score_drift.py` (new
+                          dataclass field, additive, default `None`) is a
+                          live path; `scripts/score_drift_monitor.py` is the
+                          CLI's only write-enabling change (one `None` ->
+                          `report.run_id`). `severity` computation and
+                          `kernel.score_audit.run_score_drift_audit` (the
+                          other, already-correct write path) are untouched.
+           existing data: n/a — this is a coverage-path fix, not a new
+                          historical measurement. Re-ran the read-only audit
+                          against the live production DB
+                          `[VERIFIED — python3 scripts/audit_score_drift_excess.py
+                          --db /Users/renhao/git/github/RenQuant/data/runs.alpaca.db]`
+                          → `n_rows=1082 n_unreconstructable=1082 n_scored=0`,
+                          unchanged from the 7th round (expected: this agent
+                          did not and must not write a `--persist` audit to
+                          that production path; the fix only unblocks
+                          scoring for rows written going forward once a
+                          scheduled `--persist` run accrues them).
+           best-known?:   yes — closes the 8th-round P1 finding; the
+                          end-to-end test proves the specific path the
+                          reviewer flagged (monitor persist -> audit score)
+                          rather than only the unit-level field plumbing.
+           scope:         "one new dataclass field + one keyword threaded
+                          through two functions, one `None` -> `report.run_id`
+                          fix in the monitor CLI, two regression tests
+                          (one end-to-end). No config/pin/artifact change; no
+                          write to any production data path. Drift suite 49
+                          passed, 1 skipped
+                          `[VERIFIED — python3 -m pytest tests/ -q -k drift]`;
+                          full suite 2541 passed / 9 skipped / 2 pre-existing
+                          unrelated failures in
+                          `tests/test_replay_d6_conventions.py` (confirmed
+                          identical on the unmodified pre-fix head via `git
+                          stash`) `[VERIFIED — python3 -m pytest tests/ -q]`.
+                          `ruff check` clean on all changed files."
+NEXT:      none for this finding. The forward-coverage claim now holds for
+           BOTH write paths (`run_score_drift_audit` and the monitor CLI's
+           `--persist`); whether either is actually invoked on a schedule in
+           production is outside this PR's scope — this fix only removes the
+           entry-point-specific dead path the reviewer found.
+
 ## REVERT
 
 Delete `null_psi_floor`, `_baseline_key`, `_NULL_TRIALS`, `_NULL_FLOOR_CACHE`,
@@ -568,4 +652,9 @@ the two `DriftReport` fields and their computation in `score_drift_report`,
 `load_score_drift_from_db()`, the `score_drift_audits.baseline_run_ids_json`
 column + its `_COLUMN_MIGRATIONS` entry + `record_score_drift_audit()`'s
 write of it, and the matching DDL/migration guard in
-`scripts/score_drift_monitor.py::_persist_audit()`. No other file changes.
+`scripts/score_drift_monitor.py::_persist_audit()`. Also delete `DriftReport
+.run_id`, the `run_id=` keyword on `score_drift_report()`, its population in
+`load_score_drift_from_db()`, and revert
+`scripts/score_drift_monitor.py::_persist_audit()`'s
+`record_score_drift_audit(conn, run_id=report.run_id, ...)` back to
+`run_id=None`. No other file changes.

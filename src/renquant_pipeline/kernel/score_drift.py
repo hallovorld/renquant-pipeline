@@ -146,11 +146,20 @@ class DriftReport:
     #: scripts/audit_score_drift_excess.py. Empty when the caller didn't
     #: supply it (e.g. a report built directly from arrays in a test).
     baseline_run_ids: tuple[str, ...] = ()
+    #: The run_id of the CURRENT run this report measured (i.e. `latest` in
+    #: `load_score_drift_from_db`) — NOT a member of `baseline_run_ids`.
+    #: Lets a persist-only caller (scripts/score_drift_monitor.py) record
+    #: which run an audit row is about instead of writing `run_id=None`,
+    #: which made every monitor-persisted row permanently unscorable by
+    #: audit_score_drift_excess.py's `run_id IS NOT NULL` check (PR #280
+    #: review, P1 round 3). None when the caller didn't supply it.
+    run_id: str | None = None
 
 
 def score_drift_report(baseline: np.ndarray, current: np.ndarray,
                        bins: int = 10, *,
-                       baseline_run_ids: tuple[str, ...] = ()) -> DriftReport:
+                       baseline_run_ids: tuple[str, ...] = (),
+                       run_id: str | None = None) -> DriftReport:
     """PSI + banded verdict for two score arrays.
 
     Degenerate inputs (either side too small to bin) return a WARN
@@ -162,7 +171,7 @@ def score_drift_report(baseline: np.ndarray, current: np.ndarray,
         return DriftReport(psi=float("nan"), severity="WARN",
                            n_baseline=int(baseline.size),
                            n_current=int(current.size), ok=False,
-                           baseline_run_ids=baseline_run_ids)
+                           baseline_run_ids=baseline_run_ids, run_id=run_id)
     v = psi(baseline, current, bins=bins)
     sev = severity(v)
     floor = null_psi_floor(baseline, current.size, bins=bins)
@@ -170,7 +179,7 @@ def score_drift_report(baseline: np.ndarray, current: np.ndarray,
     return DriftReport(psi=v, severity=sev, n_baseline=int(baseline.size),
                        n_current=int(current.size), ok=(sev == "INFO"),
                        null_floor=floor, excess_over_floor=float(excess),
-                       baseline_run_ids=baseline_run_ids)
+                       baseline_run_ids=baseline_run_ids, run_id=run_id)
 
 
 def load_score_drift_from_db(conn, *, trailing: int = 20,
@@ -193,4 +202,5 @@ def load_score_drift_from_db(conn, *, trailing: int = 20,
     baseline = np.array([s for rid in baseline_ids for s in by_run[rid]])
     current = np.array(by_run[latest])
     return score_drift_report(baseline, current, bins=bins,
-                              baseline_run_ids=tuple(baseline_ids))
+                              baseline_run_ids=tuple(baseline_ids),
+                              run_id=latest)

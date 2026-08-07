@@ -69,7 +69,11 @@ def _persist_audit(path: str, report: DriftReport) -> None:
             conn.execute(
                 "ALTER TABLE score_drift_audits ADD COLUMN "
                 "baseline_run_ids_json TEXT")
-        record_score_drift_audit(conn, run_id=None,
+        # report.run_id is the CURRENT run this measurement is about (set by
+        # load_score_drift_from_db) — persisting it (not None) is what lets
+        # audit_score_drift_excess.py's `run_id IS NOT NULL` check ever score
+        # a monitor-persisted row (PR #280 review, P1 round 3).
+        record_score_drift_audit(conn, run_id=report.run_id,
                                  run_date=_dt.date.today(), report=report)
         conn.commit()
     finally:

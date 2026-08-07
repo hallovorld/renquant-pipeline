@@ -97,6 +97,19 @@ class TestDbLoader:
         assert r.baseline_run_ids == tuple(
             f"2026-06-{d:02d}-r" for d in range(1, 5))
 
+    def test_run_id_is_the_current_run_not_a_baseline_member(self):
+        """Round 3 (PR #280 review, P1): the CURRENT run's id must be on the
+        report so a persist-only caller can record which run an audit row
+        is about, instead of writing `run_id=None` (which made every
+        monitor-persisted row permanently unscorable)."""
+        rng = np.random.RandomState(0)
+        runs = [(f"2026-06-{d:02d}-r", rng.normal(0.5, 0.1, 140).tolist())
+                for d in range(1, 6)]
+        conn = self._db(runs)
+        r = load_score_drift_from_db(conn, trailing=20)
+        assert r.run_id == "2026-06-05-r"
+        assert r.run_id not in r.baseline_run_ids
+
     def test_none_when_too_few_full_runs(self):
         conn = self._db([("2026-06-01-r", [0.5] * 40),
                          ("2026-06-02-r", [0.5] * 5)])   # 2nd is partial

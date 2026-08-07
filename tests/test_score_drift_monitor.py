@@ -10,6 +10,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "scripts"))
 
+from audit_score_drift_excess import audit  # noqa: E402
 from score_drift_monitor import monitor  # noqa: E402
 
 
@@ -87,6 +88,28 @@ class TestPersist:
             "SELECT severity, psi FROM score_drift_audits").fetchone()
         conn.close()
         assert row[0] == "CRITICAL" and row[1] is not None
+
+    def test_persisted_row_is_scored_by_the_read_only_audit(self, tmp_path):
+        """End-to-end regression (PR #280 review, P1 round 3): `_persist_audit`
+        used to hardcode `run_id=None`, and audit_score_drift_excess.py's
+        `audit()` unconditionally skips any row with `run_id is None` — so
+        every --persist row was permanently unscorable and the "coverage
+        grows forward-only" claim in the progress doc was false. Proves a
+        freshly persisted, provenance-tagged row is reconstructable and
+        scored by the read-only audit."""
+        rng = np.random.RandomState(0)
+        runs = [(f"2026-06-{d:02d}-full", rng.normal(0.5, 0.1, 140).tolist())
+                for d in range(1, 5)]
+        runs.append(("2026-06-06-full", [0.5] * 140))  # collapse -> CRITICAL
+        db = tmp_path / "runs.db"
+        _make_db(db, runs)
+        code, reports = monitor([str(db)], persist=True)
+        assert code == 1 and reports[0]["persisted"] is True
+
+        result = audit(str(db))
+        assert result["n_rows"] == 1
+        assert result["n_unreconstructable"] == 0
+        assert result["n_scored"] == 1
 
     def test_no_persist_does_not_write(self, tmp_path):
         import sqlite3
