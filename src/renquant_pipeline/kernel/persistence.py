@@ -549,6 +549,11 @@ CREATE TABLE IF NOT EXISTS score_drift_audits (
     severity     TEXT    NOT NULL,      -- INFO | WARN | CRITICAL
     n_baseline   INTEGER,
     n_current    INTEGER,
+    -- Exact run_ids backing n_baseline, JSON-encoded (PR #280 review, P1) —
+    -- lets a later re-banding tool prove it reconstructed the SAME baseline,
+    -- not a same-sized substitute after candidate_scores pruning. NULL for
+    -- rows written before this column existed; those stay unreconstructable.
+    baseline_run_ids_json TEXT,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_score_drift_date ON score_drift_audits(run_date);
@@ -794,6 +799,11 @@ _COLUMN_MIGRATIONS: dict[str, list[tuple[str, str]]] = {
     ],
     "ticker_forward_returns": [
         ("fwd_60d",               "REAL"),
+    ],
+    # PR #280 review, P1: existing score_drift_audits rows predate this
+    # provenance column and stay unreconstructable (NULL) until re-audited.
+    "score_drift_audits": [
+        ("baseline_run_ids_json", "TEXT"),
     ],
 }
 
@@ -2961,10 +2971,12 @@ def record_score_drift_audit(
     if conn is None or report is None:
         return 0
     psi_val = getattr(report, "psi", None)
+    baseline_run_ids = getattr(report, "baseline_run_ids", None)
     conn.execute(
         """INSERT INTO score_drift_audits
-              (run_id, run_date, psi, severity, n_baseline, n_current)
-           VALUES (?, ?, ?, ?, ?, ?)""",
+              (run_id, run_date, psi, severity, n_baseline, n_current,
+               baseline_run_ids_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (
             run_id,
             run_date.isoformat(),
@@ -2972,6 +2984,7 @@ def record_score_drift_audit(
             report.severity,
             getattr(report, "n_baseline", None),
             getattr(report, "n_current", None),
+            json.dumps(list(baseline_run_ids)) if baseline_run_ids else None,
         ),
     )
     return 1

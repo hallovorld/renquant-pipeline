@@ -85,6 +85,18 @@ class TestDbLoader:
         r = load_score_drift_from_db(conn, trailing=20)
         assert r is not None and r.severity == "INFO"
 
+    def test_baseline_run_ids_are_the_trailing_window(self):
+        """Persisted alongside the row (PR #280 review, P1) so a later
+        re-banding tool can prove which exact runs backed the baseline,
+        rather than inferring a same-sized substitute after pruning."""
+        rng = np.random.RandomState(0)
+        runs = [(f"2026-06-{d:02d}-r", rng.normal(0.5, 0.1, 140).tolist())
+                for d in range(1, 6)]
+        conn = self._db(runs)
+        r = load_score_drift_from_db(conn, trailing=20)
+        assert r.baseline_run_ids == tuple(
+            f"2026-06-{d:02d}-r" for d in range(1, 5))
+
     def test_none_when_too_few_full_runs(self):
         conn = self._db([("2026-06-01-r", [0.5] * 40),
                          ("2026-06-02-r", [0.5] * 5)])   # 2nd is partial
