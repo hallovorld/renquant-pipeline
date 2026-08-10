@@ -25,6 +25,14 @@
       "new_public_sha256": "bdb3f75a6307435ce97182691ccf567405f7f57b0b8f2ae57f8c6275b8923927",
       "new_kernel_sha256": "50e7bf4b03545122b618e1af00c9f94465c1a446cdbce71fd322e27135d6023c",
       "reason": "orch#703 adds PersistServedMatrixTask to the KERNEL PanelScoringJob only, and NOT to the public twin, deliberately. The public PanelScoringJob (renquant_pipeline/panel_scoring.py) is the intraday/frozen-score chain: it has no NGBoost/GlobalCalibration/Kelly/QualityFloor stage, so the surface the sink exists to record does not exist there; and its matrix lives at ctx.panel_feature_matrix, which _StubFrozenFeatureMatrixTask fills with EMPTY per-ticker dicts. Mirroring the task would write a file that looks like served-input evidence and contains none - strictly worse than not writing it. The asymmetry is the intended behaviour, not an oversight, and the sink SKIPS rather than writing an empty matrix if it is ever reached from there."
+    },
+    {
+      "pair": "RegimeModelAdmissionTask",
+      "old_public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2",
+      "old_kernel_sha256": "3b4c2d113ab61385d575c5c3be7d696577dfdf1f5d01cfc1d0a05c6bae4e9e1e",
+      "new_public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2",
+      "new_kernel_sha256": "0c898b93e0c21e4154604a47dd641c8b5ca2eb59ea149d5974e4fc16941f6b55",
+      "reason": "wf-fail override PR (pipeline#283): the KERNEL RegimeModelAdmissionTask.run gains a second, independent governed admission check (_wf_fail_admission) alongside _diagnostic_only_admission, so a bypassed preflight cannot ride a REJECTED WF-FAIL operator authorization on a passed=False artifact. The public twin (renquant_pipeline/panel_scoring.py::RegimeModelAdmissionTask) is a genuinely different implementation: it gates via evaluate_model_admission(strategy_config, artifact_manifest, market_snapshot) and has NO _diagnostic_only_admission and NO _wf_fail_admission call site at all - it never reads wf_gate_metadata.passed. The diagnostic_only override that this mirrors was itself wired kernel-only for the same structural reason (kernel_sha256-only pins already stand for that lineage). So mirroring the wf_fail admission into the public twin has no call site to mirror it into; the KERNEL-only re-pin is the correct shape, not an oversight. public_sha256 is unchanged and intended to stay unchanged."
     }
   ]
 }

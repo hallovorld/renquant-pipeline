@@ -225,6 +225,13 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
         # is a dict of EMPTY per-ticker dicts, so mirroring the task would write
         # a file that looks like served-input evidence and contains none.
         ("PanelScoringJob", "bc1d082dd37b", "50e7bf4b0354"),
+        # wf-fail override (pipeline#283): _wf_fail_admission is added to the
+        # KERNEL RegimeModelAdmissionTask.run beside _diagnostic_only_admission
+        # (a second governed check so a bypassed preflight cannot ride a
+        # rejected WF-FAIL authorization on a passed=False artifact). The public
+        # twin is a different implementation (evaluate_model_admission, no
+        # diagnostic_only/wf_fail admission) with no call site to mirror it into.
+        ("RegimeModelAdmissionTask", "3b4c2d113ab6", "0c898b93e0c2"),
     ]
     for e in entries:
         for key in ("pair", "old_public_sha256", "old_kernel_sha256",
