@@ -84,15 +84,49 @@ WHY/DIR:   Direction is toward MORE stringency, not less. The operator wants a
            resolution flags), so adding or expiring it never invalidates artifact
            config-consistency stamps — pinned by a test.
 
-           The real passed=False `wf_reason` this override is written against,
-           measured 2026-08-10 on
-           `RenQuant/backtesting/renquant_104/artifacts/prod/panel-ltr.alpha158_fund.weekly_20260804T200020Z.staging.json`:
-           `"FAIL: absolute_ok=True, benchmark_ok=False, regime_ok=False; mean
-           Sharpe +0.602, 3/3 cuts > 0; SPY mean Sharpe +1.081, ΔSharpe -0.479,
-           beat SPY Sharpe 1/3, beat SPY APY 0/3; benchmark-lag
-           regimes=['HIGH_CALM', 'LOW_SPIKED']"`. The reason string lives under
-           `wf_reason` (present on 80/80 stamped artifacts), NOT `reason`, which
-           is what the byte-ack compares against.
+           The wf_reason byte-ack is written against a REAL passed=False gate
+           stamp. That is an artifact-based observation, so it carries a §4(b)
+           evidence block:
+
+           artifact:      the failure string this override's byte-ack compares
+                          against lives under `wf_gate_metadata.wf_reason`, NOT
+                          `reason`. Measured 2026-08-10 by a read-only glob over
+                          `RenQuant/**/artifacts/**/*.json`: 80/80 stamped
+                          artifacts carry `wf_reason`; 17/80 are `passed=False`.
+                          One live passed=False example,
+                          `RenQuant/backtesting/renquant_104/artifacts/prod/panel-ltr.alpha158_fund.weekly_20260804T200020Z.staging.json`:
+                          `"FAIL: absolute_ok=True, benchmark_ok=False,
+                          regime_ok=False; mean Sharpe +0.602, 3/3 cuts > 0; SPY
+                          mean Sharpe +1.081, ΔSharpe -0.479, beat SPY Sharpe
+                          1/3, beat SPY APY 0/3; benchmark-lag
+                          regimes=['HIGH_CALM', 'LOW_SPIKED']"`.
+                          `[VERIFIED — read-only python json probe over the
+                          umbrella tree, 2026-08-10]`
+           prod or exp:   read-only observation of PROD gate stamps to fix which
+                          key/string the mechanism binds. NOT a model/data
+                          performance claim — no IC/Sharpe/edge asserted here;
+                          the −0.479 ΔSharpe is quoted FROM the artifact as the
+                          failure being overridden, not measured or endorsed.
+           existing data: `python` json probe reading each artifact's
+                          `metadata.wf_gate_metadata` (keys + `passed` +
+                          `wf_reason`); the `wf_reason` value is used verbatim as
+                          the test fixture `WF_REASON` and asserted by
+                          `tests/test_wf_fail_override.py` (byte-equality admits,
+                          any mutation refuses). `str reason` on these stamps was
+                          None — hence the byte-ack targets `wf_reason`.
+           best-known?:   n/a — this is not a variant comparison; it is the
+                          current live gate-stamp schema (the string the operator
+                          must byte-acknowledge). No sweep, no alternative.
+           scope:         claim is ONLY that the byte-exact `wf_reason` string
+                          and its key location are what the override compares
+                          against — a mechanism/fixture anchor, not a statement
+                          about the strategy's quality. The §4(b) sanity triad
+                          (edge vs cost / placebo / OOS) does not apply: no alpha
+                          claim is made.
+
+           (The distinct config key + the wf_reason byte-ack are strictly harder
+           to satisfy than the diagnostic_only override, and with no block every
+           existing outcome is byte-identical — behaviour-invariance test.)
 
 EVIDENCE:  `[VERIFIED — pytest via renquant-pipeline/.venv (py3.11) with
            PYTHONPATH=worktree/src:../renquant-common/src:..., 2026-08-10]`
