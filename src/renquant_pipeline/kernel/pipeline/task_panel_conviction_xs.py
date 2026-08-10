@@ -33,6 +33,14 @@ Config:
         # AND-rule: in bottom %ile AND mu ≤ ceiling. Both required.
         xs_panel_percentile_floor: 0.20  # bottom 20% of today's panel scores
         mu_sell_ceiling: 0.0             # NGBoost μ must be ≤ this
+        # Optional per-regime overrides for the two AND-rule knobs
+        # (orch#962 B1; BEAR-exit prereg 2026-08-08 §2). Resolution order
+        # mirrors min_holding_days_by_regime (soft_exit_guards
+        # _configured_min_days): exact regime -> "default"/"_default" key
+        # -> the flat scalar above. A config without these maps behaves
+        # byte-identically to the scalar-only read.
+        # xs_panel_percentile_floor_by_regime: {default: 0.20, BEAR: 0.35}
+        # mu_sell_ceiling_by_regime: {default: 0.0, BEAR: 0.01}
         # OR-rule (independent bypass): strong-mu alone fires regardless
         # of percentile. Captures cases like BA where mu=-0.12 but panel
         # is only 32%ile — model strongly says "this will lose money".
@@ -67,6 +75,35 @@ from .soft_exit_guards import (
 )
 
 log = logging.getLogger("kernel.pipeline.panel_conviction_xs")
+
+
+def _by_regime_trigger_value(cfg: dict, key: str, regime: str | None, scalar_default):
+    """Resolve an AND-rule trigger knob per-regime (orch#962 B1).
+
+    Mirrors the existing ``min_holding_days_by_regime`` pattern
+    (``soft_exit_guards._configured_min_days``) — resolution order when a
+    ``{key}_by_regime`` map is configured:
+
+      1. exact ``regime`` entry
+      2. explicit ``default`` / ``_default`` key in the map
+      3. the flat scalar ``cfg[key]`` (with its scalar default)
+
+    A non-dict or empty map is ignored (flat scalar used), exactly like the
+    existing pattern. Value parsing/validation stays in the caller's
+    existing scalar path — a malformed resolved value raises there and the
+    task skips (no false exit), the same behavior a malformed scalar
+    exhibits today. A config carrying ONLY the scalar keys is byte-identical
+    to the pre-``_by_regime`` read (BEAR-exit prereg 2026-08-08 §2 frozen
+    fallback semantics).
+    """
+    by_regime = cfg.get(f"{key}_by_regime")
+    if isinstance(by_regime, dict) and by_regime:
+        if regime is not None and regime in by_regime:
+            return by_regime[regime]
+        for default_key in ("default", "_default"):
+            if default_key in by_regime:
+                return by_regime[default_key]
+    return cfg.get(key, scalar_default)
 
 
 def _stamp_blocked(ctx: InferenceContext, ticker: str, reason: str) -> None:
@@ -129,9 +166,12 @@ class CrossSectionalPanelExitTask(Task):
         if not ctx.holdings:
             return None
 
+        regime = getattr(ctx, "regime", None)
         try:
-            pct_floor   = float(cfg.get("xs_panel_percentile_floor", 0.20))
-            mu_ceiling  = float(cfg.get("mu_sell_ceiling", 0.0))
+            pct_floor   = float(_by_regime_trigger_value(
+                cfg, "xs_panel_percentile_floor", regime, 0.20))
+            mu_ceiling  = float(_by_regime_trigger_value(
+                cfg, "mu_sell_ceiling", regime, 0.0))
             min_universe = int(cfg.get("min_universe", 5))
             # OR-bypass: strong negative mu fires regardless of percentile.
             # None disables (only the AND-rule fires).
