@@ -198,4 +198,5 @@ OWNED_KERNEL_STEMS: frozenset[str] = frozenset({
     "typed_past",
     "vol_target",
     "walk_forward",
+    "wf_fail_override",
 })
