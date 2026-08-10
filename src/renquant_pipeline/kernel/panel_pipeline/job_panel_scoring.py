@@ -2314,6 +2314,67 @@ def _diagnostic_only_admission(
     return True, "ok", {}
 
 
+def _wf_fail_admission(
+    metadata: dict,
+    config: dict | None = None,
+    *,
+    today: datetime.date | None = None,
+) -> tuple[bool, str, dict]:
+    """Second enforcement point for a hard WF-FAIL (``passed is False``) scorer.
+
+    This mirrors :func:`_diagnostic_only_admission` so a bypassed preflight is
+    still caught, with one deliberate asymmetry: it does NOT introduce a NEW
+    unconditional ``passed=False`` block. The unconditional passed=False refusal
+    is P-WF-GATE's job (and RFC #210's freshness license, which itself has no
+    scoring-path twin); a new unconditional scoring-path block would refuse the
+    live RFC #210-served passed=False book and break behaviour invariance. So
+    when NO ``wf_gate.wf_fail_buy_admission`` authorization is present the
+    verdict is "absent" and this passes through unchanged.
+
+    What it DOES enforce is THIS PR's new authorization surface: a
+    present-but-rejected WF-FAIL authorization (expired / wrong scorer /
+    wf_reason mismatch / malformed) is refused here too — fail-closed
+    defence-in-depth — and a VALID one admits with audited provenance. The
+    governed validator is :mod:`renquant_pipeline.kernel.wf_fail_override`:
+    explicit, expiring, scorer-content-bound, and byte-acknowledging the
+    artifact's ``wf_reason`` (the extra stringency vs the diagnostic-only
+    override, which can never admit a passed=False artifact).
+    """
+    wf = metadata.get("wf_gate_metadata") if isinstance(metadata, dict) else {}
+    if not isinstance(wf, dict) or wf.get("passed") is not False:
+        return True, "ok", {}
+    from renquant_pipeline.kernel.wf_fail_override import (  # noqa: PLC0415
+        evaluate_wf_fail_override,
+    )
+    verdict = evaluate_wf_fail_override(
+        wf,
+        config,
+        scorer_content_sha=(
+            metadata.get("model_content_fingerprint_v1_recompute")
+            if isinstance(metadata, dict) else None
+        ),
+        now=today,
+    )
+    if verdict.authorized:
+        return True, "ok:wf_fail_operator_override", {
+            "wf_fail_override": verdict.provenance,
+        }
+    if verdict.reason == "absent":
+        # No authorization present: the passed=False refusal (and any RFC #210
+        # freshness serving) is handled at preflight — pass through unchanged.
+        return True, "ok", {}
+    details = {
+        "wf_gate_metadata": {
+            "passed": False,
+            "wf_reason": wf.get("wf_reason"),
+        },
+        "wf_fail_override_rejected": {
+            "reason": verdict.reason, **verdict.provenance,
+        },
+    }
+    return False, "regime_admission:wf_fail_evidence", details
+
+
 def _trade_monotonicity_admission(metadata: dict, regime: str) -> tuple[bool, str, dict]:
     wf = metadata.get("wf_gate_metadata") if isinstance(metadata, dict) else {}
     tm = wf.get("trade_monotonicity") if isinstance(wf, dict) else {}
@@ -2585,11 +2646,32 @@ class RegimeModelAdmissionTask(Task):
         )
         # The governed-override provenance must survive into the admission
         # record even when later admission stages overwrite reason/details.
-        override_provenance = details.get("diagnostic_only_override")
+        diagnostic_override = details.get("diagnostic_only_override")
+        # Second, independent governed refusal: a hard WF-FAIL (passed=False)
+        # artifact. Mirrors the diagnostic-only enforcement so a bypassed
+        # preflight is still caught, but ONLY a present-but-rejected wf_fail
+        # authorization blocks here — with no authorization it passes through
+        # (the unconditional passed=False refusal is preflight P-WF-GATE's and
+        # RFC #210's job; a new scoring-path block would refuse the live RFC
+        # #210-served passed=False book and break behaviour invariance).
+        wf_fail_override = None
+        if ok:
+            wf_ok, wf_reason, wf_details = _wf_fail_admission(
+                metadata, ctx.config, today=getattr(ctx, "today", None),
+            )
+            wf_fail_override = wf_details.get("wf_fail_override")
+            if (not wf_ok) or (wf_fail_override is not None):
+                ok, reason, details = wf_ok, wf_reason, wf_details
+        override_records = {}
+        if diagnostic_override:
+            override_records["diagnostic_only_override"] = diagnostic_override
+        if wf_fail_override:
+            override_records["wf_fail_override"] = wf_fail_override
         if ok and cfg.get("enabled", True) is False:
-            if override_provenance:
+            if override_records:
                 ctx._regime_model_admission = {  # noqa: SLF001
-                    "ok": True, "reason": reason, "regime": regime, **details,
+                    "ok": True, "reason": reason, "regime": regime,
+                    **details, **override_records,
                 }
             return None
         if ok:
@@ -2603,8 +2685,7 @@ class RegimeModelAdmissionTask(Task):
             )
         ctx._regime_model_admission = {  # noqa: SLF001
             "ok": bool(ok), "reason": reason, "regime": regime, **details,
-            **({"diagnostic_only_override": override_provenance}
-               if override_provenance else {}),
+            **override_records,
         }
         if ok:
             return None

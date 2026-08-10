@@ -95,7 +95,8 @@
       "public_sha256": "bdb3f75a6307435ce97182691ccf567405f7f57b0b8f2ae57f8c6275b8923927"
     },
     "RegimeModelAdmissionTask": {
-      "kernel_sha256": "3b4c2d113ab61385d575c5c3be7d696577dfdf1f5d01cfc1d0a05c6bae4e9e1e",
+      "_repin_2026_08_10": "wf-fail override PR: the KERNEL RegimeModelAdmissionTask.run gained a second, independent governed admission check (_wf_fail_admission) alongside _diagnostic_only_admission, so a bypassed preflight cannot ride a rejected WF-FAIL authorization. This is a KERNEL-ONLY change: the public twin (renquant_pipeline.panel_scoring.RegimeModelAdmissionTask) is a genuinely different implementation (evaluate_model_admission, no diagnostic_only/wf_fail admission), so its digest is intentionally unchanged. Only kernel_sha256 was re-pinned.",
+      "kernel_sha256": "0c898b93e0c21e4154604a47dd641c8b5ca2eb59ea149d5974e4fc16941f6b55",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,

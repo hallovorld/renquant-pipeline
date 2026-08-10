@@ -17,6 +17,10 @@ from renquant_pipeline.kernel.diagnostic_only_override import (
 from renquant_pipeline.kernel.rfc210_license import (
     evaluate_freshness_fallback_license,
 )
+from renquant_pipeline.kernel.wf_fail_override import (
+    evaluate_wf_fail_override,
+    scorer_content_sha_from_payload,
+)
 from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge)
     PreflightCheck,
     _active_panel_config,
@@ -41,7 +45,15 @@ class WfGateMetadataTask(PreflightTask):
       - artifact missing → soft pass (handled by P-MODEL-ARTIFACT)
       - sidecar unreadable → soft|hard per run_mode (P-PANEL-CONTRACT handles)
       - wf metadata absent → soft|hard per run_mode (full/buy strict)
-      - passed=False → HARD fail (sell-only soft pass with warning)
+      - passed=False → HARD fail (sell-only soft pass with warning), UNLESS
+        the artifact is RFC #210 freshness-served, OR a valid
+        ``wf_gate.wf_fail_buy_admission`` operator authorization (explicit,
+        expiring, bound to this exact scorer's schema-v1 content hash AND
+        byte-acknowledging this artifact's ``wf_reason`` — see
+        ``kernel.wf_fail_override``) admits buys; that authorization is
+        DISTINCT from and more stringent than diagnostic_only's, and a
+        diagnostic_only authorization can never admit a passed=False artifact.
+        The authorization provenance is attached to the check details
       - passed=True + diagnostic_only=True → sell-only, UNLESS a valid
         ``wf_gate.diagnostic_only_buy_admission`` operator authorization
         (explicit, expiring, bound to this exact scorer's schema-v1 content
@@ -177,15 +189,52 @@ class WfGateMetadataTask(PreflightTask):
                 details=details,
             )
         details["freshness_fallback_rfc210_refused"] = rfc210.reason
-        return PreflightCheck(
-            self.check_name, "hard", False,
+        # Governed operator "I-accept-the-risk" override for a hard WF-FAIL
+        # (kernel.wf_fail_override): explicit, expiring, scorer-content-bound,
+        # AND byte-acknowledging THIS artifact's wf_reason (the extra stringency
+        # vs the diagnostic-only override). Consulted ONLY after RFC #210
+        # refused, and ONLY on this passed=False branch — a diagnostic_only
+        # authorization can never admit a passed=False artifact. With no
+        # wf_fail_buy_admission block the verdict is "absent" and the hard fail
+        # below is returned byte-identically (behaviour invariance).
+        verdict = evaluate_wf_fail_override(
+            wf, ctx.config,
+            scorer_content_sha=scorer_content_sha_from_payload(payload),
+        )
+        if verdict.authorized:
+            details["wf_fail_override"] = verdict.provenance
+            prov = verdict.provenance
+            return PreflightCheck(
+                self.check_name, "hard", True,
+                "active panel artifact carries failed WF gate evidence "
+                f"(wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
+                f"reason={wf.get('wf_reason')}); buys admitted under a governed "
+                "operator WF-FAIL authorization "
+                f"(operator={prov['operator']}, "
+                f"authorized_at={prov['authorized_at']}, "
+                f"expires={prov['expires']}, scorer-bound "
+                f"{prov['scorer_model_content_sha256']}, wf_reason "
+                "acknowledged) — I-accept-the-risk override.",
+                details=details,
+            )
+        blocked_msg = (
             "active panel artifact carries failed WF gate evidence: "
             f"wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')} "
             f"spy_sharpe_mean={wf.get('spy_sharpe_mean')} "
             f"reason={wf.get('wf_reason')}. Refusing new live decisions until "
             "a WF-passing artifact is promoted or buy mode is explicitly isolated "
-            "to shadow/research.",
-            details=details,
+            "to shadow/research."
+        )
+        if verdict.reason != "absent":
+            details["wf_fail_override_rejected"] = {
+                "reason": verdict.reason, **verdict.provenance,
+            }
+            blocked_msg += (
+                " (a WF-FAIL operator authorization was present but rejected: "
+                f"{verdict.reason})"
+            )
+        return PreflightCheck(
+            self.check_name, "hard", False, blocked_msg, details=details,
         )
 
     def _validate_passed(self, wf: dict, details: dict,
