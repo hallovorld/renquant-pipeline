@@ -39,6 +39,37 @@ WHY/DIR:  Prod strategy-104 serves `panel_scoring.kind = "blend"` (a z-blend:
           scorer was going stale. The check is SOFT (does not block trading);
           it stays SOFT.
 
+EVIDENCE:
+  artifact:      `src/renquant_pipeline/kernel/preflight_pipeline/tasks/staleness.py`
+                 (+182 insertions, 0 deletions) and `tests/test_staleness_blend.py`
+                 (12 new cases) `[VERIFIED — git diff on the branch head]`.
+  prod or exp:   prod — the P-MODEL-STALENESS preflight rail. Observability only:
+                 the blend branch emits SOFT findings and cannot block a cycle; no
+                 gating threshold, order path, or live config is touched.
+  existing data: yes — the live served
+                 `strategy-104/configs/strategy_config.json` was read READ-ONLY for
+                 the smoke below. No data generated, no artifact written.
+  best-known?:   yes — binding on the STALEST leg is the only rule that cannot
+                 report a blend as fresher than the inputs it is computed from.
+                 Reusing each kind's existing per-leg read (artifact JSON for a
+                 direct leg, `_load_sequence_sidecar` for patchtst) beats a
+                 blend-only reader, which would be free to drift from the primary
+                 branches it is supposed to agree with.
+  scope:         "this is the `kind == \"blend\"` branch of `ModelStalenessTask`
+                 (prod), vs existing best = today's unregistered-kind fallback,
+                 which emits an opaque 'kind not registered' for the kind prod
+                 ACTUALLY serves. The new branch names each leg by index/kind and
+                 reports which leg binds. Reading the `momentum_residual` leg's
+                 ledger freshness is a DISTINCT kind-registration and is still
+                 unregistered — surfaced as a named gap, not silently passed."
+
+NEXT: register the `momentum_residual` leg's ledger freshness read (via the
+existing `load_momentum_residual_scorer` chain) so `component[1]` resolves to an
+age instead of a named gap — until then a blend binds on whichever leg it CAN
+read, which is a floor on staleness, not the full picture. Land behind Codex
+review as usual; no pin advance is required for this PR, since the rail is
+observability-only.
+
 ## The rule (stalest-leg-binds), quoted from the diff
 
 The binding leg on each axis is the max-age (oldest) leg:
