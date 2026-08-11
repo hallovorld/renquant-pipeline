@@ -1339,12 +1339,18 @@ def _check_state_file(
 # small, bounded number of times with a short backoff, but STILL fail closed
 # after every attempt fails — a genuine outage must refuse to trade.
 #
-# DEPENDENCY: these retries stay comfortably under the ~12-min intraday cadence
-# ONLY because the Alpaca broker client now has a bounded read/connect timeout
-# (renquant-execution: AlpacaBroker's bounded-timeout session, armed around
-# connect()/get_account_value()). Without it a single attempt could hang ~82s
-# and 3 attempts would blow the cadence. Do not raise these bounds beyond what
-# (attempts * (read_timeout + backoff)) keeps under the cadence.
+# DEPENDENCY: retrying at all is only defensible because the Alpaca broker
+# client now bounds NO-PROGRESS connect/read stalls (renquant-execution:
+# AlpacaBroker's bounded-timeout session, armed around connect() /
+# get_account_value()). Without it a stalled read is timeout=None -- unbounded
+# -- and retrying multiplies that; with it, the observed ~82s hang costs
+# seconds. But Requests' timeout is an INACTIVITY timer, not a wall-clock cap:
+# a peer that keeps trickling bytes outlasts it indefinitely (measured 30.1s
+# under timeout=(5,10) against a 1-byte-every-2s server). So the ~94s budget in
+# the progress doc covers the no-progress stall mode only -- it is not a proven
+# ceiling on cycle time. Do not raise these bounds beyond what
+# (attempts * (connect + read) + (attempts - 1) * backoff) keeps under the
+# cadence, and do not restate that budget as a guarantee.
 _BROKER_CONNECT_MAX_ATTEMPTS = 3
 _BROKER_CONNECT_BACKOFF_SECONDS = 2.0
 
