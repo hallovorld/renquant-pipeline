@@ -55,6 +55,17 @@ class ModelStalenessTask(PreflightTask):
             return PreflightCheck(self.check_name, "soft", True,
                                   "panel scoring disabled — skip")
         kind = str(panel_cfg.get("kind", "xgb"))
+        # 2026-08-11: a "blend" is a z-composite of >=2 legs (blend_scorer /
+        # pipeline#260, GOAL-8 S1). Its freshness is NOT the single top-level
+        # artifact_path but the STALEST of its component legs — a blend is only
+        # as fresh as its oldest leg. Assessed via a dedicated branch so the
+        # LIVE prod z-blend scorer is actually covered by this rail; before this
+        # it took the unrecognised-kind else below and the prod scorer's decay
+        # rail was never established (the daily model_freshness monitor reported
+        # "binding data cutoff unknown / kind not registered"). SOFT, like the
+        # rest — the WF gate stays the promotion/demotion authority.
+        if kind == "blend":
+            return self._check_blend(ctx, panel_cfg)
         rel = panel_cfg.get("artifact_path")
         if not rel:
             return PreflightCheck(self.check_name, "soft", False,
@@ -170,3 +181,174 @@ class ModelStalenessTask(PreflightTask):
             self.check_name, "soft", True,
             f"model fresh: retrained {retrain_age}d ago, "
             f"cutoff {cutoff_age}d old", details=details)
+
+    # ── kind == "blend": a z-composite is only as fresh as its OLDEST leg ────
+    def _check_blend(self, ctx: PreflightContext, panel_cfg: dict) -> PreflightCheck:
+        """Assess a blend's freshness as the STALEST of its scoring legs.
+
+        Each leg is resolved the SAME way the per-kind branches resolve a solo
+        scorer — REUSING their reads, never reimplementing them: a direct-
+        artifact leg (``blend_scorer.PANEL_COMPONENT_KIND`` / ``"panel"``, the
+        default when a component omits ``kind``, or ``"xgb"`` /
+        ``"panel_ltr_xgboost"``) is read from the artifact JSON exactly like the
+        xgb branch; an ``"hf_patchtst"`` leg is read from the sequence sidecar
+        exactly like the patchtst branch. The blend's freshness then BINDS to
+        the stalest (oldest cutoff / max age) leg, and the identical decay-curve
+        / provenance rails the xgb branch applies are applied to that binding
+        leg, with every leg's age carried in ``details``.
+
+        Fail-closed provenance discipline (matching the rail's existing
+        behaviour): a leg whose kind this rail does not register (e.g.
+        ``blend_scorer.MOMENTUM_COMPONENT_KIND`` ``"momentum_residual"``, an
+        append-only ledger axis not yet registered here), whose artifact is
+        unreadable, or whose ``trained_date`` cannot be established, is a
+        SURFACED provenance gap NAMING the leg — never a false "fresh" pass. An
+        unestablished leg is the binding constraint (a blend cannot be fresher
+        than a leg whose age is unknown). SOFT throughout.
+        """
+        try:  # canonical component-kind constant (frozen); literal fallback
+            from renquant_pipeline.kernel.panel_pipeline.blend_scorer import (  # noqa: PLC0415
+                PANEL_COMPONENT_KIND,
+            )
+        except Exception:  # noqa: BLE001
+            PANEL_COMPONENT_KIND = "panel"
+
+        comps = panel_cfg.get("components")
+        if not isinstance(comps, list) or not comps:
+            return PreflightCheck(
+                self.check_name, "soft", False,
+                "kind='blend' but ranking.panel_scoring.components is missing "
+                "or empty — the blend's legs (and therefore its freshness) "
+                "cannot be established (provenance gap, NOT a pass)")
+
+        today = ctx.as_of if getattr(ctx, "as_of", None) else dt.date.today()
+        st_cfg = (ctx.config.get("preflight", {}) or {}).get("staleness", {})
+        max_retrain = int(st_cfg.get("max_retrain_age_days",
+                                     DEFAULT_MAX_RETRAIN_AGE_DAYS))
+        max_cutoff = int(st_cfg.get("max_cutoff_age_days",
+                                    DEFAULT_MAX_CUTOFF_AGE_DAYS))
+
+        legs = [self._read_blend_leg(ctx, i, entry, today, PANEL_COMPONENT_KIND)
+                for i, entry in enumerate(comps)]
+        details = {
+            "legs": [{k: v for k, v in leg.items() if k != "gap"} for leg in legs],
+            "max_retrain_age_days": max_retrain,
+            "max_cutoff_age_days": max_cutoff,
+        }
+        gaps = [leg["gap"] for leg in legs if leg["gap"] is not None]
+
+        # Fail-closed: any leg whose age/axis could not be established BINDS the
+        # blend (it is the least-fresh, unbounded leg). Surface and name it, but
+        # still report every leg age we DID read so the finding is actionable.
+        if gaps:
+            readable = [f"component[{leg['index']}] ({leg['kind']}) "
+                        f"retrain_age={leg['retrain_age_days']}d"
+                        for leg in legs if leg["retrain_age_days"] is not None]
+            tail = ("; readable legs: " + ", ".join(readable)) if readable else ""
+            return PreflightCheck(
+                self.check_name, "soft", False,
+                "blend freshness binds to its STALEST leg; unresolved leg(s): "
+                + "; ".join(gaps) + tail + " — a blend is only as fresh as its "
+                "oldest leg, so an unestablished leg is the binding constraint "
+                "(NOT a pass). Register/repair the named leg to make this "
+                "actionable.", details=details)
+
+        # Every leg resolved a trained_date. Bind to the stalest (max-age) leg
+        # and apply the identical rails the xgb branch applies.
+        retrain_leg = max(legs, key=lambda leg: leg["retrain_age_days"])
+        details["binding_retrain_leg"] = retrain_leg["index"]
+        breaches = []
+        if retrain_leg["retrain_age_days"] > max_retrain:
+            breaches.append(
+                f"binding leg component[{retrain_leg['index']}] "
+                f"({retrain_leg['kind']}) retrain age "
+                f"{retrain_leg['retrain_age_days']}d > {max_retrain}d "
+                f"(quarterly rail)")
+        # Decay rail: the blend is bounded by its OLDEST cutoff; a single
+        # unstamped leg makes the rail unmeasurable — the SAME surfaced gap the
+        # xgb branch keeps (xgb usually does not stamp effective cutoff).
+        unstamped = [leg for leg in legs if leg["cutoff_age_days"] is None]
+        if unstamped:
+            names = ", ".join(f"component[{leg['index']}] ({leg['kind']})"
+                              for leg in unstamped)
+            breaches.append(
+                f"effective_train_cutoff_date unstamped on {names} — "
+                "decay-curve rail unmeasurable (provenance gap)")
+            details["binding_cutoff_leg"] = None
+            cutoff_leg = None
+        else:
+            cutoff_leg = max(legs, key=lambda leg: leg["cutoff_age_days"])
+            details["binding_cutoff_leg"] = cutoff_leg["index"]
+            if cutoff_leg["cutoff_age_days"] > max_cutoff:
+                breaches.append(
+                    f"binding leg component[{cutoff_leg['index']}] "
+                    f"({cutoff_leg['kind']}) train-cutoff age "
+                    f"{cutoff_leg['cutoff_age_days']}d > {max_cutoff}d "
+                    f"(decay-curve knee; measured −0.058 IC by 18mo)")
+        if breaches:
+            return PreflightCheck(
+                self.check_name, "soft", False,
+                "blend model staleness: " + "; ".join(breaches) + " — schedule "
+                "a retrain through the WF gate", details=details)
+        return PreflightCheck(
+            self.check_name, "soft", True,
+            f"blend fresh: binding leg component[{retrain_leg['index']}] "
+            f"({retrain_leg['kind']}) retrained "
+            f"{retrain_leg['retrain_age_days']}d ago, oldest cutoff "
+            f"{cutoff_leg['cutoff_age_days']}d old across {len(legs)} legs",
+            details=details)
+
+    def _read_blend_leg(self, ctx: PreflightContext, index: int, entry,
+                        today: dt.date, default_kind: str) -> dict:
+        """Resolve ONE blend leg's freshness axis, REUSING the per-kind reads.
+
+        Returns a detail dict; ``gap`` is a human-readable string when the
+        leg's provenance could NOT be established (else ``None``). A gap is a
+        finding, not a skip — the caller surfaces it fail-closed.
+        """
+        leg = {"index": index, "kind": None, "artifact": None,
+               "trained_date": None, "effective_train_cutoff_date": None,
+               "retrain_age_days": None, "cutoff_age_days": None, "gap": None}
+        if not isinstance(entry, dict):
+            leg["gap"] = f"component[{index}] is not a mapping ({entry!r})"
+            return leg
+        comp_kind = str(entry.get("kind") or default_kind)
+        leg["kind"] = comp_kind
+        rel = entry.get("artifact_path")
+        if not rel:
+            leg["gap"] = f"component[{index}] ({comp_kind}) artifact_path missing"
+            return leg
+        path = _resolve_artifact_path(ctx.strategy_dir, rel)
+        leg["artifact"] = path.name
+        try:
+            if comp_kind == "hf_patchtst":
+                meta, _src = _load_sequence_sidecar(path)  # same read as patchtst
+            elif comp_kind in (default_kind, "xgb", "panel_ltr_xgboost"):
+                import json  # noqa: PLC0415
+                meta = json.loads(path.read_text(encoding="utf-8"))  # same as xgb
+            else:
+                # Inverted default (never enumerate-and-fall-through): a leg kind
+                # this rail does not register — e.g. momentum_residual, whose
+                # append-only ledger axis is not read here — is a surfaced gap,
+                # not a silent pass. Register it to make this actionable.
+                leg["gap"] = (
+                    f"component[{index}] kind={comp_kind!r} is not a "
+                    f"staleness-readable leg kind — this rail cannot establish "
+                    f"its freshness axis (register the kind)")
+                return leg
+        except Exception as exc:  # noqa: BLE001
+            leg["gap"] = (f"component[{index}] ({comp_kind}) artifact dates "
+                          f"unreadable for {path.name}: {exc}")
+            return leg
+        trained = _parse_date(meta.get("trained_date"))
+        cutoff = _parse_date(meta.get("effective_train_cutoff_date"))
+        if trained is None:
+            leg["gap"] = (f"component[{index}] ({comp_kind}, {path.name}) lacks "
+                          f"trained_date — provenance gap, leg age unmeasurable")
+            return leg
+        leg["trained_date"] = trained.isoformat()
+        leg["retrain_age_days"] = (today - trained).days
+        if cutoff is not None:
+            leg["effective_train_cutoff_date"] = cutoff.isoformat()
+            leg["cutoff_age_days"] = (today - cutoff).days
+        return leg

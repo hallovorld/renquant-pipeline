@@ -15,6 +15,12 @@ differently on each.
 The blend lane was issuing buy recommendations at the time. `patchtst` (no `hf_`
 prefix) and an absent kind (`None`) also appear in committed strategy configs and
 took the same branch.
+
+2026-08-11: `blend` is now a REGISTERED scoring kind — its stalest-leg freshness
+rail lives in ``ModelStalenessTask._check_blend`` and is exercised by
+``test_staleness_blend.py``. So this module now uses ``ensemble`` (and
+``patchtst`` / ``""`` / ``None``) as the still-unregistered representatives that
+must fail closed via the inverted-default else branch.
 """
 
 from __future__ import annotations
@@ -42,7 +48,7 @@ def _artifact(tmp_path: Path, payload: dict, name="art.json") -> Path:
     return p
 
 
-@pytest.mark.parametrize("kind", ["blend", "patchtst", "ensemble", "", None])
+@pytest.mark.parametrize("kind", ["patchtst", "ensemble", "", None])
 def test_an_unrecognised_kind_without_trained_date_FAILS(tmp_path, kind):
     """THE DEFECT. Every one of these used to return passed=True."""
     _artifact(tmp_path, {"note": "no dates here"})
@@ -64,7 +70,7 @@ def test_an_unrecognised_kind_with_FRESH_dates_STILL_DOES_NOT_PASS(tmp_path):
     # and the test failed on my expectation, not on the fix.
     _artifact(tmp_path, {"trained_date": "2026-07-29",
                          "effective_train_cutoff_date": "2026-07-20"})
-    res = ModelStalenessTask().check(_Ctx(tmp_path, "blend"))
+    res = ModelStalenessTask().check(_Ctx(tmp_path, "ensemble"))
     assert res.ok is False, res.message
     assert "not a registered scoring kind" in res.message
     # the measurement must survive into the message
@@ -77,16 +83,16 @@ def test_the_reported_measurement_distinguishes_fresh_from_stale(tmp_path):
     routine registration from an urgent one. If both cases printed the same text
     the measurement would be decorative."""
     _artifact(tmp_path, {"trained_date": "2020-01-02"})
-    old = ModelStalenessTask().check(_Ctx(tmp_path, "blend")).message
+    old = ModelStalenessTask().check(_Ctx(tmp_path, "ensemble")).message
     _artifact(tmp_path, {"trained_date": "2026-07-29"})
-    new = ModelStalenessTask().check(_Ctx(tmp_path, "blend")).message
+    new = ModelStalenessTask().check(_Ctx(tmp_path, "ensemble")).message
     assert old != new
     assert "2020-01-02" in old and "2026-07-29" in new
 
 
 def test_an_unreadable_artifact_under_an_unknown_kind_FAILS(tmp_path):
     (tmp_path / "art.json").write_text("{not json")
-    res = ModelStalenessTask().check(_Ctx(tmp_path, "blend"))
+    res = ModelStalenessTask().check(_Ctx(tmp_path, "ensemble"))
     assert res.ok is False
     assert "not a registered scoring kind" in res.message
     assert "unreadable" in res.message
@@ -104,6 +110,6 @@ def test_the_RECOGNISED_kinds_are_unchanged(tmp_path, kind):
 def test_panel_scoring_disabled_still_skips(tmp_path):
     """The one legitimate skip. If this broke, every non-panel strategy would
     alarm forever and the check would be turned off wholesale."""
-    ctx = _Ctx(tmp_path, "blend")
+    ctx = _Ctx(tmp_path, "ensemble")
     ctx.config["ranking"]["panel_scoring"]["enabled"] = False
     assert ModelStalenessTask().check(ctx).ok is True
