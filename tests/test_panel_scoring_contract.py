@@ -27,7 +27,8 @@ def _ctx(*, feature_frame=None, panel_scores=None, artifact_extra=None) -> Infer
         "strategy": "renquant_104",
         "fingerprint": "sha256:model",
         "uri": "object://renquant-artifacts/panel-ltr-prod.json",
-        "promotion_status": "prod",
+        "promotion_status": "candidate",
+        "provenance": {"kind": "none"},
         "feature_cols": ["alpha_1", "alpha_2"],
         "metrics": {
             "accepted": True,

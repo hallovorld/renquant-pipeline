@@ -89,7 +89,8 @@ def _artifact_manifest() -> dict[str, Any]:
         "strategy": "renquant_104",
         "fingerprint": "sha256:model",
         "uri": "object://renquant-artifacts/panel-ltr-prod.json",
-        "promotion_status": "prod",
+        "promotion_status": "candidate",
+        "provenance": {"kind": "none"},
         "feature_cols": ["alpha_1"],
         "metrics": {"accepted": True},
     }
