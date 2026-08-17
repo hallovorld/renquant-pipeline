@@ -1,5 +1,24 @@
 # 2026-08-17 — #289: pre-filter untradeable buy-legs before rotation pairing
 
+STATUS:    delivered — code + tests complete, approved by codex at 7125d1e; this
+           C5 header block was added after that approval to satisfy the required
+           field template (sections below unchanged).
+WHAT:      `BuildPairsTask` now runs the object-only long-signal guard on buy-leg
+           candidates BEFORE any pair-finder, so a candidate the model refuses to
+           buy can no longer claim a holding's rotation slot. All three finder
+           modes covered by the single filter point; emit-time guard kept as
+           backstop; blocked-candidate telemetry parity preserved (§2).
+WHY/DIR:   Fixes #289 — measured 2026-08-17 live: the one allowed pair
+           (CRWD→PANW) was blocked at emit, the slot was never released, and an
+           eligible GOOG went unused → 0 rotations, ECONOMIC_NO_TRADE (§1).
+           Runtime selection fix, so it belongs in renquant-pipeline.
+EVIDENCE:  see §4 below (artifact / prod or exp / existing data / best-known? /
+           scope — the §4(b) block).
+NEXT:      none in this PR — pin advance is a separate operator-gated step;
+           pair-DEPENDENT blocks (bad price, kelly_zero, insufficient_cash,
+           preexisting_exit, ValidatePairsTask rejections) still burn slots and
+           are named as remaining, out of scope for #289 (§4).
+
 ## 1. Problem
 
 Measured 2026-08-17 live (renquant_104): the rotation tree formed one pair
