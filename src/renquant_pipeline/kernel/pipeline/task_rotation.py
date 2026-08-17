@@ -249,6 +249,61 @@ class BuildPairsTask(Task):
         held_set = set(ctx.holdings.keys())
         eligible_candidates = [c for c in ctx.ranked if c.ticker not in held_set]
 
+        # #289 (2026-08-17): pre-filter untradeable buy-legs BEFORE pairing.
+        # The long-signal guard used to run only at emit time
+        # (EmitRotationsTask), AFTER the greedy pair-finders had assigned
+        # each held ticker to at most one candidate (`used_holds`). A
+        # candidate that could never be bought still claimed a holding, its
+        # later rejection was a bare `continue` (never a re-pair), and with
+        # max_rotations_per_bar=1 a single blocked pair consumed the entire
+        # bar's rotation budget. Measured 2026-08-17: PANW (ER −0.0589)
+        # claimed CRWD and was blocked, while GOOG (ER +0.0252, net_adv
+        # +0.1669 vs the same holding) sat unused → 0 rotations.
+        #
+        # The guard is object-only — long_signal_ok_for_object(candidate,
+        # config) — never pair-dependent, so eligibility can run before
+        # allocation. All three finder modes (er / thesis_primary /
+        # thesis_symmetric) consume THIS list, so this single filter point
+        # covers every path. The emit-time guard below stays as a
+        # normally-unreachable backstop (defense in depth).
+        #
+        # Observability parity: each pre-filtered candidate is recorded
+        # with the SAME reason string, counter family, and blocked-by
+        # bookkeeping the emit-time guard writes — plus stage="prefilter"
+        # and sell=None (no pair exists yet) so monitors can tell the
+        # stages apart.
+        if not hasattr(ctx, "rotations_blocked"):
+            ctx.rotations_blocked = []
+        tradeable_candidates: list = []
+        for c in eligible_candidates:
+            signal_ok, signal_reason = long_signal_ok_for_object(c, ctx.config)
+            if signal_ok:
+                tradeable_candidates.append(c)
+                continue
+            log.info(
+                "BuildPairsTask: %s blocked rotation buy-leg (prefilter) — %s "
+                "(panel_score=%s expected_return=%s)",
+                c.ticker,
+                signal_reason,
+                getattr(c, "panel_score", None),
+                getattr(c, "expected_return", None),
+            )
+            ctx.rotations_blocked.append({
+                "sell": None,
+                "buy": c.ticker,
+                "reason": signal_reason,
+                "stage": "prefilter",
+            })
+            blocked = getattr(ctx, "_blocked_by_ticker", None)
+            if blocked is None:
+                blocked = {}
+                ctx._blocked_by_ticker = blocked  # noqa: SLF001
+            blocked.setdefault(c.ticker, signal_reason)
+            ctx.counters[f"rotation_{signal_reason}"] = (
+                ctx.counters.get(f"rotation_{signal_reason}", 0) + 1
+            )
+        eligible_candidates = tradeable_candidates
+
         # Route B — rotation_mode "thesis_primary" bypasses ER-based pair
         # discovery and uses thesis-degradation + uplift as PRIMARY gate.
         # Useful when ER magnitudes are systematically smaller than
