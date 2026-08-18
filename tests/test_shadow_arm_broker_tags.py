@@ -156,3 +156,33 @@ def test_fleet_state_files_all_disjoint(mod, tmp_path) -> None:
     # the _mom prefix must not swallow the _mom_fast tag
     assert mod.runs_db_path(tmp_path / "runs.db", "alpaca_shadow_blend_mom_fast").name == (
         "runs.alpaca_shadow_blend_mom_fast.db")
+
+
+# ── vol-window lane tag (orch#1004 impl; registered BEFORE session 1) ─────────
+#
+# The alpaca_shadow_blend_mom lesson (its state write raised ValueError on
+# session 1 because the tag landed after the lane shipped) — this lane's tag
+# lands ahead of any scheduled run.
+
+_VOL_WINDOW_TAG = "alpaca_shadow_vol_window"
+
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+def test_vol_window_tag_accepted_in_both_copies(mod, tmp_path) -> None:
+    assert _VOL_WINDOW_TAG in mod.ALLOWED_BROKERS
+    assert mod.live_state_path(tmp_path, _VOL_WINDOW_TAG).name == (
+        f"live_state.{_VOL_WINDOW_TAG}.json"
+    )
+    assert mod.runs_db_path(tmp_path / "runs.db", _VOL_WINDOW_TAG).name == (
+        f"runs.{_VOL_WINDOW_TAG}.db"
+    )
+
+
+@pytest.mark.parametrize("mod", BOTH_COPIES, ids=("top", "kernel"))
+def test_vol_window_state_disjoint_from_other_lanes(mod, tmp_path) -> None:
+    tags = (_VOL_WINDOW_TAG, "alpaca_shadow", "alpaca_shadow_blend",
+            "alpaca_shadow_blend_mom")
+    state_files = {mod.live_state_path(tmp_path, t) for t in tags}
+    db_files = {mod.runs_db_path(tmp_path / "runs.db", t) for t in tags}
+    assert len(state_files) == len(tags)
+    assert len(db_files) == len(tags)
