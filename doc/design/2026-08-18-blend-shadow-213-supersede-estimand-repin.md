@@ -3,7 +3,9 @@
 STATUS: **superseding design PR (docs only)** amending
 `doc/design/2026-07-25-blend-shadow-deployment.md` per its own §4 anti-drift rule
 ("any amendment = superseding design PR"). DATE: 2026-08-18. Triggered by the
-2026-08-17 forward-shadow audit; every finding below is [VERIFIED] there.
+2026-08-17 forward-shadow audit — committed alongside this design as
+`doc/research/2026-08-17-blend-shadow-forward-audit.md` (each finding lists its
+primary source there).
 
 ## 1. Why now — the defect that voids the readout if left until gate time
 
