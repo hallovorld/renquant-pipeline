@@ -249,9 +249,14 @@ def _evaluate_enabled(
 
     killed = kill_switch_engaged()
 
-    top_decile, decile_info = top_decile_by_score(
-        getattr(ctx, "_panel_scores_all", None) or {}
-    )
+    # MAIDEN-SESSION FIX (2026-08-18): the real ctx carries a pandas Series
+    # here, and ``Series or {}`` raises "truth value of a Series is ambiguous"
+    # — the lane crashed on session 1. Sentinel on None instead of truthiness;
+    # top_decile_by_score handles Series natively via .items().
+    panel_scores = getattr(ctx, "_panel_scores_all", None)
+    if panel_scores is None:
+        panel_scores = {}
+    top_decile, decile_info = top_decile_by_score(panel_scores)
     window_on = bool(vol_on and not bear_blocked and not killed)
     applied = bool(
         window_on

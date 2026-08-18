@@ -725,3 +725,33 @@ class TestLicenseApplied:
         assert vwl.ANNUALIZATION_DAYS == 252.0
         assert vwl.TOP_DECILE_DIVISOR == 10
         assert vwl.KILL_SWITCH_ENV == "RENQUANT_VOL_WINDOW_LICENSE_DISABLE"
+
+
+def test_evaluate_handles_pandas_series_scores(monkeypatch):
+    """MAIDEN-SESSION regression (2026-08-18): ctx._panel_scores_all is a pandas
+    Series in the real pipeline; the old ``or {}`` truthiness raised
+    'truth value of a Series is ambiguous' and crashed the lane's first run."""
+    import pandas as pd
+    from renquant_pipeline.kernel.panel_pipeline import vol_window_license as vwl
+
+    scores = pd.Series({"AAA": 1.0, "BBB": 2.0, "CCC": 3.0, "DDD": 4.0,
+                        "EEE": 5.0, "FFF": 6.0, "GGG": 7.0, "HHH": 8.0,
+                        "III": 9.0, "JJJ": 10.0})
+    top, info = vwl.top_decile_by_score(scores)
+    assert top == ["JJJ"]
+    assert info["universe_n"] == 10
+
+    # and the call-site path: a ctx whose scores are a Series must not raise
+    class Ctx:
+        _panel_scores_all = scores
+        spy_returns = [0.001] * 50
+        config = {}
+    # evaluate under a disabled flag: must return None WITHOUT evaluating
+    # truthiness on the Series (the crash happened before the flag check's
+    # partition, at the top_decile call)
+    rec = vwl.evaluate_vol_window_license(
+        Ctx(), {"vol_window_license": {"enabled": True}},
+        diagnostic_only_ok=True, admission_ok=False, base_reason="test",
+    )
+    # must not raise on the Series; returns a record (window state evaluated)
+    assert rec is not None
