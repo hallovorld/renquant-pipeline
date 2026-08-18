@@ -2667,12 +2667,38 @@ class RegimeModelAdmissionTask(Task):
             override_records["diagnostic_only_override"] = diagnostic_override
         if wf_fail_override:
             override_records["wf_fail_override"] = wf_fail_override
+        # Vol-window license (orch#1004 design §3, impl PR 1). governance_ok
+        # snapshots the verdict of the two GOVERNANCE stages above
+        # (diagnostic-only + wf-fail): the license may substitute ONLY for the
+        # missing per-regime WF evidence refusals below, NEVER for a
+        # governance refusal. evaluate_vol_window_license returns None before
+        # reading anything off ctx unless the lane config explicitly enables
+        # ranking.panel_scoring.vol_window_license — every config without the
+        # flag runs this task byte-identically (test-pinned).
+        governance_ok = bool(ok)
+        from renquant_pipeline.kernel.panel_pipeline.vol_window_license import (  # noqa: PLC0415
+            evaluate_vol_window_license,
+            emit_session_record,
+        )
         if ok and cfg.get("enabled", True) is False:
             if override_records:
                 ctx._regime_model_admission = {  # noqa: SLF001
                     "ok": True, "reason": reason, "regime": regime,
                     **details, **override_records,
                 }
+            # Misconfig visibility: a lane that enables the license while
+            # regime_admission itself is disabled has no refusal slot to
+            # substitute for — record the session honestly instead of
+            # silently emitting nothing. No-op for configs without the flag.
+            license_record = evaluate_vol_window_license(
+                ctx, panel_cfg,
+                diagnostic_only_ok=governance_ok,
+                admission_ok=True,
+                base_reason=None,
+                note="regime_admission_disabled",
+            )
+            if license_record is not None:
+                emit_session_record(ctx, panel_cfg, license_record)
             return None
         if ok:
             ok, reason, details = _trade_monotonicity_admission(metadata, regime)
@@ -2687,8 +2713,29 @@ class RegimeModelAdmissionTask(Task):
             "ok": bool(ok), "reason": reason, "regime": regime, **details,
             **override_records,
         }
+        # Vol-window license evaluation — None for every config without the
+        # flag (unreachability contract); a full session record otherwise,
+        # emitted to the lane's JSONL ledger on every enabled session so the
+        # activation-evidence readout (impl PR 2) sees OFF days too.
+        license_record = evaluate_vol_window_license(
+            ctx, panel_cfg,
+            diagnostic_only_ok=governance_ok,
+            admission_ok=bool(ok),
+            base_reason=None if ok else str(reason),
+        )
         if ok:
+            if license_record is not None:
+                emit_session_record(ctx, panel_cfg, license_record)
             return None
+        if license_record is not None and license_record.get("license_applied"):
+            self._apply_vol_window_license(
+                ctx, candidates, holdings, license_record, reason, regime,
+                override_records,
+            )
+            emit_session_record(ctx, panel_cfg, license_record)
+            return None
+        if license_record is not None:
+            emit_session_record(ctx, panel_cfg, license_record)
 
         ctx._full_candidate_snapshot = list(getattr(ctx, "_full_candidate_snapshot", None)
                                             or candidates)  # noqa: SLF001
@@ -2730,6 +2777,93 @@ class RegimeModelAdmissionTask(Task):
             "RegimeModelAdmissionTask: regime=%s decision=BLOCK reason=%s "
             "candidates_blocked=%d holdings_exit_only=%d",
             regime, reason, n_candidates, n_holdings_exit_only,
+        )
+
+    @staticmethod
+    def _apply_vol_window_license(
+        ctx: InferenceContext,
+        candidates: list,
+        holdings: dict,
+        record: dict,
+        reason: str,
+        regime: str,
+        override_records: dict,
+    ) -> None:
+        """Partition the refused book under an APPLIED vol-window license.
+
+        orch#1004 design §3: inside the certified ON∧¬BEAR window the
+        top-decile (by served panel score) keeps buy admissibility — the
+        license substitutes ONLY for the missing per-regime WF evidence.
+        Every non-top-decile name gets EXACTLY the pre-existing block-path
+        treatment (blocked with the underlying refusal; holdings exit-only);
+        the licensed names proceed into the UNCHANGED downstream funnel
+        (veto floors, conviction, sizing, caps, tax, wash-sale, QP). The
+        pre-partition candidate list is snapshotted so downstream
+        cross-sectional references (ConvictionGate demean) still see the
+        full universe, exactly as the block path snapshots it.
+        """
+        top = {str(t) for t in (record.get("top_decile") or [])}
+        kept: list = []
+        refused: list = []
+        for cand in candidates:
+            ticker = _candidate_ticker(cand)
+            (kept if ticker in top else refused).append(cand)
+        ctx._full_candidate_snapshot = list(getattr(ctx, "_full_candidate_snapshot", None)
+                                            or candidates)  # noqa: SLF001
+        blocked = getattr(ctx, "_blocked_by_ticker", None) or {}
+        for cand in refused:
+            blocked[cand.ticker] = reason
+        n_holdings_exit_only = 0
+        if holdings:
+            exit_only = set(getattr(ctx, "_qp_exit_only_tickers", set()) or set())
+            exit_only_reasons = dict(
+                getattr(ctx, "_qp_exit_only_reasons", {}) or {}
+            )
+            for ticker in holdings:
+                if str(ticker) in top:
+                    continue  # licensed: buy admissibility substituted
+                exit_only.add(ticker)
+                exit_only_reasons.setdefault(ticker, reason)
+                blocked.setdefault(ticker, reason)
+                n_holdings_exit_only += 1
+            ctx._qp_exit_only_tickers = exit_only  # noqa: SLF001
+            ctx._qp_exit_only_reasons = exit_only_reasons  # noqa: SLF001
+        ctx._blocked_by_ticker = blocked  # noqa: SLF001
+        ctx.candidates = kept
+        window_keys = (
+            "vol_window_days", "vol20", "threshold", "vol_verdict_on",
+            "hard_bear", "bear_precedence_blocked", "window_on",
+            "license_applied", "top_decile", "licensed_candidates",
+            "licensed_holdings", "top_decile_n", "universe_n",
+        )
+        ctx._regime_model_admission = {  # noqa: SLF001
+            "ok": True,
+            "reason": "ok:vol_window_license",
+            "regime": regime,
+            "underlying_reason": reason,
+            "vol_window_license": {k: record.get(k) for k in window_keys},
+            **override_records,
+        }
+        ctx.counters["regime_admission_blocked"] = (
+            ctx.counters.get("regime_admission_blocked", 0) + len(refused)
+        )
+        ctx.counters["regime_admission_holdings_exit_only"] = (
+            ctx.counters.get("regime_admission_holdings_exit_only", 0)
+            + n_holdings_exit_only
+        )
+        ctx.counters["vol_window_license_sessions"] = (
+            ctx.counters.get("vol_window_license_sessions", 0) + 1
+        )
+        ctx.counters["vol_window_licensed_candidates"] = (
+            ctx.counters.get("vol_window_licensed_candidates", 0) + len(kept)
+        )
+        log.warning(
+            "RegimeModelAdmissionTask: vol-window LICENSE APPLIED — regime=%s "
+            "vol20=%s > %s licensed_candidates=%d/%d blocked=%d "
+            "holdings_exit_only=%d underlying_reason=%s",
+            regime, record.get("vol20"), record.get("threshold"),
+            len(kept), len(candidates), len(refused), n_holdings_exit_only,
+            reason,
         )
 
 

@@ -96,12 +96,13 @@
     },
     "RegimeModelAdmissionTask": {
       "_repin_2026_08_10": "wf-fail override PR: the KERNEL RegimeModelAdmissionTask.run gained a second, independent governed admission check (_wf_fail_admission) alongside _diagnostic_only_admission, so a bypassed preflight cannot ride a rejected WF-FAIL authorization. This is a KERNEL-ONLY change: the public twin (renquant_pipeline.panel_scoring.RegimeModelAdmissionTask) is a genuinely different implementation (evaluate_model_admission, no diagnostic_only/wf_fail admission), so its digest is intentionally unchanged. Only kernel_sha256 was re-pinned.",
-      "kernel_sha256": "0c898b93e0c21e4154604a47dd641c8b5ca2eb59ea149d5974e4fc16941f6b55",
+      "kernel_sha256": "2587eb473f1a7a367eeea5ed4e7e0df9025ddaec5df6c8589615129de2234d63",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
       "public_module": "renquant_pipeline.panel_scoring",
-      "public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2"
+      "public_sha256": "7e6d8201dc155d42eaf9be18f158f1e9e518bb16e5c6b8f35c26d5739659cfa2",
+      "_repin_2026_08_18": "vol-window license PR (orch#1004 impl PR 1): the KERNEL RegimeModelAdmissionTask.run gains the flag-gated vol_window_license evaluation + the _apply_vol_window_license partition (top-decile keeps buy admissibility inside the certified ON\u2227\u00acBEAR window; everything else gets the unchanged block path). KERNEL-ONLY for the same structural reason as the diagnostic-only and wf-fail lineage above: the public twin is a different implementation (evaluate_model_admission over an artifact-manifest contract) with no regime_admission refusal slot to substitute for \u2014 no call site exists there. public_sha256 unchanged and intended to stay unchanged. Unreachability + byte-identity are test-pinned in tests/test_vol_window_license.py."
     },
     "RuntimeInferencePipeline": {
       "kernel_twin_file": null,
