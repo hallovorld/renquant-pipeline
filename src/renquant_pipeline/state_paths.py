@@ -44,6 +44,7 @@ ALLOWED_BROKERS: frozenset[str] = frozenset({
     "alpaca_shadow_blend_mom_fast",  # F2: zblend(reversal + FAST momentum); dormant until the first fast artifact 2026-08-08
     "alpaca_shadow_blend_rb_mom",    # F1: zblend(reversal-blend[prod+clf] + slow momentum); needs 3-component scorer
     "alpaca_shadow_blend_rb_fast",   # F3: zblend(reversal-blend[prod+clf] + FAST momentum); needs 3-component scorer
+    "alpaca_shadow_vol_window",      # 2026-08-18 vol-window license lane (orch#1004; pipeline#294 + s104#99 + RQ#594) — registered BEFORE session 1, the alpaca_shadow_blend_mom lesson
     "ibkr",
 })
 

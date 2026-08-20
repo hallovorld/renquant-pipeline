@@ -225,13 +225,17 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
         # is a dict of EMPTY per-ticker dicts, so mirroring the task would write
         # a file that looks like served-input evidence and contains none.
         ("PanelScoringJob", "bc1d082dd37b", "50e7bf4b0354"),
-        # wf-fail override (pipeline#283): _wf_fail_admission is added to the
-        # KERNEL RegimeModelAdmissionTask.run beside _diagnostic_only_admission
-        # (a second governed check so a bypassed preflight cannot ride a
-        # rejected WF-FAIL authorization on a passed=False artifact). The public
-        # twin is a different implementation (evaluate_model_admission, no
-        # diagnostic_only/wf_fail admission) with no call site to mirror it into.
-        ("RegimeModelAdmissionTask", "3b4c2d113ab6", "0c898b93e0c2"),
+        # vol-window license (orch#1004 impl PR 1; supersedes the pipeline#283
+        # wf-fail entry, whose 0c898b93e0c2 state this movement departs from):
+        # the KERNEL RegimeModelAdmissionTask.run gains the flag-gated
+        # vol_window_license evaluation + top-decile partition (certified
+        # ON∧¬BEAR window substitutes for the missing per-regime WF evidence;
+        # governance refusals never overridden; unreachable + byte-identical
+        # without the lane flag, test-pinned in tests/test_vol_window_license
+        # .py). The public twin is a different implementation
+        # (evaluate_model_admission, no regime_admission refusal slot) with no
+        # call site to mirror the license into.
+        ("RegimeModelAdmissionTask", "0c898b93e0c2", "2587eb473f1a"),
     ]
     for e in entries:
         for key in ("pair", "old_public_sha256", "old_kernel_sha256",
