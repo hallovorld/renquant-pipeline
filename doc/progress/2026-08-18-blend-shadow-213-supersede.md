@@ -5,10 +5,17 @@ STATUS:    superseding design PR per #213 §4's own anti-drift rule. Docs only.
 WHAT:      `doc/design/2026-08-18-blend-shadow-213-supersede-estimand-repin.md`:
            re-pins the forward-shadow estimand to the CERTIFIED construction (both arms
            from per-name pure panel-xgb scores; retroactive 16-row recomputation with
-           committed evidence), ratifies the 07-29 horizon amendment with the operator
-           attestation slot, pre-commits the 3-row sensitivity treatment before signs
+           committed evidence), pre-commits the 3-row sensitivity treatment before signs
            are knowable, adds the maturation-calendar NYSE guard. Gate rules unchanged;
            nothing is read.
+
+           REVISED 2026-08-20: §3 no longer RATIFIES the 07-29 horizon amendment and
+           no longer carries an operator-attestation slot. It now INHERITS the
+           amendment as an external fact (orch `690df5da`) and asserts nothing about
+           its authorisation. That claim was scope creep — it made a correctness fix
+           hostage to a governance closure this PR does not own, and codex correctly
+           refused to approve while the precondition sat open. The procedural gap
+           stays OPEN and is tracked on its own.
 
 WHY/DIR:   2026-08-17 audit [all VERIFIED]: prod changed identity 08-04 (momentum
            z-blend became the recorded panel_score), so post-08-04 ledger rows measure
@@ -38,11 +45,17 @@ EVIDENCE:
   scope:         "amends the #213 statistic's PROD-ARM DEFINITION and adds guards;
                  changes NO gate rule, NO read schedule, NO serving behavior. The impl
                  PR (orchestrator readout job + 16-row recompute) follows approval;
-                 run-surface deploy operator-gated. Requires operator attestation of
-                 the 07-29 horizon amendment on this PR."
+                 run-surface deploy operator-gated. No operator attestation is
+                 required to merge this PR."
 
 TESTS:     none — doc-only PR.
 
-NEXT:      codex review + OPERATOR attestation (horizon amendment) → impl PR in
-           renquant-orchestrator → operator-gated deploy. First realization ~2026-10-21;
-           calendar guard must land before it.
+NEXT:      codex review → impl PR in renquant-orchestrator → operator-gated deploy.
+           First realization ~2026-10-21; the calendar guard must land before it.
+
+           SEPARATELY, not blocking: (a) the 07-29 amendment's procedural record in
+           this repo stays open and needs an operator note wherever it is tracked;
+           (b) the 2027 read schedule is in scope for the operator's 2026-08-18
+           backtest-replaces-accumulation policy. The §2 re-pin is independent of
+           both — it makes the lane's data correct whether the clock survives, is
+           shortened, or is retired.
