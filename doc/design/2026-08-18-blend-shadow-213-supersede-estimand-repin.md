@@ -37,15 +37,36 @@ costs a re-pin over 16 sessions; fixing at gate time (~2027-04) voids 120.
   whose per-name sources cannot support recomputation are dropped and counted (feed
   integrity, not discretion).
 
-## 3. Horizon amendment — ratified, with the governance record closed
+## 3. Horizon amendment — INHERITED as an external fact, not ratified here
 
-The 07-29 fwd_20d→fwd_60d + MATURITY 21→61 amendment (orch `690df5da`) is ratified as
-part of THIS superseding PR — it is substantively correct (both models are fwd_60d
-recipes; the certified +0.0687 is a 60d number) but was procedurally undocumented in
-this repo. **Operator attestation required on this PR**: the amendment doc records it as
-an operator decision "not independently checkable"; the operator's approving comment
-here becomes that record. Revised calendar under 61-td maturity (from the audit,
-trading-day arithmetic): INFO@60 ≈ **2027-01-15**, GATE@120 ≈ **2027-04-14**.
+The readout runs under the 07-29 `fwd_20d`→`fwd_60d` + MATURITY 21→61 amendment
+(orch `690df5da`). Under it, the maturation calendar is INFO@60 ≈ **2027-01-15**,
+GATE@120 ≈ **2027-04-14** (audit arithmetic, trading days).
+
+**This PR does not ratify that amendment, and no attestation is required to merge
+it.** An earlier revision claimed the opposite — that the operator's approving
+comment here would become the governance record the amendment doc lacks. That was
+scope creep, and it made a technical correction hostage to a governance closure it
+does not own:
+
+- The amendment is **substantively** uncontested — both models are `fwd_60d`
+  recipes and the certified +0.0687 is a 60d number. Nothing in §2 depends on
+  re-deciding it.
+- The re-pin in §2 fixes a defect that exists **under any horizon**. Prod's
+  identity changed on 08-04; that corrupts the estimand whether maturity is 21
+  trading days or 61.
+- Its procedural gap in this repo is real and stays **OPEN**, tracked on its own
+  rather than bundled here. Closing it needs an operator record, which is exactly
+  why it must not gate a correctness fix that can be reviewed on its merits.
+
+So this PR **uses** the 61-td calendar to state when reads fall due, and asserts
+nothing about whether that calendar was properly authorised.
+
+**Note on the calendar itself, recorded but not decided here:** the operator's
+2026-08-18 policy is that backtests replace accumulation waits, which puts the
+2027 read schedule in scope for supersession on its own terms. §2's re-pin is
+independent of that outcome — it makes the lane's data correct whether the clock
+survives, is shortened, or is retired.
 
 ## 4. Pre-committed sensitivity treatment (before any sign is knowable)
 
