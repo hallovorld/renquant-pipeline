@@ -52,6 +52,7 @@ jobs:
         run: |
           python -c "import renquant_model_momentum, renquant_model_common.momentum_features; print('renquant-model importable in CI')"
           python -m pytest tests/test_momentum_residual_shadow_handler.py -q
+          python -m pytest tests/test_feature_panel_export.py -q
       - name: Test
         working-directory: renquant-pipeline
         run: make test

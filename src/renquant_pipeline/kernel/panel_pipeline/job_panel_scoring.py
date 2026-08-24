@@ -58,6 +58,7 @@ from renquant_pipeline.kernel.pipeline.pipeline import Job, Task
 
 from .panel_scorer import PanelScorer
 from .feature_matrix import build_inference_matrix
+from .feature_panel_export import ExportFeaturePanelTask
 # M6 stage-2 step-1: the fingerprint matching helpers live in
 # fingerprint_dispatch (ONE dispatch implementation for both fail-closed
 # binding checks — this site and walk_forward/loader.py). Re-bound under
@@ -4531,6 +4532,11 @@ class PanelScoringJob(Job):
             LoadScorerTask(),
             BuildFeatureMatrixTask(),
             ApplyScoresTask(),
+            # S3-P1 (orch#1026): persist the SERVED feature matrix for the
+            # rq105 snapshot producer / score attribution. Observe-only,
+            # fail-open, and self-gating (readonly lanes, candidate-less
+            # intraday cycles, and empty matrices all skip inside the task).
+            ExportFeaturePanelTask(),
             ApplyShadowScoringTask(),   # NEW: no-op if no shadow_models configured
             LoadNGBoostTask(),
             ApplyNGBoostTask(),
