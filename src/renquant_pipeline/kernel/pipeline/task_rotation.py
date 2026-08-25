@@ -706,7 +706,9 @@ class BuildPairsTask(Task):
 def _build_buy_leg_admissible(ctx):
     """(ok, reason) pre-filter for a rotation BUY candidate, mirroring the
     guards ValidatePairsTask enforces — wash-sale (with the governed
-    materiality waiver), sector cap, correlation — against CURRENT holdings.
+    materiality waiver), sector cap, correlation — against the validator's
+    stateful virtual holdings (opening book transformed by the tentatively
+    accepted pairs the kernel passes via ``accepted``).
 
     ONE definition per guard: everything here is imported from
     kernel.selection / kernel.asset_class, exactly the functions the
@@ -742,10 +744,18 @@ def _build_buy_leg_admissible(ctx):
     held           = list(ctx.holdings.keys())
     corr_matrix    = getattr(ctx, "corr_matrix", None)
 
-    def admissible(buy_ticker: str, sell_ticker: "str | None") -> "tuple[bool, str]":
-        """sell_ticker=None: sell-independent checks only (wash-sale).
-        With a sell leg: full check against holdings-minus-that-sell —
-        exactly the validator's virtual_held for the bar's first pair."""
+    def admissible(buy_ticker: str, sell_ticker: "str | None",
+                   accepted=()) -> "tuple[bool, str]":
+        """sell_ticker=None: sell-independent checks only (wash-sale — the
+        validator's own wash-sale check is per-pair stateless, so ``accepted``
+        plays no role there). With a sell leg: sector + correlation against
+        the validator's STATEFUL virtual holdings (review r2) —
+
+            set(held) - accepted sells - this sell | accepted buys
+
+        — the exact expression ValidatePairsTask evaluates for a pair with
+        ``accepted`` already validated ahead of it. ``accepted`` is the tuple
+        of tentatively selected RotationPairs the kernel passes in."""
         if sell_ticker is None:
             blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
                 buy_ticker, ctx.today, ctx.last_sell_dates or {},
@@ -767,7 +777,11 @@ def _build_buy_leg_admissible(ctx):
                 return False, "pre_pair_wash_sale"
             return True, "ok"
 
-        virtual_held = [t for t in held if t != sell_ticker]
+        virtual_held = list(
+            set(held)
+            - {p.sell_ticker for p in accepted} - {sell_ticker}
+            | {p.buy_ticker for p in accepted}
+        )
         if not passes_sector_guard(buy_ticker, virtual_held, sector_map,
                                    max_per_sector, defensive_set):
             return False, "pre_pair_sector_guard"

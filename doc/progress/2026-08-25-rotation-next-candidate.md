@@ -58,6 +58,40 @@ the prefilter only predicts it, argument-for-argument at each guard call site.
 - Full pipeline suite: **2669 passed, 9 skipped, 0 failed** under the
   CI-matching uv env. [VERIFIED: local run 2026-08-25]
 
+## 3b. Review r2 — cross-pair statefulness + validator-order equivalence
+
+Codex (P1, correct): the r1 prefilter closed over the OPENING book, so it was
+equivalent to `ValidatePairsTask` only for the first pair — the validator's
+`virtual_held` is stateful across pairs (`held − validated sells − this sell
++ validated buys`). For pair 2+, the prefilter could miss a conflict pair 1
+introduced or reject against a holding pair 1 already sold — recreating the
+post-pairing give-up.
+
+Rework, two mechanisms:
+
+1. **Stateful walk**: the callback is now
+   `(buy, sell|None, accepted=<tuple of RotationPair>)`; the kernel passes
+   the tentatively accepted pairs, and `_build_buy_leg_admissible` evaluates
+   sector/correlation against the validator's exact expression
+   `set(held) − accepted sells − this sell | accepted buys`.
+2. **Validator-order simulation** (a gap codex's text implied but did not
+   name): the validator walks the **margin-sorted** list, while pairs are
+   accepted in candidate-rank order — with 2+ pairs the orders can differ,
+   and walk-order admissibility does not imply sorted-order admissibility in
+   either direction. After sorting, the kernel simulates the validator's
+   stateful loop in the validator's exact order; an offender is vetoed and
+   the walk re-runs without that (sell, buy) combination — retry, never
+   give-up. Terminates: each iteration permanently vetoes one combination
+   from a finite set. Blocked-candidate records fire once, from the walk
+   actually returned.
+
+Evidence: three new tests — pair-1-buy-conflicts-pair-2-buy (next candidate
+tried, validator preserves all emitted), pair-1-sell-unblocks-pair-2 (the
+inverse codex asked for), and an acceptance-vs-validator-order divergence
+that only the simulation catches. Mutation sanity [VERIFIED]: freezing the
+prefilter on original holdings fails exactly the two statefulness tests;
+disabling the simulation fails exactly the order test; restored, all pass.
+
 ## 4. Also in this PR (separate commits)
 
 - `test_wash_sale_cost_branch_reachability.py`: call-site census 6 → 7 — the
