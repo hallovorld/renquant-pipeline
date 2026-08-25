@@ -24,8 +24,11 @@ so that `task_rotation.py` can emit a structured decision-tree log.
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 from dataclasses import dataclass
+
+log = logging.getLogger("kernel.rotation")
 
 
 @dataclass
@@ -434,12 +437,25 @@ def find_rotation_pairs(
     tax_cfg:        dict,
     panel_buy_floor:  "float | None" = None,    # candidate rank_score >= this
     panel_sell_floor: "float | None" = None,    # held rank_score <= this
+    buy_leg_admissible=None,  # Callable[[str, str | None], tuple[bool, str]] | None
+    on_buy_leg_blocked=None,  # Callable[[str, str], None] | None — candidate exhausted
 ) -> list[RotationPair]:
     """Greedy pairing using expected-return decision rule.
 
     Walks ranked candidates; for each, picks the held with the lowest
     expected-return whose net_advantage clears `min_expected_advantage_pct`.
     Each ticker (held or candidate) appears in at most one pair.
+
+    ``buy_leg_admissible`` (2026-08-25, the LLY→CRWD incident): a candidate
+    that can never be BOUGHT (wash-sale / sector cap / correlation guard)
+    must not consume the pairing — pre-fix, greedy pairing preceded the
+    tradeability guards, so the day's single rotation died with its first
+    blocked candidate and the engine never tried the next one. The callback
+    returns (ok, reason); an inadmissible candidate is SKIPPED (logged, and
+    recorded by the caller) and the walk continues to the next candidate.
+    ValidatePairsTask remains the authoritative final check — this is a
+    pre-filter against CURRENT holdings, deliberately conservative, and a
+    pair passing here can still be dropped there.
     """
     if not rotation_cfg.get("enabled", False):
         return []
@@ -546,28 +562,61 @@ def find_rotation_pairs(
         if not math.isfinite(cand_er):
             continue
 
+        if buy_leg_admissible is not None:
+            # Sell-independent checks first (wash-sale): if the candidate can
+            # never be bought regardless of which name is sold, skip to the
+            # next candidate without consuming any pairing.
+            ok, why = buy_leg_admissible(cand_ticker, None)
+            if not ok:
+                log.info("ROTATION_CAND_SKIP  cand=%s  reason=%s  "
+                         "(untradeable buy leg — trying next candidate)",
+                         cand_ticker, why)
+                if on_buy_leg_blocked is not None:
+                    on_buy_leg_blocked(cand_ticker, why)
+                continue
+
         # Pick weakest-ER eligible held that this candidate beats by ≥ threshold
         # after costs.  "Weakest" = lowest E[R_horizon] — since the candidate's
         # ER is fixed in this loop iteration, picking the held with the smallest
         # ER maximizes raw_advantage and (for ties on raw_advantage) leaves
         # higher-ER holds available for later, stronger candidates.
+        # Walk helds weakest-ER-first and take the FIRST pair whose buy leg
+        # is admissible against holdings-minus-that-sell (2026-08-25, the
+        # LLY→CRWD incident): pre-fix a single best_match was chosen and, if
+        # the validator later dropped the pair, no alternative sell leg and
+        # no next candidate were ever tried.
+        viable = sorted(
+            (
+                (held_ticker, info)
+                for held_ticker, info in eligible.items()
+                if held_ticker not in used_holds
+                and not (min_raw_adv > 0.0
+                         and (cand_er - info["er"]) < min_raw_adv)
+                and (cand_er - info["er"] - info["tax_drag"] - txn_cost)
+                    >= threshold
+            ),
+            key=lambda kv: kv[1]["er"],
+        )
         best_match: str | None = None
-        best_er: float = math.inf
-        for held_ticker, info in eligible.items():
-            if held_ticker in used_holds:
-                continue
-            raw_adv = cand_er - info["er"]
-            # V1 gate 1: raw_advantage depth
-            if min_raw_adv > 0.0 and raw_adv < min_raw_adv:
-                continue
-            net_adv = raw_adv - info["tax_drag"] - txn_cost
-            if net_adv < threshold:
-                continue
-            if info["er"] < best_er:
-                best_match = held_ticker
-                best_er    = info["er"]
+        last_block_reason: "str | None" = None
+        for held_ticker, _info in viable:
+            if buy_leg_admissible is not None:
+                ok, why = buy_leg_admissible(cand_ticker, held_ticker)
+                if not ok:
+                    log.info("ROTATION_PAIR_SKIP  swap=%s→%s  reason=%s  "
+                             "(trying next sell leg)",
+                             held_ticker, cand_ticker, why)
+                    last_block_reason = why
+                    continue
+            best_match = held_ticker
+            break
 
         if best_match is None:
+            # Recorded ONLY when admissibility (not the advantage gates)
+            # exhausted every viable sell — a candidate that simply cleared
+            # no threshold is not "blocked".
+            if last_block_reason is not None and on_buy_leg_blocked is not None:
+                on_buy_leg_blocked(cand_ticker, last_block_reason)
             continue
 
         # V1 gate 2: persistence — the same pair must have appeared on

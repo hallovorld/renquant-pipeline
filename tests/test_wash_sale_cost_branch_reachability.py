@@ -52,8 +52,13 @@ def _call_sites():
 
 
 def test_the_call_site_count_is_asserted_not_remembered():
+    """Re-measured 2026-08-25: **7**. The seventh is the rotation pair-level
+    prefilter (task_rotation.py `_build_buy_leg_admissible`), which mirrors the
+    ValidatePairsTask site argument-for-argument so the prefilter predicts the
+    validator exactly — it too passes no `expected_dollar_return`, so the R7
+    finding (branch (a) unreached from src/) is unchanged."""
     sites = _call_sites()
-    assert len(sites) == 6, [(p, l) for p, l, _ in sites]
+    assert len(sites) == 7, [(p, l) for p, l, _ in sites]
 
 
 def test_zero_call_sites_pass_a_real_expected_dollar_return():

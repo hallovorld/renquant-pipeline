@@ -475,6 +475,15 @@ class BuildPairsTask(Task):
         else:
             candidates_for_pairing = eligible_candidates
 
+        # 2026-08-25 (the LLY→CRWD incident): a candidate whose BUY leg can
+        # never clear the tradeability guards must not consume the pairing —
+        # pre-fix, greedy pairing preceded the guards, ValidatePairsTask
+        # dropped the pair, and the engine never tried the next candidate,
+        # so one blocked name (corr(CRWD,PANW)=0.845) cost the whole day's
+        # rotation. The callback reuses the SAME guard definitions
+        # ValidatePairsTask applies, checked against CURRENT holdings (a
+        # conservative pre-filter; ValidatePairsTask, with its virtual_held
+        # accounting, stays the authoritative final check).
         pairs = find_rotation_pairs(
             held_scores      = held_scores,
             held_er          = held_er,
@@ -485,6 +494,9 @@ class BuildPairsTask(Task):
             tax_cfg          = tax_cfg,
             panel_buy_floor  = panel_buy_floor,
             panel_sell_floor = panel_sell_floor,
+            buy_leg_admissible = _build_buy_leg_admissible(ctx),
+            on_buy_leg_blocked = lambda t, r: record_rotation_block_candidate(
+                ctx, t, r),
         )
 
         # Cross-sectional panel gate: require cand.panel_score to beat
@@ -689,6 +701,103 @@ class BuildPairsTask(Task):
             )
 
         log.info("BuildPairsTask: %d rotation pair(s) proposed", len(pairs))
+
+
+def _build_buy_leg_admissible(ctx):
+    """(ok, reason) pre-filter for a rotation BUY candidate, mirroring the
+    guards ValidatePairsTask enforces — wash-sale (with the governed
+    materiality waiver), sector cap, correlation — against CURRENT holdings.
+
+    ONE definition per guard: everything here is imported from
+    kernel.selection / kernel.asset_class, exactly the functions the
+    validator calls. A candidate rejected here is recorded on
+    ``ctx.rotations_blocked`` with a ``pre_pair_`` prefix so observability
+    distinguishes "skipped before pairing, next candidate tried" from a
+    validator drop.
+    """
+    from renquant_pipeline.kernel.selection import (  # noqa: PLC0415
+        is_wash_sale_blocked_with_cost,
+        passes_correlation_guard,
+        passes_sector_guard,
+        resolve_wash_sale_materiality_policy,
+        resolve_wash_sale_min_material_npv,
+        wash_sale_materiality_floor_waives,
+    )
+    from renquant_pipeline.kernel.asset_class import (  # noqa: PLC0415
+        resolve_asset_class,
+        resolve_validated_crypto_spot_pairs,
+    )
+
+    cfg            = ctx.config
+    regime_cfg     = cfg.get("regime", {})
+    wash_days      = int(cfg.get("wash_sale_days", 0))
+    corr_threshold = float(regime_cfg.get("correlation_guard_threshold", 0.70))
+    max_per_sector = int(cfg.get("max_positions_per_sector", 0))
+    sector_map     = cfg.get("sector_map", {})
+    defensive_set  = set(cfg.get("defensive_tickers", []))
+    asset_class    = resolve_asset_class(cfg)
+    crypto_pairs   = resolve_validated_crypto_spot_pairs(cfg)
+    min_npv        = resolve_wash_sale_min_material_npv(cfg)
+    ws_policy      = resolve_wash_sale_materiality_policy(cfg)
+    held           = list(ctx.holdings.keys())
+    corr_matrix    = getattr(ctx, "corr_matrix", None)
+
+    def admissible(buy_ticker: str, sell_ticker: "str | None") -> "tuple[bool, str]":
+        """sell_ticker=None: sell-independent checks only (wash-sale).
+        With a sell leg: full check against holdings-minus-that-sell —
+        exactly the validator's virtual_held for the bar's first pair."""
+        if sell_ticker is None:
+            blocked, ws_reason, _ = is_wash_sale_blocked_with_cost(
+                buy_ticker, ctx.today, ctx.last_sell_dates or {},
+                getattr(ctx, "last_sell_pls", None) or {}, wash_days,
+                asset_class=asset_class,
+                validated_crypto_pairs=crypto_pairs,
+                min_material_npv_cost=min_npv,
+            )
+            if blocked and ws_policy.floor_usd > 0.0:
+                if wash_sale_materiality_floor_waives(
+                    floor_usd=ws_policy.floor_usd,
+                    assumed_marginal_rate=ws_policy.assumed_marginal_rate,
+                    event_net_realized_pl_usd=(
+                        getattr(ctx, "last_sell_pls", None) or {}
+                    ).get(buy_ticker),
+                ):
+                    blocked = False
+            if blocked:
+                return False, "pre_pair_wash_sale"
+            return True, "ok"
+
+        virtual_held = [t for t in held if t != sell_ticker]
+        if not passes_sector_guard(buy_ticker, virtual_held, sector_map,
+                                   max_per_sector, defensive_set):
+            return False, "pre_pair_sector_guard"
+        if not passes_correlation_guard(buy_ticker, virtual_held, corr_matrix,
+                                        corr_threshold):
+            return False, "pre_pair_correlation_guard"
+        return True, "ok"
+
+    return admissible
+
+
+def record_rotation_block_candidate(ctx, ticker: str, reason: str) -> None:
+    """A candidate whose buy leg exhausted admissibility BEFORE pairing.
+
+    Same observability surfaces as the #289 long-signal prefilter: the
+    rotations_blocked row (sell=None, stage="prefilter"), the
+    rotation_<reason> counter family, and _blocked_by_ticker.
+    """
+    if not hasattr(ctx, "rotations_blocked"):
+        ctx.rotations_blocked = []
+    ctx.rotations_blocked.append({"sell": None, "buy": ticker,
+                                  "reason": reason, "stage": "prefilter"})
+    blocked = getattr(ctx, "_blocked_by_ticker", None)
+    if blocked is None:
+        blocked = {}
+        ctx._blocked_by_ticker = blocked  # noqa: SLF001
+    blocked.setdefault(ticker, reason)
+    ctx.counters[f"rotation_{reason}"] = (
+        ctx.counters.get(f"rotation_{reason}", 0) + 1
+    )
 
 
 def record_rotation_block(ctx, pair, reason: str) -> None:
