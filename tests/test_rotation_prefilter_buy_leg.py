@@ -226,3 +226,204 @@ def test_prefiltered_candidate_never_reaches_thesis_primary_finder(monkeypatch):
     assert [r["buy"] for r in ctx.rotations_blocked] == ["BAD"]
     assert ctx.rotations_blocked[0]["stage"] == "prefilter"
     assert ctx._blocked_by_ticker["BAD"] == BLOCK_ER
+
+
+# ═══ 2026-08-25: the LLY→CRWD incident — guard prefilter (wash/sector/corr) ═══
+# Measured live: rotation chose CRWD (ER +0.0995) with sell leg LLY; the
+# correlation guard rejected the pair at VALIDATION (corr(CRWD,PANW)=0.845 ≥
+# 0.70) and the engine gave up for the day — no next candidate, no other
+# sell leg was tried. These tests pin the fix: guard admissibility now runs
+# INSIDE the pairing walk, pair-level (holdings-minus-sell — the validator's
+# exact first-pair semantics), so a blocked buy leg advances to the next
+# candidate instead of ending rotation.
+
+def _ctx_two_held(ranked, *, config=None, corr=None):
+    cfg = config or _cfg()
+    ctx = InferenceContext(
+        config=cfg,
+        today=dt.date(2026, 8, 25),
+        regime="BULL_CALM",
+        confidence=0.63,
+        portfolio_value=10_825.0,
+        cash=1_000.0,
+        holdings={
+            "LLY": SimpleNamespace(
+                shares=1.0, rank_score=1.0, expected_return=-0.05,
+                entry_price=800.0, entry_date=dt.date(2026, 5, 1)),
+            "PANW": SimpleNamespace(
+                shares=2.0, rank_score=1.5, expected_return=+0.02,
+                entry_price=180.0, entry_date=dt.date(2026, 5, 1)),
+        },
+        prices={**{c.ticker: 100.0 for c in ranked},
+                "LLY": 700.0, "PANW": 170.0},
+        ranked=ranked,
+    )
+    ctx.corr_matrix = corr or {}
+    return ctx
+
+
+def test_replay_20260825_corr_blocked_candidate_yields_to_the_next():
+    """CRWD (top-ranked) is 0.845-correlated with held PANW; NET (clean)
+    ranks second. Pre-fix: pair=(LLY→CRWD) died at validation, day over.
+    Post-fix: CRWD exhausts admissibility, NET pairs and validates."""
+    ranked = [
+        _cand("CRWD", rank_score=2.812, expected_return=+0.0995),
+        _cand("NET",  rank_score=2.500, expected_return=+0.0900),
+    ]
+    corr = {"CRWD": {"PANW": 0.845, "LLY": -0.09},
+            "NET":  {"PANW": 0.30,  "LLY": 0.10}}
+    ctx = _ctx_two_held(ranked, corr=corr)
+    BuildPairsTask().run(ctx)
+    # The fix does better than "skip to NET": CRWD's conflict is WITH PANW,
+    # so the walk finds the sell leg that RESOLVES it — selling PANW and
+    # upgrading the correlated slot in place (ER +0.02 → +0.0995). Exactly
+    # the validator's virtual_held semantics, found at pairing time.
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("PANW", "CRWD")], ctx.rotations
+    ValidatePairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("PANW", "CRWD")], "the validator agrees with the pre-filter"
+
+
+def test_candidate_correlated_only_with_the_sell_leg_still_pairs():
+    """Validator semantics preserved: corr is checked against
+    holdings-MINUS-the-sell-leg. A candidate 0.9-correlated ONLY with the
+    name being sold must still rotate in — over-blocking here would be a
+    regression the validator never had."""
+    ranked = [_cand("MRK", rank_score=2.8, expected_return=+0.10)]
+    corr = {"MRK": {"LLY": 0.90, "PANW": 0.10}}   # only the sell leg breaches
+    ctx = _ctx_two_held(ranked, corr=corr)
+    BuildPairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "MRK")]
+    ValidatePairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "MRK")], "the validator agrees — no over-block"
+
+
+def test_wash_sale_blocked_candidate_yields_without_consuming_the_pairing():
+    ranked = [
+        _cand("CRWD", rank_score=2.8, expected_return=+0.10),
+        _cand("NET",  rank_score=2.5, expected_return=+0.09),
+    ]
+    cfg = _cfg()
+    cfg["wash_sale_days"] = 30
+    ctx = _ctx_two_held(ranked, config=cfg,
+                        corr={"CRWD": {"LLY": 0.1, "PANW": 0.1},
+                              "NET": {"LLY": 0.1, "PANW": 0.2}})
+    ctx.last_sell_dates = {"CRWD": dt.date(2026, 8, 10)}   # 15d ago < 30
+    ctx.last_sell_pls = {"CRWD": -50.0}                    # loss → blockable
+    BuildPairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "NET")]
+    pre = [b for b in ctx.rotations_blocked
+           if b.get("stage") == "prefilter" and b["buy"] == "CRWD"]
+    assert len(pre) == 1 and pre[0]["reason"] == "pre_pair_wash_sale"
+
+
+def test_a_candidate_failing_only_the_threshold_is_not_recorded_blocked():
+    """'No advantage' is not 'blocked' — the exhaustion recorder must not
+    fire for candidates that simply cleared no ER threshold."""
+    # POSITIVE ER (passes the #289 signal prefilter) but clears no ER
+    # threshold vs either held (raw_adv 0.055 / -0.015 < 0.06)
+    ranked = [_cand("NET", rank_score=2.5, expected_return=+0.005)]
+    ctx = _ctx_two_held(ranked, corr={"NET": {"LLY": 0.1, "PANW": 0.2}})
+    BuildPairsTask().run(ctx)
+    assert ctx.rotations == []
+    assert not [b for b in getattr(ctx, "rotations_blocked", [])
+                if b.get("stage") == "prefilter" and b["buy"] == "NET"]
+
+
+# ── review r2: cross-pair statefulness (codex, PR #298) ─────────────────────
+# The validator is stateful across pairs: virtual_held = held − validated
+# sells − this sell + validated buys, walked in MARGIN-SORTED order. The
+# prefilter must be equivalent in both state and order, or a 2nd pair can be
+# dropped post-pairing — the very give-up this PR closes.
+
+
+def test_pair1_buy_conflicts_with_pair2_buy_next_candidate_tried():
+    """Pair 1 ADDS a buy (AVGO) that pair 2's candidate (CRWD) is 0.90-
+    correlated with. A first-pair-only prefilter would emit (PANW→CRWD) and
+    the validator would drop it after pairing consumed the legs. Stateful:
+    CRWD exhausts against the virtual book, NET (next-ranked) pairs, and the
+    validator preserves every emitted pair."""
+    ranked = [
+        _cand("AVGO", rank_score=3.0, expected_return=+0.30),
+        _cand("CRWD", rank_score=2.8, expected_return=+0.12),
+        _cand("NET",  rank_score=2.5, expected_return=+0.10),
+    ]
+    corr = {
+        "AVGO": {"LLY": 0.1, "PANW": 0.1},
+        "CRWD": {"LLY": 0.1, "PANW": 0.1, "AVGO": 0.90},
+        "NET":  {"LLY": 0.1, "PANW": 0.1, "AVGO": 0.1},
+    }
+    ctx = _ctx_two_held(ranked, config=_cfg(max_rotations_per_bar=2),
+                        corr=corr)
+    BuildPairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "AVGO"), ("PANW", "NET")], ctx.rotations
+    pre = [b for b in ctx.rotations_blocked
+           if b.get("stage") == "prefilter" and b["buy"] == "CRWD"]
+    assert len(pre) == 1
+    assert pre[0]["reason"] == "pre_pair_correlation_guard"
+    ValidatePairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "AVGO"), ("PANW", "NET")], \
+        "the validator preserves every emitted pair"
+
+
+def test_pair1_sell_unblocks_pair2_buy():
+    """The inverse: NET is 0.95-correlated with held LLY, but pair 1 SELLS
+    LLY. Against the opening book NET is untradeable; against the validator's
+    virtual book it is clean. A prefilter frozen on original holdings would
+    reject NET and burn the second slot for nothing. Margins put AVGO first
+    in validator order, so the validator sees LLY leave before judging NET."""
+    ranked = [
+        _cand("AVGO", rank_score=3.0, expected_return=+0.30),
+        _cand("NET",  rank_score=2.5, expected_return=+0.10),
+    ]
+    corr = {
+        "AVGO": {"LLY": 0.1, "PANW": 0.1},
+        "NET":  {"LLY": 0.95, "PANW": 0.1, "AVGO": 0.1},
+    }
+    ctx = _ctx_two_held(ranked, config=_cfg(max_rotations_per_bar=2),
+                        corr=corr)
+    BuildPairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "AVGO"), ("PANW", "NET")], ctx.rotations
+    assert all(b["buy"] != "NET" for b in ctx.rotations_blocked)
+    ValidatePairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "AVGO"), ("PANW", "NET")], \
+        "the validator preserves every emitted pair"
+
+
+def test_acceptance_order_pass_that_fails_validator_order_is_vetoed():
+    """Acceptance order and validator (margin-sorted) order can DISAGREE.
+    ALPH (rank 3.0, margin 0.08) is accepted first and sells LLY; BETA
+    (rank 2.5, margin 0.22) is accepted second — clean against the walk's
+    virtual book, where LLY is already gone. But BETA sorts FIRST, and the
+    validator judging BETA before ALPH still holds LLY (corr 0.90): it would
+    drop BETA after pairing consumed PANW. The order simulation catches this,
+    vetoes (PANW→BETA), and the re-walk keeps (LLY→ALPH) with BETA recorded
+    blocked — instead of emitting a pair the validator kills."""
+    ranked = [
+        _cand("ALPH", rank_score=3.0, expected_return=+0.09),
+        _cand("BETA", rank_score=2.5, expected_return=+0.30),
+    ]
+    corr = {
+        "ALPH": {"LLY": 0.1, "PANW": 0.1, "BETA": 0.1},
+        "BETA": {"LLY": 0.90, "PANW": 0.1, "ALPH": 0.1},
+    }
+    ctx = _ctx_two_held(ranked, config=_cfg(max_rotations_per_bar=2),
+                        corr=corr)
+    BuildPairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "ALPH")], ctx.rotations
+    pre = [b for b in ctx.rotations_blocked
+           if b.get("stage") == "prefilter" and b["buy"] == "BETA"]
+    assert len(pre) == 1
+    assert pre[0]["reason"] == "pre_pair_correlation_guard"
+    ValidatePairsTask().run(ctx)
+    assert [(p.sell_ticker, p.buy_ticker) for p in ctx.rotations] \
+        == [("LLY", "ALPH")]

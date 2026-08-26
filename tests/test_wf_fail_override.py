@@ -295,8 +295,15 @@ class TestPreflightGateIntegration:
 
     def test_wrong_scorer_authorization_blocks(self, tmp_path: Path):
         payload, _sha = self._payload()
+        # _evaluate_wf reads the real clock, so a pinned fixture expiry would
+        # make this test assert "expired" once the calendar passes it (it did,
+        # 2026-08-25). Keep the authorization alive so the ONLY rejection
+        # cause is the wrong scorer hash — same pattern as the valid-path test.
         cfg = _config(_authorization(
-            scorer_model_content_sha256="sha256:" + "ef" * 32))
+            scorer_model_content_sha256="sha256:" + "ef" * 32,
+            expires=(datetime.datetime.now(datetime.timezone.utc).date()
+                     + datetime.timedelta(days=14)).isoformat(),
+        ))
         ctx = PreflightContext(config=cfg, strategy_dir=tmp_path, run_mode="full")
         result = WfGateMetadataTask()._evaluate_wf(
             _failed_wf(), ctx, payload=payload)
