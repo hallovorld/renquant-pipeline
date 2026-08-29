@@ -906,6 +906,32 @@ def _drop_unscored_panel_candidates(
     return dropped
 
 
+def _locate_config_artifact(strategy_dir: Any, ref: str | Path) -> Path:
+    """Turn a config artifact ref into a filesystem path through the ONE
+    resolution authority (``kernel.artifact_resolver``), with the SAME
+    precedence the blend components use (``blend_scorer._resolve_component_path``):
+    absolute → strategy_dir → repo_root (= strategy_dir/../..).
+
+    orch#1066 (a'): before this helper the PRIMARY scorer and the global
+    calibrator joined the ref onto ``_strategy_dir`` ONLY, while blend
+    components (and every preflight check) already fell back to the repo
+    root — the same ref string meant two different files depending on which
+    loader read it, and the shadow config's ``hf_patchtst`` leg (present only
+    at the repo root) died with ``panel_scorer_load_failed``.
+
+    ``locate_artifact`` never raises: a miss returns the strategy_dir
+    candidate, exactly the path the pre-fix code produced, so every
+    downstream loader still fails on the same path with the same error and
+    the same fail-closed reason. No ``_strategy_dir`` → ``Path(".")`` (the
+    blend components' convention), which reduces to the bare ref.
+    """
+    from renquant_pipeline.kernel.artifact_resolver import locate_artifact  # noqa: PLC0415
+
+    return locate_artifact(
+        ref, strategy_dir=Path(str(strategy_dir)) if strategy_dir else Path("."),
+    )
+
+
 # ── Task chain ────────────────────────────────────────────────────────────────
 
 class LoadScorerTask(Task):
@@ -921,12 +947,7 @@ class LoadScorerTask(Task):
         artifact_path = metadata.get("artifact_path") or panel_cfg.get("artifact_path")
         if not artifact_path:
             return None
-        p = Path(artifact_path)
-        if not p.is_absolute():
-            strategy_dir = ctx.config.get("_strategy_dir")
-            if strategy_dir:
-                p = Path(strategy_dir) / p
-        return p
+        return _locate_config_artifact(ctx.config.get("_strategy_dir"), artifact_path)
 
     @staticmethod
     def _blend_component0_path(ctx: InferenceContext, panel_cfg: dict) -> Path | None:
@@ -942,12 +963,9 @@ class LoadScorerTask(Task):
         first = comps[0] if comps and isinstance(comps[0], dict) else {}
         if not first.get("artifact_path"):
             return None
-        p = Path(str(first["artifact_path"]))
-        if not p.is_absolute():
-            strategy_dir = ctx.config.get("_strategy_dir")
-            if strategy_dir:
-                p = Path(strategy_dir) / p
-        return p
+        return _locate_config_artifact(
+            ctx.config.get("_strategy_dir"), str(first["artifact_path"]),
+        )
 
     @staticmethod
     def _assert_config_consistency(
@@ -3181,7 +3199,9 @@ class LoadGlobalCalibrationTask(Task):
         strategy_dir = ctx.config.get("_strategy_dir")
 
         def _resolve(p: Path) -> Path:
-            return p if p.is_absolute() or not strategy_dir else Path(strategy_dir) / p
+            # Same authority + precedence as the primary scorer and the blend
+            # components (orch#1066 a'): strategy_dir first, repo_root fallback.
+            return _locate_config_artifact(strategy_dir, p)
 
         from renquant_pipeline.kernel.panel_pipeline.global_calibrator import (  # noqa: PLC0415
             GlobalPanelCalibration,

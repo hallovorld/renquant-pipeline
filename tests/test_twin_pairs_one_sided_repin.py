@@ -211,13 +211,25 @@ def test_the_committed_exception_file_is_well_formed_and_every_entry_is_bound():
     the public twin has no scorer loading to receive it). This pin holds the
     file to exactly the justified entries: every entry must carry both digest
     tuples and a non-empty reason, and adding one means updating this list in
-    the same reviewed diff."""
+    the same reviewed diff. orch#1066 (a') then superseded the pipeline#258
+    LoadScorerTask entry with its own movement (the #258 record's ef0f915648a6
+    state no longer exists — provenance in git history, chained in the new
+    entry's reason)."""
     data = json.loads((REPO / "twin_repin_exceptions.json").read_text())
     assert data["schema_version"] == 1
     entries = data["exceptions"]
     assert [(e["pair"], e["old_kernel_sha256"][:12], e["new_kernel_sha256"][:12])
             for e in entries] == [
-        ("LoadScorerTask", "869272ff155c", "ef0f915648a6"),
+        # orch#1066 (a') primary-scorer artifact resolver (supersedes the
+        # pipeline#258 momentum-consistency entry, whose ef0f915648a6 state this
+        # movement departs from): the KERNEL LoadScorerTask's path helpers now
+        # route the config ref through kernel.artifact_resolver.locate_artifact
+        # (strategy_dir first, repo_root fallback — the blend components'
+        # precedence); a miss still yields the strategy_dir candidate, so every
+        # fail-closed reason is unchanged. The public twin validates an
+        # artifact-manifest contract and never resolves a filesystem path — no
+        # call site to receive the change.
+        ("LoadScorerTask", "ef0f915648a6", "6e22f0899db5"),
         ("ApplyScoresTask", "5cf79a1be970", "3b5f35bd8637"),
         # orch#703: PersistServedMatrixTask is appended to the KERNEL
         # PanelScoringJob only. The public twin is the intraday/frozen-score
