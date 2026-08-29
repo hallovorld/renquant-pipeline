@@ -54,4 +54,7 @@ def test_panel_only_candidate_skips_tournament_feature_and_score_requirements():
     assert tc.model_action == "panel_pending"
     assert tc._raw_score == 0.0
     assert tc._rank_score == 0.0
-    assert tc._expected_return == 0.0
+    # orch#1082: no forecast yet → None, never a 0.0 placeholder (the
+    # decision-trace validator counts ER-without-horizon as a gap).
+    assert tc._expected_return is None
+    assert tc._expected_return_horizon_days is None

@@ -323,10 +323,24 @@ class ScoreBuyTask(Task):
         if tc.model is None and _panel_watchlist_candidate_mode(tc):
             # PanelScoringJob overwrites these placeholders with the active
             # panel model's raw score, calibrated rank and expected return.
+            #
+            # orch#1082 (2026-08-29): the expected return is NOT a 0.0
+            # placeholder. A panel-only candidate has no forecast until
+            # ApplyGlobalCalibrationTask stamps one WITH its horizon; a
+            # candidate dropped before that point (RealizedVolGateTask,
+            # panel_score_missing, panel_scorer_load_failed) kept the 0.0
+            # and its None horizon all the way into candidate_scores /
+            # ticker_daily_state, where the decision-trace validator
+            # (persistence.decision_trace_integrity_report) counts
+            # ``expected_return IS NOT NULL AND horizon IS NULL`` as a
+            # gap and fails the commit. "No forecast" is None; every
+            # reader between here and calibration already treats None as
+            # absent (rotation/joint-actions coerce via ``or 0.0``, the
+            # gates test ``is not None``).
             tc.model_action = "panel_pending"
             tc._raw_score = 0.0  # noqa: SLF001
             tc._rank_score = 0.0  # noqa: SLF001
-            tc._expected_return = 0.0  # noqa: SLF001
+            tc._expected_return = None  # noqa: SLF001
             tc._expected_return_horizon_days = None  # noqa: SLF001
             return None
 
@@ -420,15 +434,19 @@ class AssembleCandidateTask(Task):
         from renquant_pipeline.kernel.selection import CandidateResult  # noqa: PLC0415
         raw  = getattr(tc, "_raw_score",        0.0)
         rank = getattr(tc, "_rank_score",       0.0)
+        # ``_expected_return`` is None for a panel-only candidate that
+        # PanelScoringJob has not scored yet (orch#1082): carry the absence
+        # through instead of inventing a 0.0 forecast with no horizon.
         er   = getattr(tc, "_expected_return",  0.0)
         er_h = getattr(tc, "_expected_return_horizon_days", None)
+        er_txt = f"{er:+.4f}" if er is not None else "none"
         tc.candidate = CandidateResult(
             ticker          = tc.ticker,
             raw_score       = raw,
             rank_score      = rank,
             rs_score        = tc.rs_score,
             detail          = (f"raw={raw:.3f} rank={rank:.3f} "
-                               f"rs={tc.rs_score:.3f} er={er:+.4f}"),
+                               f"rs={tc.rs_score:.3f} er={er_txt}"),
             expected_return = er,
             expected_return_horizon_days=er_h,
         )

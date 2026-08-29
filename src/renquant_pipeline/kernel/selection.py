@@ -31,7 +31,12 @@ class CandidateResult:
     rank_score:      float
     rs_score:        float
     detail:          str = ""
-    expected_return: float = 0.0   # E[R - SPY] over rotation.target_horizon_days
+    # E[R - SPY] over rotation.target_horizon_days. None = no forecast yet
+    # (a panel-only candidate before PanelScoringJob calibrates it,
+    # orch#1082); a non-None value MUST carry expected_return_horizon_days
+    # (persistence.decision_trace_integrity_report fails the commit
+    # otherwise).
+    expected_return: float | None = 0.0
     expected_return_horizon_days: int | None = None
     panel_score:     float | None = None   # cross-sectional panel-LTR score; None when disabled
     mu:              float | None = None   # NGBoost μ (residual return forecast)
