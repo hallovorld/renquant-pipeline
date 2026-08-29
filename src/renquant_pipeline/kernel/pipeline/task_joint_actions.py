@@ -171,6 +171,8 @@ class JointActionTask(Task):
         from renquant_pipeline.kernel.sizing   import (                                         # noqa: PLC0415
             compute_position_size, conviction_score_for_object,
             conviction_score_percentiles, conviction_multiplier,
+            FRACTIONAL_BOOK_CAP_DOWNSIZED, FRACTIONAL_BOOK_CAP_SKIP_REASON,
+            cap_fractional_intent_to_book,
             fractional_dust_floor_usd, fractional_eligible,
             fractional_sizing_cfg, sigma_multiplier, sizing_target_notional,
             universe_sigma_median,
@@ -855,6 +857,36 @@ class JointActionTask(Task):
                     ctx.counters.get("joint_fractional_dust_skip", 0) + 1
                 )
                 continue
+            book_cap_info = None
+            if use_frac and shares > 0 and a.kind == "buy":
+                # S-FRAC v2 stage 3 AC #8 (`fractional_max_book_pct`) — same
+                # cap as SizeAndEmitTask, applied in joint emission order.
+                shares, cap_outcome, cap_info = cap_fractional_intent_to_book(
+                    shares, price,
+                    config=ctx.config, portfolio_value=ctx.portfolio_value,
+                    holdings=getattr(ctx, "holdings", None),
+                    prices=ctx.prices, orders=ctx.orders,
+                    floor_notional=frac_dust_floor,
+                )
+                if cap_outcome == FRACTIONAL_BOOK_CAP_SKIP_REASON:
+                    log.info("JointActionTask: %s FRACTIONAL_BOOK_CAP — cap "
+                             "$%.2f exposure $%s — skip",
+                             a.cand_ticker, cap_info["cap_notional"],
+                             "?" if cap_info["exposure"] is None
+                             else f"{cap_info['exposure']:.2f}")
+                    ctx.counters["joint_" + FRACTIONAL_BOOK_CAP_SKIP_REASON] = (
+                        ctx.counters.get("joint_" + FRACTIONAL_BOOK_CAP_SKIP_REASON, 0) + 1
+                    )
+                    continue
+                if cap_outcome == FRACTIONAL_BOOK_CAP_DOWNSIZED:
+                    log.info("JointActionTask: %s FRACTIONAL_BOOK_CAP — "
+                             "downsized to $%.2f (qty=%.6f) to fit cap $%.2f",
+                             a.cand_ticker, shares * price, shares,
+                             cap_info["cap_notional"])
+                    ctx.counters[FRACTIONAL_BOOK_CAP_DOWNSIZED] = (
+                        ctx.counters.get(FRACTIONAL_BOOK_CAP_DOWNSIZED, 0) + 1
+                    )
+                    book_cap_info = cap_info
             if (shares <= 0) if use_frac else (shares < 1):
                 ctx.counters["joint_blocked_cash"] = (
                     ctx.counters.get("joint_blocked_cash", 0) + 1
@@ -898,6 +930,8 @@ class JointActionTask(Task):
                             max_pct, reserve_pct, None)[0],
                         "realized_notional_planned": invest}
                        if frac_on else {}),
+                    **({"size_cap_reason": FRACTIONAL_BOOK_CAP_SKIP_REASON}
+                       if book_cap_info is not None else {}),
                 }, ctx=ctx, source_job="JointActionJob",
                     source_task="JointActionTask",
                     acceptance_reason="joint_action_buy_net_alpha_ranked",
@@ -908,6 +942,8 @@ class JointActionTask(Task):
                         "cash_remaining_before": cash_remaining + invest,
                         "fee_pct": fee_pct,
                         "slippage_pct": slip_pct,
+                        **({"fractional_book_cap": book_cap_info}
+                           if book_cap_info is not None else {}),
                     }))
                 ctx.counters["joint_buys"] = ctx.counters.get("joint_buys", 0) + 1
                 log.info(

@@ -212,6 +212,9 @@ class SizeAndEmitTask(Task):
             # Governor fault → legacy sizing path below (fail-closed).
 
         from renquant_pipeline.kernel.sizing import (  # noqa: PLC0415
+            FRACTIONAL_BOOK_CAP_DOWNSIZED,
+            FRACTIONAL_BOOK_CAP_SKIP_REASON,
+            cap_fractional_intent_to_book,
             compute_position_size,
             conviction_score_for_object,
             conviction_score_percentiles,
@@ -382,7 +385,8 @@ class SizeAndEmitTask(Task):
                          conv: float, sig_m: float, max_pct: float, *,
                          one_share_floor_applied: bool,
                          sizing_mode: str | None = None,
-                         target_notional: float | None = None) -> None:
+                         target_notional: float | None = None,
+                         book_cap_info: dict | None = None) -> None:
             nonlocal remaining_cash
             invest = shares * price
             # Defensive: per-position sizer already rounded down to whole
@@ -445,6 +449,12 @@ class SizeAndEmitTask(Task):
                     "target_notional": target_notional,
                     "realized_notional_planned": invest}
                    if sizing_mode is not None else {}),
+                # S-FRAC v2 stage 3 AC #8: stamped ONLY when the fractional
+                # book cap actually downsized this intent (mirrors
+                # `size_floor_reason`), so every cap bite is ledger-visible
+                # and flag-off orders stay byte-identical.
+                **({"size_cap_reason": FRACTIONAL_BOOK_CAP_SKIP_REASON}
+                   if book_cap_info is not None else {}),
             }, ctx=ctx, source_job="SelectionJob",
                 source_task="SizeAndEmitTask",
                 acceptance_reason="selected_by_greedy_loop",
@@ -458,6 +468,8 @@ class SizeAndEmitTask(Task):
                     "kelly_enabled": kelly_on,
                     **({"one_share_floor_applied": True}
                        if one_share_floor_applied else {}),
+                    **({"fractional_book_cap": book_cap_info}
+                       if book_cap_info is not None else {}),
                 }))
             remaining_cash -= invest
             log.info(
@@ -595,6 +607,48 @@ class SizeAndEmitTask(Task):
                     )
                     _block(ticker, "fractional_dust_skip")
                     continue
+                # S-FRAC v2 stage 3 AC #8 — `fractional_max_book_pct`: the
+                # post-trade fractional sleeve (held fractional positions +
+                # fractional intents already emitted this bar, in emission
+                # order) may not exceed max_book_pct × PV. Beyond the cap
+                # the intent is floored to the remaining room; room below
+                # the fractional floor ⇒ dropped with a dedicated reason.
+                # Reached ONLY on the fractional path, so flag-off runs
+                # never call it.
+                shares, cap_outcome, cap_info = cap_fractional_intent_to_book(
+                    shares, price,
+                    config=ctx.config, portfolio_value=ctx.portfolio_value,
+                    holdings=getattr(ctx, "holdings", None),
+                    prices=ctx.prices, orders=ctx.orders,
+                    floor_notional=frac_dust_floor,
+                )
+                if cap_outcome == FRACTIONAL_BOOK_CAP_SKIP_REASON:
+                    log.info(
+                        "SizeAndEmitTask: %s FRACTIONAL_BOOK_CAP — sleeve "
+                        "exposure $%s of cap $%.2f (%.1f%% PV) leaves room "
+                        "$%s < floor $%.2f — skip",
+                        ticker,
+                        "?" if cap_info["exposure"] is None else f"{cap_info['exposure']:.2f}",
+                        cap_info["cap_notional"], cap_info["cap_pct"] * 100.0,
+                        "?" if cap_info["room"] is None else f"{cap_info['room']:.2f}",
+                        frac_dust_floor,
+                    )
+                    _block(ticker, FRACTIONAL_BOOK_CAP_SKIP_REASON)
+                    continue
+                book_cap_info = None
+                if cap_outcome == FRACTIONAL_BOOK_CAP_DOWNSIZED:
+                    log.info(
+                        "SizeAndEmitTask: %s FRACTIONAL_BOOK_CAP — downsized "
+                        "$%.2f → $%.2f (qty=%.6f @ %.2f) to fit cap $%.2f "
+                        "(%.1f%% PV, exposure $%.2f)",
+                        ticker, invest_planned, shares * price, shares, price,
+                        cap_info["cap_notional"], cap_info["cap_pct"] * 100.0,
+                        cap_info["exposure"],
+                    )
+                    ctx.counters[FRACTIONAL_BOOK_CAP_DOWNSIZED] = (
+                        ctx.counters.get(FRACTIONAL_BOOK_CAP_DOWNSIZED, 0) + 1
+                    )
+                    book_cap_info = cap_info
                 target_notional, _ = sizing_target_notional(
                     ctx.portfolio_value, remaining_cash,
                     max_pct, reserve_pct, override_pct,
@@ -602,7 +656,8 @@ class SizeAndEmitTask(Task):
                 _emit_order(ticker, shares, price, c, conv, sig_m, max_pct,
                             one_share_floor_applied=False,
                             sizing_mode="fractional",
-                            target_notional=target_notional)
+                            target_notional=target_notional,
+                            book_cap_info=book_cap_info)
                 continue
             # MEASUREMENT ONLY — no control flow depends on this block.
             #
