@@ -9,6 +9,7 @@ from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .tasks.config_fingerprint import ConfigFingerprintTask
 from .tasks.config_schema import ConfigSchemaTask
 from .tasks.correlation import CorrelationMetadataTask
+from .tasks.correlation_freshness import CorrelationFreshnessTask
 from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.fundamentals_freshness import FundamentalsFreshnessTask
 from .tasks.gate import RegimeLayeredICTask, WfGateMetadataTask
@@ -43,13 +44,14 @@ class _GateJob(PreflightJob):
 
 class _IdentityJob(PreflightJob):
     """Identity-of-trained-model group — config fingerprint, watchlist
-    consistency, sector-map coverage, correlation metadata."""
+    consistency, sector-map coverage, correlation metadata + freshness."""
 
     tasks = [
         ConfigFingerprintTask(),
         WatchlistSizeTask(),
         SectorMapCoverageTask(),
         CorrelationMetadataTask(),
+        CorrelationFreshnessTask(),  # orch#1065 staleness alarm (soft)
         FundamentalsFreshnessTask(),
     ]
 

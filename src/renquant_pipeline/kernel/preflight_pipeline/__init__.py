@@ -24,6 +24,7 @@ from .tasks.sector_map import SectorMapCoverageTask
 from .tasks.staleness import ModelStalenessTask
 from .tasks.watchlist import WatchlistSizeTask
 from .tasks.correlation import CorrelationMetadataTask
+from .tasks.correlation_freshness import CorrelationFreshnessTask
 from .tasks.calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .tasks.feature_coverage import FeatureCoverageTask
 from .tasks.kelly_config import KellySigmaHorizonTask
@@ -51,6 +52,7 @@ __all__ = [
     "ModelStalenessTask",
     "WatchlistSizeTask",
     "CorrelationMetadataTask",
+    "CorrelationFreshnessTask",
     "CalibratorHealthTask",
     "CalibratorFlatRegionTask",
     "FeatureCoverageTask",
