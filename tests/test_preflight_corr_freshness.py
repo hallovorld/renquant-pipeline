@@ -128,6 +128,63 @@ def test_numeric_as_of_date_is_unverified(tmp_path):
     assert r.ok is False and "UNVERIFIED" in r.message
 
 
+@pytest.mark.parametrize("days", [1, 400])
+def test_future_stamp_is_unverified_not_fresh(tmp_path, days):
+    # PR #299 review: a future-dated stamp used to collapse to age 0 and PASS.
+    future = TODAY + dt.timedelta(days=days)
+    _write(tmp_path, _v2(future.isoformat()))
+    r = _run(tmp_path)
+    assert r.severity == "soft" and r.ok is False
+    assert "UNVERIFIED" in r.message and "FUTURE" in r.message
+    assert future.isoformat() in r.message and TODAY.isoformat() in r.message
+    assert r.details["as_of_date"] == future.isoformat()
+    assert r.details["today"] == TODAY.isoformat()
+    assert "age_sessions" not in r.details
+
+
+@pytest.mark.parametrize("bad", [
+    "2026-08-28garbage",   # valid prefix + junk (was accepted via text[:10])
+    "2026-08-28T",         # dangling separator
+    "2026-13-01",          # impossible month
+    "20260828",            # basic ISO form — rejected on every Python version
+    "2026-08-28 garbage",
+    "2026-8-28",
+    "08-28-2026",
+])
+def test_malformed_stamp_suffixes_are_unverified(tmp_path, bad):
+    _write(tmp_path, _v2(bad))
+    r = _run(tmp_path)
+    assert r.severity == "soft" and r.ok is False
+    assert "UNVERIFIED" in r.message and bad in r.message
+    assert "age_sessions" not in r.details
+
+
+@pytest.mark.parametrize("good", [
+    "2026-08-28",
+    "2026-08-28T13:00:00",
+    "2026-08-28T13:00:00Z",
+    "2026-08-28T13:00:00+00:00",
+    "2026-08-28 13:00:00",
+    "2026-08-28T13:00:00.250000-04:00",
+])
+def test_valid_iso_date_and_datetime_forms_parse(tmp_path, good):
+    _write(tmp_path, _v2(good))
+    r = _run(tmp_path)
+    assert r.ok is True
+    assert r.details["as_of_date"] == "2026-08-28"
+    assert r.details["age_sessions"] == 0
+
+
+def test_parse_stamp_unit():
+    assert cf._parse_stamp("2026-08-28") == dt.date(2026, 8, 28)
+    assert cf._parse_stamp("2026-08-28T23:59:59Z") == dt.date(2026, 8, 28)
+    assert cf._parse_stamp(dt.datetime(2026, 8, 28, 1)) == dt.date(2026, 8, 28)
+    assert cf._parse_stamp(dt.date(2026, 8, 28)) == dt.date(2026, 8, 28)
+    for bad in ("2026-08-28garbage", "2026-08-28T", "2026-13-01", "20260828",
+                "", "   ", 20260828, None, ["2026-08-28"]):
+        assert cf._parse_stamp(bad) is None, bad
+
+
 def test_unreadable_artifact_is_unverified(tmp_path):
     _write(tmp_path, "{ not json")
     r = _run(tmp_path)

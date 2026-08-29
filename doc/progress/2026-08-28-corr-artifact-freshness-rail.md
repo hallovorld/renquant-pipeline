@@ -32,6 +32,8 @@ hallovorld/renquant-orchestrator#1065 — this PR is the alarm, not the path cha
 | Bound | `regime.correlation_artifact_max_age_sessions`, default 30. Malformed / negative / bool → default, with a "malformed … using default 30" note in message + `details["bound_note"]`. `0` is legal. |
 | Severity | ALWAYS `soft`. `age > bound` → `ok=False` naming as_of_date, age, bound, path and the fix pointer ("regenerate to the served path or point the config at the maintained file; see orch#1065"). `age <= bound` → `ok=True` naming the age. |
 | Stamp absent / unparseable / file unreadable | soft `ok=False` "freshness UNVERIFIED" — absence must not read as fresh. `data_window_end` is accepted when `as_of_date` is absent (the v2 writer stamps both identically); the field used is in `details["stamp_field"]`. |
+| Stamp parsing (r2, PR #299 review) | STRICT: the whole string must be exactly `YYYY-MM-DD` or a fully parseable ISO datetime (`datetime.fromisoformat` on the entire string, trailing `Z` tolerated). No prefix slicing — `2026-08-28garbage`, `2026-08-28T`, `2026-13-01`, `20260828` → UNVERIFIED. |
+| Future stamp (r2, PR #299 review) | `as_of_date > today` → soft `ok=False` "freshness UNVERIFIED" naming both dates, both in `details` (`as_of_date`, `today`), no `age_sessions`. Previously collapsed to age 0 and passed. `as_of_date == today` stays age 0 / ok. |
 | Sell-only | Unchanged: soft either way (no `_soft_for_sell_only` routing — nothing to downgrade). |
 
 Registered in `_IdentityJob` right after `CorrelationMetadataTask`
@@ -56,8 +58,11 @@ Runner: `uv run --no-project --python 3.10 --with pytest,xgboost,pandas,numpy,sc
 | `tests/test_preflight_corr_freshness.py` | n/a | 26 passed, 0 skipped |
 | `tests/test_preflight*.py` (incl. new file) | — | 70 passed, 3 skipped (pre-existing skips) |
 | Full suite | 2673 passed, 8 skipped, 0 failed | 2699 passed, 8 skipped, 0 failed |
+| Full suite after r2 (review fixes) | — | 2715 passed, 8 skipped, 55 warnings, 0 failed |
+| `tests/test_preflight_corr_freshness.py` after r2 | — | 42 passed, 0 skipped |
+| `tests/test_preflight*.py` after r2 | — | 86 passed, 3 skipped |
 
-Delta = +26, exactly the new file. No pre-existing failures on the clean base
+Delta = +26, exactly the new file (r1); r2 adds +16 review-regression tests. No pre-existing failures on the clean base
 (`tests/test_wf_fail_override.py` date fix of 08-25 holds). `[VERIFIED — runs of 2026-08-28 22:5x PDT]`
 
 Scenarios covered: fresh → ok naming age; stamped today → 0; age == bound
@@ -75,6 +80,22 @@ soft not-ok and absent from the hard-failure slate.
 CI coverage of the new file: `.github/workflows/ci.yml` runs `make test` →
 `python -m pytest -q` with `testpaths = ["tests"]` (pyproject), so the file is
 collected without being named. `[VERIFIED — read ci.yml:57, Makefile:19, pyproject.toml:64]`
+
+## r2 — PR #299 review fixes (2026-08-28)
+
+Codex (haorensjtu-dev) requested two fixes; both landed in the same file:
+
+1. Future-dated stamp passed as fresh (`_age_in_sessions` returned 0 for
+   `as_of >= today`). Now `check()` rejects `as_of > today` as UNVERIFIED
+   naming both dates, and `_age_in_sessions` raises on a future input as a
+   guard. Tests: future by 1 and 400 days.
+2. `_parse_stamp` sliced `text[:10]`, so `2026-08-28garbage` parsed. Now
+   strict whole-string parsing gated by a `^\d{4}-\d{2}-\d{2}` prefix (rejects
+   the basic form `20260828` even on Python 3.11+, where `date.fromisoformat`
+   would accept it). Tests: 7 malformed forms, 6 valid date/datetime forms,
+   plus a unit test on `_parse_stamp` itself.
+
+Test counts after r2 are in the evidence table below.
 
 ## Updated tests
 

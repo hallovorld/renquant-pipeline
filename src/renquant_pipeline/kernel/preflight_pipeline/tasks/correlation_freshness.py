@@ -36,6 +36,11 @@ Contract (frozen 2026-08-28):
       * age <= bound → ok=True, message names the age.
       * as_of_date absent / unparseable → ok=False "freshness UNVERIFIED".
         Absence must NOT read as fresh (invented-keys-return-silent-empties).
+        Parsing is STRICT: exactly ``YYYY-MM-DD`` or a fully parseable ISO
+        datetime (trailing ``Z`` tolerated) — no prefix slicing.
+      * as_of_date AFTER today → ok=False "freshness UNVERIFIED" naming both
+        dates; a future stamp is a broken stamp, not a fresh one.
+        ``as_of_date == today`` is age 0 / ok.
         ``data_window_end`` is accepted as the stamp when ``as_of_date`` is
         absent (the v2 writer sets both to the same value); the field used is
         reported in ``details["stamp_field"]``.
@@ -44,6 +49,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +67,11 @@ from ..ctx import PreflightContext
 DEFAULT_MAX_AGE_SESSIONS = 30
 
 _CONFIG_KEY = "correlation_artifact_max_age_sessions"
+#: A stamp must START with a strict ``YYYY-MM-DD`` (the calendar-validity
+#: check is left to ``fromisoformat``); the remainder must be an ISO time
+#: suffix or nothing. Rejects the basic form ``20260828`` even on Python
+#: 3.11+, where ``date.fromisoformat`` would otherwise accept it.
+_ISO_PREFIX = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _FIX_POINTER = (
     "regenerate to the served path or point the config at the maintained "
     "file; see orch#1065"
@@ -76,9 +87,12 @@ def _today() -> _dt.date:
 def _parse_stamp(value: Any) -> _dt.date | None:
     """Coerce an artifact date stamp to ``datetime.date``; ``None`` on failure.
 
-    Accepts ISO date / datetime strings (``YYYY-MM-DD[T...]``) and
-    date/datetime objects. Anything else — including numbers and empty
-    strings — is a parse failure, which the caller reports as UNVERIFIED.
+    STRICT (PR #299 review): the WHOLE string must be either an ISO date
+    (exactly ``YYYY-MM-DD``) or a fully parseable ISO datetime
+    (``datetime.fromisoformat`` on the entire string, tolerating a trailing
+    ``Z``). No prefix slicing — ``2026-08-28garbage``, ``2026-08-28T``,
+    ``2026-13-01`` and ``20260828`` are all parse failures, which the caller
+    reports as UNVERIFIED. Numbers, empty strings and other types fail too.
     """
     if isinstance(value, _dt.datetime):
         return value.date()
@@ -87,10 +101,19 @@ def _parse_stamp(value: Any) -> _dt.date | None:
     if not isinstance(value, str):
         return None
     text = value.strip()
-    if not text:
+    if not _ISO_PREFIX.match(text):
         return None
+    if len(text) == 10:
+        try:
+            return _dt.date.fromisoformat(text)
+        except ValueError:
+            return None
+    if text[10] not in ("T", " "):
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
     try:
-        return _dt.date.fromisoformat(text[:10])
+        return _dt.datetime.fromisoformat(text).date()
     except ValueError:
         return None
 
@@ -124,12 +147,18 @@ def _age_in_sessions(as_of: _dt.date, today: _dt.date) -> tuple[int, str, str | 
     """Return (age, calendar_label, note).
 
     ``age`` counts sessions strictly after ``as_of`` up to and including
-    ``today`` (an artifact stamped today is 0 sessions old). A future stamp
-    yields 0. ``calendar_label`` is ``"NYSE"`` when the shared calendar
-    primitive answered, ``"weekday-fallback"`` otherwise, with ``note``
-    explaining why the fallback was used.
+    ``today`` (an artifact stamped today is 0 sessions old). A FUTURE stamp
+    is not an age at all — the caller must reject it before calling here
+    (PR #299 review: it used to collapse to 0 and pass as fresh); this
+    function raises ``ValueError`` on one as a guard. ``calendar_label`` is
+    ``"NYSE"`` when the shared calendar primitive answered,
+    ``"weekday-fallback"`` otherwise, with ``note`` explaining why.
     """
-    if as_of >= today:
+    if as_of > today:
+        raise ValueError(
+            f"as_of={as_of.isoformat()} is after today={today.isoformat()}"
+        )
+    if as_of == today:
         return 0, "NYSE", None
     start = as_of + _dt.timedelta(days=1)
     try:
@@ -224,6 +253,19 @@ class CorrelationFreshnessTask(PreflightTask):
             )
 
         today = _today()
+        details["as_of_date"] = as_of.isoformat()
+        details["today"] = today.isoformat()
+        if as_of > today:
+            # A future-dated stamp cannot be aged; it is a broken stamp, not a
+            # fresh one (PR #299 review — it previously read as 0 sessions old).
+            return PreflightCheck(
+                self.check_name, "soft", False,
+                f"correlation artifact freshness UNVERIFIED at {p}: "
+                f"as_of_date={as_of.isoformat()} is in the FUTURE relative to "
+                f"today={today.isoformat()}; a future stamp is not freshness — "
+                f"{_FIX_POINTER}",
+                details=details,
+            )
         age, calendar_label, cal_note = _age_in_sessions(as_of, today)
         details.update({
             "as_of_date": as_of.isoformat(),
