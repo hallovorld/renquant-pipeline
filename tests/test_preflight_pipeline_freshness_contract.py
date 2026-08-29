@@ -24,9 +24,10 @@ def test_full_pipeline_includes_broker_fill_freshness(tmp_path):
     ctx = PreflightContext(config={}, strategy_dir=tmp_path)
     results = build_preflight_pipeline().run(ctx, strict=False)
     names = [r.name for r in results]
-    assert len(results) == 22  # +P-CONFIG-SCHEMA, +P-MODEL-STALENESS, +P-FUND-FRESHNESS, +P-SIZING-GATE-KEYS
+    assert len(results) == 23  # +P-CONFIG-SCHEMA, +P-MODEL-STALENESS, +P-FUND-FRESHNESS, +P-SIZING-GATE-KEYS, +P-CORR-FRESHNESS
     assert "P-KELLY-SIGMA-HORIZON" in names
     assert "P-FUND-FRESHNESS" in names
+    assert names.index("P-CORR-FRESHNESS") == names.index("P-CORR-METADATA") + 1
     assert names[-3:] == [
         "P-STATE-FILE",
         "P-BROKER-CONNECT",
@@ -37,7 +38,7 @@ def test_full_pipeline_includes_broker_fill_freshness(tmp_path):
 def test_run_preflight_legacy_order_covers_all_checks(tmp_path):
     results = run_preflight(config={}, broker=None, strategy_dir=tmp_path, strict=False)
     names = [r.name for r in results]
-    assert len(results) == len(_LEGACY_CHECK_ORDER) == 22
+    assert len(results) == len(_LEGACY_CHECK_ORDER) == 23
     assert names == list(_LEGACY_CHECK_ORDER)
     assert "P-KELLY-SIGMA-HORIZON" in names
     assert "P-SIZING-GATE-KEYS" in names

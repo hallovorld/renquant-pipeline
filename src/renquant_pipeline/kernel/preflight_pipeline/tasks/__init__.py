@@ -12,6 +12,7 @@ from .gate import RegimeLayeredICTask, WfGateMetadataTask
 from .sector_map import SectorMapCoverageTask
 from .watchlist import WatchlistSizeTask
 from .correlation import CorrelationMetadataTask
+from .correlation_freshness import CorrelationFreshnessTask
 from .calibrator import CalibratorFlatRegionTask, CalibratorHealthTask
 from .feature_coverage import FeatureCoverageTask
 from .run_id import ArtifactRunIdAlignmentTask
@@ -30,6 +31,7 @@ __all__ = [
     "SectorMapCoverageTask",
     "WatchlistSizeTask",
     "CorrelationMetadataTask",
+    "CorrelationFreshnessTask",
     "CalibratorHealthTask",
     "CalibratorFlatRegionTask",
     "FeatureCoverageTask",

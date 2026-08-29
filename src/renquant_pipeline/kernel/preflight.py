@@ -24,6 +24,9 @@ Checks (each returns ok / soft-warn / hard-fail):
 	                          evidence
 	  6. P-CORR-METADATA    — correlation artifact must be stamped with
 	                          as_of_date before buy/full runs
+	  6b. P-CORR-FRESHNESS  — SOFT alarm when that stamp is older than
+	                          regime.correlation_artifact_max_age_sessions
+	                          NYSE sessions (default 30; orch#1065)
 	  7. P-FEATURE-COVER    — NGBoost head's feature_cols all present in
 	                          current panel pipeline output (≥ 95%)
 	  8. P-STATE-FILE       — live_state.{broker}.json parses (or absent
@@ -2131,6 +2134,7 @@ _LEGACY_CHECK_ORDER: tuple[str, ...] = (
     "P-WATCHLIST",
     "P-SECTOR-MAP",
     "P-CORR-METADATA",
+    "P-CORR-FRESHNESS",  # orch#1065: soft staleness alarm, sibling of P-CORR-METADATA
     "P-FUND-FRESHNESS",
     "P-FEATURE-COVER",
     "P-STATE-FILE",
