@@ -71,7 +71,8 @@
       "public_sha256": "d50d1881e1802b3620689e4101d71022186fa5af2070453cdc929710da43cb6a"
     },
     "LoadScorerTask": {
-      "kernel_sha256": "ef0f915648a6f067c9903529ceba2d7048dcfb4011f81b3f43285c76fa155092",
+      "kernel_sha256": "6e22f0899db52711196220d433363c9ddfe2c2bff286fbd517d70d1e0e77bd4d",
+      "_repin_2026_08_29": "orch#1066 (a') primary-scorer artifact resolver: the KERNEL LoadScorerTask's two path helpers (_resolve_artifact_path, _blend_component0_path) now route the config ref through kernel.artifact_resolver.locate_artifact (strategy_dir first, repo_root fallback) instead of joining onto _strategy_dir only, matching the blend components' precedence; a miss still returns the strategy_dir candidate so every fail-closed reason is unchanged. KERNEL-ONLY for the same structural reason as the pipeline#258 lineage: the public twin (renquant_pipeline.panel_scoring.LoadScorerTask) validates an artifact-manifest contract on ctx and never resolves a filesystem path, so there is no call site to receive this change. public_sha256 unchanged and intended to stay unchanged.",
       "kernel_twin_file": "renquant_pipeline/kernel/panel_pipeline/job_panel_scoring.py",
       "public_file": "renquant_pipeline/panel_scoring.py",
       "public_is_kernel": false,
