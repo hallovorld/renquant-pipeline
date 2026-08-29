@@ -960,6 +960,9 @@ class EmitRotationsTask(Task):
             conviction_score_for_object,
             conviction_score_percentiles,
             conviction_multiplier,
+            FRACTIONAL_BOOK_CAP_DOWNSIZED,
+            FRACTIONAL_BOOK_CAP_SKIP_REASON,
+            cap_fractional_intent_to_book,
             fractional_dust_floor_usd,
             fractional_eligible,
             fractional_sizing_cfg,
@@ -1205,6 +1208,39 @@ class EmitRotationsTask(Task):
                     "reason": "fractional_dust_skip",
                 })
                 continue
+            book_cap_info = None
+            if use_frac and shares > 0:
+                # S-FRAC v2 stage 3 AC #8 (`fractional_max_book_pct`) —
+                # same cap as SizeAndEmitTask; rotation buy-legs are emitted
+                # FIRST in the bar, so they take the sleeve's room first.
+                # Conservative: the paired sell-leg's own fractional
+                # exposure (if any) is still counted — it has not sold yet.
+                shares, cap_outcome, cap_info = cap_fractional_intent_to_book(
+                    shares, price,
+                    config=ctx.config, portfolio_value=ctx.portfolio_value,
+                    holdings=_holdings, prices=ctx.prices, orders=ctx.orders,
+                    floor_notional=frac_dust_floor,
+                )
+                if cap_outcome == FRACTIONAL_BOOK_CAP_SKIP_REASON:
+                    log.info("EmitRotationsTask: %s FRACTIONAL_BOOK_CAP — cap "
+                             "$%.2f exposure $%s — skip ENTIRE pair",
+                             pair.buy_ticker, cap_info["cap_notional"],
+                             "?" if cap_info["exposure"] is None
+                             else f"{cap_info['exposure']:.2f}")
+                    ctx.rotations_blocked.append({
+                        "sell": pair.sell_ticker, "buy": pair.buy_ticker,
+                        "reason": FRACTIONAL_BOOK_CAP_SKIP_REASON,
+                    })
+                    continue
+                if cap_outcome == FRACTIONAL_BOOK_CAP_DOWNSIZED:
+                    log.info("EmitRotationsTask: %s FRACTIONAL_BOOK_CAP — "
+                             "downsized to $%.2f (qty=%.6f) to fit cap $%.2f",
+                             pair.buy_ticker, shares * price, shares,
+                             cap_info["cap_notional"])
+                    ctx.counters[FRACTIONAL_BOOK_CAP_DOWNSIZED] = (
+                        ctx.counters.get(FRACTIONAL_BOOK_CAP_DOWNSIZED, 0) + 1
+                    )
+                    book_cap_info = cap_info
             if (shares <= 0) if use_frac else (shares < 1):
                 log.info("EmitRotationsTask: %s insufficient cash — skip ENTIRE pair "
                          "(no atomic-rotation orphan exit)  cash_for_sizing=%.0f",
@@ -1258,6 +1294,8 @@ class EmitRotationsTask(Task):
                         max_pct, reserve_pct, None)[0],
                     "realized_notional_planned": invest}
                    if frac_on else {}),
+                **({"size_cap_reason": FRACTIONAL_BOOK_CAP_SKIP_REASON}
+                   if book_cap_info is not None else {}),
             }, ctx=ctx, source_job="RotationJob",
                 source_task="EmitRotationsTask",
                 acceptance_reason="rotation_net_advantage_passed",
@@ -1271,6 +1309,8 @@ class EmitRotationsTask(Task):
                     "transaction_cost": pair.transaction_cost,
                     "threshold": pair.threshold,
                     "horizon_days": pair.horizon_days,
+                    **({"fractional_book_cap": book_cap_info}
+                       if book_cap_info is not None else {}),
                 }))
             rotated_buys.add(pair.buy_ticker)
             # PR1-CASH: roll the cash forward — credit sell, debit buy.

@@ -4,6 +4,11 @@ Self-contained: no common/ imports.
 """
 from __future__ import annotations
 
+import logging
+from typing import Any
+
+log = logging.getLogger("kernel.sizing")
+
 
 def _finite_float(value) -> float | None:
     import math
@@ -256,6 +261,199 @@ def fractional_dust_floor_usd(config: dict | None) -> float:
     if not math.isfinite(floor) or floor < 0:
         floor = DEFAULT_MIN_FRACTIONAL_TRADE_NOTIONAL_USD
     return max(MIN_FRACTIONAL_NOTIONAL_USD, min_notional, floor)
+
+
+# ── Fractional book cap (S-FRAC v2 stage 3 AC #8, `fractional_max_book_pct`) ──
+#
+# Design §3.3/§3.4: the aggregate notional of fractional-sized positions is
+# the worst-case notional UNPROTECTED by a broker-resident stop (fractional
+# orders are TIF=DAY only — no GTC stop can cover them; protection is the
+# loop-resident software-stop layer, which dies with the machine). The cap
+# budgets that exposure at a share of portfolio value (proposed default 10%).
+#
+# Config key: ``execution.fractional_shares.max_book_pct`` (beside the other
+# stage-2 keys; the design names the knob `fractional_max_book_pct` but gives
+# no path — see doc/progress/2026-08-28-fractional-max-book-pct.md).
+# Absent → 0.10. Malformed (bool / non-numeric / non-finite / negative /
+# > 1.0) → 0.0 = NO new fractional exposure permitted (fail CLOSED for the
+# fractional path only; whole-share sizing never consults this key).
+DEFAULT_FRACTIONAL_MAX_BOOK_PCT = 0.10
+FRACTIONAL_BOOK_CAP_SKIP_REASON = "fractional_book_cap"
+FRACTIONAL_BOOK_CAP_DOWNSIZED = "fractional_book_cap_downsized"
+# Quantities within this distance of an integer are whole-share holdings.
+_FRACTIONAL_QTY_EPS = 1e-9
+
+
+def fractional_max_book_pct(config: dict | None) -> float:
+    """Read ``execution.fractional_shares.max_book_pct`` → fraction of PV.
+
+    Missing key → :data:`DEFAULT_FRACTIONAL_MAX_BOOK_PCT`. Anything that is
+    not a real, non-bool, finite number in ``[0, 1]`` fails CLOSED to ``0.0``
+    (no fractional exposure permitted) and logs a warning naming the value.
+    Only the fractional path consults this; a malformed value can never
+    change whole-share sizing.
+    """
+    import math
+    exec_cfg = (config or {}).get("execution", {}) or {}
+    frac_cfg = exec_cfg.get("fractional_shares", {}) or {}
+    if "max_book_pct" not in frac_cfg:
+        return DEFAULT_FRACTIONAL_MAX_BOOK_PCT
+    raw = frac_cfg.get("max_book_pct")
+    pct: float | None
+    # Strict: a real int/float only. No str() coercion — a quoted "0.1" is a
+    # malformed config, not a 10% cap (fail-closed type discipline, as for
+    # `enabled`); bool is an int subclass and is rejected explicitly.
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        pct = None
+    else:
+        pct = float(raw)
+    if pct is None or not math.isfinite(pct) or pct < 0.0 or pct > 1.0:
+        log.warning(
+            "execution.fractional_shares.max_book_pct=%r is malformed — "
+            "failing CLOSED: no new fractional exposure this bar "
+            "(whole-share sizing unaffected)", raw,
+        )
+        return 0.0
+    return pct
+
+
+def is_fractional_quantity(qty: Any) -> bool:
+    """True when ``qty`` is a finite positive number that is NOT integral."""
+    import math
+    if isinstance(qty, bool) or qty is None:
+        return False
+    try:
+        q = float(qty)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(q) or q <= 0:
+        return False
+    return abs(q - round(q)) > _FRACTIONAL_QTY_EPS
+
+
+def fractional_book_exposure(
+    holdings: dict | None,
+    prices: dict | None,
+    orders: list | None,
+) -> float | None:
+    """Current fractional-sleeve notional: held fractional positions marked at
+    ``prices`` + fractional BUY intents already emitted this bar.
+
+    * A holding counts when its recorded quantity (``shares``, the attribute
+      the umbrella stamps on ``HoldingState``; see task_rotation.py) is
+      non-integral. Whole-share holdings are never part of the sleeve.
+    * An emitted intent counts when it is stamped ``sizing_mode ==
+      "fractional"`` OR carries a non-integral ``shares`` — so intents from
+      every buy-emitting task (rotation → joint/selection) accumulate in the
+      pipeline's existing emission order.
+    * Returns ``None`` when a fractional holding has no usable mark (no
+      finite positive price): the exposure is UNKNOWN and the caller must
+      fail closed rather than assume it is small.
+    """
+    import math
+    total = 0.0
+    prices = prices or {}
+    for ticker, hs in (holdings or {}).items():
+        qty = getattr(hs, "shares", None)
+        if not is_fractional_quantity(qty):
+            continue
+        price = prices.get(ticker)
+        try:
+            price_f = float(price) if price is not None and not isinstance(price, bool) else None
+        except (TypeError, ValueError):
+            price_f = None
+        if price_f is None or not math.isfinite(price_f) or price_f <= 0:
+            return None
+        total += float(qty) * price_f
+    for o in orders or []:
+        if not isinstance(o, dict):
+            continue
+        shares = o.get("shares")
+        if o.get("sizing_mode") == "fractional" or is_fractional_quantity(shares):
+            invest = o.get("invest")
+            try:
+                invest_f = float(invest) if invest is not None else float(shares) * float(o.get("price", 0.0))
+            except (TypeError, ValueError):
+                invest_f = 0.0
+            if math.isfinite(invest_f) and invest_f > 0:
+                total += invest_f
+    return total
+
+
+def apply_fractional_book_cap(
+    shares: float,
+    price: float,
+    *,
+    cap_notional: float,
+    exposure: float | None,
+    floor_notional: float,
+) -> tuple[float, str | None]:
+    """Fit one fractional BUY intent inside the remaining book-cap room.
+
+    Returns ``(shares, outcome)`` where ``outcome`` is:
+
+    * ``None`` — the intent fits (``shares × price ≤ room``), unchanged;
+    * :data:`FRACTIONAL_BOOK_CAP_DOWNSIZED` — ``shares`` was floored (6 dp,
+      never rounded up) to the remaining room;
+    * :data:`FRACTIONAL_BOOK_CAP_SKIP_REASON` — dropped: the exposure is
+      unknown (``None``), or the room (or the floored downsized notional) is
+      below ``floor_notional`` — the effective fractional floor, which is
+      never below the $1 broker minimum.
+
+    Boundary: an intent EXACTLY at the room is unchanged (``≤``, with a 1e-9
+    fp tolerance).
+    """
+    import math
+    if exposure is None or not math.isfinite(cap_notional) or not math.isfinite(exposure):
+        return 0.0, FRACTIONAL_BOOK_CAP_SKIP_REASON
+    intent = float(shares) * float(price)
+    room = cap_notional - exposure
+    if intent <= room + 1e-9:
+        return float(shares), None
+    if room < floor_notional or room <= 0:
+        return 0.0, FRACTIONAL_BOOK_CAP_SKIP_REASON
+    capped = math.floor((room / float(price)) * 1_000_000) / 1_000_000
+    if capped <= 0 or capped * float(price) < floor_notional:
+        return 0.0, FRACTIONAL_BOOK_CAP_SKIP_REASON
+    return capped, FRACTIONAL_BOOK_CAP_DOWNSIZED
+
+
+def cap_fractional_intent_to_book(
+    shares: float,
+    price: float,
+    *,
+    config: dict | None,
+    portfolio_value: float,
+    holdings: dict | None,
+    prices: dict | None,
+    orders: list | None,
+    floor_notional: float,
+) -> tuple[float, str | None, dict[str, Any]]:
+    """Single entry point the buy-emitting tasks call for a fractional intent.
+
+    Called ONLY on the fractional path (``execution.fractional_shares.enabled``
+    is a real ``True`` and the name is fractionable and sized > 0) — with the
+    flag off this function is never invoked (pinned by
+    tests/test_fractional_book_cap.py). Returns ``(shares, outcome, info)``;
+    ``info`` carries ``cap_pct / cap_notional / exposure / room`` for the
+    decision ledger.
+    """
+    cap_pct = fractional_max_book_pct(config)
+    pv = float(portfolio_value or 0.0)
+    cap_notional = cap_pct * pv if pv > 0 else 0.0
+    exposure = fractional_book_exposure(holdings, prices, orders)
+    new_shares, outcome = apply_fractional_book_cap(
+        shares, price,
+        cap_notional=cap_notional, exposure=exposure,
+        floor_notional=floor_notional,
+    )
+    info = {
+        "cap_pct": cap_pct,
+        "cap_notional": cap_notional,
+        "exposure": exposure,
+        "room": (cap_notional - exposure) if exposure is not None else None,
+    }
+    return new_shares, outcome, info
 
 
 def fractional_eligible(
