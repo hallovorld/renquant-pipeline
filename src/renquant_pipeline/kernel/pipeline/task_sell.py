@@ -159,7 +159,23 @@ class ScoreModelTask(Task):
                 holdings=1, horizon_days=rotation_horizon,
             )
             tc.model_action = sr.signal
-            if tc.holding is not None:
+            if sr.abstained:
+                # 2026-08-30: no opinion on the held name (unseen Q-state).
+                # ``model_action="abstain"`` moves neither the model_sell
+                # streak (kernel.exits.check_model_sell) nor the
+                # model_protection strike count (model_protection.evaluate
+                # treats a None μ as "mu_unavailable"): a strike needs a
+                # real number. The holding carries None, not a stale or
+                # invented reading.
+                log.info("ScoreModelTask [%s]: model abstained (%s) — no "
+                         "expected return; not a model_sell / "
+                         "model_protection strike",
+                         tc.ticker, sr.abstain_reason)
+                if tc.holding is not None:
+                    tc.holding.rank_score      = None
+                    tc.holding.expected_return = None
+                    tc.holding.expected_return_horizon_days = None
+            elif tc.holding is not None:
                 tc.holding.rank_score      = float(sr.rank_score)
                 tc.holding.expected_return = float(sr.expected_return)
                 tc.holding.expected_return_horizon_days = rotation_horizon

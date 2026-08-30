@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS ticker_daily_state (
     model_type        TEXT,           -- 'hf_patchtst' | 'xgb' | per-ticker label when panel scoring off
     active_scorer     TEXT,           -- active panel scorer identity, NULL when off
     legacy_model_type TEXT,           -- 'Manual' | 'XGBoost' | 'QLearning' | 'Classification'
-    model_action      TEXT,           -- 'buy' | 'hold' | 'sell'
+    model_action      TEXT,           -- 'buy' | 'hold' | 'sell' | 'abstain' (no opinion, 2026-08-30)
     sell_streak       INTEGER,        -- only meaningful when has_position=1
     -- Panel scores (when computed)
     panel_score       REAL,

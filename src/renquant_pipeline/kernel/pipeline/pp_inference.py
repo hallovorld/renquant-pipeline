@@ -519,8 +519,27 @@ class InferencePipeline:
                 collect_wash_sale_decision_records,
             )
             collect_wash_sale_decision_records(ctx, cand_tctxs)
-            log.info("Phase 2b (buy scan): %d candidates from %d tickers",
-                     len(ctx.candidates), len(universe))
+            # 2026-08-30: per-ticker models that ABSTAINED (unseen Q-state,
+            # kernel.models) are neither candidates nor a 0.0 score. Counted
+            # on the summary line + a run counter so a day the model has no
+            # opinion on a third of the universe is visible, not silent.
+            from renquant_pipeline.kernel.models import (  # noqa: PLC0415
+                REASON_ER_ABSTAIN_UNSEEN_STATE, warn_horizon_extrapolation,
+            )
+            abstain_count = sum(
+                1 for tc in cand_tctxs
+                if getattr(tc, "blocked_by", None) == REASON_ER_ABSTAIN_UNSEEN_STATE
+            )
+            ctx.counters[REASON_ER_ABSTAIN_UNSEEN_STATE] = (
+                ctx.counters.get(REASON_ER_ABSTAIN_UNSEEN_STATE, 0) + abstain_count
+            )
+            log.info("Phase 2b (buy scan): %d candidates from %d tickers "
+                     "abstain_count=%d",
+                     len(ctx.candidates), len(universe), abstain_count)
+            # Once per run: how far every ER is extrapolated past its fit
+            # (er_lookahead vs rotation.target_horizon_days). Visibility
+            # only — the ×(horizon/lookahead) scaling is unchanged.
+            warn_horizon_extrapolation(getattr(ctx, "models", None) or {}, ctx.config)
 
         # G8 (2026-05-04 post-stop blackout): drop candidates whose ticker
         # had a path-rule exit (trailing_stop / stop_loss / single_day_loss /
