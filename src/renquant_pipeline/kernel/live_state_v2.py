@@ -27,6 +27,7 @@ older reader's rewrite, and never silently accepted into the typed model.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -53,6 +54,12 @@ class HoldingV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
     entry_date: str
     sell_streak: int = 0
+    # ISO date of the last ``sell_streak`` increment (exits.HoldingState
+    # .last_streak_inc_date). The once-per-session dedup in
+    # exits.check_model_sell is only real across runs when this round-trips:
+    # 2026-08-25 two runs on one date each incremented (sell_streaks was
+    # persisted, this date was not) → streak 3 after two sessions → exit.
+    last_streak_inc_date: Optional[str] = None
     protection_breaches: int = 0   # the PR-#294 field — the 1-line example
     position_hwm: Optional[float] = None
     entry_signal: Optional[EntrySignalV2] = None
@@ -63,6 +70,7 @@ class HoldingV2(BaseModel):
 _HOLDING_V1_KEYS: dict[str, str] = {
     "entry_date": "entry_dates",
     "sell_streak": "sell_streaks",
+    "last_streak_inc_date": "last_streak_inc_dates",
     "protection_breaches": "protection_breaches",
     "position_hwm": "position_hwm",
     "entry_signal": "entry_signals",
@@ -227,6 +235,37 @@ class LiveStateV2(BaseModel):
 
     def canonical_json(self) -> str:
         return json.dumps(self.to_wire(), sort_keys=True, indent=2, default=str)
+
+
+def streak_inc_date_from_wire(value: Any) -> Optional[datetime.date]:
+    """``last_streak_inc_dates[ticker]`` (ISO str) → ``date`` for HoldingState.
+
+    Malformed / empty values read as ``None`` (= never incremented): the
+    dedup then degrades to the pre-fix behaviour for that name, it never
+    raises on a hand-edited file.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date()
+    if isinstance(value, datetime.date):
+        return value
+    try:
+        return datetime.date.fromisoformat(str(value)[:10])
+    except ValueError:
+        log.warning("live_state: unparseable last_streak_inc_date %r ignored", value)
+        return None
+
+
+def streak_inc_date_to_wire(value: Any) -> Optional[str]:
+    """``HoldingState.last_streak_inc_date`` → ISO str for the wire."""
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        return value.date().isoformat()
+    if isinstance(value, datetime.date):
+        return value.isoformat()
+    return str(value)[:10]
 
 
 def read_live_state(path: Path) -> LiveStateV2:

@@ -344,13 +344,36 @@ class ScoreBuyTask(Task):
             tc._expected_return_horizon_days = None  # noqa: SLF001
             return None
 
-        from renquant_pipeline.kernel.models import score_artifact  # noqa: PLC0415
+        from renquant_pipeline.kernel.models import (  # noqa: PLC0415
+            REASON_ER_ABSTAIN_UNSEEN_STATE, score_artifact,
+        )
         rotation_horizon = int(tc.config.get("rotation", {}).get("target_horizon_days", 20))
         sr = score_artifact(
             tc.model, tc.features.iloc[-1],
             holdings=0, horizon_days=rotation_horizon,
         )
         tc.model_action = sr.signal
+
+        if sr.abstained:
+            # 2026-08-30: the per-ticker model has NO opinion (unseen /
+            # unresolvable Q-state). This is the same shape as the
+            # panel-only "no forecast yet" placeholder (pipeline#302):
+            # every score is None, never 0.0. Unlike that placeholder
+            # nothing downstream will stamp a forecast later, so the
+            # candidate is dropped HERE — it is not a buy and not a
+            # rotation buy-leg — with a stable reason. This is not the
+            # advisory tournament gate: ``bypass_ticker_gate`` bypasses a
+            # SIGNAL the model gave; an abstain is the absence of one.
+            tc._raw_score       = None   # noqa: SLF001
+            tc._rank_score      = None   # noqa: SLF001
+            tc._expected_return = None   # noqa: SLF001
+            tc._expected_return_horizon_days = None  # noqa: SLF001
+            tc.blocked_by = REASON_ER_ABSTAIN_UNSEEN_STATE
+            log.info("DROP_ScoreBuy [%s]: model abstained (%s) — no raw score, "
+                     "no expected return; not a buy, not a rotation buy-leg",
+                     tc.ticker, sr.abstain_reason)
+            return False
+
         log.debug("ScoreBuyTask [%s]: action=%s  raw=%.4f  rank=%.4f  er=%.4f",
                   tc.ticker, sr.signal, sr.raw_score, sr.rank_score, sr.expected_return)
 
@@ -440,12 +463,14 @@ class AssembleCandidateTask(Task):
         er   = getattr(tc, "_expected_return",  0.0)
         er_h = getattr(tc, "_expected_return_horizon_days", None)
         er_txt = f"{er:+.4f}" if er is not None else "none"
+        raw_txt = f"{raw:.3f}" if raw is not None else "none"
+        rank_txt = f"{rank:.3f}" if rank is not None else "none"
         tc.candidate = CandidateResult(
             ticker          = tc.ticker,
             raw_score       = raw,
             rank_score      = rank,
             rs_score        = tc.rs_score,
-            detail          = (f"raw={raw:.3f} rank={rank:.3f} "
+            detail          = (f"raw={raw_txt} rank={rank_txt} "
                                f"rs={tc.rs_score:.3f} er={er_txt}"),
             expected_return = er,
             expected_return_horizon_days=er_h,
