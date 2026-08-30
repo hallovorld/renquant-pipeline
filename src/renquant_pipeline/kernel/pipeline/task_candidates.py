@@ -345,7 +345,7 @@ class ScoreBuyTask(Task):
             return None
 
         from renquant_pipeline.kernel.models import (  # noqa: PLC0415
-            REASON_ER_ABSTAIN_UNSEEN_STATE, score_artifact,
+            abstain_block_reason, score_artifact,
         )
         rotation_horizon = int(tc.config.get("rotation", {}).get("target_horizon_days", 20))
         sr = score_artifact(
@@ -355,8 +355,9 @@ class ScoreBuyTask(Task):
         tc.model_action = sr.signal
 
         if sr.abstained:
-            # 2026-08-30: the per-ticker model has NO opinion (unseen /
-            # unresolvable Q-state). This is the same shape as the
+            # 2026-08-30: the per-ticker model has NO opinion (unseen
+            # Q-state, or NaN / missing required features for any model
+            # type — pipeline#303 + follow-up). This is the same shape as the
             # panel-only "no forecast yet" placeholder (pipeline#302):
             # every score is None, never 0.0. Unlike that placeholder
             # nothing downstream will stamp a forecast later, so the
@@ -368,7 +369,7 @@ class ScoreBuyTask(Task):
             tc._rank_score      = None   # noqa: SLF001
             tc._expected_return = None   # noqa: SLF001
             tc._expected_return_horizon_days = None  # noqa: SLF001
-            tc.blocked_by = REASON_ER_ABSTAIN_UNSEEN_STATE
+            tc.blocked_by = abstain_block_reason(sr.abstain_reason)
             log.info("DROP_ScoreBuy [%s]: model abstained (%s) — no raw score, "
                      "no expected return; not a buy, not a rotation buy-leg",
                      tc.ticker, sr.abstain_reason)

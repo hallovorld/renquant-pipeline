@@ -519,23 +519,24 @@ class InferencePipeline:
                 collect_wash_sale_decision_records,
             )
             collect_wash_sale_decision_records(ctx, cand_tctxs)
-            # 2026-08-30: per-ticker models that ABSTAINED (unseen Q-state,
-            # kernel.models) are neither candidates nor a 0.0 score. Counted
-            # on the summary line + a run counter so a day the model has no
-            # opinion on a third of the universe is visible, not silent.
+            # 2026-08-30: per-ticker models that ABSTAINED (unseen Q-state
+            # or NaN / missing features, kernel.models) are neither
+            # candidates nor a 0.0 score. Counted per reason on the summary
+            # line + run counters (``er_abstain_<reason>``) so a day the
+            # model has no opinion on a third of the universe is visible.
             from renquant_pipeline.kernel.models import (  # noqa: PLC0415
-                REASON_ER_ABSTAIN_UNSEEN_STATE, warn_horizon_extrapolation,
+                abstain_breakdown, warn_horizon_extrapolation,
             )
-            abstain_count = sum(
-                1 for tc in cand_tctxs
-                if getattr(tc, "blocked_by", None) == REASON_ER_ABSTAIN_UNSEEN_STATE
+            breakdown = abstain_breakdown(
+                getattr(tc, "blocked_by", None) for tc in cand_tctxs
             )
-            ctx.counters[REASON_ER_ABSTAIN_UNSEEN_STATE] = (
-                ctx.counters.get(REASON_ER_ABSTAIN_UNSEEN_STATE, 0) + abstain_count
-            )
+            for reason, n in breakdown.items():
+                ctx.counters[reason] = ctx.counters.get(reason, 0) + n
+            abstain_count = sum(breakdown.values())
             log.info("Phase 2b (buy scan): %d candidates from %d tickers "
-                     "abstain_count=%d",
-                     len(ctx.candidates), len(universe), abstain_count)
+                     "abstain_count=%d (%s)",
+                     len(ctx.candidates), len(universe), abstain_count,
+                     " ".join(f"{k}={v}" for k, v in sorted(breakdown.items())))
             # Once per run: how far every ER is extrapolated past its fit
             # (er_lookahead vs rotation.target_horizon_days). Visibility
             # only — the ×(horizon/lookahead) scaling is unchanged.
