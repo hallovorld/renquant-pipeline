@@ -57,7 +57,7 @@ from typing import Any
 
 from .artifact_resolver import locate_artifact
 from .pipeline.task_topup import resolve_topup_enablement
-from .rfc210_license import evaluate_freshness_fallback_license
+from .rfc210_license import evaluate_freshness_fallback_license, licensed_check_message
 
 log = logging.getLogger("kernel.preflight")
 
@@ -568,10 +568,7 @@ def _check_wf_gate_metadata(
             details["freshness_fallback_rfc210"] = rfc210.provenance
             return PreflightCheck(
                 "P-WF-GATE", "hard", True,
-                f"active panel artifact is {rfc210.reason}; gate-fail evidence "
-                f"acknowledged (wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
-                f"reason={wf.get('wf_reason')}) — buys admitted while the "
-                "freshness license holds.",
+                licensed_check_message(rfc210, wf, payload),
                 details=details,
             )
         details["freshness_fallback_rfc210_refused"] = rfc210.reason
@@ -767,9 +764,41 @@ def _check_regime_layered_ic(
     pooled_spearman = _finite_float(pooled.get("spearman")) if pooled else None
     return PreflightCheck(
         "P-REGIME-IC", "hard", True,
-        "regime-layered IC/monotonicity passed for eligible regimes "
-        f"{sorted(eligible)}; pooled_spearman={pooled_spearman}",
+        _regime_ic_pass_message(details, eligible, failed, pooled_spearman),
         details=details,
+    )
+
+
+def _regime_ic_pass_message(
+    details: dict, eligible: dict, failed: dict, pooled_spearman: float | None,
+) -> str:
+    """The ✓ text for P-REGIME-IC (both twins). A RELAXED pass must never read as a pass.
+
+    2026-08-30: with ``wf_gate.sanity_regime_ic_required=false`` the check
+    logged "regime-layered IC/monotonicity passed for eligible regimes
+    ['BULL_CALM']" while the stamp said BULL_CALM FAILED (ρ=0.002) and the
+    sanity IC FAILED — the log lied. The relaxed state now leads the line.
+    """
+    relaxed_parts: list[str] = []
+    if details.get("sanity_regime_ic_relaxed"):
+        sanity = details.get("sanity_regime_ic") or {}
+        relaxed_parts.append(f"sanity IC failed ({sanity.get('reason', 'unknown')})")
+    if details.get("trade_monotonicity_relaxed"):
+        stamped = []
+        for regime in sorted(failed) or sorted(eligible):
+            rho = _finite_float((failed.get(regime) or eligible.get(regime) or {}).get("spearman"))
+            stamped.append(f"{regime} ρ={rho:.3f}" if rho is not None else regime)
+        relaxed_parts.append("stamp failed " + ", ".join(stamped))
+    if not relaxed_parts:
+        return (
+            "regime-layered IC/monotonicity passed for eligible regimes "
+            f"{sorted(eligible)}; pooled_spearman={pooled_spearman}"
+        )
+    return (
+        "RELAXED: " + "; ".join(relaxed_parts)
+        + "; sanity_regime_ic_required=false — regime-layered IC/monotonicity "
+        f"NOT proven for eligible regimes {sorted(eligible)}; "
+        f"pooled_spearman={pooled_spearman}"
     )
 
 
