@@ -368,6 +368,40 @@ def load_momentum_artifact_as_of(ledger_path: str | Path, *,
     return finite, identity
 
 
+def verified_ledger_tail_row(ledger_path: str | Path) -> "dict | None":
+    """Chain-verified TAIL ROW of the momentum artifact ledger, or ``None``.
+
+    orch#906 / P-MODEL-STALENESS: the staleness rail needs the leg's dates —
+    ``appended_at_utc`` (the weekly train job's publish stamp) and
+    ``cutoff_date`` (the formation cutoff, the declared staleness surface of
+    the serving contract) — WITHOUT running the full serving contract (dated
+    artifact load + golden reproduction). Same discipline as the serving
+    loader: one read of the live path into an immutable snapshot, then the
+    model package's OWN chain verification (never reimplemented here).
+
+    Returns the tail row mapping; ``None`` for a successfully read,
+    chain-verified EMPTY ledger (the designed PENDING_FIRST_ARTIFACT window).
+    Raises ``ValueError`` (``ledger_unreadable:`` /
+    ``ledger_chain_verification_failed:``) on any fault, and ``ImportError``
+    when the renquant-model distribution is absent — callers surface both
+    fail-closed.
+    """
+    mm, _composite_scores = _import_momentum_construction()
+    ledger = Path(ledger_path)
+    try:
+        raw = ledger.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"ledger_unreadable: {ledger}: {exc}") from exc
+    try:
+        with tempfile.TemporaryDirectory(prefix="momentum-ledger-tail-") as td:
+            snap = Path(td) / "momentum_artifact_ledger.jsonl"
+            snap.write_bytes(raw)
+            rows = mm.load_and_verify_ledger(snap)
+    except mm.LedgerIntegrityError as exc:
+        raise ValueError(f"ledger_chain_verification_failed: {exc}") from exc
+    return rows[-1] if rows else None
+
+
 def load_momentum_residual_scorer(ledger_path: str | Path,
                                   config: Mapping[str, Any] | None = None,
                                   ) -> MomentumResidualScorer:
@@ -479,4 +513,5 @@ __all__ = [
     "MomentumResidualScorer",
     "ShadowNotYetPublished",
     "load_momentum_residual_scorer",
+    "verified_ledger_tail_row",
 ]

@@ -44,6 +44,54 @@ def _parse_date(raw) -> dt.date | None:
         return None
 
 
+#: Mirrors ``blend_scorer.MOMENTUM_COMPONENT_KIND`` as a literal so this
+#: preflight module stays import-light (the canonical constant lives in the
+#: scorer package); pinned equal by test_preflight_staleness_momentum.
+MOMENTUM_LEG_KIND = "momentum_residual"
+
+
+def _momentum_ledger_meta(path) -> dict:
+    """Freshness dates for a ``momentum_residual`` ledger leg (orch#906).
+
+    Reads the chain-VERIFIED tail row via the scorer package's own
+    ``verified_ledger_tail_row`` (single-read snapshot + the model package's
+    chain verification — never reimplemented here) and maps it onto the same
+    two axes every other leg exposes:
+
+    * ``trained_date``  <- ``appended_at_utc``: the weekly train job appends
+      the row at publish time, so the append stamp IS the retrain clock;
+    * ``effective_train_cutoff_date`` <- ``cutoff_date``: the formation
+      cutoff — the serving contract's DECLARED staleness surface (the
+      artifact's own MEASURED cutoff trails it by the skip embargo BY
+      CONSTRUCTION and would flag a same-day publish stale on arrival, the
+      exact fwd60-stale-on-arrival class PR #220 fixed).
+
+    Raises ``ValueError`` naming the fault (unreadable ledger, broken chain,
+    verified-but-EMPTY ledger, undated row); ``ImportError`` when the
+    renquant-model distribution is absent. The caller surfaces both as a
+    provenance gap — never a pass.
+    """
+    from renquant_pipeline.kernel.panel_pipeline.momentum_residual_scorer import (  # noqa: PLC0415
+        verified_ledger_tail_row,
+    )
+    row = verified_ledger_tail_row(path)
+    if row is None:
+        raise ValueError(
+            "momentum ledger verifies but carries zero rows — the designed "
+            "PENDING_FIRST_ARTIFACT window; no served artifact exists to be "
+            "fresh or stale yet")
+    appended = str(row.get("appended_at_utc") or "")[:10]
+    if _parse_date(appended) is None:
+        raise ValueError(
+            f"ledger tail row {row.get('row_index')} carries no parseable "
+            f"appended_at_utc ({row.get('appended_at_utc')!r})")
+    return {
+        "trained_date": appended,
+        "effective_train_cutoff_date": row.get("cutoff_date"),
+        "ledger_row_index": row.get("row_index"),
+    }
+
+
 class ModelStalenessTask(PreflightTask):
     """P-MODEL-STALENESS — warn when the active scorer outlives its rails."""
 
@@ -86,6 +134,11 @@ class ModelStalenessTask(PreflightTask):
             elif kind in ("xgb", "panel_ltr_xgboost"):
                 import json  # noqa: PLC0415
                 meta = json.loads(path.read_text(encoding="utf-8"))
+                source_name = path.name
+            elif kind == MOMENTUM_LEG_KIND:
+                # orch#906: ledger-served momentum registered — dates come
+                # from the chain-verified tail row (see _momentum_ledger_meta).
+                meta = _momentum_ledger_meta(path)
                 source_name = path.name
             else:
                 # 2026-07-30: an UNRECOGNISED kind is ALWAYS a non-pass.
@@ -326,11 +379,17 @@ class ModelStalenessTask(PreflightTask):
             elif comp_kind in (default_kind, "xgb", "panel_ltr_xgboost"):
                 import json  # noqa: PLC0415
                 meta = json.loads(path.read_text(encoding="utf-8"))  # same as xgb
+            elif comp_kind == MOMENTUM_LEG_KIND:
+                # orch#906: the LIVE prod z-blend's slow-momentum leg is a
+                # ledger pointer; its freshness axis is the chain-verified
+                # tail row (appended_at_utc / cutoff_date) — read via the
+                # scorer package's own verifier, never reimplemented.
+                meta = _momentum_ledger_meta(path)
+                leg["ledger_row_index"] = meta.get("ledger_row_index")
             else:
                 # Inverted default (never enumerate-and-fall-through): a leg kind
-                # this rail does not register — e.g. momentum_residual, whose
-                # append-only ledger axis is not read here — is a surfaced gap,
-                # not a silent pass. Register it to make this actionable.
+                # this rail does not register is a surfaced gap, not a silent
+                # pass. Register it to make this actionable.
                 leg["gap"] = (
                     f"component[{index}] kind={comp_kind!r} is not a "
                     f"staleness-readable leg kind — this rail cannot establish "
