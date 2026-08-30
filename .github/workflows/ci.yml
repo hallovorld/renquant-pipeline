@@ -41,7 +41,23 @@ jobs:
         with:
           python-version: "3.10"
       - name: Install test tools
-        run: python -m pip install -e renquant-common -e renquant-base-data -e renquant-artifacts -e renquant-model -e renquant-pipeline pytest xgboost
+        # scs is pinned below 3.3.0 (released 2026-08-30T16:08Z).  cvxpy's
+        # solver chain in kernel/portfolio_qp/qp_solver.py falls through to
+        # SCS only for an INFEASIBLE problem, and under the linux/py3.10
+        # wheel that call kills the interpreter: the run dies mid-suite with
+        # pytest exit 2 and no traceback, always immediately after
+        # tests/test_baseline_allocators.py::TestHardOnlyQPAllocator::
+        # test_basic_feasible_solve — i.e. inside the first infeasible solve.
+        # Proof it is not any PR's diff: re-running the UNCHANGED main run
+        # 33246639677 (green 2026-08-29) reproduced it exactly, and the only
+        # package deltas between the green and red attempts were
+        # patsy 1.0.2->1.0.3, scs 3.2.11->3.3.0, wrapt 2.3.0->2.4.0.
+        # Everything else here stays unpinned on purpose.
+        # REMOVE THIS PIN once CI's cvxpy resolves to a release that
+        # supports scs >= 3.3.0 on python 3.10 (today it resolves 1.7.5);
+        # doc/progress/2026-08-30-ci-unbreak-scs-330.md carries the recipe
+        # for re-testing it.
+        run: python -m pip install -e renquant-common -e renquant-base-data -e renquant-artifacts -e renquant-model -e renquant-pipeline pytest xgboost "scs<3.3.0"
       # Fail-closed guard: the momentum serving-boundary suite importorskips
       # renquant_model_momentum for machines genuinely without it — CI must
       # never be such a machine, or the suite goes vacuously green. This step
