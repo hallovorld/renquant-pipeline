@@ -85,6 +85,8 @@ class TestV1Migration:
         assert mu.entry_signal == EntrySignalV2(rank_score=0.325)
         # PR-#294 field absent in v1 → schema default, not KeyError
         assert mu.protection_breaches == 0
+        # 2026-08-30 field absent in v1 → None (never incremented)
+        assert mu.last_streak_inc_date is None
         assert s.holdings["GE"].entry_signal is None
         assert isinstance(s.monitor_state, MonitorStateV2)
         assert s.monitor_state.no_trade_streak == 2
@@ -136,6 +138,7 @@ class TestRollbackRead:
         # Exactly the access patterns v1 runner code uses today:
         assert wire["entry_dates"] == GOLDEN_V1["entry_dates"]
         assert wire["sell_streaks"] == GOLDEN_V1["sell_streaks"]
+        assert wire["last_streak_inc_dates"] == {}     # additive, empty on old state
         assert wire["position_hwm"] == GOLDEN_V1["position_hwm"]
         assert wire["last_sell_dates"] == GOLDEN_V1["last_sell_dates"]
         assert wire.get("skip_buys") is False
@@ -235,6 +238,7 @@ def _random_state(rng: random.Random) -> LiveStateV2:
         holdings[t] = HoldingV2(
             entry_date=f"2026-{rng.randint(1, 12):02d}-{rng.randint(1, 28):02d}",
             sell_streak=rng.randint(0, 5),
+            last_streak_inc_date=rng.choice([None, "2026-08-25", "2026-08-26"]),
             protection_breaches=rng.randint(0, 3),
             position_hwm=rng.choice([None, round(rng.uniform(10, 2000), 3)]),
             entry_signal=rng.choice([

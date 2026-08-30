@@ -800,7 +800,21 @@ def check_model_sell(
         # Sunday / market holiday — leave streak unchanged. Don't reset
         # either (otherwise a Sun e2e would clear a legitimate streak).
         pass
+    elif model_action == "abstain":
+        # 2026-08-30: the model had NO opinion today (unseen Q-state —
+        # kernel.models.score_artifact). A strike needs a real number, and
+        # so does a reset: leave the streak exactly where it was, like a
+        # non-trading day. Never fires either (below).
+        pass
     elif model_action == "sell":
+        # STREAK-DAY-DEDUP is only as good as ``last_streak_inc_date``'s
+        # persistence. 2026-08-25 (runs f184d281 + bbd3a0f9): the runner
+        # persisted ``sell_streaks`` but NOT this date, so the second run
+        # of the day re-incremented (2 → 3 at 06:30 08-26 → model_sell
+        # after two sessions). LiveStateV2 now carries
+        # ``last_streak_inc_dates`` (live_state_v2.HoldingV2) so the
+        # round-trip can restore it; a restored date == today is the
+        # "already counted this session" signal.
         if state.last_streak_inc_date != today:
             state.sell_streak += 1
             state.last_streak_inc_date = today
@@ -820,7 +834,7 @@ def check_model_sell(
     # Path-dependent rules (stop_loss, trailing, SDL, max_hold) are NOT
     # affected — those go through compute_exits's other branches and
     # represent risk management that must always fire.
-    if not trading_day:
+    if not trading_day or model_action == "abstain":
         return state, _NO_EXIT
 
     if state.sell_streak >= consecutive_required:
