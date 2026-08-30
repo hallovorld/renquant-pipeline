@@ -16,6 +16,7 @@ from renquant_pipeline.kernel.diagnostic_only_override import (
 )
 from renquant_pipeline.kernel.rfc210_license import (
     evaluate_freshness_fallback_license,
+    licensed_check_message,
 )
 from renquant_pipeline.kernel.wf_fail_override import (
     evaluate_wf_fail_override,
@@ -29,6 +30,7 @@ from renquant_pipeline.kernel.preflight import (  # noqa: PLC0415 (legacy bridge
     _is_sell_only_run,
     _is_sequence_artifact,
     _load_sequence_sidecar,
+    _regime_ic_pass_message,
     _resolve_artifact_path,
     _soft_for_sell_only,
     _wf_metadata_from_payload,
@@ -182,10 +184,7 @@ class WfGateMetadataTask(PreflightTask):
             details["freshness_fallback_rfc210"] = rfc210.provenance
             return PreflightCheck(
                 self.check_name, "hard", True,
-                f"active panel artifact is {rfc210.reason}; gate-fail evidence "
-                f"acknowledged (wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
-                f"reason={wf.get('wf_reason')}) — buys admitted while the "
-                "freshness license holds.",
+                licensed_check_message(rfc210, wf, payload),
                 details=details,
             )
         details["freshness_fallback_rfc210_refused"] = rfc210.reason
@@ -417,7 +416,6 @@ class RegimeLayeredICTask(PreflightTask):
         pooled_spearman = _finite_float(pooled.get("spearman")) if pooled else None
         return PreflightCheck(
             self.check_name, "hard", True,
-            "regime-layered IC/monotonicity passed for eligible regimes "
-            f"{sorted(eligible)}; pooled_spearman={pooled_spearman}",
+            _regime_ic_pass_message(details, eligible, failed, pooled_spearman),
             details=details,
         )

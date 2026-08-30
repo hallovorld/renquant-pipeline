@@ -109,3 +109,50 @@ def evaluate_freshness_fallback_license(
             "max_served_age_days": max_age,
         },
     )
+
+
+def genuine_ic_from_payload(payload: object) -> float | None:
+    """The genuine IC the fallback promotion recorded for this artifact.
+
+    ``metadata.fallback_genuine_ic`` is what the RFC #210 promoter stamps;
+    ``wf_gate_metadata.sanity_placebo_genuine_ic`` is the gate's own copy.
+    ``None`` when neither is a finite number — the caller prints ``n/a``,
+    never a made-up figure.
+    """
+    if not isinstance(payload, dict):
+        return None
+    meta = payload.get("metadata")
+    candidates: list[object] = []
+    if isinstance(meta, dict):
+        candidates.append(meta.get("fallback_genuine_ic"))
+        wf = meta.get("wf_gate_metadata")
+        if isinstance(wf, dict):
+            candidates.append(wf.get("sanity_placebo_genuine_ic"))
+    for value in candidates:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f = float(value)
+            if f == f and f not in (float("inf"), float("-inf")):
+                return f
+    return None
+
+
+def licensed_check_message(license: Rfc210License, wf: dict, payload: object) -> str:
+    """The P-WF-GATE ✓ text while a gate-FAILED artifact is served under RFC #210.
+
+    2026-08-30: the served artifact (trained 2026-08-02, passed=false,
+    genuine_ic=+0.0029) logged ``✓ P-WF-GATE ... governance-served ... buys
+    admitted`` — a reader saw a pass. The licensed state now leads the line,
+    with the fact that the gate FAILED, the genuine IC and the age-vs-SLA the
+    license is about, so the log never prints a bare ✓ for a licensed gate.
+    """
+    prov = license.provenance
+    gi = genuine_ic_from_payload(payload)
+    gi_s = f"{gi:+.4f}" if gi is not None else "n/a"
+    return (
+        f"LICENSED: WF gate FAILED, genuine_ic={gi_s}, served age "
+        f"{prov.get('age_days')}d ≤ {prov.get('max_served_age_days')} "
+        f"(promotion_basis={prov.get('promotion_basis')}, trained "
+        f"{prov.get('trained_date')}; wf_sharpe_mean={wf.get('wf_3cut_sharpe_mean')}, "
+        f"reason={wf.get('wf_reason')}) — buys admitted ONLY while the RFC#210 "
+        "freshness license holds; this is not a WF pass."
+    )
