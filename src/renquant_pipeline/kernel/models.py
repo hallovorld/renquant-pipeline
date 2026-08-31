@@ -15,11 +15,46 @@ import pandas as pd
 
 log = logging.getLogger("kernel.models")
 
-# Stable abstain reason (blocked_by / telemetry). A per-ticker Q-learning
-# model whose state was never visited in training — or whose features are
-# NaN so no state can be resolved — has NO opinion: it must not score 0.0.
+# Stable abstain reasons (ScoreResult.abstain_reason) and the blocked_by
+# reasons they map to (``er_abstain_<reason>``, telemetry / decision trace).
+# A per-ticker model that has NO opinion must not score 0.0 — the isotonic
+# ER map turns 0.0 into a positive expected return (x12 at the 60d horizon).
+#
+# * ``unseen_state``  — Q-learning: the resolved Q-row was never updated in
+#   training (all-zero) or the state index is outside the table.
+# * ``nan_features``  — any per-ticker model type (classification, xgboost,
+#   qlearning): a required feature column is missing / None / NaN, so there
+#   is no input to score. Pre-2026-08-30 ``predict_classification`` and the
+#   xgboost branch of ``score_artifact`` returned ``raw = 0.0`` here — the
+#   same trap pipeline#303 closed for qlearning.
 ABSTAIN_UNSEEN_STATE = "unseen_state"
-REASON_ER_ABSTAIN_UNSEEN_STATE = "er_abstain_unseen_state"
+ABSTAIN_NAN_FEATURES = "nan_features"
+REASON_ER_ABSTAIN_PREFIX = "er_abstain_"
+REASON_ER_ABSTAIN_UNSEEN_STATE = REASON_ER_ABSTAIN_PREFIX + ABSTAIN_UNSEEN_STATE
+REASON_ER_ABSTAIN_NAN_FEATURES = REASON_ER_ABSTAIN_PREFIX + ABSTAIN_NAN_FEATURES
+ABSTAIN_REASONS = (ABSTAIN_UNSEEN_STATE, ABSTAIN_NAN_FEATURES)
+
+
+def abstain_block_reason(abstain_reason: str) -> str:
+    """``ScoreResult.abstain_reason`` → the candidate ``blocked_by`` reason."""
+    return REASON_ER_ABSTAIN_PREFIX + str(abstain_reason)
+
+
+def is_abstain_block_reason(blocked_by: object) -> bool:
+    return isinstance(blocked_by, str) and blocked_by.startswith(REASON_ER_ABSTAIN_PREFIX)
+
+
+def abstain_breakdown(blocked_by_values) -> dict[str, int]:
+    """Count abstain ``blocked_by`` reasons: ``{er_abstain_<reason>: n}``.
+
+    Every known reason is present (0 when absent) so the Phase 2b summary
+    line and the run counters have a stable shape run to run.
+    """
+    out = {abstain_block_reason(r): 0 for r in ABSTAIN_REASONS}
+    for b in blocked_by_values:
+        if is_abstain_block_reason(b):
+            out[b] = out.get(b, 0) + 1
+    return out
 
 
 # ── Calibration ───────────────────────────────────────────────────────────────
@@ -142,11 +177,42 @@ def _traverse_tree(tree: list, row: list) -> float:
         idx += int(left_off) if row[int(feat)] <= split_val else int(right_off)
 
 
-def predict_classification(artifact: dict, feature_row: pd.Series) -> float:
+def missing_features(artifact: dict, feature_row: pd.Series) -> list[str]:
+    """Required ``feature_columns`` that are absent / None / NaN in the row.
+
+    Non-empty means the per-ticker model has no input to score and must
+    ABSTAIN (``ABSTAIN_NAN_FEATURES``) — for every model type. A value that
+    cannot be coerced to float counts as missing too.
+    """
+    missing: list[str] = []
+    for col in artifact.get("feature_columns", []) or []:
+        val = feature_row.get(col) if feature_row is not None else None
+        if val is None:
+            missing.append(col)
+            continue
+        try:
+            if math.isnan(float(val)):
+                missing.append(col)
+        except (TypeError, ValueError):
+            missing.append(col)
+    return missing
+
+
+def predict_classification(artifact: dict, feature_row: pd.Series) -> float | None:
+    """Mean vote of the random-forest trees, or ``None`` to ABSTAIN.
+
+    ``None`` (2026-08-30, follow-up to pipeline#303) on any missing / NaN
+    feature: the forest cannot be traversed, so there is no vote. Pre-fix
+    this returned ``0.0`` "neutral" — but the isotonic ER calibrator maps
+    0.0 to a positive expected return on live artifacts (the qlearning trap
+    of #303, same shape). A REAL vote that happens to land exactly on the
+    calibrator's neutral value is still a vote and is returned unchanged:
+    only absent input abstains, never a value the trees produced.
+    """
     feat_cols = artifact["feature_columns"]
-    feat_vals = [float(feature_row.get(c, float("nan"))) for c in feat_cols]
-    if any(math.isnan(v) for v in feat_vals):
-        return 0.0
+    if missing_features(artifact, feature_row):
+        return None
+    feat_vals = [float(feature_row.get(c)) for c in feat_cols]
     trees = artifact["trees"]
     return sum(_traverse_tree(t, feat_vals) for t in trees) / len(trees)
 
@@ -384,8 +450,20 @@ def score_artifact(
     """
     ptype = artifact["policy_type"]
 
+    # 2026-08-30 (follow-up to pipeline#303): a missing / NaN required
+    # feature is the absence of an input, for every learned model type.
+    # ABSTAIN before dispatch — never the pre-fix ``raw = 0.0`` that the
+    # isotonic ER map turned into a positive expected return. ``manual``
+    # is rule-based and skips NaN rules by contract (predict_manual); it is
+    # not a learned model and is left alone.
+    if ptype in ("classification", "qlearning", "xgboost"):
+        if missing_features(artifact, feature_row):
+            return abstain_result(ABSTAIN_NAN_FEATURES)
+
     if ptype == "classification":
         raw = predict_classification(artifact, feature_row)
+        if raw is None:                    # defensive: same contract as above
+            return abstain_result(ABSTAIN_NAN_FEATURES)
 
     elif ptype == "manual":
         raw = predict_manual(artifact, feature_row)
@@ -399,13 +477,10 @@ def score_artifact(
 
     elif ptype == "xgboost":
         feat_cols = artifact["feature_columns"]
-        feat_vals = [float(feature_row.get(c, float("nan"))) for c in feat_cols]
-        if any(math.isnan(v) for v in feat_vals):
-            raw = 0.0
-        else:
-            p_buy  = predict_xgboost(artifact["xgb_buy"],  feat_vals)
-            p_sell = predict_xgboost(artifact["xgb_sell"], feat_vals)
-            raw    = float(p_buy - p_sell)
+        feat_vals = [float(feature_row.get(c)) for c in feat_cols]
+        p_buy  = predict_xgboost(artifact["xgb_buy"],  feat_vals)
+        p_sell = predict_xgboost(artifact["xgb_sell"], feat_vals)
+        raw    = float(p_buy - p_sell)
     else:
         raw = 0.0
 
