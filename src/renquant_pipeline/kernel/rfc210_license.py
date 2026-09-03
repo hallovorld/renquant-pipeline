@@ -156,3 +156,79 @@ def licensed_check_message(license: Rfc210License, wf: dict, payload: object) ->
         f"reason={wf.get('wf_reason')}) — buys admitted ONLY while the RFC#210 "
         "freshness license holds; this is not a WF pass."
     )
+
+
+# ── RFC#210 Amendment A4-T1 (2026-08-31 .. 2026-09-07) ───────────────────────
+#: The ONE operator-authorized zero-trade candidate (renquant-backtesting#128,
+#: renquant-orchestrator#1110, RenQuant#632). A second exception is a code change
+#: here, by design: this is a one-shot license, not a mechanism.
+A4T1_LICENSED_RUN_IDS = frozenset({"20260831T141820Z"})
+
+
+def _meta(payload: dict) -> dict:
+    meta = payload.get("metadata")
+    return meta if isinstance(meta, dict) else {}
+
+
+def evaluate_a4t1_regime_evidence_license(
+    payload: object,
+    *,
+    config: dict | None = None,
+    today: dt.date | None = None,
+) -> Rfc210License:
+    """May a served artifact with NO regime-layered OOS evidence admit buys?
+
+    Only under RFC#210 Amendment A4-T1: the operator authorized exactly one
+    zero-trade candidate (its WF produced no round-trips, so no regime has
+    eligible trades) to be served for a time-limited window. The orchestrator
+    consumed that exception atomically and stamped the artifact; this license
+    reads the stamp and refuses on any missing piece:
+
+      1. the RFC#210 freshness license itself is served (basis, trained_date, SLA);
+      2. ``metadata.fallback_a4t1_override`` is ``True``;
+      3. ``metadata.fallback_a4t1_candidate_run_id`` is in ``A4T1_LICENSED_RUN_IDS``;
+      4. ``metadata.fallback_a4t1_expiry`` is an ISO date and ``today <= expiry``;
+      5. ``metadata.fallback_a4t1_consumption_proof.receipt_id`` is a non-empty
+         string (the orchestrator's ledger receipt — proof the exception was
+         consumed before the stamp).
+
+    After the expiry the artifact falls back to the standing hard fail, so the
+    window closes by itself.
+    """
+    base = evaluate_freshness_fallback_license(payload, config=config, today=today)
+    if not base.served:
+        return Rfc210License(False, f"A4-T1 requires the RFC#210 license: {base.reason}")
+    meta = _meta(payload)  # type: ignore[arg-type]
+    if meta.get("fallback_a4t1_override") is not True:
+        return Rfc210License(False, "A4-T1: metadata.fallback_a4t1_override is not True")
+    run_id = meta.get("fallback_a4t1_candidate_run_id")
+    if not isinstance(run_id, str) or run_id not in A4T1_LICENSED_RUN_IDS:
+        return Rfc210License(False, f"A4-T1: candidate run id {run_id!r} is not licensed")
+    raw_exp = meta.get("fallback_a4t1_expiry")
+    if not isinstance(raw_exp, str) or not raw_exp.strip():
+        return Rfc210License(False, f"A4-T1: fallback_a4t1_expiry is {raw_exp!r}")
+    try:
+        expiry = dt.date.fromisoformat(raw_exp.strip())
+    except ValueError:
+        return Rfc210License(False, f"A4-T1: fallback_a4t1_expiry {raw_exp!r} is not an ISO date")
+    today = today if today is not None else dt.date.today()
+    if today > expiry:
+        return Rfc210License(
+            False, f"A4-T1 window closed: expiry {raw_exp} < today {today.isoformat()}")
+    proof = meta.get("fallback_a4t1_consumption_proof")
+    receipt = proof.get("receipt_id") if isinstance(proof, dict) else None
+    if not isinstance(receipt, str) or not receipt.strip():
+        return Rfc210License(False, "A4-T1: no orchestrator consumption receipt on the artifact")
+    return Rfc210License(
+        True,
+        f"served under RFC#210 A4-T1 for candidate {run_id} until {raw_exp}",
+        provenance={
+            **base.provenance,
+            "a4t1_candidate_run_id": run_id,
+            "a4t1_expiry": raw_exp,
+            "a4t1_days_left": (expiry - today).days,
+            "a4t1_receipt_id": receipt,
+            "a4t1_authority": meta.get("fallback_a4t1_candidate_authority"),
+        },
+    )
+
