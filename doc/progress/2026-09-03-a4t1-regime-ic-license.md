@@ -1,4 +1,4 @@
-# P-REGIME-IC honours the RFC#210 A4-T1 license for the one authorized zero-trade candidate   (PR TBD)
+# P-REGIME-IC honours the RFC#210 A4-T1 license for the one authorized zero-trade candidate   (PR #308)
 
 STATUS:    delivered — time-limited, artifact-bound license; fails closed to the
            standing hard fail on every missing piece and after 2026-09-07.
