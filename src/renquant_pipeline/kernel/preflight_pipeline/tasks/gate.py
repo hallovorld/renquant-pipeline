@@ -15,6 +15,7 @@ from renquant_pipeline.kernel.diagnostic_only_override import (
     evaluate_diagnostic_only_override,
 )
 from renquant_pipeline.kernel.rfc210_license import (
+    evaluate_a4t1_regime_evidence_license,
     evaluate_freshness_fallback_license,
     licensed_check_message,
 )
@@ -324,7 +325,9 @@ class RegimeLayeredICTask(PreflightTask):
         details = self._initial_details(p, ctx.run_mode, tm, sanity)
         admission_cfg = panel_cfg.get("regime_admission", {}) or {}
         require_sanity = bool(admission_cfg.get("require_sanity_regime_ic", True))
-        return self._evaluate(wf, tm, sanity, details, ctx, require_sanity)
+        # RFC#210 A4-T1 license (parity with preflight._check_regime_layered_ic)
+        a4t1 = evaluate_a4t1_regime_evidence_license(payload, config=ctx.config)
+        return self._evaluate(wf, tm, sanity, details, ctx, require_sanity, a4t1=a4t1)
 
     def _initial_details(self, artifact_path, run_mode, tm: dict, sanity: dict) -> dict:
         return {
@@ -338,7 +341,7 @@ class RegimeLayeredICTask(PreflightTask):
         }
 
     def _evaluate(self, wf: dict, tm: dict, sanity: dict, details: dict,
-                  ctx: PreflightContext, require_sanity: bool) -> PreflightCheck:
+                  ctx: PreflightContext, require_sanity: bool, *, a4t1=None) -> PreflightCheck:
         if not tm:
             return _soft_for_sell_only(
                 self.check_name,
@@ -366,10 +369,10 @@ class RegimeLayeredICTask(PreflightTask):
                     details=details,
                 )
             details["sanity_regime_ic_relaxed"] = True
-        return self._evaluate_regimes(wf, tm, details, ctx)
+        return self._evaluate_regimes(wf, tm, details, ctx, a4t1=a4t1)
 
     def _evaluate_regimes(self, wf: dict, tm: dict, details: dict,
-                          ctx: PreflightContext) -> PreflightCheck:
+                          ctx: PreflightContext, *, a4t1=None) -> PreflightCheck:
         regimes_raw = tm.get("regimes")
         if isinstance(regimes_raw, dict):
             regimes = regimes_raw
@@ -393,6 +396,23 @@ class RegimeLayeredICTask(PreflightTask):
         details["failed_regimes"] = sorted(failed)
         details["regimes"] = regimes
         if not eligible:
+            # RFC#210 Amendment A4-T1 — byte-for-byte the same text as the legacy
+            # twin (preflight._check_regime_layered_ic); the parity test pins it.
+            if a4t1 is not None and a4t1.served:
+                prov = a4t1.provenance
+                details["rfc210_a4t1_license"] = prov
+                return PreflightCheck(
+                    self.check_name, "soft", True,
+                    "LICENSED (RFC#210 A4-T1): regime-layered OOS evidence ABSENT — "
+                    "zero-trade WF, no eligible regime; buys admitted WITHOUT regime IC "
+                    f"proof by operator authorization for candidate "
+                    f"{prov['a4t1_candidate_run_id']} until {prov['a4t1_expiry']} "
+                    f"({prov['a4t1_days_left']}d left), orchestrator receipt "
+                    f"{str(prov['a4t1_receipt_id'])[:12]}…",
+                    details=details,
+                )
+            if a4t1 is not None:
+                details["rfc210_a4t1_license_refused"] = a4t1.reason
             return _soft_for_sell_only(
                 self.check_name,
                 "no regime has enough OOS trades for regime-layered IC validation",

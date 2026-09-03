@@ -57,7 +57,11 @@ from typing import Any
 
 from .artifact_resolver import locate_artifact
 from .pipeline.task_topup import resolve_topup_enablement
-from .rfc210_license import evaluate_freshness_fallback_license, licensed_check_message
+from .rfc210_license import (
+    evaluate_a4t1_regime_evidence_license,
+    evaluate_freshness_fallback_license,
+    licensed_check_message,
+)
 
 log = logging.getLogger("kernel.preflight")
 
@@ -738,6 +742,27 @@ def _check_regime_layered_ic(
     details["failed_regimes"] = sorted(failed)
     details["regimes"] = regimes
     if not eligible:
+        # RFC#210 Amendment A4-T1 (2026-08-31..09-07): the ONE operator-authorized
+        # zero-trade candidate carries no eligible regime by construction (its WF
+        # produced no round-trips). The orchestrator consumed that exception and
+        # stamped the artifact; the license reads the stamp and closes itself at
+        # the stamped expiry. The text must never read as a pass: the evidence
+        # is ABSENT, and the operator chose to admit buys anyway.
+        a4t1 = evaluate_a4t1_regime_evidence_license(payload, config=config)
+        if a4t1.served:
+            prov = a4t1.provenance
+            details["rfc210_a4t1_license"] = prov
+            return PreflightCheck(
+                "P-REGIME-IC", "soft", True,
+                "LICENSED (RFC#210 A4-T1): regime-layered OOS evidence ABSENT — "
+                "zero-trade WF, no eligible regime; buys admitted WITHOUT regime IC "
+                f"proof by operator authorization for candidate "
+                f"{prov['a4t1_candidate_run_id']} until {prov['a4t1_expiry']} "
+                f"({prov['a4t1_days_left']}d left), orchestrator receipt "
+                f"{str(prov['a4t1_receipt_id'])[:12]}…",
+                details=details,
+            )
+        details["rfc210_a4t1_license_refused"] = a4t1.reason
         return _soft_for_sell_only(
             "P-REGIME-IC",
             "no regime has enough OOS trades for regime-layered IC validation",
