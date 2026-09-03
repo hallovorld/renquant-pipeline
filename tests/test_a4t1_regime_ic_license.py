@@ -14,9 +14,12 @@ import datetime as dt
 import json
 from pathlib import Path
 
+import pytest
+
 from renquant_pipeline.kernel import preflight as kp
 from renquant_pipeline.kernel.preflight_pipeline.ctx import PreflightContext
 from renquant_pipeline.kernel.preflight_pipeline.tasks.gate import RegimeLayeredICTask
+from renquant_pipeline.kernel import rfc210_license
 from renquant_pipeline.kernel.rfc210_license import (
     A4T1_LICENSED_RUN_IDS,
     evaluate_a4t1_regime_evidence_license as ev,
@@ -25,6 +28,22 @@ from renquant_pipeline.kernel.rfc210_license import (
 RUN_ID = "20260831T141820Z"
 TODAY = dt.date(2026, 9, 4)
 RECEIPT = "2cd9d27b0b96835119827de0760213a0539e71ac7574c213a74f68a5cc772d6e"
+
+
+class _FrozenDate(dt.date):
+    """`dt.date` with `today()` pinned to TODAY — the preflight paths call
+    `evaluate_a4t1_regime_evidence_license(..., today=None)`, which resolves
+    the wall clock; freezing it keeps every positive-path assertion valid
+    after the real window closes on 2026-09-07 (codex #308 r1)."""
+    @classmethod
+    def today(cls):
+        return cls(TODAY.year, TODAY.month, TODAY.day)
+
+
+@pytest.fixture
+def frozen_today(monkeypatch):
+    monkeypatch.setattr(rfc210_license.dt, "date", _FrozenDate)
+    return TODAY
 
 
 def _zero_trade_wf() -> dict:
@@ -139,8 +158,8 @@ def test_malformed_expiry_refuses():
 
 # ── P-REGIME-IC in the full daily run ──────────────────────────────────────
 
-def test_full_run_admits_the_licensed_zero_trade_candidate_as_SOFT_and_says_so(tmp_path):
-    _write(tmp_path, _payload(today=dt.date.today()))
+def test_full_run_admits_the_licensed_zero_trade_candidate_as_SOFT_and_says_so(tmp_path, frozen_today):
+    _write(tmp_path, _payload())
     res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="full")
     assert res.ok is True and res.severity == "soft", (res.severity, res.message)
     assert res.message.startswith("LICENSED (RFC#210 A4-T1): regime-layered OOS evidence ABSENT")
@@ -150,8 +169,8 @@ def test_full_run_admits_the_licensed_zero_trade_candidate_as_SOFT_and_says_so(t
     assert res.details["eligible_regimes"] == []
 
 
-def test_full_run_still_hard_fails_an_unlicensed_zero_trade_artifact(tmp_path):
-    p = _payload(today=dt.date.today())
+def test_full_run_still_hard_fails_an_unlicensed_zero_trade_artifact(tmp_path, frozen_today):
+    p = _payload()
     for k in list(p["metadata"]):
         if k.startswith("fallback_a4t1_"):
             del p["metadata"][k]
@@ -162,28 +181,28 @@ def test_full_run_still_hard_fails_an_unlicensed_zero_trade_artifact(tmp_path):
     assert "fallback_a4t1_override" in res.details["rfc210_a4t1_license_refused"]
 
 
-def test_full_run_hard_fails_once_the_window_has_closed(tmp_path):
-    _write(tmp_path, _payload(today=dt.date.today(), expiry="2026-09-01"))
+def test_full_run_hard_fails_once_the_window_has_closed(tmp_path, frozen_today):
+    _write(tmp_path, _payload(expiry="2026-09-01"))   # < TODAY 2026-09-04
     res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="full")
     assert res.ok is False and res.severity == "hard"
     assert "window closed" in res.details["rfc210_a4t1_license_refused"]
 
 
-def test_full_run_hard_fails_without_the_orchestrator_receipt(tmp_path):
-    _write(tmp_path, _payload(today=dt.date.today(), receipt=None))
+def test_full_run_hard_fails_without_the_orchestrator_receipt(tmp_path, frozen_today):
+    _write(tmp_path, _payload(receipt=None))
     res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="full")
     assert res.ok is False and res.severity == "hard"
 
 
-def test_sell_only_run_is_unchanged(tmp_path):
-    _write(tmp_path, _payload(today=dt.date.today()))
+def test_sell_only_run_is_unchanged(tmp_path, frozen_today):
+    _write(tmp_path, _payload())
     res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="sell_only")
     assert res.ok is True and res.severity == "soft"
     assert res.message.startswith("LICENSED (RFC#210 A4-T1)")
 
 
-def test_an_artifact_with_eligible_regimes_never_takes_the_license_path(tmp_path):
-    p = _payload(today=dt.date.today())
+def test_an_artifact_with_eligible_regimes_never_takes_the_license_path(tmp_path, frozen_today):
+    p = _payload()
     p["metadata"]["wf_gate_metadata"]["trade_monotonicity"] = {
         "passed": True, "pooled": {"n": 117, "spearman": 0.12},
         "regimes": [{"regime": "BULL_CALM", "eligible": True, "passed": True, "spearman": 0.12}],
@@ -204,19 +223,35 @@ def _both(tmp_path: Path, run_mode: str = "full"):
     return mono, task
 
 
-def test_licensed_text_is_identical_in_both_twins(tmp_path):
+def test_licensed_text_is_identical_in_both_twins(tmp_path, frozen_today):
     """The daily runner uses the task twin (its log lines are tagged
     preflight_pipeline); a license that only the legacy function knew would
     never reach production."""
-    _write(tmp_path, _payload(today=dt.date.today()))
+    _write(tmp_path, _payload())
     mono, task = _both(tmp_path)
     assert mono.message == task.message
     assert mono.severity == task.severity == "soft" and mono.ok is task.ok is True
     assert task.details["rfc210_a4t1_license"] == mono.details["rfc210_a4t1_license"]
 
 
-def test_refusal_reason_is_identical_in_both_twins(tmp_path):
-    _write(tmp_path, _payload(today=dt.date.today(), expiry="2026-09-01"))
+def test_refusal_reason_is_identical_in_both_twins(tmp_path, frozen_today):
+    _write(tmp_path, _payload(expiry="2026-09-01"))
     mono, task = _both(tmp_path)
     assert mono.message == task.message and task.ok is False and task.severity == "hard"
     assert task.details["rfc210_a4t1_license_refused"] == mono.details["rfc210_a4t1_license_refused"]
+
+
+def test_positive_paths_do_not_depend_on_the_wall_clock(tmp_path, monkeypatch):
+    """codex #308 r1: with the machine date past the window the SAME payload
+    must still be judged against the frozen TODAY, not the wall clock."""
+    class _Late(dt.date):
+        @classmethod
+        def today(cls):
+            return cls(2026, 9, 8)
+    monkeypatch.setattr(rfc210_license.dt, "date", _Late)
+    _write(tmp_path, _payload())           # expiry TODAY+3 = 2026-09-07 < 2026-09-08
+    res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="full")
+    assert res.ok is False and "window closed" in res.details["rfc210_a4t1_license_refused"]
+    monkeypatch.setattr(rfc210_license.dt, "date", _FrozenDate)
+    res = kp._check_regime_layered_ic(_config(), tmp_path, run_mode="full")
+    assert res.ok is True and res.message.startswith("LICENSED (RFC#210 A4-T1)")
