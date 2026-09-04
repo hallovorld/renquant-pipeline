@@ -52,6 +52,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -161,6 +162,67 @@ DEFAULT_CUTOFF_LAG_SLACK_DAYS = 28
 MAX_DECLARED_LOOKAHEAD_TDAYS = 252
 
 CONTENT_SHA256_PREFIX = "sha256:"
+
+
+# ── Frozen forward readouts (2026-09-03) ───────────────────────────────────────
+#
+# A shadow lane whose artifact is FROZEN BY DESIGN — a certified model accruing
+# a fixed-length forward ledger (pipeline#213: 60-session INFO read, 120-session
+# GATE) — cannot be "retrained" without voiding the readout, so the two-axis
+# freshness rule (trained_date age, cutoff lag) fires on it every session for
+# the whole readout window. Measured 2026-09-01..03 on the live sentinel log:
+# `topdecile_clf_blend_leg` DEGRADED daily with `cutoff_lag_128d_over_112d`,
+# `trained_37d_limit_28d` — a page that says "retrain me" about a lane whose
+# whole value is that it is NOT retrained.
+#
+# The exemption is bound to the ARTIFACT, not the lane name: it applies only
+# while the record's observed ``content_sha256`` AND the config-pinned
+# ``expected_content_sha256`` both equal the certified digest, and only until
+# ``until`` (self-expiring, like the RFC#210 A4-T1 license). A swapped
+# artifact, a config that stops pinning it, or the calendar running out all
+# return the lane to the standing rule with no code change. Only the
+# FRESHNESS tokens are suppressed — identity mismatch, missing provenance,
+# low coverage and no-scores remain faults — and the suppressed tokens are
+# written into the record (``frozen_forward_readout.freshness_suppressed``)
+# so the staleness stays visible to a reader, just not as an alarm.
+
+@dataclass(frozen=True)
+class FrozenForwardReadout:
+    lane: str                 # shadow_name (exact, or '<lane>_<suffix>')
+    content_sha256: str       # certified artifact digest (16-hex prefix or full)
+    frozen_since: datetime.date
+    until: datetime.date      # inclusive; after this the standing rule applies
+    authority: str
+
+    def matches_lane(self, shadow_name: Any) -> bool:
+        name = str(shadow_name or "")
+        return name == self.lane or name.startswith(self.lane + "_")
+
+
+FROZEN_FORWARD_READOUTS: tuple[FrozenForwardReadout, ...] = (
+    FrozenForwardReadout(
+        lane="topdecile_clf_blend_leg",
+        content_sha256="1e644354e0981f47",
+        frozen_since=datetime.date(2026, 7, 27),
+        # 120 sessions from 2026-07-27 plus the 60-session label maturity the
+        # GATE read needs lands ~Feb 2027 (pipeline#213 schedule); one month
+        # of slack for holidays and the readout job's own cadence.
+        until=datetime.date(2027, 3, 31),
+        authority=("pipeline#213 frozen forward readout (design doc "
+                   "2026-07-25-blend-shadow-deployment.md); strategy-104 config "
+                   "pins the artifact via expected_content_sha256 and records "
+                   "the role in _2026_07_26_role"),
+    ),
+)
+
+#: Freshness reason tokens a frozen forward readout suppresses. Provenance
+#: defects (missing / unparseable / future dates) are NOT freshness and stay.
+_FROZEN_SUPPRESSIBLE = (
+    re.compile(r"^cutoff_lag_\d+d_over_\d+d"),
+    re.compile(r"^stale_\d+d_limit_\d+d$"),
+    re.compile(r"^trained_\d+d_limit_\d+d$"),
+    re.compile(r"^no_declared_lookahead_single_axis$"),
+)
 
 #: Config key under which the live runner stamps the RESOLVED path of the
 #: strategy config file it loaded (``live/runner.py`` — set alongside
@@ -550,6 +612,23 @@ def finalize_shadow_health(
                 max_staleness_days=max_staleness_days,
                 cutoff_lag_slack_days=cutoff_lag_slack_days))
 
+    # 1b) A frozen forward readout (certified artifact, fixed-length ledger)
+    #     is stale BY DESIGN: suppress the freshness tokens only, keep them in
+    #     the record, and leave every other fault class untouched.
+    frozen = frozen_forward_readout_for(health, run_date=run_date)
+    if frozen is not None:
+        suppressed = [r for r in reasons if _is_frozen_suppressible(r)]
+        reasons = [r for r in reasons if not _is_frozen_suppressible(r)]
+        health["frozen_forward_readout"] = {
+            "lane": frozen.lane,
+            "content_sha256": frozen.content_sha256,
+            "frozen_since": frozen.frozen_since.isoformat(),
+            "until": frozen.until.isoformat(),
+            "days_left": (frozen.until - run_date).days,
+            "authority": frozen.authority,
+            "freshness_suppressed": suppressed,
+        }
+
     # 2) Required artifact IDENTITY (immutable content + provenance), plus any
     #    config-pinned expected identity (a swapped/wrong artifact → mismatch).
     reasons.extend(_identity_reasons(health))
@@ -599,6 +678,53 @@ def _identity_reasons(health: dict[str, Any]) -> list[str]:
     if exp_fp and fp and str(exp_fp).strip() != str(fp).strip():
         out.append("config_fingerprint_mismatch")
     return out
+
+
+def _is_frozen_suppressible(reason: Any) -> bool:
+    text = str(reason or "")
+    return any(p.match(text) for p in _FROZEN_SUPPRESSIBLE)
+
+
+def frozen_forward_readout_for(
+    health: dict[str, Any], *, run_date: datetime.date,
+) -> FrozenForwardReadout | None:
+    """The registered frozen readout this record is entitled to, or None.
+
+    Entitlement needs ALL of: the lane name matches; the OBSERVED
+    ``content_sha256`` equals the certified digest (the bytes that scored);
+    the config-pinned ``expected_content_sha256`` equals it too (the served
+    config still declares this exact artifact); and ``run_date`` is inside
+    ``[frozen_since, until]``. Anything missing → None → the standing rule.
+    Digests compare on the shorter of the two normalized forms so a 16-hex
+    config pin and a full digest agree, exactly as ``_identity_reasons``
+    compares them.
+    """
+    observed = _norm_digest(health.get("content_sha256"))
+    pinned = _norm_digest(health.get("expected_content_sha256"))
+    if not observed or not pinned:
+        return None
+    for entry in FROZEN_FORWARD_READOUTS:
+        if not entry.matches_lane(health.get("shadow_name")):
+            continue
+        cert = _norm_digest(entry.content_sha256)
+        if not cert:
+            continue
+        if not _digest_prefix_equal(observed, cert):
+            continue
+        if not _digest_prefix_equal(pinned, cert):
+            continue
+        if run_date < entry.frozen_since or run_date > entry.until:
+            continue
+        return entry
+    return None
+
+
+def _digest_prefix_equal(a: str, b: str) -> bool:
+    """Equal on the shorter length, minimum 16 hex (the config-pin form)."""
+    n = min(len(a), len(b))
+    if n < 16:
+        return False
+    return a[:n] == b[:n]
 
 
 # ── Sink resolution + append ───────────────────────────────────────────────────
