@@ -1,4 +1,4 @@
-# Shadow health: a frozen forward readout is stale by design, not a fault   (PR #TBD)
+# Shadow health: a frozen forward readout is stale by design, not a fault   (PR #309)
 
 STATUS:    delivered — G-A (stop the standing page by fixing its cause):
            the certified top-decile classifier lane no longer pages
