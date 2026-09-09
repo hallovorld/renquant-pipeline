@@ -191,18 +191,32 @@ class A4T1WindowExtension:
 #: eligible regimes. AUTHORIZATION PENDING — see the LONG ledger row named in
 #: `authority`; this entry does nothing until that row carries the operator's
 #: first-hand confirmation and both PRs merge.
+#:
+#: THE WINDOW IS NOT THE OUTER BOUND. An A4-T1 window only decides whether the
+#: regime-evidence exception still applies; the artifact must ALSO hold the
+#: ordinary RFC#210 license, whose age bar is `DEFAULT_MAX_SERVED_AGE_DAYS`.
+#: This artifact is trained 2026-08-31, so it stops being servable after
+#: 2026-09-28 (28d) no matter what any window says — measured, not reasoned:
+#: with this entry set to 2026-10-16 the license returned SERVED=True through
+#: 09-28 and SERVED=False from 09-29 with "governance-served artifact aged
+#: out", i.e. the last 18 days of that window were inert. A window that
+#: outlives its artifact reads in the ledger as authority the system cannot
+#: honour, so the date below is the real ceiling and `test_a4t1_window_
+#: extension.py` refuses any entry that exceeds it.
 A4T1_WINDOW_EXTENSIONS: tuple[A4T1WindowExtension, ...] = (
     A4T1WindowExtension(
         run_id="20260831T141820Z",
         artifact_digest="760912ec122fa6e02628077df8b35e58145209ea3b6b395bd670d8ead9e4af1e",
-        until=dt.date(2026, 10, 16),
+        until=dt.date(2026, 9, 28),
         authority="renquant-orchestrator LONG-ledger row 2h",
         reason=(
             "the 09-07 window closed while the merge gate was unavailable "
             "(codex quota exhausted to 2026-10-03), so neither the served-pin "
             "fix nor the WF-gate repair that would produce a validated "
             "candidate could land; extends the SAME artifact's window to "
-            "2026-10-16 so the book is not sell-only for five weeks"),
+            "2026-09-28, which is the last day this artifact is servable at "
+            "all (trained 2026-08-31 + the 28d RFC#210 age bar) — asking for "
+            "more would grant a window the age bar overrides"),
     ),
 )
 

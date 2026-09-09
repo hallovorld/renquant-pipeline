@@ -80,7 +80,7 @@ def test_registry_holds_exactly_the_one_promoted_artifact():
     assert isinstance(ext, A4T1WindowExtension)
     assert ext.run_id == RUN_ID and ext.run_id in lic.A4T1_LICENSED_RUN_IDS
     assert ext.artifact_digest == DIGEST
-    assert ext.until == dt.date(2026, 10, 16)
+    assert ext.until == dt.date(2026, 9, 28)
     assert "row 2h" in ext.authority and ext.reason.strip()
 
 
@@ -91,8 +91,8 @@ def test_the_2026_09_08_artifact_is_served_again_and_the_text_says_extended():
     assert "EXTENDED by" in v.reason and "row 2h" in v.reason
     assert v.provenance["a4t1_window_extended"] is True
     assert v.provenance["a4t1_stamped_expiry"] == STAMPED       # never rewritten
-    assert v.provenance["a4t1_expiry"] == "2026-10-16"
-    assert v.provenance["a4t1_days_left"] == (dt.date(2026, 10, 16) - today).days
+    assert v.provenance["a4t1_expiry"] == "2026-09-28"
+    assert v.provenance["a4t1_days_left"] == (dt.date(2026, 9, 28) - today).days
     assert v.provenance["a4t1_receipt_id"] == RECEIPT
 
 
@@ -105,11 +105,36 @@ def test_inside_the_stamped_window_nothing_changes():
 
 
 def test_the_extension_closes_by_itself():
-    for day, served in ((dt.date(2026, 10, 16), True), (dt.date(2026, 10, 17), False)):
+    for day, served in ((dt.date(2026, 9, 28), True), (dt.date(2026, 9, 29), False)):
         v = ev(_payload(today=day, trained_days_old=4), today=day)
         assert v.served is served, day
         if not served:
             assert "window closed" in v.reason
+
+
+def test_no_extension_may_outlive_the_artifact_it_extends():
+    """A window only decides whether the regime-evidence exception applies; the
+    artifact must ALSO hold the ordinary RFC#210 license, whose age bar is
+    `DEFAULT_MAX_SERVED_AGE_DAYS`. The first version of this entry ran to
+    2026-10-16 while the artifact (trained 2026-08-31) stops being servable
+    after 2026-09-28 — the last 18 days were inert, and a ledger row that grants
+    a window the age bar overrides is authority the system cannot honour.
+
+    This is the class guard: every registered extension must end on or before
+    its artifact's age-bar ceiling.
+    """
+    trained = dt.date(2026, 8, 31)          # the one promoted artifact
+    ceiling = trained + dt.timedelta(days=lic.DEFAULT_MAX_SERVED_AGE_DAYS)
+    assert ceiling == dt.date(2026, 9, 28)
+    for ext in A4T1_WINDOW_EXTENSIONS:
+        assert ext.until <= ceiling, (ext.run_id, ext.until, ceiling)
+
+    # and the ceiling is real, not asserted: one day past it the license refuses
+    # on AGE, with the window still nominally open.
+    day = ceiling + dt.timedelta(days=1)
+    v = ev(_payload(today=day, trained_days_old=(day - trained).days), today=day)
+    assert v.served is False
+    assert "aged out" in v.reason, v.reason
 
 
 def test_extension_binds_the_artifact_digest():
