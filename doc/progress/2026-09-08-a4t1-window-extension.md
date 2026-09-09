@@ -1,4 +1,4 @@
-# A4-T1 window extension: one reviewed, digest-bound second window   (PR #TBD)
+# A4-T1 window extension: one reviewed, digest-bound second window   (PR #310)
 
 STATUS:    prepared — AUTHORIZATION PENDING. This does NOT merge until
            renquant-orchestrator LONG-ledger row 2h carries the operator's
