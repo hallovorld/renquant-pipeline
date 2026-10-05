@@ -1,8 +1,14 @@
 # A4-T1 window extension: one reviewed, digest-bound second window   (PR #310)
 
-STATUS:    prepared — AUTHORIZATION PENDING. This does NOT merge until
-           renquant-orchestrator LONG-ledger row 2h carries the operator's
-           first-hand confirmation of exactly this artifact and this end date.
+STATUS:    in-progress — authority row LANDED, awaiting Codex re-review.
+           renquant-orchestrator LONG-ledger row 2h is on orchestrator `main`
+           (renquant-orchestrator#1118, merge `d2369b28`, 2026-10-05) and
+           quotes the operator's 2026-09-12 confirmation naming this artifact
+           and the 2026-09-28 end date. Per that row the window was served on
+           the live tree 2026-09-12..2026-09-28 under the CLAUDE.md §5
+           containment and has since closed by its own date: merging this PR
+           legitimizes that record and does not, by itself, restore any buy
+           path. (Until 2026-10-05 this line read "AUTHORIZATION PENDING".)
 WHAT:      `kernel/rfc210_license.py` gains `A4T1WindowExtension` +
            `A4T1_WINDOW_EXTENSIONS` (one entry) and `a4t1_window_extension()`.
            The artifact's stamped `fallback_a4t1_expiry` remains the default
@@ -67,13 +73,12 @@ CORRECTION (2026-09-09): the window was 2026-10-16; it is now 2026-09-28.
            timeline row 2h cannot restore the buy path at all. That is an
            operator decision, not a code change, and it is stated here rather
            than discovered on 09-29.
-NEXT:      row 2h (orchestrator) must carry the operator's confirmation
-           naming this artifact and this date — the operator may name a
-           shorter date, which is a one-line amendment here. Then: row 2h →
-           this PR → strategy-104#107 (the served-pin move, row 2g; buys stay
-           blocked at the blend load without it) → umbrella pin advance +
-           snapshot → live ff-only + `subrepo_assemble --sync` → the next dawn
-           preflight reports 0 problems and the 13:55 run places orders.
-           The real exit remains RenQuant#639 (the WF gate has crashed on
-           every retrain since 09-01) plus a candidate with genuine edge;
-           this window buys time for that, it does not substitute for it.
+NEXT:      Codex re-review of this PR against the merged row 2h (scope: one
+           `A4T1WindowExtension` entry, run 20260831T141820Z, digest
+           `760912ec…4af1e`, until 2026-09-28 — unchanged since `235d3c5e`).
+           Then: this PR → strategy-104#107 (the served-pin move, row 2g) →
+           umbrella pin advance + snapshot (RenQuant#644) → live ff-only +
+           `subrepo_assemble --sync`, which lifts the 2026-09-12 containment.
+           The window is already closed, so none of this places orders; the
+           real exit remains RenQuant#639 (the WF gate has crashed on every
+           retrain since 09-01) plus a candidate with genuine edge.
