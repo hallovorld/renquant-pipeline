@@ -165,9 +165,89 @@ def licensed_check_message(license: Rfc210License, wf: dict, payload: object) ->
 A4T1_LICENSED_RUN_IDS = frozenset({"20260831T141820Z"})
 
 
+@dataclass(frozen=True)
+class A4T1WindowExtension:
+    """A reviewed, operator-authorized extension of ONE artifact's A4-T1 window.
+
+    The stamped ``fallback_a4t1_expiry`` stays the default and is never
+    rewritten — extending by editing the served artifact would break the
+    digest the orchestrator's consumption ledger bound at promotion time.
+    An extension is instead recorded HERE, in code, bound to the run id AND
+    the promoted artifact's content digest, with its own hard end date, so
+    it covers exactly one artifact, cannot outlive its own date, and is a
+    reviewed change like the original license was.
+    """
+    run_id: str
+    artifact_digest: str
+    until: dt.date
+    authority: str
+    reason: str
+
+
+#: 2026-09-08: the 2026-09-07 expiry closed itself exactly as designed, and
+#: P-REGIME-IC went back to HARD — the daily has aborted to sell-only since.
+#: There is no other servable artifact: the previous model (2026-08-02) is
+#: 37d old against a 28d SLA, and every candidate since 09-01 carries zero
+#: eligible regimes. AUTHORIZATION PENDING — see the LONG ledger row named in
+#: `authority`; this entry does nothing until that row carries the operator's
+#: first-hand confirmation and both PRs merge.
+#:
+#: THE WINDOW IS NOT THE OUTER BOUND. An A4-T1 window only decides whether the
+#: regime-evidence exception still applies; the artifact must ALSO hold the
+#: ordinary RFC#210 license, whose age bar is `DEFAULT_MAX_SERVED_AGE_DAYS`.
+#: This artifact is trained 2026-08-31, so it stops being servable after
+#: 2026-09-28 (28d) no matter what any window says — measured, not reasoned:
+#: with this entry set to 2026-10-16 the license returned SERVED=True through
+#: 09-28 and SERVED=False from 09-29 with "governance-served artifact aged
+#: out", i.e. the last 18 days of that window were inert. A window that
+#: outlives its artifact reads in the ledger as authority the system cannot
+#: honour, so the date below is the real ceiling and `test_a4t1_window_
+#: extension.py` refuses any entry that exceeds it.
+A4T1_WINDOW_EXTENSIONS: tuple[A4T1WindowExtension, ...] = (
+    A4T1WindowExtension(
+        run_id="20260831T141820Z",
+        artifact_digest="760912ec122fa6e02628077df8b35e58145209ea3b6b395bd670d8ead9e4af1e",
+        until=dt.date(2026, 9, 28),
+        authority="renquant-orchestrator LONG-ledger row 2h",
+        reason=(
+            "the 09-07 window closed while the merge gate was unavailable "
+            "(codex quota exhausted to 2026-10-03), so neither the served-pin "
+            "fix nor the WF-gate repair that would produce a validated "
+            "candidate could land; extends the SAME artifact's window to "
+            "2026-09-28, which is the last day this artifact is servable at "
+            "all (trained 2026-08-31 + the 28d RFC#210 age bar) — asking for "
+            "more would grant a window the age bar overrides"),
+    ),
+)
+
+
 def _meta(payload: dict) -> dict:
     meta = payload.get("metadata")
     return meta if isinstance(meta, dict) else {}
+
+
+def a4t1_window_extension(
+    run_id: str, meta: dict, today: dt.date
+) -> A4T1WindowExtension | None:
+    """The extension this artifact is entitled to today, or None.
+
+    Binds run id AND the stamped candidate digest (``fallback_a4t1_candidate_digest``
+    — the digest the orchestrator's ledger receipt covers), and refuses once
+    ``until`` has passed. A missing or mismatched digest is a refusal: an
+    extension must never cover an artifact other than the one authorized.
+    """
+    digest = meta.get("fallback_a4t1_candidate_digest")
+    if not isinstance(digest, str) or not digest.strip():
+        return None
+    for ext in A4T1_WINDOW_EXTENSIONS:
+        if ext.run_id != run_id:
+            continue
+        if digest.strip().lower() != ext.artifact_digest.lower():
+            continue
+        if today > ext.until:
+            continue
+        return ext
+    return None
 
 
 def evaluate_a4t1_regime_evidence_license(
@@ -212,23 +292,46 @@ def evaluate_a4t1_regime_evidence_license(
     except ValueError:
         return Rfc210License(False, f"A4-T1: fallback_a4t1_expiry {raw_exp!r} is not an ISO date")
     today = today if today is not None else dt.date.today()
+    extension = None
     if today > expiry:
-        return Rfc210License(
-            False, f"A4-T1 window closed: expiry {raw_exp} < today {today.isoformat()}")
+        # The stamped expiry is the default and is never rewritten. A reviewed
+        # extension (bound to this run id AND this artifact's digest, with its
+        # own end date) may carry the SAME artifact further; anything else
+        # keeps the standing close-by-itself behaviour.
+        extension = a4t1_window_extension(run_id, meta, today)
+        if extension is None:
+            return Rfc210License(
+                False, f"A4-T1 window closed: expiry {raw_exp} < today {today.isoformat()}")
     proof = meta.get("fallback_a4t1_consumption_proof")
     receipt = proof.get("receipt_id") if isinstance(proof, dict) else None
     if not isinstance(receipt, str) or not receipt.strip():
         return Rfc210License(False, "A4-T1: no orchestrator consumption receipt on the artifact")
+    effective = extension.until if extension is not None else expiry
+    provenance = {
+        **base.provenance,
+        "a4t1_candidate_run_id": run_id,
+        "a4t1_expiry": effective.isoformat(),
+        "a4t1_stamped_expiry": raw_exp,
+        "a4t1_days_left": (effective - today).days,
+        "a4t1_receipt_id": receipt,
+        "a4t1_authority": meta.get("fallback_a4t1_candidate_authority"),
+    }
+    if extension is not None:
+        provenance.update({
+            "a4t1_window_extended": True,
+            "a4t1_extension_authority": extension.authority,
+            "a4t1_extension_reason": extension.reason,
+        })
+        return Rfc210License(
+            True,
+            f"served under RFC#210 A4-T1 for candidate {run_id} until "
+            f"{effective.isoformat()} — stamped window {raw_exp} EXTENDED by "
+            f"{extension.authority}",
+            provenance=provenance,
+        )
     return Rfc210License(
         True,
         f"served under RFC#210 A4-T1 for candidate {run_id} until {raw_exp}",
-        provenance={
-            **base.provenance,
-            "a4t1_candidate_run_id": run_id,
-            "a4t1_expiry": raw_exp,
-            "a4t1_days_left": (expiry - today).days,
-            "a4t1_receipt_id": receipt,
-            "a4t1_authority": meta.get("fallback_a4t1_candidate_authority"),
-        },
+        provenance=provenance,
     )
 
